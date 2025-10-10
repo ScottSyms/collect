@@ -1,0 +1,15 @@
+[package]
+name = "hive_parquet_ingest"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4", features = ["derive"] }
+parquet = { version = "53", features = ["arrow", "zstd"] }
+arrow = "53"
+tokio = { version = "1", features = ["full"] }
+aws-sdk-s3 = "1.0"
+aws-config = "1.0"
+aws-credential-types = "1.0"
