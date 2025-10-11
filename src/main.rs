@@ -30,76 +30,76 @@ use parquet::basic::Compression;
 #[command(version, about="Stream a text file or TCP feed into Hive-partitioned Parquet with Zstd compression")]
 struct Args {
     /// Input text file (one record per line)
-    #[arg(short, long, env = "INPUT_FILE", conflicts_with_all = ["tcp_host", "tcp_port"])]
+    #[arg(short, long, conflicts_with_all = ["tcp_host", "tcp_port"])]
     input: Option<PathBuf>,
 
     /// TCP host address to receive data from (e.g., 153.44.253.27)
-    #[arg(long, env = "TCP_HOST", requires = "tcp_port", conflicts_with = "input")]
+    #[arg(long, requires = "tcp_port", conflicts_with = "input")]
     tcp_host: Option<String>,
 
     /// TCP port to receive data from (e.g., 5631)
-    #[arg(long, env = "TCP_PORT", requires = "tcp_host", conflicts_with = "input")]
+    #[arg(long, requires = "tcp_host", conflicts_with = "input")]
     tcp_port: Option<u16>,
 
     /// Logical source label; defaults to input file stem or "tcp" for network input
-    #[arg(short, long, env = "SOURCE")]
+    #[arg(short, long)]
     source: Option<String>,
 
     /// Output root directory
-    #[arg(short='o', long, env = "OUT_DIR", default_value = "data")]
+    #[arg(short='o', long, default_value = "data")]
     out_dir: PathBuf,
 
     /// Max rows to buffer per Parquet file before flush (default: flush on minute boundary only)
-    #[arg(long, env = "MAX_ROWS")]
+    #[arg(long)]
     max_rows: Option<usize>,
 
     /// Run health check and exit (for Docker HEALTHCHECK)
-    #[arg(long, env = "HEALTH_CHECK")]
+    #[arg(long)]
     health_check: bool,
 
     /// S3 bucket name for remote storage (enables S3 upload)
-    #[arg(long, env = "S3_BUCKET")]
+    #[arg(long)]
     s3_bucket: Option<String>,
 
     /// S3 endpoint URL (for MinIO or custom S3-compatible storage)
-    #[arg(long, env = "S3_ENDPOINT")]
+    #[arg(long)]
     s3_endpoint: Option<String>,
 
     /// S3 region (default: us-east-1)
-    #[arg(long, env = "S3_REGION", default_value = "us-east-1")]
+    #[arg(long, default_value = "us-east-1")]
     s3_region: String,
 
     /// S3 access key ID (can also use AWS_ACCESS_KEY_ID env var)
-    #[arg(long, env = "S3_ACCESS_KEY")]
+    #[arg(long)]
     s3_access_key: Option<String>,
 
     /// S3 secret access key (can also use AWS_SECRET_ACCESS_KEY env var)
-    #[arg(long, env = "S3_SECRET_KEY")]
+    #[arg(long)]
     s3_secret_key: Option<String>,
 
     /// Keep local files after S3 upload (default: delete after successful upload)
-    #[arg(long, env = "KEEP_LOCAL")]
+    #[arg(long)]
     keep_local: bool,
 
     /// WebSocket URL to connect to (e.g., wss://stream.aisstream.io/v0/stream)
-    #[arg(long, env = "WS_URL", conflicts_with_all = ["input", "tcp_host", "tcp_port"])]
+    #[arg(long, conflicts_with_all = ["input", "tcp_host", "tcp_port"])]
     ws_url: Option<String>,
 
     /// API key for WebSocket authentication (for AISStream.io)
-    #[arg(long, env = "WS_API_KEY", requires = "ws_url")]
+    #[arg(long, requires = "ws_url")]
     ws_api_key: Option<String>,
 
     /// Bounding box for WebSocket subscription (format: lat1,lon1,lat2,lon2) 
     /// Can be specified multiple times for multiple boxes. Default: entire world
-    #[arg(long, env = "WS_BBOX", requires = "ws_url")]
+    #[arg(long, requires = "ws_url")]
     ws_bbox: Vec<String>,
 
     /// Filter WebSocket messages by MMSI (can be specified multiple times, max 50)
-    #[arg(long, env = "WS_MMSI_FILTER", requires = "ws_url")]
+    #[arg(long, requires = "ws_url")]
     ws_mmsi_filter: Vec<String>,
 
     /// Filter WebSocket messages by message type (e.g., PositionReport)
-    #[arg(long, env = "WS_MESSAGE_TYPE_FILTER", requires = "ws_url")]
+    #[arg(long, requires = "ws_url")]
     ws_message_type_filter: Vec<String>,
 }
 
@@ -434,8 +434,105 @@ fn check_health() -> Result<()> {
 async fn main() -> Result<()> {
     let mut args = Args::parse();
     
+    // Handle environment variables gracefully - only override if not set via CLI and env var exists
+    
+    // Input source environment variables
+    if args.input.is_none() {
+        if let Ok(input_env) = std::env::var("INPUT_FILE") {
+            args.input = Some(PathBuf::from(input_env));
+        }
+    }
+    
+    if args.tcp_host.is_none() {
+        if let Ok(host_env) = std::env::var("TCP_HOST") {
+            args.tcp_host = Some(host_env);
+        }
+    }
+    
+    if args.tcp_port.is_none() {
+        if let Ok(port_env) = std::env::var("TCP_PORT") {
+            args.tcp_port = port_env.parse().ok();
+        }
+    }
+    
+    if args.source.is_none() {
+        if let Ok(source_env) = std::env::var("SOURCE") {
+            args.source = Some(source_env);
+        }
+    }
+    
+    // Check OUT_DIR environment variable (only if still default)
+    if args.out_dir == PathBuf::from("data") {
+        if let Ok(out_dir_env) = std::env::var("OUT_DIR") {
+            args.out_dir = PathBuf::from(out_dir_env);
+        }
+    }
+    
+    if args.max_rows.is_none() {
+        if let Ok(max_rows_env) = std::env::var("MAX_ROWS") {
+            args.max_rows = max_rows_env.parse().ok();
+        }
+    }
+    
+    // Health check environment variable
+    if !args.health_check {
+        if let Ok(health_env) = std::env::var("HEALTH_CHECK") {
+            args.health_check = health_env.to_lowercase() == "true" || health_env == "1";
+        }
+    }
+    
+    // S3 configuration environment variables
+    if args.s3_bucket.is_none() {
+        if let Ok(bucket_env) = std::env::var("S3_BUCKET") {
+            args.s3_bucket = Some(bucket_env);
+        }
+    }
+    
+    if args.s3_endpoint.is_none() {
+        if let Ok(endpoint_env) = std::env::var("S3_ENDPOINT") {
+            args.s3_endpoint = Some(endpoint_env);
+        }
+    }
+    
+    // Check S3_REGION environment variable (only if still default)
+    if args.s3_region == "us-east-1" {
+        if let Ok(region_env) = std::env::var("S3_REGION") {
+            args.s3_region = region_env;
+        }
+    }
+    
+    if args.s3_access_key.is_none() {
+        if let Ok(access_key_env) = std::env::var("S3_ACCESS_KEY") {
+            args.s3_access_key = Some(access_key_env);
+        }
+    }
+    
+    if args.s3_secret_key.is_none() {
+        if let Ok(secret_key_env) = std::env::var("S3_SECRET_KEY") {
+            args.s3_secret_key = Some(secret_key_env);
+        }
+    }
+    
+    if !args.keep_local {
+        if let Ok(keep_local_env) = std::env::var("KEEP_LOCAL") {
+            args.keep_local = keep_local_env.to_lowercase() == "true" || keep_local_env == "1";
+        }
+    }
+    
+    // WebSocket configuration environment variables
+    if args.ws_url.is_none() {
+        if let Ok(ws_url_env) = std::env::var("WS_URL") {
+            args.ws_url = Some(ws_url_env);
+        }
+    }
+    
+    if args.ws_api_key.is_none() {
+        if let Ok(api_key_env) = std::env::var("WS_API_KEY") {
+            args.ws_api_key = Some(api_key_env);
+        }
+    }
+    
     // Handle comma-separated environment variables for Vec fields
-    // This ensures missing environment variables are gracefully handled
     if args.ws_bbox.is_empty() {
         if let Ok(bbox_env) = std::env::var("WS_BBOX") {
             args.ws_bbox = bbox_env.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
