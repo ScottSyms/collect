@@ -162,6 +162,32 @@ This allows for flexible configuration where you can:
 - Set base configuration via environment variables
 - Override specific values with command-line arguments when needed
 
+## Missing Environment Variables
+
+The application gracefully handles missing environment variables:
+
+- **Optional parameters** (like `S3_BUCKET`, `WS_URL`): Missing environment variables are treated as unset/empty
+- **Parameters with defaults** (like `S3_REGION`, `OUT_DIR`): Use their default values when environment variable is missing
+- **Boolean parameters** (like `HEALTH_CHECK`, `KEEP_LOCAL`): Default to `false` when environment variable is missing
+- **Array parameters** (like `WS_BBOX`, `WS_MMSI_FILTER`): Default to empty arrays when environment variable is missing
+
+### Comma-Separated Values
+
+For array parameters, you can use comma-separated values in environment variables:
+
+```bash
+# Multiple bounding boxes
+export WS_BBOX="37.9,-122.6,37.6,-122.3,40.7,-74.0,40.6,-73.9"
+
+# Multiple MMSI filters  
+export WS_MMSI_FILTER="123456789,987654321,555666777"
+
+# Multiple message types
+export WS_MESSAGE_TYPE_FILTER="PositionReport,StaticAndVoyageRelatedData"
+```
+
+Empty or missing array environment variables will result in empty arrays, which is equivalent to not specifying the parameter.
+
 ## Docker Health Checks
 
 The application supports Docker health checks via the `HEALTH_CHECK` environment variable or `--health-check` command-line flag:

@@ -91,15 +91,15 @@ struct Args {
 
     /// Bounding box for WebSocket subscription (format: lat1,lon1,lat2,lon2) 
     /// Can be specified multiple times for multiple boxes. Default: entire world
-    #[arg(long, env = "WS_BBOX", requires = "ws_url", value_delimiter = ',')]
+    #[arg(long, env = "WS_BBOX", requires = "ws_url")]
     ws_bbox: Vec<String>,
 
     /// Filter WebSocket messages by MMSI (can be specified multiple times, max 50)
-    #[arg(long, env = "WS_MMSI_FILTER", requires = "ws_url", value_delimiter = ',')]
+    #[arg(long, env = "WS_MMSI_FILTER", requires = "ws_url")]
     ws_mmsi_filter: Vec<String>,
 
     /// Filter WebSocket messages by message type (e.g., PositionReport)
-    #[arg(long, env = "WS_MESSAGE_TYPE_FILTER", requires = "ws_url", value_delimiter = ',')]
+    #[arg(long, env = "WS_MESSAGE_TYPE_FILTER", requires = "ws_url")]
     ws_message_type_filter: Vec<String>,
 }
 
@@ -432,7 +432,27 @@ fn check_health() -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
+    
+    // Handle comma-separated environment variables for Vec fields
+    // This ensures missing environment variables are gracefully handled
+    if args.ws_bbox.is_empty() {
+        if let Ok(bbox_env) = std::env::var("WS_BBOX") {
+            args.ws_bbox = bbox_env.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        }
+    }
+    
+    if args.ws_mmsi_filter.is_empty() {
+        if let Ok(mmsi_env) = std::env::var("WS_MMSI_FILTER") {
+            args.ws_mmsi_filter = mmsi_env.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        }
+    }
+    
+    if args.ws_message_type_filter.is_empty() {
+        if let Ok(msg_type_env) = std::env::var("WS_MESSAGE_TYPE_FILTER") {
+            args.ws_message_type_filter = msg_type_env.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        }
+    }
 
     // Handle health check mode
     if args.health_check {
