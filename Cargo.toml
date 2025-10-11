@@ -10,6 +10,10 @@ clap = { version = "4", features = ["derive"] }
 parquet = { version = "53", features = ["arrow", "zstd"] }
 arrow = "53"
 tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.20", features = ["native-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+futures-util = "0.3"
 aws-sdk-s3 = "1.0"
 aws-config = "1.0"
 aws-credential-types = "1.0"

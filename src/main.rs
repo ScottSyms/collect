@@ -11,6 +11,10 @@ use aws_credential_types::Credentials;
 use aws_sdk_s3::{Client as S3Client, Config as S3Config};
 use aws_sdk_s3::primitives::ByteStream;
 
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use futures_util::{SinkExt, StreamExt};
+use serde::{Deserialize, Serialize};
+
 use chrono::{Datelike, Timelike, Utc};
 
 use arrow::array::{StringBuilder, TimestampMillisecondBuilder, TimestampMillisecondArray};
@@ -76,6 +80,27 @@ struct Args {
     /// Keep local files after S3 upload (default: delete after successful upload)
     #[arg(long)]
     keep_local: bool,
+
+    /// WebSocket URL to connect to (e.g., wss://stream.aisstream.io/v0/stream)
+    #[arg(long, conflicts_with_all = ["input", "tcp_host", "tcp_port"])]
+    ws_url: Option<String>,
+
+    /// API key for WebSocket authentication (for AISStream.io)
+    #[arg(long, requires = "ws_url")]
+    ws_api_key: Option<String>,
+
+    /// Bounding box for WebSocket subscription (format: lat1,lon1,lat2,lon2) 
+    /// Can be specified multiple times for multiple boxes. Default: entire world
+    #[arg(long, requires = "ws_url")]
+    ws_bbox: Vec<String>,
+
+    /// Filter WebSocket messages by MMSI (can be specified multiple times, max 50)
+    #[arg(long, requires = "ws_url")]
+    ws_mmsi_filter: Vec<String>,
+
+    /// Filter WebSocket messages by message type (e.g., PositionReport)
+    #[arg(long, requires = "ws_url")]
+    ws_message_type_filter: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -181,6 +206,117 @@ impl S3Storage {
         }
 
         Ok(())
+    }
+}
+
+#[derive(Serialize, Debug)]
+struct WebSocketSubscription {
+    #[serde(rename = "APIKey")]
+    api_key: String,
+    #[serde(rename = "BoundingBoxes")]
+    bounding_boxes: Vec<Vec<Vec<f64>>>,
+    #[serde(rename = "FiltersShipMMSI", skip_serializing_if = "Vec::is_empty")]
+    filters_ship_mmsi: Vec<String>,
+    #[serde(rename = "FilterMessageTypes", skip_serializing_if = "Vec::is_empty")]
+    filter_message_types: Vec<String>,
+}
+
+#[derive(Deserialize, Debug)]
+struct AISMessage {
+    #[serde(rename = "MessageType")]
+    message_type: String,
+    #[serde(rename = "Message")]
+    message: serde_json::Value,
+    #[serde(rename = "MetaData")]
+    metadata: Option<serde_json::Value>,
+}
+
+pub struct WebSocketClient {
+    url: String,
+    subscription: WebSocketSubscription,
+}
+
+impl WebSocketClient {
+    pub fn new(
+        url: String,
+        api_key: String,
+        bounding_boxes: Vec<String>,
+        mmsi_filters: Vec<String>,
+        message_type_filters: Vec<String>,
+    ) -> Result<Self> {
+        // Parse bounding boxes from "lat1,lon1,lat2,lon2" format
+        let parsed_boxes: Result<Vec<Vec<Vec<f64>>>, _> = bounding_boxes
+            .iter()
+            .map(|bbox| {
+                let coords: Vec<f64> = bbox.split(',').map(|s| s.parse()).collect::<Result<Vec<_>, _>>()?;
+                if coords.len() != 4 {
+                    return Err(anyhow::anyhow!("Bounding box must have 4 coordinates: lat1,lon1,lat2,lon2"));
+                }
+                Ok(vec![vec![coords[0], coords[1]], vec![coords[2], coords[3]]])
+            })
+            .collect();
+
+        let bounding_boxes = match parsed_boxes {
+            Ok(boxes) if !boxes.is_empty() => boxes,
+            _ => {
+                println!("⚠️  No valid bounding boxes specified, using entire world: [[-90,-180],[90,180]]");
+                vec![vec![vec![-90.0, -180.0], vec![90.0, 180.0]]]
+            }
+        };
+
+        let subscription = WebSocketSubscription {
+            api_key,
+            bounding_boxes,
+            filters_ship_mmsi: mmsi_filters,
+            filter_message_types: message_type_filters,
+        };
+
+        Ok(WebSocketClient { url, subscription })
+    }
+
+    pub async fn connect_and_stream(&self) -> Result<impl futures_util::Stream<Item = Result<String>>> {
+        let (ws_stream, _) = connect_async(&self.url).await
+            .with_context(|| format!("Failed to connect to WebSocket: {}", self.url))?;
+
+        let (mut write, mut read) = ws_stream.split();
+
+        // Send subscription message
+        let subscription_json = serde_json::to_string(&self.subscription)
+            .context("Failed to serialize subscription message")?;
+        
+        println!("🔄 Sending WebSocket subscription: {}", subscription_json);
+        
+        write.send(Message::Text(subscription_json)).await
+            .context("Failed to send subscription message")?;
+
+        // Return the read stream
+        Ok(read.filter_map(|msg| async move {
+            match msg {
+                Ok(Message::Text(text)) => {
+                    // Try to parse as AIS message first
+                    match serde_json::from_str::<AISMessage>(&text) {
+                        Ok(_ais_msg) => Some(Ok(text)), // Valid AIS message
+                        Err(_) => {
+                            // Check if it's an error message
+                            if text.contains("error") {
+                                eprintln!("❌ WebSocket error: {}", text);
+                                Some(Err(anyhow::anyhow!("WebSocket error: {}", text)))
+                            } else {
+                                // Unknown message format, log but continue
+                                eprintln!("⚠️  Unknown WebSocket message format: {}", text);
+                                None
+                            }
+                        }
+                    }
+                },
+                Ok(Message::Close(_)) => {
+                    eprintln!("🔌 WebSocket connection closed");
+                    Some(Err(anyhow::anyhow!("WebSocket connection closed")))
+                },
+                Err(e) => Some(Err(anyhow::anyhow!("WebSocket error: {}", e))),
+                _ => None, // Ignore other message types (binary, ping, pong)
+            }
+        }))
     }
 }
 
@@ -304,7 +440,42 @@ async fn main() -> Result<()> {
         return Ok(()); // This line won't be reached due to process::exit in check_health
     }
 
-    // Determine source name and create appropriate reader
+    // Initialize S3 storage if bucket is specified
+    let s3_storage = if let Some(bucket) = args.s3_bucket.clone() {
+        println!("🔄 Initializing S3 storage for bucket: {}", bucket);
+        Some(S3Storage::new(
+            bucket,
+            args.s3_region.clone(),
+            args.s3_endpoint.clone(),
+            args.s3_access_key.clone(),
+            args.s3_secret_key.clone(),
+            args.keep_local,
+        ).await?)
+    } else {
+        None
+    };
+
+    // Handle WebSocket input separately
+    if let Some(ws_url) = &args.ws_url {
+        let api_key = args.ws_api_key.clone()
+            .ok_or_else(|| anyhow::anyhow!("WebSocket API key is required"))?;
+        
+        let source = args.source.unwrap_or_else(|| "websocket".to_string());
+        
+        return handle_websocket_input(
+            ws_url.clone(),
+            api_key,
+            args.ws_bbox.clone(),
+            args.ws_mmsi_filter.clone(),
+            args.ws_message_type_filter.clone(),
+            source,
+            args.out_dir.clone(),
+            args.max_rows,
+            s3_storage,
+        ).await;
+    }
+
+    // Determine source name and create appropriate reader for file/TCP
     let (source, reader): (String, Box<dyn BufRead>) = match (&args.input, &args.tcp_host, &args.tcp_port) {
         (Some(input_path), None, None) => {
             // File input
@@ -326,23 +497,8 @@ async fn main() -> Result<()> {
             (source, Box::new(BufReader::new(stream)))
         },
         _ => {
-            return Err(anyhow::anyhow!("Must specify either --input <file> or --tcp-host <host> --tcp-port <port>"));
+            return Err(anyhow::anyhow!("Must specify either --input <file>, --tcp-host <host> --tcp-port <port>, or --ws-url <url>"));
         }
-    };
-
-    // Initialize S3 storage if bucket is specified
-    let s3_storage = if let Some(bucket) = args.s3_bucket.clone() {
-        println!("🔄 Initializing S3 storage for bucket: {}", bucket);
-        Some(S3Storage::new(
-            bucket,
-            args.s3_region.clone(),
-            args.s3_endpoint.clone(),
-            args.s3_access_key.clone(),
-            args.s3_secret_key.clone(),
-            args.keep_local,
-        ).await?)
-    } else {
-        None
     };
 
     let mut current_key = PartKey::from_now(&source);
@@ -418,6 +574,90 @@ async fn flush_batch(root: &Path, key: &PartKey, buf: &mut BatchBuf, s3_storage:
     if let Some(s3) = s3_storage {
         let s3_key = key.s3_key(&filename);
         s3.upload_file(&path, &s3_key).await?;
+    }
+
+    Ok(())
+}
+
+async fn handle_websocket_input(
+    ws_url: String,
+    api_key: String,
+    bounding_boxes: Vec<String>,
+    mmsi_filters: Vec<String>,
+    message_type_filters: Vec<String>,
+    source: String,
+    out_dir: PathBuf,
+    max_rows: Option<usize>,
+    s3_storage: Option<S3Storage>,
+) -> Result<()> {
+    println!("🔄 Connecting to WebSocket: {}", ws_url);
+    
+    let ws_client = WebSocketClient::new(
+        ws_url,
+        api_key,
+        bounding_boxes,
+        mmsi_filters,
+        message_type_filters,
+    )?;
+
+    let stream = ws_client.connect_and_stream().await?;
+    tokio::pin!(stream);
+    
+    let mut current_key = PartKey::from_now(&source);
+    let mut buf = BatchBuf::new();
+    let mut rows_in_file = 0usize;
+    let mut processed_count = 0usize;
+
+    // Mark as healthy when starting
+    update_health_status(true)?;
+
+    println!("✅ WebSocket connected, processing messages...");
+
+    while let Some(message_result) = StreamExt::next(&mut stream).await {
+        let payload = message_result?;
+        
+        // Echo the payload to stdout as it's received
+        println!("{}", payload);
+        
+        let now = Utc::now();
+        let key = PartKey {
+            source: source.clone(),
+            year: now.year(),
+            month: now.month(),
+            day: now.day(),
+            hour: now.hour(),
+            minute: now.minute(),
+        };
+
+        // If the minute boundary changed, flush
+        if key != current_key && !buf.is_empty() {
+            flush_batch(&out_dir, &current_key, &mut buf, &s3_storage).await?;
+            rows_in_file = 0;
+            current_key = key.clone();
+        } else {
+            current_key = key.clone();
+        }
+
+        buf.push(now.timestamp_millis(), &payload);
+        rows_in_file += 1;
+        processed_count += 1;
+
+        // Update health status every 100 processed lines
+        if processed_count % 100 == 0 {
+            update_health_status(true).unwrap_or_else(|e| eprintln!("Failed to update health status: {}", e));
+        }
+
+        if let Some(max_rows) = max_rows {
+            if rows_in_file >= max_rows {
+                flush_batch(&out_dir, &current_key, &mut buf, &s3_storage).await?;
+                rows_in_file = 0;
+            }
+        }
+    }
+
+    // Flush any remaining data
+    if !buf.is_empty() {
+        flush_batch(&out_dir, &current_key, &mut buf, &s3_storage).await?;
     }
 
     Ok(())
