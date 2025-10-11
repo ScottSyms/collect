@@ -30,76 +30,76 @@ use parquet::basic::Compression;
 #[command(version, about="Stream a text file or TCP feed into Hive-partitioned Parquet with Zstd compression")]
 struct Args {
     /// Input text file (one record per line)
-    #[arg(short, long, conflicts_with_all = ["tcp_host", "tcp_port"])]
+    #[arg(short, long, env = "INPUT_FILE", conflicts_with_all = ["tcp_host", "tcp_port"])]
     input: Option<PathBuf>,
 
     /// TCP host address to receive data from (e.g., 153.44.253.27)
-    #[arg(long, requires = "tcp_port", conflicts_with = "input")]
+    #[arg(long, env = "TCP_HOST", requires = "tcp_port", conflicts_with = "input")]
     tcp_host: Option<String>,
 
     /// TCP port to receive data from (e.g., 5631)
-    #[arg(long, requires = "tcp_host", conflicts_with = "input")]
+    #[arg(long, env = "TCP_PORT", requires = "tcp_host", conflicts_with = "input")]
     tcp_port: Option<u16>,
 
     /// Logical source label; defaults to input file stem or "tcp" for network input
-    #[arg(short, long)]
+    #[arg(short, long, env = "SOURCE")]
     source: Option<String>,
 
     /// Output root directory
-    #[arg(short='o', long, default_value = "data")]
+    #[arg(short='o', long, env = "OUT_DIR", default_value = "data")]
     out_dir: PathBuf,
 
     /// Max rows to buffer per Parquet file before flush (default: flush on minute boundary only)
-    #[arg(long)]
+    #[arg(long, env = "MAX_ROWS")]
     max_rows: Option<usize>,
 
     /// Run health check and exit (for Docker HEALTHCHECK)
-    #[arg(long)]
+    #[arg(long, env = "HEALTH_CHECK")]
     health_check: bool,
 
     /// S3 bucket name for remote storage (enables S3 upload)
-    #[arg(long)]
+    #[arg(long, env = "S3_BUCKET")]
     s3_bucket: Option<String>,
 
     /// S3 endpoint URL (for MinIO or custom S3-compatible storage)
-    #[arg(long)]
+    #[arg(long, env = "S3_ENDPOINT")]
     s3_endpoint: Option<String>,
 
     /// S3 region (default: us-east-1)
-    #[arg(long, default_value = "us-east-1")]
+    #[arg(long, env = "S3_REGION", default_value = "us-east-1")]
     s3_region: String,
 
     /// S3 access key ID (can also use AWS_ACCESS_KEY_ID env var)
-    #[arg(long)]
+    #[arg(long, env = "S3_ACCESS_KEY")]
     s3_access_key: Option<String>,
 
     /// S3 secret access key (can also use AWS_SECRET_ACCESS_KEY env var)
-    #[arg(long)]
+    #[arg(long, env = "S3_SECRET_KEY")]
     s3_secret_key: Option<String>,
 
     /// Keep local files after S3 upload (default: delete after successful upload)
-    #[arg(long)]
+    #[arg(long, env = "KEEP_LOCAL")]
     keep_local: bool,
 
     /// WebSocket URL to connect to (e.g., wss://stream.aisstream.io/v0/stream)
-    #[arg(long, conflicts_with_all = ["input", "tcp_host", "tcp_port"])]
+    #[arg(long, env = "WS_URL", conflicts_with_all = ["input", "tcp_host", "tcp_port"])]
     ws_url: Option<String>,
 
     /// API key for WebSocket authentication (for AISStream.io)
-    #[arg(long, requires = "ws_url")]
+    #[arg(long, env = "WS_API_KEY", requires = "ws_url")]
     ws_api_key: Option<String>,
 
     /// Bounding box for WebSocket subscription (format: lat1,lon1,lat2,lon2) 
     /// Can be specified multiple times for multiple boxes. Default: entire world
-    #[arg(long, requires = "ws_url")]
+    #[arg(long, env = "WS_BBOX", requires = "ws_url", value_delimiter = ',')]
     ws_bbox: Vec<String>,
 
     /// Filter WebSocket messages by MMSI (can be specified multiple times, max 50)
-    #[arg(long, requires = "ws_url")]
+    #[arg(long, env = "WS_MMSI_FILTER", requires = "ws_url", value_delimiter = ',')]
     ws_mmsi_filter: Vec<String>,
 
     /// Filter WebSocket messages by message type (e.g., PositionReport)
-    #[arg(long, requires = "ws_url")]
+    #[arg(long, env = "WS_MESSAGE_TYPE_FILTER", requires = "ws_url", value_delimiter = ',')]
     ws_message_type_filter: Vec<String>,
 }
 
