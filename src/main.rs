@@ -14,6 +14,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 use chrono::{Datelike, Timelike, Utc};
 
@@ -101,6 +102,10 @@ struct Args {
     /// Filter WebSocket messages by message type (e.g., PositionReport)
     #[arg(long, requires = "ws_url")]
     ws_message_type_filter: Vec<String>,
+
+    /// Enable debug mode for WebSocket connections
+    #[arg(long)]
+    ws_debug: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -234,6 +239,7 @@ struct AISMessage {
 pub struct WebSocketClient {
     url: String,
     subscription: WebSocketSubscription,
+    debug: bool,
 }
 
 impl WebSocketClient {
@@ -243,6 +249,7 @@ impl WebSocketClient {
         bounding_boxes: Vec<String>,
         mmsi_filters: Vec<String>,
         message_type_filters: Vec<String>,
+        debug: bool,
     ) -> Result<Self> {
         // Parse bounding boxes from "lat1,lon1,lat2,lon2" format
         let parsed_boxes: Result<Vec<Vec<Vec<f64>>>, _> = bounding_boxes
@@ -271,50 +278,144 @@ impl WebSocketClient {
             filter_message_types: message_type_filters,
         };
 
-        Ok(WebSocketClient { url, subscription })
+        Ok(WebSocketClient { url, subscription, debug })
     }
 
     pub async fn connect_and_stream(&self) -> Result<impl futures_util::Stream<Item = Result<String>>> {
-        let (ws_stream, _) = connect_async(&self.url).await
-            .with_context(|| format!("Failed to connect to WebSocket: {}", self.url))?;
+        // Add connection timeout and retry logic
+        let mut retry_count = 0;
+        const MAX_RETRIES: u32 = 3;
+        const RETRY_DELAY: u64 = 5; // seconds
 
-        let (mut write, mut read) = ws_stream.split();
+        loop {
+            match self.try_connect().await {
+                Ok(stream) => return Ok(stream),
+                Err(e) => {
+                    retry_count += 1;
+                    if retry_count > MAX_RETRIES {
+                        return Err(e.context(format!("Failed to connect after {} attempts", MAX_RETRIES)));
+                    }
+                    
+                    eprintln!("⚠️  WebSocket connection failed (attempt {}/{}): {}", retry_count, MAX_RETRIES, e);
+                    eprintln!("🔄 Retrying in {} seconds...", RETRY_DELAY);
+                    
+                    tokio::time::sleep(tokio::time::Duration::from_secs(RETRY_DELAY)).await;
+                }
+            }
+        }
+    }
+
+    async fn try_connect(&self) -> Result<impl futures_util::Stream<Item = Result<String>>> {
+        println!("🔄 Attempting WebSocket connection to: {}", self.url);
+        
+        // Connect with timeout
+        let connect_future = connect_async(&self.url);
+        let (ws_stream, response) = tokio::time::timeout(
+            tokio::time::Duration::from_secs(30),
+            connect_future
+        ).await
+        .context("WebSocket connection timed out after 30 seconds")?
+        .with_context(|| format!("Failed to connect to WebSocket: {}", self.url))?;
+
+        println!("✅ WebSocket connected, response status: {:?}", response.status());
+
+        let (mut write, read) = ws_stream.split();
 
         // Send subscription message
         let subscription_json = serde_json::to_string(&self.subscription)
             .context("Failed to serialize subscription message")?;
         
-        println!("🔄 Sending WebSocket subscription: {}", subscription_json);
+        println!("� Sending WebSocket subscription: {}", subscription_json);
         
-        write.send(Message::Text(subscription_json)).await
-            .context("Failed to send subscription message")?;
+        // Send subscription with timeout
+        let send_future = write.send(Message::Text(subscription_json));
+        tokio::time::timeout(
+            tokio::time::Duration::from_secs(10),
+            send_future
+        ).await
+        .context("Subscription message send timed out")?
+        .context("Failed to send subscription message")?;
 
-        // Return the read stream
+        println!("✅ Subscription message sent successfully");
+
+        // Return the read stream with improved error handling
         Ok(read.filter_map(|msg| async move {
             match msg {
                 Ok(Message::Text(text)) => {
-                    // Try to parse as AIS message first
+                    // Log first few messages for debugging
+                    static mut MESSAGE_COUNT: u32 = 0;
+                    unsafe {
+                        MESSAGE_COUNT += 1;
+                        if self.debug || MESSAGE_COUNT <= 3 {
+                            println!("📨 WebSocket message #{}: {}", MESSAGE_COUNT, 
+                                if text.len() > 200 { format!("{}...", &text[..200]) } else { text.clone() });
+                        }
+                    }
+                    
+                    // Check for authentication/error messages first
+                    if text.contains("error") || text.contains("Error") || text.contains("unauthorized") || text.contains("Unauthorized") {
+                        eprintln!("❌ WebSocket authentication/error: {}", text);
+                        return Some(Err(anyhow::anyhow!("WebSocket authentication error: {}", text)));
+                    }
+                    
+                    // Check for success/acknowledgment messages
+                    if text.contains("subscribed") || text.contains("success") || text.contains("acknowledged") {
+                        println!("✅ WebSocket subscription acknowledged: {}", text);
+                        return None; // Don't process as data
+                    }
+                    
+                    // Try to parse as AIS message
                     match serde_json::from_str::<AISMessage>(&text) {
-                        Ok(_ais_msg) => Some(Ok(text)), // Valid AIS message
-                        Err(_) => {
-                            // Check if it's an error message
-                            if text.contains("error") {
-                                eprintln!("❌ WebSocket error: {}", text);
-                                Some(Err(anyhow::anyhow!("WebSocket error: {}", text)))
-                            } else {
-                                // Unknown message format, log but continue
-                                eprintln!("⚠️  Unknown WebSocket message format: {}", text);
-                                None
+                        Ok(_ais_msg) => {
+                            static mut VALID_COUNT: u32 = 0;
+                            unsafe {
+                                VALID_COUNT += 1;
+                                if VALID_COUNT % 100 == 0 || self.debug {
+                                    println!("📊 Processed {} valid AIS messages", VALID_COUNT);
+                                }
                             }
+                            Some(Ok(text)) // Valid AIS message
+                        },
+                        Err(parse_error) => {
+                            // Log parsing errors for first few messages only to avoid spam
+                            static mut ERROR_COUNT: u32 = 0;
+                            unsafe {
+                                ERROR_COUNT += 1;
+                                if self.debug || ERROR_COUNT <= 5 {
+                                    eprintln!("⚠️  Message parsing error #{}: {} | Message: {}", 
+                                        ERROR_COUNT, parse_error, 
+                                        if text.len() > 100 { format!("{}...", &text[..100]) } else { text });
+                                } else if ERROR_COUNT == 6 && !self.debug {
+                                    eprintln!("⚠️  Suppressing further parsing error messages (use --ws-debug for all errors)...");
+                                }
+                            }
+                            None // Skip unparseable messages but continue
                         }
                     }
                 },
-                Ok(Message::Close(_)) => {
-                    eprintln!("🔌 WebSocket connection closed");
-                    Some(Err(anyhow::anyhow!("WebSocket connection closed")))
+                Ok(Message::Close(close_frame)) => {
+                    let reason = close_frame.as_ref()
+                        .map(|cf| format!("code: {}, reason: {}", cf.code, cf.reason))
+                        .unwrap_or_else(|| "no reason provided".to_string());
+                    eprintln!("🔌 WebSocket connection closed: {}", reason);
+                    Some(Err(anyhow::anyhow!("WebSocket connection closed: {}", reason)))
                 },
-                Err(e) => Some(Err(anyhow::anyhow!("WebSocket error: {}", e))),
-                _ => None, // Ignore other message types (binary, ping, pong)
+                Ok(Message::Ping(_)) => {
+                    // Ping messages are handled automatically by the WebSocket library
+                    None
+                },
+                Ok(Message::Pong(_)) => {
+                    // Pong responses
+                    None
+                },
+                Ok(Message::Binary(_)) => {
+                    eprintln!("⚠️  Received unexpected binary WebSocket message");
+                    None
+                },
+                Err(e) => {
+                    eprintln!("❌ WebSocket protocol error: {}", e);
+                    Some(Err(anyhow::anyhow!("WebSocket protocol error: {}", e)))
+                },
             }
         }))
     }
@@ -551,6 +652,12 @@ async fn main() -> Result<()> {
         }
     }
 
+    if !args.ws_debug {
+        if let Ok(debug_env) = std::env::var("WS_DEBUG") {
+            args.ws_debug = debug_env.to_lowercase() == "true" || debug_env == "1";
+        }
+    }
+
     // Handle health check mode
     if args.health_check {
         check_health()?;
@@ -585,6 +692,7 @@ async fn main() -> Result<()> {
             args.ws_bbox.clone(),
             args.ws_mmsi_filter.clone(),
             args.ws_message_type_filter.clone(),
+            args.ws_debug,
             source,
             args.out_dir.clone(),
             args.max_rows,
@@ -702,6 +810,7 @@ async fn handle_websocket_input(
     bounding_boxes: Vec<String>,
     mmsi_filters: Vec<String>,
     message_type_filters: Vec<String>,
+    ws_debug: bool,
     source: String,
     out_dir: PathBuf,
     max_rows: Option<usize>,
@@ -715,11 +824,9 @@ async fn handle_websocket_input(
         bounding_boxes,
         mmsi_filters,
         message_type_filters,
+        ws_debug,
     )?;
 
-    let stream = ws_client.connect_and_stream().await?;
-    tokio::pin!(stream);
-    
     let mut current_key = PartKey::from_now(&source);
     let mut buf = BatchBuf::new();
     let mut rows_in_file = 0usize;
@@ -728,10 +835,34 @@ async fn handle_websocket_input(
     // Mark as healthy when starting
     update_health_status(true)?;
 
-    println!("✅ WebSocket connected, processing messages...");
+    // Main connection loop with automatic reconnection
+    'connection_loop: loop {
+        let stream = ws_client.connect_and_stream().await?;
+        tokio::pin!(stream);
+        
+        println!("✅ WebSocket connected, processing messages...");
 
-    while let Some(message_result) = StreamExt::next(&mut stream).await {
-        let payload = message_result?;
+        'message_loop: while let Some(message_result) = StreamExt::next(&mut stream).await {
+            let payload = match message_result {
+                Ok(payload) => payload,
+                Err(e) => {
+                    eprintln!("❌ WebSocket stream error: {}", e);
+                    
+                    // Check if this is a connection error that we should recover from
+                    let error_str = format!("{}", e);
+                    if error_str.contains("Connection reset") || 
+                       error_str.contains("connection closed") ||
+                       error_str.contains("protocol error") ||
+                       error_str.contains("timed out") {
+                        
+                        eprintln!("🔄 Connection lost, attempting to reconnect...");
+                        break 'message_loop; // Break inner loop, reconnect in outer loop
+                    } else {
+                        // For other types of errors, propagate them
+                        return Err(e);
+                    }
+                }
+            };
         
         // Echo the payload to stdout as it's received
         println!("{}", payload);
@@ -764,15 +895,21 @@ async fn handle_websocket_input(
             update_health_status(true).unwrap_or_else(|e| eprintln!("Failed to update health status: {}", e));
         }
 
-        if let Some(max_rows) = max_rows {
-            if rows_in_file >= max_rows {
-                flush_batch(&out_dir, &current_key, &mut buf, &s3_storage).await?;
-                rows_in_file = 0;
+            if let Some(max_rows) = max_rows {
+                if rows_in_file >= max_rows {
+                    flush_batch(&out_dir, &current_key, &mut buf, &s3_storage).await?;
+                    rows_in_file = 0;
+                }
             }
-        }
-    }
+        } // End of message_loop
+        
+        // Connection was lost, wait a moment before reconnecting
+        eprintln!("⏳ Waiting 5 seconds before reconnection attempt...");
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+    } // End of connection_loop
 
-    // Flush any remaining data
+    // This point should never be reached due to infinite loop
+    // But flush any remaining data just in case
     if !buf.is_empty() {
         flush_batch(&out_dir, &current_key, &mut buf, &s3_storage).await?;
     }
