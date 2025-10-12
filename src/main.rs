@@ -14,7 +14,6 @@ use aws_sdk_s3::primitives::ByteStream;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 
 use chrono::{Datelike, Timelike, Utc};
 
@@ -338,15 +337,18 @@ impl WebSocketClient {
 
         println!("✅ Subscription message sent successfully");
 
+        // Capture debug flag to avoid borrowing self in closure
+        let debug = self.debug;
+
         // Return the read stream with improved error handling
-        Ok(read.filter_map(|msg| async move {
+        Ok(read.filter_map(move |msg| async move {
             match msg {
                 Ok(Message::Text(text)) => {
                     // Log first few messages for debugging
                     static mut MESSAGE_COUNT: u32 = 0;
                     unsafe {
                         MESSAGE_COUNT += 1;
-                        if self.debug || MESSAGE_COUNT <= 3 {
+                        if debug || MESSAGE_COUNT <= 3 {
                             println!("📨 WebSocket message #{}: {}", MESSAGE_COUNT, 
                                 if text.len() > 200 { format!("{}...", &text[..200]) } else { text.clone() });
                         }
@@ -370,7 +372,7 @@ impl WebSocketClient {
                             static mut VALID_COUNT: u32 = 0;
                             unsafe {
                                 VALID_COUNT += 1;
-                                if VALID_COUNT % 100 == 0 || self.debug {
+                                if VALID_COUNT % 100 == 0 || debug {
                                     println!("📊 Processed {} valid AIS messages", VALID_COUNT);
                                 }
                             }
@@ -381,11 +383,11 @@ impl WebSocketClient {
                             static mut ERROR_COUNT: u32 = 0;
                             unsafe {
                                 ERROR_COUNT += 1;
-                                if self.debug || ERROR_COUNT <= 5 {
+                                if debug || ERROR_COUNT <= 5 {
                                     eprintln!("⚠️  Message parsing error #{}: {} | Message: {}", 
                                         ERROR_COUNT, parse_error, 
                                         if text.len() > 100 { format!("{}...", &text[..100]) } else { text });
-                                } else if ERROR_COUNT == 6 && !self.debug {
+                                } else if ERROR_COUNT == 6 && !debug {
                                     eprintln!("⚠️  Suppressing further parsing error messages (use --ws-debug for all errors)...");
                                 }
                             }
@@ -410,6 +412,10 @@ impl WebSocketClient {
                 },
                 Ok(Message::Binary(_)) => {
                     eprintln!("⚠️  Received unexpected binary WebSocket message");
+                    None
+                },
+                Ok(Message::Frame(_)) => {
+                    // Raw frame messages - ignore these
                     None
                 },
                 Err(e) => {
@@ -836,13 +842,13 @@ async fn handle_websocket_input(
     update_health_status(true)?;
 
     // Main connection loop with automatic reconnection
-    'connection_loop: loop {
+    loop {
         let stream = ws_client.connect_and_stream().await?;
         tokio::pin!(stream);
         
         println!("✅ WebSocket connected, processing messages...");
 
-        'message_loop: while let Some(message_result) = StreamExt::next(&mut stream).await {
+        while let Some(message_result) = StreamExt::next(&mut stream).await {
             let payload = match message_result {
                 Ok(payload) => payload,
                 Err(e) => {
@@ -856,7 +862,7 @@ async fn handle_websocket_input(
                        error_str.contains("timed out") {
                         
                         eprintln!("🔄 Connection lost, attempting to reconnect...");
-                        break 'message_loop; // Break inner loop, reconnect in outer loop
+                        break; // Break inner loop, reconnect in outer loop
                     } else {
                         // For other types of errors, propagate them
                         return Err(e);
@@ -901,18 +907,15 @@ async fn handle_websocket_input(
                     rows_in_file = 0;
                 }
             }
-        } // End of message_loop
+        }
         
         // Connection was lost, wait a moment before reconnecting
         eprintln!("⏳ Waiting 5 seconds before reconnection attempt...");
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-    } // End of connection_loop
-
-    // This point should never be reached due to infinite loop
-    // But flush any remaining data just in case
-    if !buf.is_empty() {
-        flush_batch(&out_dir, &current_key, &mut buf, &s3_storage).await?;
+        
+        // Flush any buffered data before reconnecting
+        if !buf.is_empty() {
+            flush_batch(&out_dir, &current_key, &mut buf, &s3_storage).await?;
+        }
     }
-
-    Ok(())
 }
