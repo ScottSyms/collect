@@ -369,12 +369,8 @@ impl WebSocketClient {
                     // Try to parse as AIS message
                     match serde_json::from_str::<AISMessage>(&text) {
                         Ok(_ais_msg) => {
-                            static mut VALID_COUNT: u32 = 0;
-                            unsafe {
-                                VALID_COUNT += 1;
-                                if VALID_COUNT % 1000 == 0 || debug {
-                                    println!("📊 Processed {} valid AIS messages", VALID_COUNT);
-                                }
+                            if debug {
+                                println!("📊 Processing valid AIS message");
                             }
                             Some(Ok(text)) // Valid AIS message
                         },
@@ -439,12 +435,8 @@ impl WebSocketClient {
                             // Try to parse as AIS message
                             match serde_json::from_str::<AISMessage>(&text) {
                                 Ok(_ais_msg) => {
-                                    static mut BINARY_VALID_COUNT: u32 = 0;
-                                    unsafe {
-                                        BINARY_VALID_COUNT += 1;
-                                        if BINARY_VALID_COUNT % 1000 == 0 || debug {
-                                            println!("📊 Processed {} valid AIS messages from binary format", BINARY_VALID_COUNT);
-                                        }
+                                    if debug {
+                                        println!("📊 Processing valid AIS message from binary format");
                                     }
                                     Some(Ok(text)) // Valid AIS message
                                 },
