@@ -372,7 +372,7 @@ impl WebSocketClient {
                             static mut VALID_COUNT: u32 = 0;
                             unsafe {
                                 VALID_COUNT += 1;
-                                if VALID_COUNT % 100 == 0 || debug {
+                                if VALID_COUNT % 1000 == 0 || debug {
                                     println!("📊 Processed {} valid AIS messages", VALID_COUNT);
                                 }
                             }
@@ -442,7 +442,7 @@ impl WebSocketClient {
                                     static mut BINARY_VALID_COUNT: u32 = 0;
                                     unsafe {
                                         BINARY_VALID_COUNT += 1;
-                                        if BINARY_VALID_COUNT % 100 == 0 || debug {
+                                        if BINARY_VALID_COUNT % 1000 == 0 || debug {
                                             println!("📊 Processed {} valid AIS messages from binary format", BINARY_VALID_COUNT);
                                         }
                                     }
@@ -925,8 +925,10 @@ async fn handle_websocket_input(
                 }
             };
         
-        // Echo the payload to stdout as it's received
-        println!("{}", payload);
+        // Echo the payload to stdout as it's received (only in debug mode)
+        if ws_debug {
+            println!("{}", payload);
+        }
         
         let now = Utc::now();
         let key = PartKey {
