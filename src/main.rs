@@ -410,9 +410,64 @@ impl WebSocketClient {
                     // Pong responses
                     None
                 },
-                Ok(Message::Binary(_)) => {
-                    eprintln!("⚠️  Received unexpected binary WebSocket message");
-                    None
+                Ok(Message::Binary(data)) => {
+                    if debug {
+                        println!("📦 Received binary WebSocket message ({} bytes)", data.len());
+                    }
+                    
+                    // Try to decode binary data as UTF-8 text
+                    match String::from_utf8(data.clone()) {
+                        Ok(text) => {
+                            if debug {
+                                println!("📝 Binary message decoded as text: {}", 
+                                    if text.len() > 200 { format!("{}...", &text[..200]) } else { text.clone() });
+                            }
+                            
+                            // Process the decoded text like a regular text message
+                            // Check for authentication/error messages first
+                            if text.contains("error") || text.contains("Error") || text.contains("unauthorized") || text.contains("Unauthorized") {
+                                eprintln!("❌ WebSocket authentication/error (binary): {}", text);
+                                return Some(Err(anyhow::anyhow!("WebSocket authentication error: {}", text)));
+                            }
+                            
+                            // Check for success/acknowledgment messages
+                            if text.contains("subscribed") || text.contains("success") || text.contains("acknowledged") {
+                                println!("✅ WebSocket subscription acknowledged (binary): {}", text);
+                                return None; // Don't process as data
+                            }
+                            
+                            // Try to parse as AIS message
+                            match serde_json::from_str::<AISMessage>(&text) {
+                                Ok(_ais_msg) => {
+                                    static mut BINARY_VALID_COUNT: u32 = 0;
+                                    unsafe {
+                                        BINARY_VALID_COUNT += 1;
+                                        if BINARY_VALID_COUNT % 100 == 0 || debug {
+                                            println!("📊 Processed {} valid AIS messages from binary format", BINARY_VALID_COUNT);
+                                        }
+                                    }
+                                    Some(Ok(text)) // Valid AIS message
+                                },
+                                Err(parse_error) => {
+                                    if debug {
+                                        eprintln!("⚠️  Binary message parsing error: {} | Message: {}", 
+                                            parse_error, 
+                                            if text.len() > 100 { format!("{}...", &text[..100]) } else { text });
+                                    }
+                                    None // Skip unparseable messages but continue
+                                }
+                            }
+                        },
+                        Err(utf8_error) => {
+                            if debug {
+                                eprintln!("⚠️  Binary message is not valid UTF-8: {} | First 50 bytes: {:?}", 
+                                    utf8_error, &data[..std::cmp::min(50, data.len())]);
+                            }
+                            // Could be compressed data or other binary format
+                            // For now, we'll ignore non-UTF8 binary messages
+                            None
+                        }
+                    }
                 },
                 Ok(Message::Frame(_)) => {
                     // Raw frame messages - ignore these
