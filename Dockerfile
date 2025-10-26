@@ -28,6 +28,10 @@ RUN adduser \
     --no-create-home \
     --uid "${UID}" \
     appuser
+
+# Create data directory and set ownership
+RUN mkdir -p /data && chown appuser:appuser /data
+
 USER appuser
 
 # Copy the executable from the "builder" stage.
