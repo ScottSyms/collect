@@ -1,39 +1,37 @@
 # Multi-stage build for smaller final image
-FROM rust:1.75 AS builder
 
-WORKDIR /usr/src/app
-COPY Cargo.toml Cargo.lock ./
-COPY src ./src
+ARG RUST_VERSION=1.90.0
+ARG APP_NAME=hive_parquet_ingest
 
-# Build the application
-RUN cargo build --release
+FROM rust:${RUST_VERSION}-alpine AS builder
 
-# Runtime stage
-FROM debian:bookworm-slim
+WORKDIR /app
+RUN apk add --no-cache clang lld musl-dev git
 
-# Install runtime dependencies
-RUN apt-get update && apt-get install -y \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+RUN --mount=type=bind,source=src,target=src \
+    --mount=type=bind,source=Cargo.toml,target=Cargo.toml \
+    --mount=type=bind,source=Cargo.lock,target=Cargo.lock \
+    --mount=type=cache,target=/app/target/ \
+    --mount=type=cache,target=/usr/local/cargo/git/db \
+    --mount=type=cache,target=/usr/local/cargo/registry/ \
+cargo build --locked --release && \
+cp ./target/release/hive_parquet_ingest /bin/server
 
-# Create app user
-RUN useradd -m -u 1000 appuser
+FROM alpine:latest AS final
 
-# Copy the binary from builder stage
-COPY --from=builder /usr/src/app/target/release/hive_parquet_ingest /usr/local/bin/hive_parquet_ingest
-
-# Create data directory
-RUN mkdir -p /data && chown appuser:appuser /data
-
-# Switch to non-root user
+ARG UID=10001
+RUN adduser \
+    --disabled-password \
+    --gecos "" \
+    --home "/nonexistent" \
+    --shell "/sbin/nologin" \
+    --no-create-home \
+    --uid "${UID}" \
+    appuser
 USER appuser
 
-# Set working directory
-WORKDIR /data
+# Copy the executable from the "builder" stage.
+COPY --from=builder /bin/server /bin/
 
-# Add health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD /usr/local/bin/hive_parquet_ingest --health-check
-
-# Default command (override with docker run arguments)
-ENTRYPOINT ["/usr/local/bin/hive_parquet_ingest"]
+# What the container should run when it is started.
+CMD ["/bin/server"]
