@@ -8,6 +8,7 @@ A high-performance Rust application for ingesting data streams into Hive-partiti
 - **Hive Partitioning**: Automatic partitioning by source, year, month, day, hour, and minute
 - **Parquet Format**: Efficient columnar storage with Zstd compression
 - **S3 Integration**: Upload to AWS S3 or S3-compatible storage (MinIO)
+- **Apache Iceberg Support**: Write to Iceberg tables (placeholder implementation for future development)
 - **Docker Support**: Full Docker and docker-compose integration with health checks
 - **Environment Variables**: Complete environment variable support for containerized deployments
 - **Real-time Processing**: Async processing with configurable buffering
@@ -18,13 +19,16 @@ A high-performance Rust application for ingesting data streams into Hive-partiti
 ### Using Environment Variables (Recommended for Docker)
 
 ```bash
-# WebSocket AIS Stream
+# WebSocket AIS Stream with S3 and Iceberg
 export WS_URL="wss://stream.aisstream.io/v0/stream"
 export WS_API_KEY="your-api-key"
 export WS_BBOX="37.9,-122.6,37.6,-122.3"
 export SOURCE="ais-sf-bay"
 export S3_BUCKET="maritime-data"
 export S3_REGION="us-west-2"
+export ICEBERG_CATALOG_URI="http://localhost:8181"
+export ICEBERG_NAMESPACE="ais_data"
+export ICEBERG_TABLE="vessel_positions"
 
 ./hive_parquet_ingest
 ```
@@ -70,6 +74,10 @@ All command-line parameters can be configured using environment variables:
 | `S3_ACCESS_KEY` | `--s3-access-key` | S3 access key |
 | `S3_SECRET_KEY` | `--s3-secret-key` | S3 secret key |
 | `KEEP_LOCAL` | `--keep-local` | Keep local files |
+| `ICEBERG_CATALOG_URI` | `--iceberg-catalog-uri` | Iceberg catalog URI |
+| `ICEBERG_NAMESPACE` | `--iceberg-namespace` | Iceberg namespace/database |
+| `ICEBERG_TABLE` | `--iceberg-table` | Iceberg table name |
+| `ICEBERG_WAREHOUSE` | `--iceberg-warehouse` | Iceberg warehouse path |
 
 See [ENVIRONMENT_VARIABLES.md](ENVIRONMENT_VARIABLES.md) for detailed usage examples.
 
@@ -204,6 +212,53 @@ export S3_SECRET_KEY="minioadmin"
 ```
 
 See [S3_INTEGRATION.md](S3_INTEGRATION.md) for detailed configuration.
+
+## Apache Iceberg Integration
+
+**Note: The current Iceberg implementation is a placeholder for future development. The Rust Iceberg ecosystem is still maturing.**
+
+Configure Iceberg table writing:
+
+```bash
+# Basic Iceberg configuration
+export ICEBERG_CATALOG_URI="http://localhost:8181"
+export ICEBERG_NAMESPACE="maritime_data"
+export ICEBERG_TABLE="vessel_positions"
+export ICEBERG_WAREHOUSE="s3://data-lake/warehouse"
+```
+
+### Current Implementation
+
+The current implementation provides:
+- Command-line argument and environment variable support
+- Placeholder structure for Iceberg integration
+- Parquet file reading and metadata extraction
+- Framework for future full Iceberg table writing
+
+### Future Development
+
+Full Iceberg integration will include:
+- Automatic table schema creation and evolution
+- Transaction-based writes with ACID guarantees
+- Time travel and snapshot management
+- Integration with Iceberg REST catalogs
+- Support for partition evolution and hidden partitioning
+
+### Example Usage
+
+```bash
+# Combined S3 and Iceberg output
+./hive_parquet_ingest \
+  --ws-url wss://stream.aisstream.io/v0/stream \
+  --ws-api-key your-api-key \
+  --source vessel_data \
+  --s3-bucket maritime-lake \
+  --iceberg-catalog-uri http://iceberg-rest:8181 \
+  --iceberg-namespace shipping \
+  --iceberg-table positions
+```
+
+This will write parquet files locally, upload them to S3, and prepare the data structure for Iceberg table integration.
 
 ## WebSocket Integration
 

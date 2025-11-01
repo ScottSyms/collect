@@ -26,6 +26,10 @@ use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use parquet::basic::Compression;
 
+// Iceberg imports for future implementation
+// use iceberg::{Catalog, TableCreation, spec::{Schema as IcebergSchema, NestedField, PrimitiveType, Type}, NamespaceIdent, TableIdent};
+// use iceberg_catalog_rest::RestCatalog;
+
 #[derive(Parser, Debug)]
 #[command(version, about="Stream a text file or TCP feed into Hive-partitioned Parquet with Zstd compression")]
 struct Args {
@@ -80,6 +84,22 @@ struct Args {
     /// Keep local files after S3 upload (default: delete after successful upload)
     #[arg(long)]
     keep_local: bool,
+
+    /// Iceberg catalog URI (enables Iceberg table writes)
+    #[arg(long)]
+    iceberg_catalog_uri: Option<String>,
+
+    /// Iceberg namespace/database name
+    #[arg(long, requires = "iceberg_catalog_uri", default_value = "default")]
+    iceberg_namespace: String,
+
+    /// Iceberg table name
+    #[arg(long, requires = "iceberg_catalog_uri", default_value = "ais_messages")]
+    iceberg_table: String,
+
+    /// Iceberg warehouse path (for local/HDFS catalogs)
+    #[arg(long)]
+    iceberg_warehouse: Option<String>,
 
     /// WebSocket URL to connect to (e.g., wss://stream.aisstream.io/v0/stream)
     #[arg(long, conflicts_with_all = ["input", "tcp_host", "tcp_port"])]
@@ -209,6 +229,161 @@ impl S3Storage {
             println!("🗑️  Removed local file: {}", local_path.display());
         }
 
+        Ok(())
+    }
+}
+
+// Placeholder for Iceberg Storage - simplified implementation
+// Note: The Rust iceberg crate is still in early development
+// This is a basic structure for future Iceberg integration
+pub struct IcebergStorage {
+    catalog_uri: String,
+    namespace: String,
+    table_name: String,
+    keep_local: bool,
+}
+
+impl IcebergStorage {
+    pub async fn new(
+        catalog_uri: String,
+        namespace: String,
+        table_name: String,
+        _warehouse_path: Option<String>,
+        keep_local: bool,
+    ) -> Result<Self> {
+        println!("🔄 Initializing Iceberg storage (placeholder implementation)");
+        println!("   Catalog URI: {}", catalog_uri);
+        println!("   Namespace: {}", namespace);
+        println!("   Table: {}", table_name);
+
+        // For now, just validate that we can create the structure
+        // In a full implementation, this would connect to the actual Iceberg catalog
+        
+        Ok(IcebergStorage {
+            catalog_uri,
+            namespace,
+            table_name,
+            keep_local,
+        })
+    }
+
+    pub async fn upload_file(&self, local_path: &Path, partition_key: &PartKey) -> Result<()> {
+        // This is a placeholder implementation
+        // In a real implementation, this would:
+        // 1. Read the parquet file
+        // 2. Connect to the Iceberg catalog
+        // 3. Create/update the table schema if needed
+        // 4. Write the data as a new commit to the Iceberg table
+        
+        println!("📦 [PLACEHOLDER] Would write parquet file to Iceberg table:");
+        println!("   File: {}", local_path.display());
+        println!("   Catalog: {}", self.catalog_uri);
+        println!("   Table: {}.{}", self.namespace, self.table_name);
+        println!("   Partition: source={}/year={}/month={}/day={}/hour={}/minute={}", 
+                partition_key.source, partition_key.year, partition_key.month, 
+                partition_key.day, partition_key.hour, partition_key.minute);
+
+        // Read the parquet file to get schema and data
+        let file = File::open(local_path)
+            .with_context(|| format!("Failed to open parquet file: {}", local_path.display()))?;
+        
+        let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+            .with_context(|| "Failed to create parquet reader builder")?;
+        
+        // Get the Arrow schema from the parquet file
+        let arrow_schema = builder.schema();
+        println!("   Detected Arrow schema with {} fields", arrow_schema.fields().len());
+        
+        // Check if table exists and create if needed
+        self.ensure_table_exists(&arrow_schema, partition_key).await?;
+        
+        let mut reader = builder.build()
+            .with_context(|| "Failed to create parquet reader")?;
+
+        let mut total_rows = 0;
+        let mut batch_count = 0;
+        
+        // Count the data we would write
+        while let Some(batch_result) = reader.next() {
+            let batch = batch_result.with_context(|| "Failed to read parquet batch")?;
+            total_rows += batch.num_rows();
+            batch_count += 1;
+        }
+        
+        println!("   Would write {} rows in {} batches", total_rows, batch_count);
+        
+        // TODO: Implement actual Iceberg table writing when the Rust library is more mature
+        // For now, we just simulate the operation
+        
+        // Note: File cleanup is handled by the caller (flush_batch function)
+        // to ensure proper coordination between multiple storage backends
+
+        Ok(())
+    }
+
+    async fn ensure_table_exists(&self, arrow_schema: &arrow::datatypes::Schema, partition_key: &PartKey) -> Result<()> {
+        println!("🔍 Checking if Iceberg table exists: {}.{}", self.namespace, self.table_name);
+        
+        // This is a placeholder for actual Iceberg catalog operations
+        // In a real implementation, this would:
+        // 1. Connect to the Iceberg REST catalog
+        // 2. Check if namespace exists, create if not
+        // 3. Check if table exists, create if not
+        // 4. Validate/update schema compatibility
+        
+        println!("📋 [PLACEHOLDER] Would check table existence via REST API:");
+        println!("   GET {}/v1/namespaces/{}/tables/{}", self.catalog_uri, self.namespace, self.table_name);
+        
+        // Simulate table existence check
+        let table_exists = false; // In real implementation, this would be the result of the API call
+        
+        if !table_exists {
+            self.create_table(arrow_schema, partition_key).await?;
+        } else {
+            println!("✅ Table {}.{} already exists", self.namespace, self.table_name);
+        }
+        
+        Ok(())
+    }
+    
+    async fn create_table(&self, arrow_schema: &arrow::datatypes::Schema, partition_key: &PartKey) -> Result<()> {
+        println!("🏗️  Creating Iceberg table: {}.{}", self.namespace, self.table_name);
+        
+        // This is a placeholder for actual table creation
+        // In a real implementation, this would:
+        // 1. Convert Arrow schema to Iceberg schema
+        // 2. Define partition spec based on our partitioning strategy
+        // 3. Send CREATE TABLE request to the REST catalog
+        
+        println!("📊 [PLACEHOLDER] Would create table with schema:");
+        for (i, field) in arrow_schema.fields().iter().enumerate() {
+            println!("   Field {}: {} ({})", i, field.name(), field.data_type());
+        }
+        
+        println!("🗂️  [PLACEHOLDER] Would create table with partition spec:");
+        println!("   - source (identity transform)");
+        println!("   - year (identity transform)");
+        println!("   - month (identity transform)");
+        println!("   - day (identity transform)");
+        println!("   - hour (identity transform)");
+        println!("   - minute (identity transform)");
+        
+        // Simulate REST API call to create table
+        println!("🌐 [PLACEHOLDER] Would send CREATE TABLE request:");
+        println!("   POST {}/v1/namespaces/{}/tables", self.catalog_uri, self.namespace);
+        println!("   Body: {{");
+        println!("     \"name\": \"{}\",", self.table_name);
+        println!("     \"schema\": {{ ... }},");
+        println!("     \"partition-spec\": {{ ... }},");
+        println!("     \"properties\": {{");
+        println!("       \"write.parquet.compression-codec\": \"zstd\",");
+        println!("       \"write.target-file-size-bytes\": \"134217728\"");
+        println!("     }}");
+        println!("   }}");
+        
+        // Simulate successful creation
+        println!("✅ [PLACEHOLDER] Table {}.{} created successfully", self.namespace, self.table_name);
+        
         Ok(())
     }
 }
@@ -673,6 +848,33 @@ async fn main() -> Result<()> {
         }
     }
     
+    // Iceberg configuration environment variables
+    if args.iceberg_catalog_uri.is_none() {
+        if let Ok(catalog_uri_env) = std::env::var("ICEBERG_CATALOG_URI") {
+            args.iceberg_catalog_uri = Some(catalog_uri_env);
+        }
+    }
+    
+    // Check ICEBERG_NAMESPACE environment variable (only if still default)
+    if args.iceberg_namespace == "default" {
+        if let Ok(namespace_env) = std::env::var("ICEBERG_NAMESPACE") {
+            args.iceberg_namespace = namespace_env;
+        }
+    }
+    
+    // Check ICEBERG_TABLE environment variable (only if still default)
+    if args.iceberg_table == "ais_messages" {
+        if let Ok(table_env) = std::env::var("ICEBERG_TABLE") {
+            args.iceberg_table = table_env;
+        }
+    }
+    
+    if args.iceberg_warehouse.is_none() {
+        if let Ok(warehouse_env) = std::env::var("ICEBERG_WAREHOUSE") {
+            args.iceberg_warehouse = Some(warehouse_env);
+        }
+    }
+    
     // WebSocket configuration environment variables
     if args.ws_url.is_none() {
         if let Ok(ws_url_env) = std::env::var("WS_URL") {
@@ -732,6 +934,20 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Initialize Iceberg storage if catalog URI is specified
+    let iceberg_storage = if let Some(catalog_uri) = args.iceberg_catalog_uri.clone() {
+        println!("🔄 Initializing Iceberg storage with catalog: {}", catalog_uri);
+        Some(IcebergStorage::new(
+            catalog_uri,
+            args.iceberg_namespace.clone(),
+            args.iceberg_table.clone(),
+            args.iceberg_warehouse.clone(),
+            args.keep_local,
+        ).await?)
+    } else {
+        None
+    };
+
     // Handle WebSocket input separately
     if let Some(ws_url) = &args.ws_url {
         let api_key = args.ws_api_key.clone()
@@ -750,6 +966,7 @@ async fn main() -> Result<()> {
             args.out_dir.clone(),
             args.max_rows,
             s3_storage,
+            iceberg_storage,
         ).await;
     }
 
@@ -805,7 +1022,7 @@ async fn main() -> Result<()> {
 
         // If the minute boundary (or source) changed, flush.
         if key != current_key && !buf.is_empty() {
-            flush_batch(&args.out_dir, &current_key, &mut buf, &s3_storage).await?;
+            flush_batch(&args.out_dir, &current_key, &mut buf, &s3_storage, &iceberg_storage).await?;
             rows_in_file = 0;
             current_key = key.clone();
         } else {
@@ -824,20 +1041,26 @@ async fn main() -> Result<()> {
 
         if let Some(max_rows) = args.max_rows {
             if rows_in_file >= max_rows {
-                flush_batch(&args.out_dir, &current_key, &mut buf, &s3_storage).await?;
+                flush_batch(&args.out_dir, &current_key, &mut buf, &s3_storage, &iceberg_storage).await?;
                 rows_in_file = 0;
             }
         }
     }
 
     if !buf.is_empty() {
-        flush_batch(&args.out_dir, &current_key, &mut buf, &s3_storage).await?;
+        flush_batch(&args.out_dir, &current_key, &mut buf, &s3_storage, &iceberg_storage).await?;
     }
 
     Ok(())
 }
 
-async fn flush_batch(root: &Path, key: &PartKey, buf: &mut BatchBuf, s3_storage: &Option<S3Storage>) -> Result<()> {
+async fn flush_batch(
+    root: &Path, 
+    key: &PartKey, 
+    buf: &mut BatchBuf, 
+    s3_storage: &Option<S3Storage>,
+    iceberg_storage: &Option<IcebergStorage>
+) -> Result<()> {
     let dir = key.dir_path(root);
     let filename = parquet_file_name();
     let path = dir.join(&filename);
@@ -848,10 +1071,36 @@ async fn flush_batch(root: &Path, key: &PartKey, buf: &mut BatchBuf, s3_storage:
     
     println!("✅ Wrote {} rows to {}", batch.num_rows(), path.display());
 
-    // Upload to S3 if configured
+    // Determine if we should keep the local file based on storage configurations
+    let should_keep_local = match (s3_storage, iceberg_storage) {
+        (Some(s3), Some(_)) => s3.keep_local, // Keep S3's preference when both are configured
+        (Some(s3), None) => s3.keep_local,    // Use S3's preference
+        (None, Some(iceberg)) => iceberg.keep_local, // Use Iceberg's preference
+        (None, None) => true, // Keep file if no storage is configured
+    };
+
+    // Upload to S3 if configured (but don't let it delete the file yet)
     if let Some(s3) = s3_storage {
         let s3_key = key.s3_key(&filename);
-        s3.upload_file(&path, &s3_key).await?;
+        // Temporarily override keep_local to prevent deletion
+        let s3_temp = S3Storage {
+            client: s3.client.clone(),
+            bucket: s3.bucket.clone(),
+            keep_local: true, // Force keep local until after Iceberg processing
+        };
+        s3_temp.upload_file(&path, &s3_key).await?;
+    }
+
+    // Write to Iceberg if configured
+    if let Some(iceberg) = iceberg_storage {
+        iceberg.upload_file(&path, key).await?;
+    }
+
+    // Clean up local file if configured to do so
+    if !should_keep_local {
+        tokio::fs::remove_file(&path).await
+            .with_context(|| format!("Failed to remove local file: {}", path.display()))?;
+        println!("🗑️  Removed local file: {}", path.display());
     }
 
     Ok(())
@@ -868,6 +1117,7 @@ async fn handle_websocket_input(
     out_dir: PathBuf,
     max_rows: Option<usize>,
     s3_storage: Option<S3Storage>,
+    iceberg_storage: Option<IcebergStorage>,
 ) -> Result<()> {
     println!("🔄 Connecting to WebSocket: {}", ws_url);
     
@@ -934,7 +1184,7 @@ async fn handle_websocket_input(
 
         // If the minute boundary changed, flush
         if key != current_key && !buf.is_empty() {
-            flush_batch(&out_dir, &current_key, &mut buf, &s3_storage).await?;
+            flush_batch(&out_dir, &current_key, &mut buf, &s3_storage, &iceberg_storage).await?;
             rows_in_file = 0;
             current_key = key.clone();
         } else {
@@ -952,7 +1202,7 @@ async fn handle_websocket_input(
 
             if let Some(max_rows) = max_rows {
                 if rows_in_file >= max_rows {
-                    flush_batch(&out_dir, &current_key, &mut buf, &s3_storage).await?;
+                    flush_batch(&out_dir, &current_key, &mut buf, &s3_storage, &iceberg_storage).await?;
                     rows_in_file = 0;
                 }
             }
@@ -964,7 +1214,7 @@ async fn handle_websocket_input(
         
         // Flush any buffered data before reconnecting
         if !buf.is_empty() {
-            flush_batch(&out_dir, &current_key, &mut buf, &s3_storage).await?;
+            flush_batch(&out_dir, &current_key, &mut buf, &s3_storage, &iceberg_storage).await?;
         }
     }
 }
