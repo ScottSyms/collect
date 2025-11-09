@@ -1,9 +1,8 @@
-# Hive Parquet Ingest
+# captur
 
 A high-performance Rust application for ingesting data streams into Hive-partitioned Parquet files with Zstd compression. Supports multiple input sources (files, TCP streams, WebSocket feeds) and remote storage (S3/MinIO).
 
 ## Features
-
 - **Multiple Input Sources**: File, TCP stream, or WebSocket (AISStream.io compatible)
 - **Hive Partitioning**: Automatic partitioning by source, year, month, day, hour, and minute
 - **Parquet Format**: Efficient columnar storage with Zstd compression
