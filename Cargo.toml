@@ -17,6 +17,8 @@ futures-util = "0.3"
 aws-sdk-s3 = "1.0"
 aws-config = "1.0"
 aws-credential-types = "1.0"
-iceberg = "0.3"
-iceberg-catalog-rest = "0.3"
+# Real Iceberg support via Polars
+polars = { version = "0.41", features = ["lazy", "parquet", "strings", "temporal", "serde"] }
+reqwest = { version = "0.11", features = ["json"] }
+uuid = { version = "1.0", features = ["v4"] }
 
