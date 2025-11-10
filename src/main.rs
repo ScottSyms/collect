@@ -178,6 +178,14 @@ impl PartKey {
     }
 }
 
+// Structure to hold upload task data
+struct UploadTask {
+    path: PathBuf,
+    key: PartKey,
+    should_keep_local: bool,
+}
+
+#[derive(Clone)]
 pub struct S3Storage {
     client: S3Client,
     bucket: String,
@@ -247,6 +255,7 @@ impl S3Storage {
 }
 
 // Real Iceberg Storage implementation using Polars and REST API
+#[derive(Clone)]
 pub struct IcebergStorage {
     catalog_uri: String,
     namespace: String,
@@ -1760,6 +1769,28 @@ async fn main() -> Result<()> {
     let mut rows_in_file = 0usize;
     let mut processed_count = 0usize;
 
+    // Create channel for background uploads (buffer up to 10 pending uploads)
+    let (upload_tx, mut upload_rx) = tokio::sync::mpsc::channel::<UploadTask>(10);
+    
+    // Spawn background upload worker
+    let s3_storage_worker = s3_storage.clone();
+    let iceberg_storage_worker = iceberg_storage.clone();
+    let upload_worker = tokio::spawn(async move {
+        while let Some(task) = upload_rx.recv().await {
+            let upload_result = perform_upload(
+                &task.path,
+                &task.key,
+                &s3_storage_worker,
+                &iceberg_storage_worker,
+                task.should_keep_local
+            ).await;
+            
+            if let Err(e) = upload_result {
+                eprintln!("⚠️  Background upload failed: {}", e);
+            }
+        }
+    });
+
     // Mark as healthy when starting
     update_health_status(true)?;
 
@@ -1781,7 +1812,7 @@ async fn main() -> Result<()> {
 
         // If the minute boundary (or source) changed, flush.
         if key != current_key && !buf.is_empty() {
-            flush_batch(&args.out_dir, &current_key, &mut buf, &s3_storage, &iceberg_storage).await?;
+            flush_batch_async(&args.out_dir, &current_key, &mut buf, &s3_storage, &iceberg_storage, &upload_tx).await?;
             rows_in_file = 0;
             current_key = key.clone();
         } else {
@@ -1800,14 +1831,104 @@ async fn main() -> Result<()> {
 
         if let Some(max_rows) = args.max_rows {
             if rows_in_file >= max_rows {
-                flush_batch(&args.out_dir, &current_key, &mut buf, &s3_storage, &iceberg_storage).await?;
+                flush_batch_async(&args.out_dir, &current_key, &mut buf, &s3_storage, &iceberg_storage, &upload_tx).await?;
                 rows_in_file = 0;
             }
         }
     }
 
     if !buf.is_empty() {
-        flush_batch(&args.out_dir, &current_key, &mut buf, &s3_storage, &iceberg_storage).await?;
+        flush_batch_async(&args.out_dir, &current_key, &mut buf, &s3_storage, &iceberg_storage, &upload_tx).await?;
+    }
+
+    // Close the upload channel and wait for all uploads to complete
+    drop(upload_tx);
+    println!("⏳ Waiting for background uploads to complete...");
+    let _ = upload_worker.await;
+    println!("✅ All uploads completed");
+
+    Ok(())
+}
+
+// Non-blocking flush: writes file and queues upload
+async fn flush_batch_async(
+    root: &Path,
+    key: &PartKey,
+    buf: &mut BatchBuf,
+    s3_storage: &Option<S3Storage>,
+    iceberg_storage: &Option<IcebergStorage>,
+    upload_tx: &tokio::sync::mpsc::Sender<UploadTask>
+) -> Result<()> {
+    let dir = key.dir_path(root);
+    let filename = parquet_file_name();
+    let path = dir.join(&filename);
+    let mut writer = open_writer(&path, &buf.schema)?;
+    let batch = buf.to_record_batch()?;
+    writer.write(&batch).context("writing batch to Parquet")?;
+    writer.close().context("closing Parquet writer")?;
+    
+    println!("✅ Wrote {} rows to {} (queued for upload)", batch.num_rows(), path.display());
+
+    // Determine if we should keep the local file
+    let should_keep_local = match (s3_storage, iceberg_storage) {
+        (Some(s3), Some(_)) => s3.keep_local,
+        (Some(s3), None) => s3.keep_local,
+        (None, Some(iceberg)) => iceberg.keep_local,
+        (None, None) => true,
+    };
+
+    // Queue the upload task (non-blocking)
+    if s3_storage.is_some() || iceberg_storage.is_some() {
+        let task = UploadTask {
+            path: path.clone(),
+            key: key.clone(),
+            should_keep_local,
+        };
+        
+        upload_tx.send(task).await
+            .context("Failed to queue upload task")?;
+    } else if !should_keep_local {
+        // No uploads configured, clean up immediately
+        tokio::fs::remove_file(&path).await
+            .with_context(|| format!("Failed to remove local file: {}", path.display()))?;
+    }
+
+    Ok(())
+}
+
+// Performs the actual upload in background
+async fn perform_upload(
+    path: &Path,
+    key: &PartKey,
+    s3_storage: &Option<S3Storage>,
+    iceberg_storage: &Option<IcebergStorage>,
+    should_keep_local: bool
+) -> Result<()> {
+    let filename = path.file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow::anyhow!("Invalid filename"))?;
+
+    // Upload to S3 if configured
+    if let Some(s3) = s3_storage {
+        let s3_key = key.s3_key(filename);
+        let s3_temp = S3Storage {
+            client: s3.client.clone(),
+            bucket: s3.bucket.clone(),
+            keep_local: true,
+        };
+        s3_temp.upload_file(path, &s3_key).await?;
+    }
+
+    // Write to Iceberg if configured
+    if let Some(iceberg) = iceberg_storage {
+        iceberg.upload_file(path, key).await?;
+    }
+
+    // Clean up local file if configured
+    if !should_keep_local {
+        tokio::fs::remove_file(path).await
+            .with_context(|| format!("Failed to remove local file: {}", path.display()))?;
+        println!("🗑️  Removed local file: {}", path.display());
     }
 
     Ok(())
@@ -1894,6 +2015,28 @@ async fn handle_websocket_input(
     let mut rows_in_file = 0usize;
     let mut processed_count = 0usize;
 
+    // Create channel for background uploads
+    let (upload_tx, mut upload_rx) = tokio::sync::mpsc::channel::<UploadTask>(10);
+    
+    // Spawn background upload worker
+    let s3_storage_worker = s3_storage.clone();
+    let iceberg_storage_worker = iceberg_storage.clone();
+    let upload_worker = tokio::spawn(async move {
+        while let Some(task) = upload_rx.recv().await {
+            let upload_result = perform_upload(
+                &task.path,
+                &task.key,
+                &s3_storage_worker,
+                &iceberg_storage_worker,
+                task.should_keep_local
+            ).await;
+            
+            if let Err(e) = upload_result {
+                eprintln!("⚠️  Background upload failed: {}", e);
+            }
+        }
+    });
+
     // Mark as healthy when starting
     update_health_status(true)?;
 
@@ -1943,7 +2086,7 @@ async fn handle_websocket_input(
 
         // If the minute boundary changed, flush
         if key != current_key && !buf.is_empty() {
-            flush_batch(&out_dir, &current_key, &mut buf, &s3_storage, &iceberg_storage).await?;
+            flush_batch_async(&out_dir, &current_key, &mut buf, &s3_storage, &iceberg_storage, &upload_tx).await?;
             rows_in_file = 0;
             current_key = key.clone();
         } else {
@@ -1961,7 +2104,7 @@ async fn handle_websocket_input(
 
             if let Some(max_rows) = max_rows {
                 if rows_in_file >= max_rows {
-                    flush_batch(&out_dir, &current_key, &mut buf, &s3_storage, &iceberg_storage).await?;
+                    flush_batch_async(&out_dir, &current_key, &mut buf, &s3_storage, &iceberg_storage, &upload_tx).await?;
                     rows_in_file = 0;
                 }
             }
@@ -1973,7 +2116,7 @@ async fn handle_websocket_input(
         
         // Flush any buffered data before reconnecting
         if !buf.is_empty() {
-            flush_batch(&out_dir, &current_key, &mut buf, &s3_storage, &iceberg_storage).await?;
+            flush_batch_async(&out_dir, &current_key, &mut buf, &s3_storage, &iceberg_storage, &upload_tx).await?;
         }
     }
 }
