@@ -24,16 +24,7 @@ use arrow::record_batch::RecordBatch;
 
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
-use parquet::basic::{Compression, ZstdLevel};
-
-// Polars and HTTP client for real Iceberg support
-use polars::prelude::*;
-use reqwest::Client as HttpClient;
-use serde_json::{json, Value};
-
-// Iceberg imports for future implementation
-// use iceberg::{Catalog, TableCreation, spec::{Schema as IcebergSchema, NestedField, PrimitiveType, Type}, NamespaceIdent, TableIdent};
-// use iceberg_catalog_rest::RestCatalog;
+use parquet::basic::Compression;
 
 #[derive(Parser, Debug)]
 #[command(version, about="Stream a text file or TCP feed into Hive-partitioned Parquet with Zstd compression")]
@@ -89,30 +80,6 @@ struct Args {
     /// Keep local files after S3 upload (default: delete after successful upload)
     #[arg(long)]
     keep_local: bool,
-
-    /// Iceberg catalog URI (enables Iceberg table writes)
-    #[arg(long)]
-    iceberg_catalog_uri: Option<String>,
-
-    /// Iceberg namespace/database name
-    #[arg(long, requires = "iceberg_catalog_uri", default_value = "default")]
-    iceberg_namespace: String,
-
-    /// Iceberg table name
-    #[arg(long, requires = "iceberg_catalog_uri", default_value = "ais_messages")]
-    iceberg_table: String,
-
-    /// Iceberg warehouse path (required for Cloudflare R2 Data Catalog, e.g., s3://bucket-name/)
-    #[arg(long)]
-    iceberg_warehouse: Option<String>,
-
-    /// Iceberg authentication token (can also use ICEBERG_TOKEN env var)
-    #[arg(long)]
-    iceberg_token: Option<String>,
-
-    /// Cloudflare email for X-Auth-Email header (can also use CLOUDFLARE_EMAIL env var)
-    #[arg(long)]
-    cloudflare_email: Option<String>,
 
     /// WebSocket URL to connect to (e.g., wss://stream.aisstream.io/v0/stream)
     #[arg(long, conflicts_with_all = ["input", "tcp_host", "tcp_port"])]
@@ -176,13 +143,6 @@ impl PartKey {
         format!("source={}/year={:04}/month={:02}/day={:02}/hour={:02}/minute={:02}/{}", 
                 self.source, self.year, self.month, self.day, self.hour, self.minute, filename)
     }
-}
-
-// Structure to hold upload task data
-struct UploadTask {
-    path: PathBuf,
-    key: PartKey,
-    should_keep_local: bool,
 }
 
 #[derive(Clone)]
@@ -252,906 +212,6 @@ impl S3Storage {
 
         Ok(())
     }
-}
-
-// Real Iceberg Storage implementation using Polars and REST API
-#[derive(Clone)]
-pub struct IcebergStorage {
-    catalog_uri: String,
-    namespace: String,
-    table_name: String,
-    warehouse_path: Option<String>,
-    http_client: HttpClient,
-    token: Option<String>,
-    email: Option<String>,
-    keep_local: bool,
-    catalog_prefix: Option<String>,
-}
-
-impl IcebergStorage {
-    async fn get_catalog_prefix(&self) -> Result<Option<String>> {
-        let config_url = if let Some(ref warehouse) = self.warehouse_path {
-            format!("{}/v1/config?warehouse={}", self.catalog_uri, warehouse)
-        } else {
-            format!("{}/v1/config", self.catalog_uri)
-        };
-        
-        let response = self.http_client
-            .get(&config_url)
-            .send()
-            .await
-            .context("Failed to get catalog config")?;
-            
-        if response.status().is_success() {
-            let text = response.text().await.context("Failed to read config response")?;
-            if let Ok(config_json) = serde_json::from_str::<serde_json::Value>(&text) {
-                if let Some(prefix) = config_json.get("overrides")
-                    .and_then(|o| o.get("prefix"))
-                    .and_then(|p| p.as_str()) {
-                    return Ok(Some(prefix.to_string()));
-                }
-            }
-        }
-        Ok(None)
-    }
-    
-    fn build_api_url(&self, path: &str, prefix: Option<&str>) -> String {
-        match prefix {
-            Some(p) => format!("{}/v1/{}{}", self.catalog_uri, p, path),
-            None => format!("{}/v1{}", self.catalog_uri, path),
-        }
-    }
-    pub async fn new(
-        catalog_uri: String,
-        namespace: String,
-        table_name: String,
-        warehouse_path: Option<String>,
-        token: Option<String>,
-        email: Option<String>,
-        keep_local: bool,
-    ) -> Result<Self> {
-        println!("🔄 Initializing Iceberg storage with Polars integration");
-        println!("   Catalog URI: {}", catalog_uri);
-        println!("   Namespace: {}", namespace);
-        println!("   Table: {}", table_name);
-        if let Some(ref warehouse) = warehouse_path {
-            println!("   Warehouse: {}", warehouse);
-        }
-
-        // Get credentials from CLI args or environment (CLI takes precedence)
-        let token = token.or_else(|| std::env::var("ICEBERG_TOKEN").ok());
-        let email = email.or_else(|| std::env::var("CLOUDFLARE_EMAIL").ok());
-        let aws_access_key = std::env::var("AWS_ACCESS_KEY_ID").ok();
-        let aws_secret_key = std::env::var("AWS_SECRET_ACCESS_KEY").ok();
-        
-        // Create HTTP client for REST API calls with auth headers
-        let mut headers = reqwest::header::HeaderMap::new();
-        
-        // If we have AWS credentials, try that first (since Cloudflare R2 uses S3-compatible auth)
-        if let (Some(ref access_key), Some(ref secret_key)) = (&aws_access_key, &aws_secret_key) {
-            // For now, we'll add basic AWS headers
-            // In a full implementation, we'd need to implement AWS Signature V4
-            headers.insert(
-                "x-amz-access-key-id",
-                reqwest::header::HeaderValue::from_str(access_key)
-                    .context("Invalid AWS access key")?,
-            );
-            println!("🔑 Added AWS-style authentication headers");
-        }
-        
-        // Also try token-based authentication
-        if let Some(ref token_val) = token {
-            // Try multiple authentication methods for Cloudflare
-            
-            // Method 1: Bearer token (standard Iceberg)
-            let auth_value = format!("Bearer {}", token_val);
-            headers.insert(
-                reqwest::header::AUTHORIZATION,
-                reqwest::header::HeaderValue::from_str(&auth_value)
-                    .context("Invalid authorization token")?,
-            );
-            
-            // Method 2: Cloudflare API Key authentication (preferred)
-            headers.insert(
-                "X-Auth-Key",
-                reqwest::header::HeaderValue::from_str(token_val)
-                    .context("Invalid X-Auth-Key")?,
-            );
-            
-            // Method 3: Cloudflare-specific headers
-            headers.insert(
-                "CF-Access-Token",
-                reqwest::header::HeaderValue::from_str(token_val)
-                    .context("Invalid CF token")?,
-            );
-            
-            // Method 4: Try API key format
-            headers.insert(
-                "X-API-Key",
-                reqwest::header::HeaderValue::from_str(token_val)
-                    .context("Invalid API key")?,
-            );
-            
-            println!("🔑 Added token-based authentication headers");
-        }
-
-        // Add Cloudflare email header if provided
-        if let Some(ref email_val) = email {
-            headers.insert(
-                "X-Auth-Email",
-                reqwest::header::HeaderValue::from_str(email_val)
-                    .context("Invalid X-Auth-Email")?,
-            );
-            println!("📧 Added Cloudflare email authentication header");
-        }
-        
-        // Add warehouse as header for Cloudflare R2 Data Catalog authentication
-        if let Some(ref warehouse_val) = warehouse_path {
-            headers.insert(
-                "X-Warehouse",
-                reqwest::header::HeaderValue::from_str(warehouse_val)
-                    .context("Invalid warehouse value")?,
-            );
-            
-            // Also try Cloudflare-specific warehouse header
-            headers.insert(
-                "CF-Warehouse", 
-                reqwest::header::HeaderValue::from_str(warehouse_val)
-                    .context("Invalid warehouse value")?,
-            );
-            
-            println!("🏭 Added warehouse authentication headers: {}", warehouse_val);
-        }
-        
-        // If no authentication provided, warn the user
-        if token.is_none() && aws_access_key.is_none() {
-            println!("⚠️  No authentication credentials provided. Set ICEBERG_TOKEN or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY");
-        }
-        
-        let http_client = HttpClient::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .default_headers(headers)
-            .build()
-            .context("Failed to create HTTP client")?;
-        
-        Ok(IcebergStorage {
-            catalog_uri,
-            namespace,
-            table_name,
-            warehouse_path,
-            http_client,
-            token,
-            email,
-            keep_local,
-            catalog_prefix: None, // Will be set after config call
-        })
-    }
-
-    pub async fn upload_file(&self, local_path: &Path, partition_key: &PartKey) -> Result<()> {
-        println!("📦 Writing parquet file to Iceberg table:");
-        println!("   File: {}", local_path.display());
-        println!("   Catalog: {}", self.catalog_uri);
-        println!("   Table: {}.{}", self.namespace, self.table_name);
-        println!("   Partition: source={}/year={}/month={}/day={}/hour={}/minute={}", 
-                partition_key.source, partition_key.year, partition_key.month, 
-                partition_key.day, partition_key.hour, partition_key.minute);
-
-        // Read the parquet file using Polars
-        let df = LazyFrame::scan_parquet(local_path, ScanArgsParquet::default())
-            .with_context(|| format!("Failed to read parquet file: {}", local_path.display()))?
-            .collect()
-            .with_context(|| "Failed to collect data from parquet file")?;
-        
-        println!("   Loaded {} rows with {} columns", df.height(), df.width());
-        
-        // Ensure table exists and get table info
-        let table_exists = self.check_table_exists().await?;
-        if !table_exists {
-            self.create_table(&df.schema(), partition_key).await?;
-        }
-        
-        // Write data to Iceberg table
-        self.write_data_to_table(&df, partition_key).await?;
-        
-        println!("✅ Successfully wrote {} rows to Iceberg table {}.{}", 
-                df.height(), self.namespace, self.table_name);
-
-        Ok(())
-    }
-
-    async fn check_table_exists(&self) -> Result<bool> {
-        println!("🔍 Checking if Iceberg table exists: {}.{}", self.namespace, self.table_name);
-        
-        // First, test basic connectivity to catalog root and try different endpoints
-        println!("🌐 Testing catalog connectivity and authentication...");
-        
-        // Only test endpoints that exist on Cloudflare R2 Data Catalog
-        let test_endpoints = [
-            ("config", if let Some(ref warehouse) = self.warehouse_path {
-                format!("{}/v1/config?warehouse={}", self.catalog_uri, warehouse)
-            } else {
-                format!("{}/v1/config", self.catalog_uri)
-            }),
-        ];
-
-        // Also check what namespaces are available
-        println!("🔍 Checking available namespaces...");
-        let prefix = self.get_catalog_prefix().await?;
-        let namespaces_url = self.build_api_url("/namespaces", prefix.as_deref());
-        let namespaces_response = self.http_client
-            .get(&namespaces_url)
-            .send()
-            .await;
-        
-        if let Ok(resp) = namespaces_response {
-            println!("📊 Namespaces response: {}", resp.status());
-            if resp.status().is_success() {
-                if let Ok(body) = resp.text().await {
-                    println!("📝 Available namespaces: {}", body);
-                }
-            }
-        }
-        
-        for (name, url) in test_endpoints.iter() {
-            println!("🔍 Testing {} endpoint: {}", name, url);
-            let test_response = self.http_client
-                .get(url)
-                .send()
-                .await;
-            
-            match test_response {
-                Ok(resp) => {
-                    let status = resp.status();
-                    let is_success = status.is_success();
-                    println!("📡 {} response: {}", name, status);
-                    
-                    // Look for authentication hints in headers
-                    for (header_name, header_value) in resp.headers().iter() {
-                        if header_name.as_str().to_lowercase().contains("auth") || 
-                           header_name.as_str().to_lowercase().contains("www") {
-                            println!("🔑 Auth header {}: {:?}", header_name, header_value);
-                        }
-                    }
-                    
-                    if let Ok(text) = resp.text().await {
-                        if text.len() < 500 {
-                            println!("📄 {} body: {}", name, text);
-                        } else {
-                            println!("📄 {} body: {}... (truncated)", name, &text[..500]);
-                        }
-                        
-                        // If this is the config response, try to parse available endpoints and extract prefix
-                        if *name == "config" && is_success {
-                            if let Ok(config_json) = serde_json::from_str::<serde_json::Value>(&text) {
-                                if let Some(endpoints) = config_json.get("endpoints") {
-                                    println!("📋 Available endpoints: {:?}", endpoints);
-                                }
-                                // Extract the prefix from the config response
-                                if let Some(prefix) = config_json.get("overrides")
-                                    .and_then(|o| o.get("prefix"))
-                                    .and_then(|p| p.as_str()) {
-                                    println!("🔑 Extracted catalog prefix: {}", prefix);
-                                    // Note: We need to store this for later use in API calls
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    println!("❌ {} endpoint failed: {}", name, e);
-                }
-            }
-            println!(""); // Empty line for readability
-        }
-        
-        // Get catalog prefix first
-        let prefix = self.get_catalog_prefix().await?;
-        if let Some(ref p) = prefix {
-            println!("🔑 Using catalog prefix: {}", p);
-        }
-        
-        let url = self.build_api_url(&format!("/namespaces/{}/tables/{}", self.namespace, self.table_name), prefix.as_deref());
-        
-        println!("🌐 Making GET request to: {}", url);
-        if self.token.is_some() {
-            println!("🔑 Using multi-method authentication (Bearer, CF-Access-Token, X-API-Token)");
-        } else {
-            println!("⚠️  No authentication token provided");
-        }
-        
-        let response = self.http_client
-            .get(&url)
-            .send()
-            .await
-            .context("Failed to check table existence")?;
-        
-        let status = response.status();
-        let headers = response.headers().clone();
-        
-        // Log response details for debugging
-        println!("📊 Response status: {}", status);
-        for (name, value) in headers.iter() {
-            if name.as_str().to_lowercase().contains("auth") || 
-               name.as_str().to_lowercase().contains("www") ||
-               name.as_str().to_lowercase().contains("error") {
-                println!("📋 Response header {}: {:?}", name, value);
-            }
-        }
-        
-        match status.as_u16() {
-            200 => {
-                println!("✅ Table {}.{} exists", self.namespace, self.table_name);
-                Ok(true)
-            }
-            404 => {
-                println!("📋 Table {}.{} does not exist", self.namespace, self.table_name);
-                Ok(false)
-            }
-            401 | 403 => {
-                let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-                println!("🔐 Authentication error details: {}", error_text);
-                anyhow::bail!("Authentication failed: HTTP {} - {}", status, error_text);
-            }
-            status => {
-                let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-                println!("❌ Unexpected error: {}", error_text);
-                anyhow::bail!("Failed to check table existence: HTTP {} - {}", status, error_text);
-            }
-        }
-    }
-
-    async fn create_table(&self, schema: &polars::prelude::Schema, _partition_key: &PartKey) -> Result<()> {
-        println!("🏗️  Creating Iceberg table: {}.{}", self.namespace, self.table_name);
-        
-        // Ensure namespace exists first
-        self.ensure_namespace_exists().await?;
-        
-        // Convert Polars schema to Iceberg schema format
-        let iceberg_schema = self.polars_to_iceberg_schema(schema)?;
-        
-        // Create partition specification - dynamically find field IDs for partition columns
-        let mut partition_fields = Vec::new();
-        let mut field_id_counter = 1000; // Start partition field IDs at 1000
-        
-        // Find the field IDs for partition columns in the schema
-        let partition_column_names = ["source", "year", "month", "day", "hour", "minute"];
-        let mut schema_field_id = 1;
-        
-        for (name, _) in schema.iter() {
-            if partition_column_names.contains(&name.as_str()) {
-                partition_fields.push(json!({
-                    "source-id": schema_field_id,
-                    "field-id": field_id_counter,
-                    "name": name.as_str(),
-                    "transform": "identity"
-                }));
-                field_id_counter += 1;
-            }
-            schema_field_id += 1;
-        }
-        
-        let partition_spec = json!({
-            "spec-id": 0,
-            "fields": partition_fields
-        });
-        
-        // Create table properties
-        let mut properties = json!({
-            "write.parquet.compression-codec": "zstd",
-            "write.target-file-size-bytes": "134217728"
-        });
-        
-        if let Some(ref warehouse) = self.warehouse_path {
-            properties["warehouse"] = json!(warehouse);
-        }
-        
-        let create_request = json!({
-            "name": self.table_name,
-            "schema": iceberg_schema,
-            "partition-spec": partition_spec,
-            "properties": properties
-        });
-        
-        let prefix = self.get_catalog_prefix().await?;
-        let url = self.build_api_url(&format!("/namespaces/{}/tables", self.namespace), prefix.as_deref());
-        
-        println!("📊 Creating table with {} fields", schema.len());
-        println!("🌐 Sending CREATE TABLE request to: {}", url);
-        println!("📋 Request payload: {}", serde_json::to_string_pretty(&create_request).unwrap_or_else(|_| "Invalid JSON".to_string()));
-        
-        let response = self.http_client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .json(&create_request)
-            .send()
-            .await
-            .context("Failed to send table creation request")?;
-        
-        if response.status().is_success() {
-            println!("✅ Table {}.{} created successfully", self.namespace, self.table_name);
-            Ok(())
-        } else {
-            let status = response.status();
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-            anyhow::bail!("Failed to create table: HTTP {} - {}", status, error_text);
-        }
-    }
-
-    async fn ensure_namespace_exists(&self) -> Result<()> {
-        let prefix = self.get_catalog_prefix().await?;
-        let url = self.build_api_url(&format!("/namespaces/{}", self.namespace), prefix.as_deref());
-        
-        let response = self.http_client
-            .get(&url)
-            .send()
-            .await
-            .context("Failed to check namespace existence")?;
-        
-        match response.status().as_u16() {
-            200 => {
-                println!("✅ Namespace {} exists", self.namespace);
-                Ok(())
-            }
-            404 => {
-                println!("📂 Creating namespace: {}", self.namespace);
-                match self.create_namespace().await {
-                    Ok(()) => Ok(()),
-                    Err(e) => {
-                        // Some catalogs auto-create namespaces or don't support explicit namespace creation
-                        println!("⚠️  Namespace creation failed, but continuing (catalog may auto-create): {}", e);
-                        println!("🔄 Proceeding with table creation...");
-                        Ok(())
-                    }
-                }
-            }
-            status => {
-                let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-                anyhow::bail!("Failed to check namespace existence: HTTP {} - {}", status, error_text);
-            }
-        }
-    }
-
-    async fn create_namespace(&self) -> Result<()> {
-        let create_request = json!({
-            "namespace": [self.namespace],
-            "properties": {}
-        });
-        
-        let prefix = self.get_catalog_prefix().await?;
-        let url = self.build_api_url("/namespaces", prefix.as_deref());
-        
-        let response = self.http_client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .json(&create_request)
-            .send()
-            .await
-            .context("Failed to create namespace")?;
-        
-        if response.status().is_success() {
-            println!("✅ Namespace {} created successfully", self.namespace);
-            Ok(())
-        } else {
-            let status = response.status();
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-            anyhow::bail!("Failed to create namespace: HTTP {} - {}", status, error_text);
-        }
-    }
-
-    fn polars_to_iceberg_schema(&self, schema: &polars::prelude::Schema) -> Result<Value> {
-        let mut fields = Vec::new();
-        let mut field_id = 1;
-        
-        for (name, data_type) in schema.iter() {
-            let iceberg_type = match data_type {
-                polars::prelude::DataType::String => json!("string"),
-                polars::prelude::DataType::Int32 => json!("int"),
-                polars::prelude::DataType::Int64 => json!("long"),
-                polars::prelude::DataType::Float32 => json!("float"),
-                polars::prelude::DataType::Float64 => json!("double"),
-                polars::prelude::DataType::Boolean => json!("boolean"),
-                polars::prelude::DataType::Date => json!("date"),
-                // Fix timestamp format - use simple "timestamp" string type
-                polars::prelude::DataType::Datetime(_, _) => json!("timestamp"),
-                _ => json!("string"), // Default to string for unsupported types
-            };
-            
-            fields.push(json!({
-                "id": field_id,
-                "name": name.as_str(),
-                "required": false,
-                "type": iceberg_type
-            }));
-            
-            field_id += 1;
-        }
-        
-        // Don't add partition fields separately - they're already in the Polars schema
-        // The DataFrame already includes partition columns when we call write_data_to_table
-        
-        // Return the correct Iceberg Schema format with all required properties
-        Ok(json!({
-            "type": "struct",
-            "schema-id": 0,
-            "fields": fields,
-            "identifier-field-ids": []
-        }))
-    }
-
-    async fn write_data_to_table(&self, df: &DataFrame, partition_key: &PartKey) -> Result<()> {
-        println!("📝 Writing data to Iceberg table via REST API");
-        
-        // Add partition columns to the dataframe
-        let df_with_partitions = df.clone()
-            .lazy()
-            .with_columns([
-                lit(partition_key.source.clone()).alias("source"),
-                lit(partition_key.year as i32).alias("year"),
-                lit(partition_key.month as i32).alias("month"),
-                lit(partition_key.day as i32).alias("day"),
-                lit(partition_key.hour as i32).alias("hour"),
-                lit(partition_key.minute as i32).alias("minute"),
-            ])
-            .collect()
-            .context("Failed to add partition columns")?;
-        
-        // For now, we simulate writing to Iceberg via REST API
-        // Implement actual Iceberg data write operation
-        println!("🔄 Writing data to Iceberg table via REST API...");
-        
-        // Step 1: Get the current table metadata and storage credentials
-        println!("   Getting table metadata and storage credentials for {} rows", df_with_partitions.height());
-        
-        let catalog_prefix = self.get_catalog_prefix().await?.unwrap_or("default".to_string());
-        let get_table_url = format!("{}/v1/{}/namespaces/{}/tables/{}", 
-            self.catalog_uri.trim_end_matches('/'), 
-            catalog_prefix, 
-            self.namespace, 
-            self.table_name);
-
-        let mut get_request = self.http_client.get(&get_table_url);
-        if let Some(ref token) = self.token {
-            get_request = get_request
-                .header("Authorization", format!("Bearer {}", token))
-                .header("X-Auth-Key", token)
-                .header("CF-Access-Token", token)
-                .header("X-API-Token", token);
-        }
-        if let Some(ref email) = self.email {
-            get_request = get_request.header("X-Auth-Email", email);
-        }
-
-        let table_response = get_request.send().await?;
-        
-        if !table_response.status().is_success() {
-            return Err(anyhow::anyhow!("Failed to get table metadata: {}", table_response.status()));
-        }
-
-        let table_info: serde_json::Value = table_response.json().await?;
-        
-        // Extract storage credentials and table location
-        let storage_credentials = table_info.get("storage-credentials")
-            .and_then(|creds| creds.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|cred| cred.get("config"));
-
-        let table_location = table_info.get("metadata")
-            .and_then(|m| m.get("location"))
-            .and_then(|l| l.as_str());
-
-        if let (Some(creds), Some(location)) = (storage_credentials, table_location) {
-            let access_key = creds.get("s3.access-key-id").and_then(|k| k.as_str());
-            let secret_key = creds.get("s3.secret-access-key").and_then(|k| k.as_str());
-            
-            println!("📍 Table location: {}", location);
-            println!("🔑 Got S3 credentials for data upload");
-            
-            if let (Some(access_key), Some(secret_key)) = (access_key, secret_key) {
-                // Parse S3 location to get bucket and prefix
-                let s3_url = location.strip_prefix("s3://").ok_or_else(|| {
-                    anyhow::anyhow!("Invalid S3 location format: {}", location)
-                })?;
-                
-                let parts: Vec<&str> = s3_url.splitn(2, '/').collect();
-                if parts.len() != 2 {
-                    return Err(anyhow::anyhow!("Invalid S3 URL format: {}", location));
-                }
-                
-                let bucket = parts[0];
-                let table_prefix = parts[1];
-                
-                println!("📦 Uploading to S3 bucket: {} with prefix: {}", bucket, table_prefix);
-                
-                // Create partition path within table
-                let partition_path = format!("source={}/year={}/month={:02}/day={:02}/hour={:02}/minute={:02}", 
-                    partition_key.source, partition_key.year, partition_key.month, 
-                    partition_key.day, partition_key.hour, partition_key.minute);
-                
-                // Write DataFrame to temporary parquet file for upload
-                let timestamp = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)?
-                    .as_millis();
-                let temp_filename = format!("temp_upload_{}.parquet", timestamp);
-                let temp_path = std::path::Path::new(&temp_filename);
-                
-                // Write DataFrame to parquet using Polars
-                let mut file = std::fs::File::create(&temp_path)?;
-                ParquetWriter::new(&mut file).finish(&mut df_with_partitions.clone())?;
-                
-                // Read the parquet file for upload
-                let parquet_data = std::fs::read(&temp_path)?;
-                let file_name = temp_path.file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("data.parquet");
-                
-                // Full S3 key for the data file
-                let s3_key = format!("{}/data/{}/{}", table_prefix, partition_path, file_name);
-                
-                println!("📤 Uploading {} bytes to s3://{}/{}", parquet_data.len(), bucket, s3_key);
-                
-                // Upload file to S3 using AWS SDK
-                let config = aws_config::ConfigLoader::default()
-                    .credentials_provider(aws_credential_types::Credentials::new(
-                        access_key,
-                        secret_key,
-                        None,  // session_token
-                        None,  // expiry
-                        "CloudflareR2"
-                    ))
-                    .region("auto")  // Cloudflare R2 uses 'auto' region
-                    .endpoint_url("https://a685327d0bba39b770810657c684484b.r2.cloudflarestorage.com") // R2 endpoint
-                    .behavior_version(aws_config::BehaviorVersion::latest())
-                    .load()
-                    .await;
-                
-                let s3_client = aws_sdk_s3::Client::new(&config);
-                
-                let upload_result = s3_client
-                    .put_object()
-                    .bucket(bucket)
-                    .key(&s3_key)
-                    .body(aws_sdk_s3::primitives::ByteStream::from(parquet_data))
-                    .content_type("application/octet-stream")
-                    .send()
-                    .await;
-                
-                match upload_result {
-                    Ok(_) => {
-                        println!("✅ Successfully uploaded parquet file to S3: s3://{}/{}", bucket, s3_key);
-                        
-                        // Now create an Iceberg manifest file
-                        let manifest = create_iceberg_manifest(&s3_key, partition_key)?;
-                        
-                        // Create new snapshot with the manifest
-                        let snapshot_id = create_iceberg_snapshot(
-                            &self.catalog_uri,
-                            self.token.as_ref().unwrap(),
-                            "default", 
-                            "ais_messages", 
-                            &manifest
-                        ).await?;
-                        
-                        // Update the table with new data using existing authenticated client
-                        let catalog_prefix = self.get_catalog_prefix().await?.unwrap_or("default".to_string());
-                        let commit_result = update_iceberg_table_with_client(
-                            &self.http_client,
-                            &self.catalog_uri,
-                            &catalog_prefix,
-                            "default", 
-                            "ais_messages", 
-                            &s3_key,
-                            df_with_partitions.height()
-                        ).await;
-                        
-                        match commit_result {
-                            Ok(_) => {
-                                println!("✅ Successfully committed {} rows to Iceberg table", df_with_partitions.height());
-                            }
-                            Err(e) => {
-                                println!("⚠️  Table update failed, but S3 upload succeeded: {}", e);
-                                println!("📊 Data is available in S3 at: s3://{}/{}", bucket, s3_key);
-                                // Don't return error since S3 upload succeeded
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        println!("❌ Failed to upload to S3: {}", e);
-                        // Clean up temp file
-                        let _ = std::fs::remove_file(&temp_path);
-                        return Err(anyhow::anyhow!("S3 upload failed: {}", e));
-                    }
-                }
-                
-                // Clean up temp file
-                let _ = std::fs::remove_file(&temp_path);
-            } else {
-                println!("⚠️  Missing S3 access credentials");
-            }
-        } else {
-            println!("⚠️  No storage credentials found in table metadata");
-        }
-        
-        Ok(())
-    }
-}
-
-// Helper function to create Iceberg manifest
-fn create_iceberg_manifest(s3_key: &str, partition_key: &PartKey) -> Result<serde_json::Value> {
-    println!("📋 Creating Iceberg manifest for: {}", s3_key);
-    
-    // Create manifest entry for the data file - this represents the uploaded parquet file
-    let data_file_path = format!("s3://iceice/{}", s3_key);
-    
-    let manifest_entry = serde_json::json!({
-        "status": 1, // ADDED = 1 (new file)
-        "snapshot_id": null, // Will be set when snapshot is created
-        "data_file": {
-            "content": "DATA",
-            "file_path": data_file_path,
-            "file_format": "PARQUET", 
-            "partition": {
-                "source": partition_key.source.clone(),
-                "year": partition_key.year,
-                "month": partition_key.month, 
-                "day": partition_key.day,
-                "hour": partition_key.hour,
-                "minute": partition_key.minute
-            },
-            "record_count": 2, // Known from our test data
-            "file_size_in_bytes": 3455, // Approximate size we uploaded
-            "column_sizes": {},
-            "value_counts": {},
-            "null_value_counts": {},
-            "nan_value_counts": {},
-            "lower_bounds": {},
-            "upper_bounds": {},
-            "key_metadata": null,
-            "split_offsets": null,
-            "equality_ids": null,
-            "sort_order_id": 0
-        }
-    });
-    
-    println!("📄 Manifest created for file: {}", data_file_path);
-    
-    Ok(serde_json::json!({
-        "schema": {
-            "type": "struct", 
-            "fields": []  // Simplified for now
-        },
-        "manifest-list": [manifest_entry]
-    }))
-}
-
-// Helper function to create Iceberg snapshot
-#[allow(unused_variables)]
-async fn create_iceberg_snapshot(
-    catalog_uri: &str, 
-    token: &str, 
-    namespace: &str, 
-    table: &str, 
-    manifest: &serde_json::Value
-) -> Result<i64> {
-    let timestamp_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)?
-        .as_millis() as i64;
-    
-    let snapshot_id = timestamp_ms; // Use timestamp as snapshot ID
-    
-    println!("📊 Preparing Iceberg snapshot: {}", snapshot_id);
-    println!("📝 Manifest contains {} entries", 
-        manifest.get("manifest-list")
-            .and_then(|m| m.as_array())
-            .map(|a| a.len())
-            .unwrap_or(0));
-    
-    // For now, return the snapshot ID - actual snapshot creation will be part of table update
-    Ok(snapshot_id)
-}
-
-// Helper function to update Iceberg table with new data
-async fn update_iceberg_table_with_client(
-    client: &reqwest::Client,
-    catalog_uri: &str,
-    catalog_prefix: &str,
-    namespace: &str,
-    table: &str,
-    s3_key: &str,
-    row_count: usize
-) -> Result<()> {
-    println!("💾 Updating Iceberg table with {} rows from S3: {}", row_count, s3_key);
-    
-    // Get current table metadata first
-    let table_url = format!("{}/v1/{}/namespaces/{}/tables/{}", catalog_uri, catalog_prefix, namespace, table);
-    println!("� Getting current table metadata from: {}", table_url);
-    
-    let table_response = client.get(&table_url).send().await?;
-    
-    println!("📊 Table metadata response status: {}", table_response.status());
-    
-    if !table_response.status().is_success() {
-        let error_text = table_response.text().await?;
-        return Err(anyhow::anyhow!("Failed to get table metadata: {}", error_text));
-    }
-    
-    let response_text = table_response.text().await?;
-    println!("📄 Raw table metadata response (first 200 chars): {}", 
-        response_text.chars().take(200).collect::<String>());
-    
-    let table_metadata: serde_json::Value = serde_json::from_str(&response_text)
-        .map_err(|e| anyhow::anyhow!("Failed to parse table metadata JSON: {}", e))?;
-    let current_metadata_location = table_metadata
-        .get("metadata-location")
-        .and_then(|l| l.as_str())
-        .ok_or_else(|| anyhow::anyhow!("No metadata-location in table response"))?;
-    
-    println!("📍 Current metadata location: {}", current_metadata_location);
-    
-    // Use the table update endpoint to append the new data file
-    // This is the standard Iceberg REST API approach for adding data to an existing table
-    let update_url = format!("{}/v1/{}/namespaces/{}/tables/{}", catalog_uri, catalog_prefix, namespace, table);
-    
-    // Create a snapshot update using Iceberg REST API format
-    // The add-snapshot action adds a new snapshot to the table
-    let snapshot_id = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
-    
-    let update_payload = serde_json::json!({
-        "requirements": [],
-        "updates": [
-            {
-                "action": "add-snapshot",
-                "snapshot": {
-                    "snapshot-id": snapshot_id,
-                    "timestamp-ms": snapshot_id,
-                    "summary": {
-                        "operation": "append",
-                        "added-records": row_count.to_string(),
-                        "added-data-files": "1",
-                        "added-files-size": "0"
-                    },
-                    "manifest-list": format!("s3://iceice/{}", s3_key),
-                    "schema-id": 0
-                }
-            },
-            {
-                "action": "set-snapshot-ref",
-                "ref-name": "main",
-                "snapshot-id": snapshot_id,
-                "type": "branch"
-            }
-        ]
-    });
-    
-    println!("� Attempting table update at: {}", update_url);
-    
-    let update_response = client
-        .post(&update_url)
-        .header("Content-Type", "application/json")
-        .json(&update_payload)
-        .send()
-        .await;
-    
-    match update_response {
-        Ok(resp) => {
-            println!("📊 Update response status: {}", resp.status());
-            if resp.status().is_success() {
-                println!("✅ Successfully updated Iceberg table with new data!");
-            } else {
-                let error_text = resp.text().await.unwrap_or_default();
-                println!("⚠️  Table update failed but S3 upload succeeded: {}", error_text);
-            }
-        }
-        Err(e) => {
-            println!("⚠️  Table update request failed but S3 upload succeeded: {}", e);
-        }
-    }
-    
-    println!("📊 Summary:");
-    println!("   ✅ Uploaded {} rows ({} bytes) to S3", row_count, "149MB");
-    println!("   📍 Location: s3://iceice/{}", s3_key);
-    println!("   🔧 Manual verification: Check Cloudflare R2 console or query with Iceberg tools");
-    
-    Ok(())
 }
 
 #[derive(Serialize, Debug)]
@@ -1614,33 +674,6 @@ async fn main() -> Result<()> {
         }
     }
     
-    // Iceberg configuration environment variables
-    if args.iceberg_catalog_uri.is_none() {
-        if let Ok(catalog_uri_env) = std::env::var("ICEBERG_CATALOG_URI") {
-            args.iceberg_catalog_uri = Some(catalog_uri_env);
-        }
-    }
-    
-    // Check ICEBERG_NAMESPACE environment variable (only if still default)
-    if args.iceberg_namespace == "default" {
-        if let Ok(namespace_env) = std::env::var("ICEBERG_NAMESPACE") {
-            args.iceberg_namespace = namespace_env;
-        }
-    }
-    
-    // Check ICEBERG_TABLE environment variable (only if still default)
-    if args.iceberg_table == "ais_messages" {
-        if let Ok(table_env) = std::env::var("ICEBERG_TABLE") {
-            args.iceberg_table = table_env;
-        }
-    }
-    
-    if args.iceberg_warehouse.is_none() {
-        if let Ok(warehouse_env) = std::env::var("ICEBERG_WAREHOUSE") {
-            args.iceberg_warehouse = Some(warehouse_env);
-        }
-    }
-    
     // WebSocket configuration environment variables
     if args.ws_url.is_none() {
         if let Ok(ws_url_env) = std::env::var("WS_URL") {
@@ -1700,22 +733,6 @@ async fn main() -> Result<()> {
         None
     };
 
-    // Initialize Iceberg storage if catalog URI is specified
-    let iceberg_storage = if let Some(catalog_uri) = args.iceberg_catalog_uri.clone() {
-        println!("🔄 Initializing Iceberg storage with catalog: {}", catalog_uri);
-        Some(IcebergStorage::new(
-            catalog_uri,
-            args.iceberg_namespace.clone(),
-            args.iceberg_table.clone(),
-            args.iceberg_warehouse.clone(),
-            args.iceberg_token.clone(),
-            args.cloudflare_email.clone(),
-            args.keep_local,
-        ).await?)
-    } else {
-        None
-    };
-
     // Handle WebSocket input separately
     if let Some(ws_url) = &args.ws_url {
         let api_key = args.ws_api_key.clone()
@@ -1734,7 +751,6 @@ async fn main() -> Result<()> {
             args.out_dir.clone(),
             args.max_rows,
             s3_storage,
-            iceberg_storage,
         ).await;
     }
 
@@ -1770,23 +786,24 @@ async fn main() -> Result<()> {
     let mut processed_count = 0usize;
 
     // Create channel for background uploads (buffer up to 10 pending uploads)
-    let (upload_tx, mut upload_rx) = tokio::sync::mpsc::channel::<UploadTask>(10);
+    let (upload_tx, mut upload_rx) = tokio::sync::mpsc::channel::<(PathBuf, String, bool)>(10);
     
     // Spawn background upload worker
     let s3_storage_worker = s3_storage.clone();
-    let iceberg_storage_worker = iceberg_storage.clone();
-    let upload_worker = tokio::spawn(async move {
-        while let Some(task) = upload_rx.recv().await {
-            let upload_result = perform_upload(
-                &task.path,
-                &task.key,
-                &s3_storage_worker,
-                &iceberg_storage_worker,
-                task.should_keep_local
-            ).await;
-            
-            if let Err(e) = upload_result {
-                eprintln!("⚠️  Background upload failed: {}", e);
+    let _upload_worker = tokio::spawn(async move {
+        while let Some((path, s3_key, should_keep_local)) = upload_rx.recv().await {
+            if let Some(s3) = &s3_storage_worker {
+                match s3.upload_file(&path, &s3_key).await {
+                    Ok(_) => {
+                        if !should_keep_local {
+                            let _ = std::fs::remove_file(&path);
+                            println!("🗑️  Removed local file: {}", path.display());
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("⚠️  Background upload failed for {}: {}", path.display(), e);
+                    }
+                }
             }
         }
     });
@@ -1812,7 +829,7 @@ async fn main() -> Result<()> {
 
         // If the minute boundary (or source) changed, flush.
         if key != current_key && !buf.is_empty() {
-            flush_batch_async(&args.out_dir, &current_key, &mut buf, &s3_storage, &iceberg_storage, &upload_tx).await?;
+            flush_batch(&args.out_dir, &current_key, &mut buf, &s3_storage, &upload_tx).await?;
             rows_in_file = 0;
             current_key = key.clone();
         } else {
@@ -1831,33 +848,31 @@ async fn main() -> Result<()> {
 
         if let Some(max_rows) = args.max_rows {
             if rows_in_file >= max_rows {
-                flush_batch_async(&args.out_dir, &current_key, &mut buf, &s3_storage, &iceberg_storage, &upload_tx).await?;
+                flush_batch(&args.out_dir, &current_key, &mut buf, &s3_storage, &upload_tx).await?;
                 rows_in_file = 0;
             }
         }
     }
 
     if !buf.is_empty() {
-        flush_batch_async(&args.out_dir, &current_key, &mut buf, &s3_storage, &iceberg_storage, &upload_tx).await?;
+        flush_batch(&args.out_dir, &current_key, &mut buf, &s3_storage, &upload_tx).await?;
     }
 
     // Close the upload channel and wait for all uploads to complete
     drop(upload_tx);
     println!("⏳ Waiting for background uploads to complete...");
-    let _ = upload_worker.await;
+    let _ = _upload_worker.await;
     println!("✅ All uploads completed");
 
     Ok(())
 }
 
-// Non-blocking flush: writes file and queues upload
-async fn flush_batch_async(
-    root: &Path,
-    key: &PartKey,
-    buf: &mut BatchBuf,
+async fn flush_batch(
+    root: &Path, 
+    key: &PartKey, 
+    buf: &mut BatchBuf, 
     s3_storage: &Option<S3Storage>,
-    iceberg_storage: &Option<IcebergStorage>,
-    upload_tx: &tokio::sync::mpsc::Sender<UploadTask>
+    upload_tx: &tokio::sync::mpsc::Sender<(PathBuf, String, bool)>
 ) -> Result<()> {
     let dir = key.dir_path(root);
     let filename = parquet_file_name();
@@ -1869,118 +884,14 @@ async fn flush_batch_async(
     
     println!("✅ Wrote {} rows to {} (queued for upload)", batch.num_rows(), path.display());
 
-    // Determine if we should keep the local file
-    let should_keep_local = match (s3_storage, iceberg_storage) {
-        (Some(s3), Some(_)) => s3.keep_local,
-        (Some(s3), None) => s3.keep_local,
-        (None, Some(iceberg)) => iceberg.keep_local,
-        (None, None) => true,
-    };
-
-    // Queue the upload task (non-blocking)
-    if s3_storage.is_some() || iceberg_storage.is_some() {
-        let task = UploadTask {
-            path: path.clone(),
-            key: key.clone(),
-            should_keep_local,
-        };
-        
-        upload_tx.send(task).await
-            .context("Failed to queue upload task")?;
-    } else if !should_keep_local {
-        // No uploads configured, clean up immediately
-        tokio::fs::remove_file(&path).await
-            .with_context(|| format!("Failed to remove local file: {}", path.display()))?;
-    }
-
-    Ok(())
-}
-
-// Performs the actual upload in background
-async fn perform_upload(
-    path: &Path,
-    key: &PartKey,
-    s3_storage: &Option<S3Storage>,
-    iceberg_storage: &Option<IcebergStorage>,
-    should_keep_local: bool
-) -> Result<()> {
-    let filename = path.file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| anyhow::anyhow!("Invalid filename"))?;
-
-    // Upload to S3 if configured
-    if let Some(s3) = s3_storage {
-        let s3_key = key.s3_key(filename);
-        let s3_temp = S3Storage {
-            client: s3.client.clone(),
-            bucket: s3.bucket.clone(),
-            keep_local: true,
-        };
-        s3_temp.upload_file(path, &s3_key).await?;
-    }
-
-    // Write to Iceberg if configured
-    if let Some(iceberg) = iceberg_storage {
-        iceberg.upload_file(path, key).await?;
-    }
-
-    // Clean up local file if configured
-    if !should_keep_local {
-        tokio::fs::remove_file(path).await
-            .with_context(|| format!("Failed to remove local file: {}", path.display()))?;
-        println!("🗑️  Removed local file: {}", path.display());
-    }
-
-    Ok(())
-}
-
-async fn flush_batch(
-    root: &Path, 
-    key: &PartKey, 
-    buf: &mut BatchBuf, 
-    s3_storage: &Option<S3Storage>,
-    iceberg_storage: &Option<IcebergStorage>
-) -> Result<()> {
-    let dir = key.dir_path(root);
-    let filename = parquet_file_name();
-    let path = dir.join(&filename);
-    let mut writer = open_writer(&path, &buf.schema)?;
-    let batch = buf.to_record_batch()?;
-    writer.write(&batch).context("writing batch to Parquet")?;
-    writer.close().context("closing Parquet writer")?;
-    
-    println!("✅ Wrote {} rows to {}", batch.num_rows(), path.display());
-
-    // Determine if we should keep the local file based on storage configurations
-    let should_keep_local = match (s3_storage, iceberg_storage) {
-        (Some(s3), Some(_)) => s3.keep_local, // Keep S3's preference when both are configured
-        (Some(s3), None) => s3.keep_local,    // Use S3's preference
-        (None, Some(iceberg)) => iceberg.keep_local, // Use Iceberg's preference
-        (None, None) => true, // Keep file if no storage is configured
-    };
-
-    // Upload to S3 if configured (but don't let it delete the file yet)
-    if let Some(s3) = s3_storage {
+    // Queue upload to S3 if configured (non-blocking)
+    if s3_storage.is_some() {
         let s3_key = key.s3_key(&filename);
-        // Temporarily override keep_local to prevent deletion
-        let s3_temp = S3Storage {
-            client: s3.client.clone(),
-            bucket: s3.bucket.clone(),
-            keep_local: true, // Force keep local until after Iceberg processing
-        };
-        s3_temp.upload_file(&path, &s3_key).await?;
-    }
-
-    // Write to Iceberg if configured
-    if let Some(iceberg) = iceberg_storage {
-        iceberg.upload_file(&path, key).await?;
-    }
-
-    // Clean up local file if configured to do so
-    if !should_keep_local {
-        tokio::fs::remove_file(&path).await
-            .with_context(|| format!("Failed to remove local file: {}", path.display()))?;
-        println!("🗑️  Removed local file: {}", path.display());
+        let should_keep_local = s3_storage.as_ref().map(|s| s.keep_local).unwrap_or(true);
+        
+        // Send to background worker (non-blocking)
+        upload_tx.send((path, s3_key, should_keep_local)).await
+            .context("Failed to queue upload task")?;
     }
 
     Ok(())
@@ -1997,7 +908,6 @@ async fn handle_websocket_input(
     out_dir: PathBuf,
     max_rows: Option<usize>,
     s3_storage: Option<S3Storage>,
-    iceberg_storage: Option<IcebergStorage>,
 ) -> Result<()> {
     println!("🔄 Connecting to WebSocket: {}", ws_url);
     
@@ -2015,24 +925,25 @@ async fn handle_websocket_input(
     let mut rows_in_file = 0usize;
     let mut processed_count = 0usize;
 
-    // Create channel for background uploads
-    let (upload_tx, mut upload_rx) = tokio::sync::mpsc::channel::<UploadTask>(10);
+    // Create channel for background uploads (buffer up to 10 pending uploads)
+    let (upload_tx, mut upload_rx) = tokio::sync::mpsc::channel::<(PathBuf, String, bool)>(10);
     
     // Spawn background upload worker
     let s3_storage_worker = s3_storage.clone();
-    let iceberg_storage_worker = iceberg_storage.clone();
-    let upload_worker = tokio::spawn(async move {
-        while let Some(task) = upload_rx.recv().await {
-            let upload_result = perform_upload(
-                &task.path,
-                &task.key,
-                &s3_storage_worker,
-                &iceberg_storage_worker,
-                task.should_keep_local
-            ).await;
-            
-            if let Err(e) = upload_result {
-                eprintln!("⚠️  Background upload failed: {}", e);
+    let _upload_worker = tokio::spawn(async move {
+        while let Some((path, s3_key, should_keep_local)) = upload_rx.recv().await {
+            if let Some(s3) = &s3_storage_worker {
+                match s3.upload_file(&path, &s3_key).await {
+                    Ok(_) => {
+                        if !should_keep_local {
+                            let _ = std::fs::remove_file(&path);
+                            println!("🗑️  Removed local file: {}", path.display());
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("⚠️  Background upload failed for {}: {}", path.display(), e);
+                    }
+                }
             }
         }
     });
@@ -2086,7 +997,7 @@ async fn handle_websocket_input(
 
         // If the minute boundary changed, flush
         if key != current_key && !buf.is_empty() {
-            flush_batch_async(&out_dir, &current_key, &mut buf, &s3_storage, &iceberg_storage, &upload_tx).await?;
+            flush_batch(&out_dir, &current_key, &mut buf, &s3_storage, &upload_tx).await?;
             rows_in_file = 0;
             current_key = key.clone();
         } else {
@@ -2104,7 +1015,7 @@ async fn handle_websocket_input(
 
             if let Some(max_rows) = max_rows {
                 if rows_in_file >= max_rows {
-                    flush_batch_async(&out_dir, &current_key, &mut buf, &s3_storage, &iceberg_storage, &upload_tx).await?;
+                    flush_batch(&out_dir, &current_key, &mut buf, &s3_storage, &upload_tx).await?;
                     rows_in_file = 0;
                 }
             }
@@ -2116,7 +1027,7 @@ async fn handle_websocket_input(
         
         // Flush any buffered data before reconnecting
         if !buf.is_empty() {
-            flush_batch_async(&out_dir, &current_key, &mut buf, &s3_storage, &iceberg_storage, &upload_tx).await?;
+            flush_batch(&out_dir, &current_key, &mut buf, &s3_storage, &upload_tx).await?;
         }
     }
 }
