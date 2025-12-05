@@ -82,6 +82,10 @@ struct Args {
     #[arg(long)]
     keep_local: bool,
 
+    /// Disable TLS/HTTPS for S3 endpoint (use plain HTTP instead)
+    #[arg(long)]
+    s3_disable_tls: bool,
+
     /// WebSocket URL to connect to (e.g., wss://stream.aisstream.io/v0/stream)
     #[arg(long, conflicts_with_all = ["input", "tcp_host", "tcp_port"])]
     ws_url: Option<String>,
@@ -161,12 +165,17 @@ impl S3Storage {
         access_key: Option<String>,
         secret_key: Option<String>,
         keep_local: bool,
+        disable_tls: bool,
     ) -> Result<Self> {
         let mut config_builder = aws_config::defaults(aws_config::BehaviorVersion::latest())
             .region(Region::new(region));
 
         // Handle custom endpoint (for MinIO)
-        if let Some(endpoint_url) = endpoint {
+        if let Some(mut endpoint_url) = endpoint {
+            // If TLS is disabled and endpoint doesn't specify protocol, ensure it uses http://
+            if disable_tls && !endpoint_url.starts_with("http://") && !endpoint_url.starts_with("https://") {
+                endpoint_url = format!("http://{}", endpoint_url);
+            }
             config_builder = config_builder.endpoint_url(endpoint_url);
         }
 
@@ -177,7 +186,10 @@ impl S3Storage {
         }
 
         let config = config_builder.load().await;
-        let s3_config = S3Config::from(&config);
+        let s3_config = S3Config::from(&config).to_builder()
+            .force_path_style(true)
+            .build();
+        
         let client = S3Client::from_conf(s3_config);
 
         Ok(S3Storage {
@@ -729,6 +741,12 @@ async fn main() -> Result<()> {
         }
     }
 
+    if !args.s3_disable_tls {
+        if let Ok(disable_tls_env) = std::env::var("S3_DISABLE_TLS") {
+            args.s3_disable_tls = disable_tls_env.to_lowercase() == "true" || disable_tls_env == "1";
+        }
+    }
+
     // Handle health check mode
     if args.health_check {
         check_health()?;
@@ -781,6 +799,7 @@ async fn main() -> Result<()> {
         if let Some(endpoint) = &args.s3_endpoint {
             println!("   Endpoint: {}", endpoint);
         }
+        println!("   TLS/HTTPS: {}", if args.s3_disable_tls { "disabled (HTTP)" } else { "enabled (HTTPS)" });
         if args.s3_access_key.is_some() {
             println!("   Access Key: *** (configured)");
         }
@@ -804,6 +823,7 @@ async fn main() -> Result<()> {
             args.s3_access_key.clone(),
             args.s3_secret_key.clone(),
             args.keep_local,
+            args.s3_disable_tls,
         ).await?)
     } else {
         None
