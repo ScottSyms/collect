@@ -10,16 +10,15 @@ clap = { version = "4", features = ["derive"] }
 parquet = { version = "53", features = ["arrow", "zstd"] }
 arrow = "53"
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = { version = "0.20", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.20", features = ["rustls-tls-native-roots"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-openssl = { version = "0.10", features = ["vendored"] }
 futures-util = "0.3"
 aws-sdk-s3 = "1.0"
-aws-config = "1.0"
+aws-config = { version = "1.0", features = ["rustls"] }
 aws-credential-types = "1.0"
 # Real Iceberg support via Polars
 polars = { version = "0.41", features = ["lazy", "parquet", "strings", "temporal", "serde"] }
-reqwest = { version = "0.11", features = ["json"] }
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
 uuid = { version = "1.0", features = ["v4"] }
 

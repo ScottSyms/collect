@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
+use std::error::Error;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -187,8 +188,12 @@ impl S3Storage {
     }
 
     pub async fn upload_file(&self, local_path: &Path, s3_key: &str) -> Result<()> {
+        let file_metadata = tokio::fs::metadata(local_path).await
+            .with_context(|| format!("Failed to read file metadata: {}", local_path.display()))?;
+        let file_size = file_metadata.len();
+        
         let file_content = tokio::fs::read(local_path).await
-            .with_context(|| format!("Failed to read file: {}", local_path.display()))?;
+            .with_context(|| format!("Failed to read file (size: {} bytes): {}", file_size, local_path.display()))?;
 
         let body = ByteStream::from(file_content);
 
@@ -199,9 +204,21 @@ impl S3Storage {
             .body(body)
             .send()
             .await
-            .with_context(|| format!("Failed to upload {} to S3", s3_key))?;
+            .map_err(|e| {
+                eprintln!("❌ S3 Upload Failed:");
+                eprintln!("   File: {}", local_path.display());
+                eprintln!("   Size: {} bytes ({:.2} MB)", file_size, file_size as f64 / 1_048_576.0);
+                eprintln!("   Bucket: s3://{}", self.bucket);
+                eprintln!("   Key: {}", s3_key);
+                eprintln!("   Error Type: {}", e);
+                if let Some(source) = e.source() {
+                    eprintln!("   Underlying Cause: {}", source);
+                }
+                anyhow::anyhow!("S3 upload failed: {}", e)
+            })?;
 
-        println!("✅ Uploaded {} to S3: s3://{}/{}", local_path.display(), self.bucket, s3_key);
+        println!("✅ Uploaded {} to S3: s3://{}/{} ({:.2} MB)", 
+                 local_path.display(), self.bucket, s3_key, file_size as f64 / 1_048_576.0);
 
         // Remove local file if not keeping it
         if !self.keep_local {
@@ -718,6 +735,65 @@ async fn main() -> Result<()> {
         return Ok(()); // This line won't be reached due to process::exit in check_health
     }
 
+    // Echo all configuration parameters at startup
+    println!("═══════════════════════════════════════════════════════════");
+    println!("🚀 AIS Capture Configuration");
+    println!("═══════════════════════════════════════════════════════════");
+    
+    // Input source configuration
+    println!("\n📥 Input Source:");
+    if let Some(input) = &args.input {
+        println!("   File: {}", input.display());
+    } else if let Some(host) = &args.tcp_host {
+        println!("   TCP: {}:{}", host, args.tcp_port.unwrap_or(0));
+    } else if let Some(ws_url) = &args.ws_url {
+        println!("   WebSocket: {}", ws_url);
+        if args.ws_api_key.is_some() {
+            println!("   API Key: *** (configured)");
+        }
+        if !args.ws_bbox.is_empty() {
+            println!("   Bounding Boxes: {:?}", args.ws_bbox);
+        }
+        if !args.ws_mmsi_filter.is_empty() {
+            println!("   MMSI Filters: {:?}", args.ws_mmsi_filter);
+        }
+        if !args.ws_message_type_filter.is_empty() {
+            println!("   Message Type Filters: {:?}", args.ws_message_type_filter);
+        }
+        println!("   Debug Mode: {}", args.ws_debug);
+    } else {
+        println!("   None specified");
+    }
+    
+    println!("\n📤 Output Configuration:");
+    println!("   Source Name: {}", args.source.as_deref().unwrap_or("(auto-detect)"));
+    println!("   Output Directory: {}", args.out_dir.display());
+    if let Some(max) = args.max_rows {
+        println!("   Max Rows Per File: {}", max);
+    } else {
+        println!("   Max Rows Per File: unlimited (flush on minute boundary)");
+    }
+    
+    println!("\n☁️  S3 Configuration:");
+    if let Some(bucket) = &args.s3_bucket {
+        println!("   Bucket: {}", bucket);
+        println!("   Region: {}", args.s3_region);
+        if let Some(endpoint) = &args.s3_endpoint {
+            println!("   Endpoint: {}", endpoint);
+        }
+        if args.s3_access_key.is_some() {
+            println!("   Access Key: *** (configured)");
+        }
+        if args.s3_secret_key.is_some() {
+            println!("   Secret Key: *** (configured)");
+        }
+        println!("   Keep Local Files: {}", args.keep_local);
+    } else {
+        println!("   Disabled (local storage only)");
+    }
+    
+    println!("═══════════════════════════════════════════════════════════\n");
+
     // Initialize S3 storage if bucket is specified
     let s3_storage = if let Some(bucket) = args.s3_bucket.clone() {
         println!("🔄 Initializing S3 storage for bucket: {}", bucket);
@@ -801,7 +877,8 @@ async fn main() -> Result<()> {
                         }
                     }
                     Err(e) => {
-                        eprintln!("⚠️  Background upload failed for {}: {}", path.display(), e);
+                        eprintln!("⚠️  Background upload failed: {}", e);
+                        eprintln!("   📁 File preserved on disk for retry: {}", path.display());
                     }
                 }
             }
@@ -941,7 +1018,8 @@ async fn handle_websocket_input(
                         }
                     }
                     Err(e) => {
-                        eprintln!("⚠️  Background upload failed for {}: {}", path.display(), e);
+                        eprintln!("⚠️  Background upload failed: {}", e);
+                        eprintln!("   📁 File preserved on disk for retry: {}", path.display());
                     }
                 }
             }

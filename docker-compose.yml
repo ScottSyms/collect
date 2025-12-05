@@ -1,51 +1,19 @@
 services:
   data-ingest:
     build: .
-    image: hive-parquet-ingest:latest
-    container_name: data-ingest
+    image: collect:latest
+    container_name: norway
     restart: unless-stopped
-    
-    # No command needed - all configuration via environment variables
-    # 
-    # Alternative configuration methods:
-    # 1. Via environment variables (recommended for Docker)
-    # 2. Via command line arguments (shown in comments below)
-    
-    # Example command for file input
-    # command: ["--input", "/input/data.txt", "--source", "mydata"]
-    # volumes:
-    #   - ./input:/input:ro
-    
-    # Example command for WebSocket AIS Stream input
-    # command: [
-    #   "--ws-url", "wss://stream.aisstream.io/v0/stream",
-    #   "--ws-api-key", "${AIS_API_KEY}",
-    #   "--ws-bbox", "37.9,-122.6,37.6,-122.3",
-    #   "--source", "ais-sf-bay",
-    #   "--s3-bucket", "maritime-data",
-    #   "--s3-region", "us-west-2"
-    # ]
-    
-    # Example command for TCP input
-    # command: [
-    #   "--tcp-host", "153.44.253.27", 
-    #   "--tcp-port", "5631",
-    #   "--source", "norway-tcp",
-    #   "--s3-bucket", "my-data-bucket",
-    #   "--s3-region", "us-west-2"
-    # ]
+    env_file:
+      - .env
     volumes:
-      - ./output:/data
-    
-    # Health check configuration
+      - ./output/norway:/data
     healthcheck:
-      test: ["CMD", "/usr/local/bin/hive_parquet_ingest", "--health-check"]
+      test: ["CMD", "/usr/local/bin/capture", "--health-check"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 10s
-    
-    # Resource limits
     deploy:
       resources:
         limits:
@@ -54,46 +22,128 @@ services:
         reservations:
           memory: 512M
           cpus: '0.25'
-    
-    # Environment variables for application configuration
     environment:
-      # Runtime configuration
-      - RUST_LOG=info
-      
-      # Input source configuration (choose one)
-      # For file input:
-      # - INPUT_FILE=/input/data.txt
-      
-      # For TCP input:
-      # - TCP_HOST=153.44.253.27
-      # - TCP_PORT=5631
-      
-      # For WebSocket AIS input:
-      - WS_URL=wss://stream.aisstream.io/v0/stream
-      - WS_API_KEY=${AIS_API_KEY}
-      - WS_BBOX=37.9,-122.6,37.6,-122.3
-      
-      # General configuration
-      - SOURCE=ais-sf-bay
+      - RUST_LOG=DEBUG
+      - TCP_HOST=${TCP_HOST}
+      - TCP_PORT=${TCP_PORT}
+      - SOURCE=${SOURCE}
       - OUT_DIR=/data
       - MAX_ROWS=10000
       - KEEP_LOCAL=false
-      
-      # S3 configuration
-      - S3_BUCKET=maritime-data
-      - S3_REGION=us-west-2
-      - S3_ENDPOINT=${S3_ENDPOINT:-}
-      - S3_ACCESS_KEY=${AWS_ACCESS_KEY_ID:-}
-      - S3_SECRET_KEY=${AWS_SECRET_ACCESS_KEY:-}
-      
-      # Health check can be disabled for normal operation
+      - S3_BUCKET=${S3_BUCKET}
+      - S3_REGION=${S3_REGION}
+      - S3_ENDPOINT=${S3_ENDPOINT}
+      - S3_ACCESS_KEY=${S3_ACCESS_KEY}
+      - S3_SECRET_KEY=${S3_SECRET_KEY}
       - HEALTH_CHECK=false
-    
-    # Network configuration (if needed)
-    # networks:
-    #   - data-network
 
-# Uncomment if you need custom networks
-# networks:
-#   data-network:
-#     driver: bridge
+  data-ingest-ais:
+    build: .
+    image: collect:latest
+    container_name: aisstream_collector
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./output/aisstream:/data
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/capture", "--health-check"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '0.5'
+        reservations:
+          memory: 512M
+          cpus: '0.25'
+    environment:
+      - RUST_LOG=DEBUG
+      - SOURCE=${AIS_SOURCE}
+      - S3_BUCKET=${AIS_S3_BUCKET}
+      - S3_ENDPOINT=${AIS_S3_ENDPOINT}
+      - S3_REGION=${AIS_S3_REGION}
+      - S3_ACCESS_KEY=${AIS_S3_ACCESS_KEY}
+      - S3_SECRET_KEY=${AIS_S3_SECRET_KEY}
+      - WS_URL=${AIS_WS_URL}
+      - WS_API_KEY=${AIS_WS_API_KEY}
+      - OUT_DIR=${AIS_OUT_DIR}
+      - MAX_ROWS=${AIS_MAX_ROWS}
+      - KEEP_LOCAL=${AIS_KEEP_LOCAL}
+      - HEALTH_CHECK=${AIS_HEALTH_CHECK}
+
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+    command: "server /data --console-address :9001 "
+    volumes:
+      - ./minio_data:/data
+
+  lakekeeper:
+    image: ${LAKEKEEPER__SERVER_IMAGE:-quay.io/lakekeeper/catalog:latest-main}
+    pull_policy: always
+    environment:
+      - LAKEKEEPER__PG_ENCRYPTION_KEY=This-is-NOT-Secure!
+      - LAKEKEEPER__PG_DATABASE_URL_READ=postgresql://postgres:postgres@db:5432/postgres
+      - LAKEKEEPER__PG_DATABASE_URL_WRITE=postgresql://postgres:postgres@db:5432/postgres
+      - LAKEKEEPER__AUTHZ_BACKEND=allowall
+    command: [ "serve" ]
+    healthcheck:
+      test: [ "CMD", "/home/nonroot/lakekeeper", "healthcheck" ]
+      interval: 1s
+      timeout: 10s
+      retries: 3
+      start_period: 3s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "8181:8181"
+
+  migrate:
+    image: ${LAKEKEEPER__SERVER_IMAGE:-quay.io/lakekeeper/catalog:latest-main}
+    pull_policy: always
+    environment:
+      - LAKEKEEPER__PG_ENCRYPTION_KEY=This-is-NOT-Secure!
+      - LAKEKEEPER__PG_DATABASE_URL_READ=postgresql://postgres:postgres@db:5432/postgres
+      - LAKEKEEPER__PG_DATABASE_URL_WRITE=postgresql://postgres:postgres@db:5432/postgres
+      - LAKEKEEPER__AUTHZ_BACKEND=allowall
+    restart: "no"
+    command: [ "migrate" ]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:17
+    environment:
+      - POSTGRES_PASSWORD=postgres
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres -p 5432 -d postgres" ]
+      interval: 2s
+      timeout: 10s
+      retries: 2
+      start_period: 10s
+    volumes:
+      - volume-lakekeeper:/var/lib/postgresql/data
+
+  sniffer:
+    image: nicolaka/netshoot
+    network_mode: "service:minio"    # share net namespace with minio
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    command: ["tcpdump", "-i", "eth0", "-nn", "port", "9000"]
+
+volumes:
+  volume-lakekeeper:
