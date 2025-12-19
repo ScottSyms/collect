@@ -14,6 +14,9 @@ tokio-tungstenite = { version = "0.20", features = ["rustls-tls-native-roots"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 futures-util = "0.3"
+rdkafka = { version = "0.36", features = ["cmake-build", "tokio"] }
+apache-avro = "0.16"
+base64 = "0.21"
 aws-sdk-s3 = "1.0"
 aws-config = { version = "1.0", features = ["rustls"] }
 aws-credential-types = "1.0"

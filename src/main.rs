@@ -110,6 +110,26 @@ struct Args {
     /// Enable debug mode for WebSocket connections
     #[arg(long)]
     ws_debug: bool,
+
+    /// Kafka bootstrap servers (comma-separated, e.g., localhost:9092,broker2:9092)
+    #[arg(long, conflicts_with_all = ["input", "tcp_host", "tcp_port", "ws_url"])]
+    kafka_brokers: Option<String>,
+
+    /// Kafka topic to consume from
+    #[arg(long, requires = "kafka_brokers")]
+    kafka_topic: Option<String>,
+
+    /// Kafka consumer group ID
+    #[arg(long, requires = "kafka_brokers")]
+    kafka_group_id: Option<String>,
+
+    /// Kafka Schema Registry URL for Avro schemas (e.g., http://localhost:8081)
+    #[arg(long, requires = "kafka_brokers")]
+    kafka_schema_registry: Option<String>,
+
+    /// Enable debug mode for Kafka connections
+    #[arg(long)]
+    kafka_debug: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -240,6 +260,207 @@ impl S3Storage {
         }
 
         Ok(())
+    }
+}
+
+// Kafka Consumer with Avro support
+pub struct KafkaConsumer {
+    brokers: String,
+    topic: String,
+    group_id: String,
+    schema_registry_url: Option<String>,
+    debug: bool,
+}
+
+impl KafkaConsumer {
+    pub fn new(
+        brokers: String,
+        topic: String,
+        group_id: String,
+        schema_registry_url: Option<String>,
+        debug: bool,
+    ) -> Self {
+        KafkaConsumer {
+            brokers,
+            topic,
+            group_id,
+            schema_registry_url,
+            debug,
+        }
+    }
+
+    pub async fn consume_and_stream(
+        &self,
+    ) -> Result<impl futures_util::Stream<Item = Result<String>>> {
+        use rdkafka::config::ClientConfig;
+        use rdkafka::consumer::{Consumer, StreamConsumer};
+        use rdkafka::Message;
+
+        let consumer: StreamConsumer = ClientConfig::new()
+            .set("bootstrap.servers", &self.brokers)
+            .set("group.id", &self.group_id)
+            .set("enable.auto.commit", "true")
+            .set("auto.offset.reset", "earliest")
+            .set("session.timeout.ms", "6000")
+            .set("enable.partition.eof", "false")
+            .create()
+            .with_context(|| format!("Failed to create Kafka consumer"))?;
+
+        consumer
+            .subscribe(&[&self.topic])
+            .with_context(|| format!("Failed to subscribe to topic: {}", self.topic))?;
+
+        println!("✅ Subscribed to Kafka topic: {}", self.topic);
+
+        let debug = self.debug;
+        let schema_registry_url_clone = self.schema_registry_url.clone();
+
+        Ok(futures_util::stream::unfold(
+            (consumer, schema_registry_url_clone),
+            move |(consumer, schema_registry_url)| async move {
+                match consumer.recv().await {
+                    Ok(message) => {
+                        if let Some(payload) = message.payload() {
+                            // Try to deserialize Avro and convert to JSON
+                            let json_result = Self::avro_to_json(payload, &schema_registry_url, debug);
+                            
+                            match json_result {
+                                Ok(json_str) => {
+                                    if debug {
+                                        println!("📨 Kafka message: {}", 
+                                            if json_str.len() > 200 { 
+                                                format!("{}...", &json_str[..200]) 
+                                            } else { 
+                                                json_str.clone() 
+                                            }
+                                        );
+                                    }
+                                    Some((Ok(json_str), (consumer, schema_registry_url)))
+                                }
+                                Err(e) => {
+                                    if debug {
+                                        eprintln!("⚠️  Failed to deserialize Avro message: {}", e);
+                                    }
+                                    // Continue processing next message
+                                    Some((Err(e), (consumer, schema_registry_url)))
+                                }
+                            }
+                        } else {
+                            if debug {
+                                eprintln!("⚠️  Received message with no payload");
+                            }
+                            // Continue to next message
+                            Some((Err(anyhow::anyhow!("Empty payload")), (consumer, schema_registry_url)))
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("❌ Kafka consumer error: {}", e);
+                        Some((Err(anyhow::anyhow!("Kafka error: {}", e)), (consumer, schema_registry_url)))
+                    }
+                }
+            },
+        ))
+    }
+
+    fn avro_to_json(
+        avro_bytes: &[u8],
+        _schema_registry_url: &Option<String>,
+        debug: bool,
+    ) -> Result<String> {
+        // Try to deserialize Avro without schema (for schema-embedded messages)
+        match apache_avro::Reader::new(avro_bytes) {
+            Ok(reader) => {
+                // Read first record
+                for value_result in reader {
+                    match value_result {
+                        Ok(value) => {
+                            // Convert Avro value to JSON
+                            let json_value = Self::avro_value_to_json(&value)?;
+                            return serde_json::to_string(&json_value)
+                                .with_context(|| "Failed to serialize to JSON");
+                        }
+                        Err(e) => {
+                            return Err(anyhow::anyhow!("Failed to read Avro record: {}", e));
+                        }
+                    }
+                }
+                Err(anyhow::anyhow!("No records in Avro message"))
+            }
+            Err(e) => {
+                if debug {
+                    eprintln!("⚠️  Avro deserialization error: {}. Trying raw bytes as fallback...", e);
+                }
+                // Fallback: treat as raw bytes and encode as JSON string
+                let base64_str = base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    avro_bytes,
+                );
+                Ok(serde_json::json!({
+                    "raw_data": base64_str,
+                    "note": "Could not deserialize as Avro, stored as base64"
+                })
+                .to_string())
+            }
+        }
+    }
+
+    fn avro_value_to_json(avro_value: &apache_avro::types::Value) -> Result<serde_json::Value> {
+        use apache_avro::types::Value;
+        
+        match avro_value {
+            Value::Null => Ok(serde_json::Value::Null),
+            Value::Boolean(b) => Ok(serde_json::Value::Bool(*b)),
+            Value::Int(i) => Ok(serde_json::Value::Number((*i).into())),
+            Value::Long(l) => Ok(serde_json::Value::Number((*l).into())),
+            Value::Float(f) => {
+                serde_json::Number::from_f64(*f as f64)
+                    .map(serde_json::Value::Number)
+                    .ok_or_else(|| anyhow::anyhow!("Invalid float value"))
+            }
+            Value::Double(d) => {
+                serde_json::Number::from_f64(*d)
+                    .map(serde_json::Value::Number)
+                    .ok_or_else(|| anyhow::anyhow!("Invalid double value"))
+            }
+            Value::Bytes(b) | Value::Fixed(_, b) => {
+                Ok(serde_json::Value::String(
+                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b)
+                ))
+            }
+            Value::String(s) => Ok(serde_json::Value::String(s.clone())),
+            Value::Array(arr) => {
+                let json_arr: Result<Vec<_>> = arr.iter().map(Self::avro_value_to_json).collect();
+                Ok(serde_json::Value::Array(json_arr?))
+            }
+            Value::Map(map) => {
+                let mut json_map = serde_json::Map::new();
+                for (k, v) in map.iter() {
+                    json_map.insert(k.clone(), Self::avro_value_to_json(v)?);
+                }
+                Ok(serde_json::Value::Object(json_map))
+            }
+            Value::Record(fields) => {
+                let mut json_map = serde_json::Map::new();
+                for (name, value) in fields {
+                    json_map.insert(name.clone(), Self::avro_value_to_json(value)?);
+                }
+                Ok(serde_json::Value::Object(json_map))
+            }
+            Value::Enum(_, symbol) => Ok(serde_json::Value::String(symbol.clone())),
+            Value::Union(_, boxed_value) => Self::avro_value_to_json(boxed_value),
+            Value::Date(d) => Ok(serde_json::Value::Number((*d).into())),
+            Value::Decimal(d) => Ok(serde_json::Value::String(format!("{:?}", d))),
+            Value::TimeMillis(t) => Ok(serde_json::Value::Number((*t).into())),
+            Value::TimeMicros(t) => Ok(serde_json::Value::Number((*t).into())),
+            Value::TimestampMillis(t) => Ok(serde_json::Value::Number((*t).into())),
+            Value::TimestampMicros(t) => Ok(serde_json::Value::Number((*t).into())),
+            Value::LocalTimestampMillis(t) => Ok(serde_json::Value::Number((*t).into())),
+            Value::LocalTimestampMicros(t) => Ok(serde_json::Value::Number((*t).into())),
+            Value::Duration(d) => {
+                Ok(serde_json::Value::String(format!("{:?}", d)))
+            }
+            Value::Uuid(u) => Ok(serde_json::Value::String(u.to_string())),
+        }
     }
 }
 
@@ -747,6 +968,37 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Kafka configuration environment variables
+    if args.kafka_brokers.is_none() {
+        if let Ok(brokers_env) = std::env::var("KAFKA_BROKERS") {
+            args.kafka_brokers = Some(brokers_env);
+        }
+    }
+
+    if args.kafka_topic.is_none() {
+        if let Ok(topic_env) = std::env::var("KAFKA_TOPIC") {
+            args.kafka_topic = Some(topic_env);
+        }
+    }
+
+    if args.kafka_group_id.is_none() {
+        if let Ok(group_env) = std::env::var("KAFKA_GROUP_ID") {
+            args.kafka_group_id = Some(group_env);
+        }
+    }
+
+    if args.kafka_schema_registry.is_none() {
+        if let Ok(registry_env) = std::env::var("KAFKA_SCHEMA_REGISTRY") {
+            args.kafka_schema_registry = Some(registry_env);
+        }
+    }
+
+    if !args.kafka_debug {
+        if let Ok(debug_env) = std::env::var("KAFKA_DEBUG") {
+            args.kafka_debug = debug_env.to_lowercase() == "true" || debug_env == "1";
+        }
+    }
+
     // Handle health check mode
     if args.health_check {
         check_health()?;
@@ -764,6 +1016,18 @@ async fn main() -> Result<()> {
         println!("   File: {}", input.display());
     } else if let Some(host) = &args.tcp_host {
         println!("   TCP: {}:{}", host, args.tcp_port.unwrap_or(0));
+    } else if let Some(kafka_brokers) = &args.kafka_brokers {
+        println!("   Kafka Brokers: {}", kafka_brokers);
+        if let Some(topic) = &args.kafka_topic {
+            println!("   Topic: {}", topic);
+        }
+        if let Some(group_id) = &args.kafka_group_id {
+            println!("   Consumer Group: {}", group_id);
+        }
+        if let Some(registry) = &args.kafka_schema_registry {
+            println!("   Schema Registry: {}", registry);
+        }
+        println!("   Debug Mode: {}", args.kafka_debug);
     } else if let Some(ws_url) = &args.ws_url {
         println!("   WebSocket: {}", ws_url);
         if args.ws_api_key.is_some() {
@@ -828,6 +1092,28 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+
+    // Handle Kafka input separately
+    if let Some(kafka_brokers) = &args.kafka_brokers {
+        let kafka_topic = args.kafka_topic.clone()
+            .ok_or_else(|| anyhow::anyhow!("Kafka topic is required"))?;
+        let kafka_group_id = args.kafka_group_id.clone()
+            .ok_or_else(|| anyhow::anyhow!("Kafka consumer group ID is required"))?;
+        
+        let source = args.source.unwrap_or_else(|| "kafka".to_string());
+        
+        return handle_kafka_input(
+            kafka_brokers.clone(),
+            kafka_topic,
+            kafka_group_id,
+            args.kafka_schema_registry.clone(),
+            args.kafka_debug,
+            source,
+            args.out_dir.clone(),
+            args.max_rows,
+            s3_storage,
+        ).await;
+    }
 
     // Handle WebSocket input separately
     if let Some(ws_url) = &args.ws_url {
@@ -990,6 +1276,124 @@ async fn flush_batch(
         upload_tx.send((path, s3_key, should_keep_local)).await
             .context("Failed to queue upload task")?;
     }
+
+    Ok(())
+}
+
+async fn handle_kafka_input(
+    kafka_brokers: String,
+    kafka_topic: String,
+    kafka_group_id: String,
+    kafka_schema_registry: Option<String>,
+    kafka_debug: bool,
+    source: String,
+    out_dir: PathBuf,
+    max_rows: Option<usize>,
+    s3_storage: Option<S3Storage>,
+) -> Result<()> {
+    println!("🔄 Connecting to Kafka brokers: {}", kafka_brokers);
+    
+    let kafka_consumer = KafkaConsumer::new(
+        kafka_brokers,
+        kafka_topic.clone(),
+        kafka_group_id,
+        kafka_schema_registry,
+        kafka_debug,
+    );
+
+    let mut current_key = PartKey::from_now(&source);
+    let mut buf = BatchBuf::new();
+    let mut rows_in_file = 0usize;
+    let mut processed_count = 0usize;
+
+    // Create channel for background uploads (buffer up to 10 pending uploads)
+    let (upload_tx, mut upload_rx) = tokio::sync::mpsc::channel::<(PathBuf, String, bool)>(10);
+    
+    // Spawn background upload worker (Kafka loop)
+    let s3_storage_worker = s3_storage.clone();
+    let _upload_worker = tokio::spawn(async move {
+        while let Some((path, s3_key, should_keep_local)) = upload_rx.recv().await {
+            if let Some(s3) = &s3_storage_worker {
+                match s3.upload_file(&path, &s3_key).await {
+                    Ok(_) => {
+                        if !should_keep_local {
+                            let _ = std::fs::remove_file(&path);
+                            println!("🗑️  Removed local file: {}", path.display());
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("⚠️  Background upload failed: {}", e);
+                        eprintln!("   📁 File preserved on disk for retry: {}", path.display());
+                    }
+                }
+            }
+        }
+    });
+
+    // Mark as healthy when starting
+    update_health_status(true)?;
+
+    // Consume messages from Kafka
+    let stream = kafka_consumer.consume_and_stream().await?;
+    tokio::pin!(stream);
+    
+    println!("✅ Kafka consumer started, processing messages from topic: {}", kafka_topic);
+
+    while let Some(payload_result) = StreamExt::next(&mut stream).await {
+        let payload = match payload_result {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("⚠️  Kafka message error: {}", e);
+                continue; // Skip this message, continue processing
+            }
+        };
+
+        let now = Utc::now();
+        let key = PartKey {
+            source: source.clone(),
+            year: now.year(),
+            month: now.month(),
+            day: now.day(),
+            hour: now.hour(),
+            minute: now.minute(),
+        };
+
+        // If the minute boundary changed, flush
+        if key != current_key && !buf.is_empty() {
+            flush_batch(&out_dir, &current_key, &mut buf, &s3_storage, &upload_tx).await?;
+            rows_in_file = 0;
+            current_key = key.clone();
+        } else {
+            current_key = key.clone();
+        }
+
+        buf.push(now.timestamp_millis(), &payload);
+        rows_in_file += 1;
+        processed_count += 1;
+
+        // Update health status every 100 processed messages
+        if processed_count % 100 == 0 {
+            update_health_status(true).unwrap_or_else(|e| eprintln!("Failed to update health status: {}", e));
+        }
+
+        if let Some(max_rows) = max_rows {
+            if rows_in_file >= max_rows {
+                flush_batch(&out_dir, &current_key, &mut buf, &s3_storage, &upload_tx).await?;
+                rows_in_file = 0;
+            }
+        }
+    }
+
+    // Flush any remaining buffered data
+    if !buf.is_empty() {
+        flush_batch(&out_dir, &current_key, &mut buf, &s3_storage, &upload_tx).await?;
+    }
+
+    // Signal upload worker to finish and wait for pending uploads
+    drop(upload_tx);
+    println!("⏳ Waiting for background uploads to complete...");
+    let _ = _upload_worker.await;
+    println!("✅ All Kafka uploads completed");
 
     Ok(())
 }

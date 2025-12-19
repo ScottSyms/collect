@@ -1,6 +1,6 @@
 # S3 Remote Storage Integration
 
-This application now supports uploading parquet files to S3-compatible object storage including AWS S3 and MinIO.
+This application supports uploading parquet files to S3-compatible object storage including AWS S3 and MinIO, with background uploads to prevent data collection pauses.
 
 ## Usage Examples
 
@@ -11,7 +11,7 @@ export AWS_ACCESS_KEY_ID=your-access-key
 export AWS_SECRET_ACCESS_KEY=your-secret-key
 
 # Run with S3 upload enabled
-./hive_parquet_ingest \
+./capture \
     --tcp-host 153.44.253.27 --tcp-port 5631 \
     --source norway-tcp \
     --s3-bucket my-data-bucket \
@@ -20,7 +20,7 @@ export AWS_SECRET_ACCESS_KEY=your-secret-key
 
 ### AWS S3 (using command line)
 ```bash
-./hive_parquet_ingest \
+./capture \
     --tcp-host 153.44.253.27 --tcp-port 5631 \
     --source norway-tcp \
     --s3-bucket my-data-bucket \
@@ -31,7 +31,7 @@ export AWS_SECRET_ACCESS_KEY=your-secret-key
 
 ### MinIO (self-hosted S3-compatible storage)
 ```bash
-./hive_parquet_ingest \
+./capture \
     --input data.txt \
     --source mydata \
     --s3-bucket data-lake \
@@ -39,12 +39,13 @@ export AWS_SECRET_ACCESS_KEY=your-secret-key
     --s3-region us-east-1 \
     --s3-access-key minioadmin \
     --s3-secret-key minioadmin \
+    --s3-disable-tls \
     --keep-local
 ```
 
 ### Other S3-compatible services (Wasabi, DigitalOcean Spaces, etc.)
 ```bash
-./hive_parquet_ingest \
+./capture \
     --tcp-host 153.44.253.27 --tcp-port 5631 \
     --s3-bucket my-bucket \
     --s3-endpoint https://s3.wasabisys.com \
@@ -62,6 +63,7 @@ export AWS_SECRET_ACCESS_KEY=your-secret-key
 | `--s3-endpoint` | Custom S3 endpoint URL | No | AWS S3 |
 | `--s3-access-key` | S3 access key ID | No* | From env/credentials |
 | `--s3-secret-key` | S3 secret access key | No* | From env/credentials |
+| `--s3-disable-tls` | Disable TLS/HTTPS (use HTTP) | No | false (use HTTPS) |
 | `--keep-local` | Keep local files after S3 upload | No | false (delete local) |
 
 *If not provided, will use AWS credential chain (environment variables, AWS CLI config, IAM roles, etc.)
@@ -76,13 +78,15 @@ s3://bucket-name/source=norway-tcp/year=2025/month=10/day=15/hour=14/minute=32/p
 
 ## Environment Variables
 
-The application supports standard AWS environment variables:
+The application supports standard AWS environment variables plus custom ones:
 
-- `AWS_ACCESS_KEY_ID` - AWS access key ID
-- `AWS_SECRET_ACCESS_KEY` - AWS secret access key  
-- `AWS_DEFAULT_REGION` - Default AWS region
-- `AWS_PROFILE` - AWS CLI profile to use
-- `AWS_ENDPOINT_URL` - Custom S3 endpoint URL
+- `AWS_ACCESS_KEY_ID` or `S3_ACCESS_KEY` - AWS access key ID
+- `AWS_SECRET_ACCESS_KEY` or `S3_SECRET_KEY` - AWS secret access key  
+- `S3_REGION` - AWS region (default: us-east-1)
+- `S3_BUCKET` - S3 bucket name
+- `S3_ENDPOINT` - Custom S3 endpoint URL
+- `S3_DISABLE_TLS` - Set to `true` or `1` to use HTTP instead of HTTPS
+- `KEEP_LOCAL` - Set to `true` or `1` to keep local files after upload
 
 ## Docker Configuration
 
@@ -146,26 +150,42 @@ volumes:
 ## Behavior
 
 1. **Local First**: Files are always written locally first
-2. **S3 Upload**: After successful local write, files are uploaded to S3
-3. **Cleanup**: By default, local files are deleted after successful S3 upload
-4. **Keep Local**: Use `--keep-local` to retain local copies
-5. **Error Handling**: If S3 upload fails, local files are preserved
-6. **Progress**: Upload progress is logged to stdout
+2. **Background Upload**: Files are queued for background upload (non-blocking)
+3. **Data Collection Continues**: No pauses during S3 uploads
+4. **Cleanup**: By default, local files are deleted after successful S3 upload
+5. **Keep Local**: Use `--keep-local` to retain local copies
+6. **Error Handling**: If S3 upload fails, local files are preserved with detailed error messages
+7. **Progress**: Upload progress is logged to stdout
+8. **Graceful Shutdown**: Application waits for pending uploads to complete before exit
 
 ## Security Notes
 
 - Never include credentials in command line arguments in production
 - Use environment variables, AWS CLI profiles, or IAM roles instead  
 - For MinIO/self-hosted: ensure TLS/SSL in production environments
+- Use `--s3-disable-tls` only for local development or internal networks
+- The application uses rustls for TLS (pure Rust, no OpenSSL dependencies)
 - Consider using IAM policies to restrict S3 access to specific buckets/paths
 
 ## Monitoring S3 Uploads
 
-The application logs S3 operations:
+The application logs S3 operations with detailed information:
 ```
-✅ Wrote 1000 rows to data/source=norway-tcp/year=2025/month=10/day=15/hour=14/minute=32/part-20251015T143245123.parquet
-✅ Uploaded data/source=norway-tcp/year=2025/month=10/day=15/hour=14/minute=32/part-20251015T143245123.parquet to S3: s3://my-bucket/source=norway-tcp/year=2025/month=10/day=15/hour=14/minute=32/part-20251015T143245123.parquet
+✅ Wrote 1000 rows to data/source=norway-tcp/year=2025/month=10/day=15/hour=14/minute=32/part-20251015T143245123.parquet (queued for upload)
+✅ Uploaded data/source=norway-tcp/year=2025/month=10/day=15/hour=14/minute=32/part-20251015T143245123.parquet to S3: s3://my-bucket/source=norway-tcp/year=2025/month=10/day=15/hour=14/minute=32/part-20251015T143245123.parquet (247.5 MB)
 🗑️  Removed local file: data/source=norway-tcp/year=2025/month=10/day=15/hour=14/minute=32/part-20251015T143245123.parquet
+```
+
+On upload failure, detailed error information is provided:
+```
+❌ S3 Upload Failed:
+   File: /path/to/file.parquet
+   Size: 259448832 bytes (247.50 MB)
+   Bucket: s3://my-bucket
+   Key: source=norway-tcp/year=2025/month=10/day=15/hour=14/minute=32/part-20251015T143245123.parquet
+   Error Type: DispatchFailure(ConnectorError { ... })
+   Underlying Cause: Connection refused
+📁 File preserved on disk for retry: /path/to/file.parquet
 ```
 
 ## Troubleshooting

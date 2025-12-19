@@ -1,4 +1,4 @@
-# captur
+# capture
 
 A high-performance Rust application for ingesting data streams into Hive-partitioned Parquet files with Zstd compression. Supports multiple input sources (files, TCP streams, WebSocket feeds) and remote storage (S3/MinIO).
 
@@ -6,43 +6,41 @@ A high-performance Rust application for ingesting data streams into Hive-partiti
 - **Multiple Input Sources**: File, TCP stream, or WebSocket (AISStream.io compatible)
 - **Hive Partitioning**: Automatic partitioning by source, year, month, day, hour, and minute
 - **Parquet Format**: Efficient columnar storage with Zstd compression
-- **S3 Integration**: Upload to AWS S3 or S3-compatible storage (MinIO)
-- **Apache Iceberg Support**: Write to Iceberg tables (placeholder implementation for future development)
+- **S3 Integration**: Upload to AWS S3 or S3-compatible storage (MinIO) with optional TLS
+- **Background Uploads**: Non-blocking S3 uploads to prevent data collection pauses
 - **Docker Support**: Full Docker and docker-compose integration with health checks
 - **Environment Variables**: Complete environment variable support for containerized deployments
 - **Real-time Processing**: Async processing with configurable buffering
 - **Health Monitoring**: Built-in health checks for container orchestration
+- **Pure Rust TLS**: Uses rustls for secure connections without OpenSSL dependencies
 
 ## Quick Start
 
 ### Using Environment Variables (Recommended for Docker)
 
 ```bash
-# WebSocket AIS Stream with S3 and Iceberg
+# WebSocket AIS Stream with S3
 export WS_URL="wss://stream.aisstream.io/v0/stream"
 export WS_API_KEY="your-api-key"
 export WS_BBOX="37.9,-122.6,37.6,-122.3"
 export SOURCE="ais-sf-bay"
 export S3_BUCKET="maritime-data"
 export S3_REGION="us-west-2"
-export ICEBERG_CATALOG_URI="http://localhost:8181"
-export ICEBERG_NAMESPACE="ais_data"
-export ICEBERG_TABLE="vessel_positions"
 
-./hive_parquet_ingest
+./capture
 ```
 
 ### Using Command Line Arguments
 
 ```bash
 # File input
-./hive_parquet_ingest --input data.txt --source mydata
+./capture --input data.txt --source mydata
 
 # TCP stream
-./hive_parquet_ingest --tcp-host 153.44.253.27 --tcp-port 5631 --source norway-tcp
+./capture --tcp-host 153.44.253.27 --tcp-port 5631 --source norway-tcp
 
 # WebSocket AIS stream
-./hive_parquet_ingest \
+./capture \
   --ws-url wss://stream.aisstream.io/v0/stream \
   --ws-api-key your-api-key \
   --ws-bbox "37.9,-122.6,37.6,-122.3" \
@@ -73,10 +71,8 @@ All command-line parameters can be configured using environment variables:
 | `S3_ACCESS_KEY` | `--s3-access-key` | S3 access key |
 | `S3_SECRET_KEY` | `--s3-secret-key` | S3 secret key |
 | `KEEP_LOCAL` | `--keep-local` | Keep local files |
-| `ICEBERG_CATALOG_URI` | `--iceberg-catalog-uri` | Iceberg catalog URI |
-| `ICEBERG_NAMESPACE` | `--iceberg-namespace` | Iceberg namespace/database |
-| `ICEBERG_TABLE` | `--iceberg-table` | Iceberg table name |
-| `ICEBERG_WAREHOUSE` | `--iceberg-warehouse` | Iceberg warehouse path |
+| `S3_DISABLE_TLS` | `--s3-disable-tls` | Disable TLS for S3 (use HTTP) |
+| `WS_DEBUG` | `--ws-debug` | Enable WebSocket debug mode |
 
 See [ENVIRONMENT_VARIABLES.md](ENVIRONMENT_VARIABLES.md) for detailed usage examples.
 
@@ -90,7 +86,7 @@ version: '3.8'
 services:
   data-ingest:
     build: .
-    image: hive-parquet-ingest:latest
+    image: capture:latest
     environment:
       # WebSocket AIS Stream
       - WS_URL=wss://stream.aisstream.io/v0/stream
@@ -106,9 +102,7 @@ services:
     volumes:
       - ./output:/data
     healthcheck:
-      test: ["CMD", "/usr/local/bin/hive_parquet_ingest"]
-      environment:
-        - HEALTH_CHECK=true
+      test: ["CMD", "/usr/local/bin/capture", "--health-check"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -117,7 +111,7 @@ services:
 ### Building the Docker Image
 
 ```bash
-docker build -t hive-parquet-ingest .
+docker build -t capture .
 ```
 
 ### Running with Docker
@@ -130,7 +124,7 @@ docker run -d \
   -e WS_API_KEY="your-api-key" \
   -e SOURCE="ais-data" \
   -v $(pwd)/output:/data \
-  hive-parquet-ingest:latest
+  capture:latest
 
 # TCP stream with environment variables
 docker run -d \
@@ -139,7 +133,7 @@ docker run -d \
   -e TCP_PORT="5631" \
   -e SOURCE="norway-tcp" \
   -v $(pwd)/output:/data \
-  hive-parquet-ingest:latest
+  capture:latest
 ```
 
 ## Configuration Precedence
@@ -181,17 +175,17 @@ The application includes health check functionality for container orchestration:
 
 ```bash
 # Check health status
-./hive_parquet_ingest --health-check
+./capture --health-check
 
 # Or using environment variable
-HEALTH_CHECK=true ./hive_parquet_ingest
+HEALTH_CHECK=true ./capture
 ```
 
 Health status is tracked in `/tmp/health_status` with timestamps and status information.
 
 ## S3 Integration
 
-Supports AWS S3 and S3-compatible storage (MinIO):
+Supports AWS S3 and S3-compatible storage (MinIO) with background uploads to prevent data collection pauses:
 
 ### AWS S3
 ```bash
@@ -201,63 +195,23 @@ export S3_ACCESS_KEY="AKIAIOSFODNN7EXAMPLE"
 export S3_SECRET_KEY="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 ```
 
-### MinIO
+### MinIO (with optional non-TLS mode)
 ```bash
 export S3_BUCKET="data-lake"
 export S3_ENDPOINT="http://minio:9000"
 export S3_REGION="us-east-1"
 export S3_ACCESS_KEY="minioadmin"
 export S3_SECRET_KEY="minioadmin"
+export S3_DISABLE_TLS="true"  # Use HTTP instead of HTTPS
 ```
+
+### Features
+- **Background Uploads**: Files are queued and uploaded asynchronously to prevent blocking data collection
+- **Error Handling**: Failed uploads preserve local files with detailed error reporting
+- **TLS Optional**: Can disable TLS for local development or internal networks
+- **Pure Rust**: Uses rustls for TLS, no OpenSSL dependencies
 
 See [S3_INTEGRATION.md](S3_INTEGRATION.md) for detailed configuration.
-
-## Apache Iceberg Integration
-
-**Note: The current Iceberg implementation is a placeholder for future development. The Rust Iceberg ecosystem is still maturing.**
-
-Configure Iceberg table writing:
-
-```bash
-# Basic Iceberg configuration
-export ICEBERG_CATALOG_URI="http://localhost:8181"
-export ICEBERG_NAMESPACE="maritime_data"
-export ICEBERG_TABLE="vessel_positions"
-export ICEBERG_WAREHOUSE="s3://data-lake/warehouse"
-```
-
-### Current Implementation
-
-The current implementation provides:
-- Command-line argument and environment variable support
-- Placeholder structure for Iceberg integration
-- Parquet file reading and metadata extraction
-- Framework for future full Iceberg table writing
-
-### Future Development
-
-Full Iceberg integration will include:
-- Automatic table schema creation and evolution
-- Transaction-based writes with ACID guarantees
-- Time travel and snapshot management
-- Integration with Iceberg REST catalogs
-- Support for partition evolution and hidden partitioning
-
-### Example Usage
-
-```bash
-# Combined S3 and Iceberg output
-./hive_parquet_ingest \
-  --ws-url wss://stream.aisstream.io/v0/stream \
-  --ws-api-key your-api-key \
-  --source vessel_data \
-  --s3-bucket maritime-lake \
-  --iceberg-catalog-uri http://iceberg-rest:8181 \
-  --iceberg-namespace shipping \
-  --iceberg-table positions
-```
-
-This will write parquet files locally, upload them to S3, and prepare the data structure for Iceberg table integration.
 
 ## WebSocket Integration
 
@@ -281,11 +235,11 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 # Clone and build
 git clone <repository-url>
-cd hive-parquet-ingest
+cd capture
 cargo build --release
 
 # Run
-./target/release/hive_parquet_ingest --help
+./target/release/capture --help
 ```
 
 ## Performance Tuning
