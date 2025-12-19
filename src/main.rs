@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 
 use chrono::{Datelike, Timelike, Utc};
 
+mod tui;
+
 use arrow::array::{StringBuilder, TimestampMillisecondBuilder, TimestampMillisecondArray};
 use arrow::array::ArrayBuilder; // Import trait for .len()
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -130,6 +132,10 @@ struct Args {
     /// Enable debug mode for Kafka connections
     #[arg(long)]
     kafka_debug: bool,
+
+    /// Launch interactive TUI for configuration
+    #[arg(long)]
+    tui: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -838,6 +844,28 @@ fn check_health() -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut args = Args::parse();
+    
+    // If --tui flag is set, launch the TUI
+    if args.tui {
+        let initial_config = tui::TuiConfig::from_env();
+        
+        match tui::run_tui(initial_config)? {
+            Some(config) => {
+                // User confirmed, convert TuiConfig back to Args
+                let cli_args = config.to_cli_args();
+                let mut full_args = vec!["capture".to_string()];
+                full_args.extend(cli_args);
+                
+                // Re-parse with TUI-generated args
+                args = Args::parse_from(full_args);
+            }
+            None => {
+                // User quit without running
+                println!("Configuration cancelled.");
+                return Ok(());
+            }
+        }
+    }
     
     // Handle environment variables gracefully - only override if not set via CLI and env var exists
     
