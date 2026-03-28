@@ -338,7 +338,7 @@ head -10000 norway.nmea > test_medium.nmea
 **I/O:**
 - **Page Faults**: Minor (soft) vs Major (hard)
 - **Disk I/O**: Read/write operations
-- **Network I/O**: TCP/WebSocket operations
+- **Network I/O**: TCP operations
 
 ### Performance Baselines
 

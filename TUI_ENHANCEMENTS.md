@@ -13,12 +13,9 @@ December 21, 2025
 
 **Checks Performed**:
 - ✅ At least one input source configured
-- ✅ No conflicting input sources (file/TCP/WebSocket/Kafka)
+- ✅ No conflicting input sources (file/TCP)
 - ✅ TCP port required when TCP host specified
 - ✅ TCP port is valid number (1-65535)
-- ✅ WebSocket URL format validation (ws:// or wss://)
-- ✅ Kafka topic required when brokers specified
-- ✅ Kafka group ID required when brokers specified
 - ✅ Max rows is valid positive number
 - ✅ S3 credentials available (fields or environment)
 
@@ -31,12 +28,10 @@ December 21, 2025
 ### 2. Helpful Hints/Examples ✅
 **Location**: `src/tui.rs` - `get_field_hint()` method
 
-**Coverage**: Hints for all 30+ fields across 6 tabs:
+**Coverage**: Hints for all fields across 5 tabs:
 - **Input Tab**: File paths, TCP addresses, ports
 - **Output Tab**: Directory paths, row limits
 - **S3 Tab**: Bucket names, endpoints, regions, prefixes
-- **WebSocket Tab**: URLs, bounding boxes, filters
-- **Kafka Tab**: Brokers, topics, consumer groups
 - **Config Tab**: File operations
 
 **User Experience**:
@@ -95,14 +90,14 @@ December 21, 2025
 - Hint panel appears below field list
 - Adjusts layout automatically
 
-## New Tab: Config (Tab 6)
+## New Tab: Config (Tab 4)
 
 **Fields**:
 1. **Config File Path**: Editable path to JSON file
 2. **Save Config**: Action button - press Enter to save
 3. **Load Config**: Action button - press Enter to load
 
-**Navigation**: Tab 6 of 7 (before Run tab)
+**Navigation**: Tab 4 of 5 (before Run tab)
 
 ## Keyboard Shortcuts Added
 
@@ -207,9 +202,7 @@ Potential additions:
 ## Compilation Status
 
 ✅ Compiles successfully
-✅ Only pre-existing warnings (AISMessage fields, static_mut_refs)
 ✅ No new warnings introduced
-✅ Binary size: ~40MB (release build)
 
 ## Files Modified
 

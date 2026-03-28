@@ -9,41 +9,18 @@ All command-line parameters can be configured using environment variables, makin
 #### File Input
 - `INPUT_FILE`: Path to input text file (one record per line)
   - Example: `INPUT_FILE=/input/data.txt`
-  - Conflicts with TCP and WebSocket options
+  - Conflicts with TCP options
 
 #### TCP Input  
 - `TCP_HOST`: TCP host address to receive data from
   - Example: `TCP_HOST=153.44.253.27`
   - Requires `TCP_PORT`
-  - Conflicts with file and WebSocket options
+  - Conflicts with file options
 
 - `TCP_PORT`: TCP port to receive data from
   - Example: `TCP_PORT=5631`
   - Requires `TCP_HOST`
-  - Conflicts with file and WebSocket options
-
-#### WebSocket Input
-- `WS_URL`: WebSocket URL to connect to
-  - Example: `WS_URL=wss://stream.aisstream.io/v0/stream`
-  - Conflicts with file and TCP options
-
-- `WS_API_KEY`: API key for WebSocket authentication (required for AISStream.io)
-  - Example: `WS_API_KEY=your-api-key-here`
-  - Requires `WS_URL`
-
-- `WS_BBOX`: Bounding box for WebSocket subscription (comma-separated values)
-  - Format: `lat1,lon1,lat2,lon2` for multiple boxes
-  - Example: `WS_BBOX=37.9,-122.6,37.6,-122.3,40.7,-74.0,40.6,-73.9`
-  - Default: entire world if not specified
-  - Requires `WS_URL`
-
-- `WS_MMSI_FILTER`: Filter WebSocket messages by MMSI (comma-separated, max 50)
-  - Example: `WS_MMSI_FILTER=123456789,987654321,555666777`
-  - Requires `WS_URL`
-
-- `WS_MESSAGE_TYPE_FILTER`: Filter WebSocket messages by message type (comma-separated)
-  - Example: `WS_MESSAGE_TYPE_FILTER=PositionReport,StaticAndVoyageRelatedData`
-  - Requires `WS_URL`
+  - Conflicts with file options
 
 ### General Configuration
 
@@ -66,6 +43,10 @@ All command-line parameters can be configured using environment variables, makin
 - `KEEP_LOCAL`: Keep local files after S3 upload
   - Example: `KEEP_LOCAL=true`
   - Default: `false` (delete after successful upload)
+
+- `UPLOAD_DRAIN_TIMEOUT_SECONDS`: Max seconds to wait for background uploads on shutdown
+  - Example: `UPLOAD_DRAIN_TIMEOUT_SECONDS=60`
+  - Default: `60`
 
 ### S3 Configuration
 
@@ -90,7 +71,7 @@ All command-line parameters can be configured using environment variables, makin
 
 ## Docker Compose Examples
 
-### WebSocket AIS Stream with S3 Upload
+### TCP Stream with S3 Upload
 
 ```yaml
 version: '3.8'
@@ -99,10 +80,9 @@ services:
   data-ingest:
     image: hive-parquet-ingest:latest
     environment:
-      - WS_URL=wss://stream.aisstream.io/v0/stream
-      - WS_API_KEY=${AIS_API_KEY}
-      - WS_BBOX=37.9,-122.6,37.6,-122.3
-      - SOURCE=ais-sf-bay
+      - TCP_HOST=153.44.253.27
+      - TCP_PORT=5631
+      - SOURCE=norway-tcp
       - S3_BUCKET=maritime-data
       - S3_REGION=us-west-2
       - S3_ACCESS_KEY=${AWS_ACCESS_KEY_ID}
@@ -166,28 +146,9 @@ This allows for flexible configuration where you can:
 
 The application gracefully handles missing environment variables:
 
-- **Optional parameters** (like `S3_BUCKET`, `WS_URL`): Missing environment variables are treated as unset/empty
+- **Optional parameters** (like `S3_BUCKET`): Missing environment variables are treated as unset/empty
 - **Parameters with defaults** (like `S3_REGION`, `OUT_DIR`): Use their default values when environment variable is missing
 - **Boolean parameters** (like `HEALTH_CHECK`, `KEEP_LOCAL`): Default to `false` when environment variable is missing
-- **Array parameters** (like `WS_BBOX`, `WS_MMSI_FILTER`): Default to empty arrays when environment variable is missing
-
-### Comma-Separated Values
-
-For array parameters, you can use comma-separated values in environment variables:
-
-```bash
-# Multiple bounding boxes
-export WS_BBOX="37.9,-122.6,37.6,-122.3,40.7,-74.0,40.6,-73.9"
-
-# Multiple MMSI filters  
-export WS_MMSI_FILTER="123456789,987654321,555666777"
-
-# Multiple message types
-export WS_MESSAGE_TYPE_FILTER="PositionReport,StaticAndVoyageRelatedData"
-```
-
-Empty or missing array environment variables will result in empty arrays, which is equivalent to not specifying the parameter.
-
 ## Docker Health Checks
 
 The application supports Docker health checks via the `HEALTH_CHECK` environment variable or `--health-check` command-line flag:
@@ -226,7 +187,6 @@ healthcheck:
 - Use environment variable substitution in docker-compose files: `${VARIABLE_NAME}`
 - Consider using Docker secrets for production deployments
 - Restrict S3 bucket access with appropriate IAM policies
-- Use HTTPS endpoints for WebSocket connections
 - Validate network access for TCP connections
 
 ## Troubleshooting
@@ -237,7 +197,7 @@ healthcheck:
 - Verify docker-compose syntax for environment variables
 
 ### Conflicting Input Sources
-- Only one input method can be specified (file, TCP, or WebSocket)
+- Only one input method can be specified (file or TCP)
 - Remove conflicting environment variables
 - Check for both environment variables and command-line arguments
 
@@ -246,9 +206,3 @@ healthcheck:
 - Check S3 credentials and permissions
 - Validate endpoint URL format for MinIO/custom S3
 - Ensure network connectivity to S3 endpoint
-
-### WebSocket Connection Problems
-- Verify API key is valid and active
-- Check WebSocket URL is reachable
-- Validate bounding box coordinates format
-- Ensure MMSI filter doesn't exceed 50 entries

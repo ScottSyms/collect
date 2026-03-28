@@ -24,22 +24,15 @@ SOURCE=test ./target/release/hive_parquet_ingest --health-check
 echo "✅ Success: Application works with partial environment variables"
 echo
 
-# Example 3: Array environment variables with comma-separated values
-echo "Example 3: Testing comma-separated array environment variables"
-echo "Command: WS_BBOX='1,2,3,4' WS_MMSI_FILTER='123,456' ./target/release/hive_parquet_ingest --health-check"
-WS_BBOX="1,2,3,4" WS_MMSI_FILTER="123,456" ./target/release/hive_parquet_ingest --health-check
-echo "✅ Success: Comma-separated environment variables parsed correctly"
-echo
-
-# Example 4: Empty environment variables
-echo "Example 4: Empty environment variables"
-echo "Command: WS_BBOX='' WS_MMSI_FILTER='' SOURCE='' ./target/release/hive_parquet_ingest --health-check"
-WS_BBOX="" WS_MMSI_FILTER="" SOURCE="" ./target/release/hive_parquet_ingest --health-check
+# Example 3: Empty environment variables
+echo "Example 3: Empty environment variables"
+echo "Command: SOURCE='' ./target/release/hive_parquet_ingest --health-check"
+SOURCE="" ./target/release/hive_parquet_ingest --health-check
 echo "✅ Success: Empty environment variables handled gracefully"
 echo
 
-# Example 5: Boolean environment variables
-echo "Example 5: Boolean environment variables"
+# Example 4: Boolean environment variables
+echo "Example 4: Boolean environment variables"
 echo "Command: KEEP_LOCAL=true HEALTH_CHECK=true ./target/release/hive_parquet_ingest"
 KEEP_LOCAL=true HEALTH_CHECK=true ./target/release/hive_parquet_ingest
 echo "✅ Success: Boolean environment variables work correctly"
@@ -50,7 +43,7 @@ echo
 echo "Key benefits of this implementation:"
 echo "• Missing environment variables don't cause errors"
 echo "• Empty environment variables are treated as unset"  
-echo "• Comma-separated values in environment variables work for arrays"
+echo "• Optional environment variables are handled gracefully"
 echo "• Command-line arguments can still override environment variables"
 echo "• Boolean environment variables work as expected"
 echo "• Application gracefully falls back to defaults when needed"
