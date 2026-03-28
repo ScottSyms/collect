@@ -2,11 +2,12 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use std::error::Error;
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::net::TcpStream;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
-use std::time::{SystemTime, UNIX_EPOCH, Duration};
+use std::time::{SystemTime, UNIX_EPOCH, Duration, Instant};
+
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::net::TcpStream;
 
 use aws_config::Region;
 use aws_credential_types::Credentials;
@@ -17,14 +18,15 @@ use chrono::{Datelike, Timelike, Utc};
 
 mod tui;
 
-use arrow::array::{StringBuilder, TimestampMillisecondBuilder, TimestampMillisecondArray};
+use arrow::array::{StringBuilder, TimestampMillisecondBuilder};
 use arrow::array::ArrayBuilder; // Import trait for .len()
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
-use parquet::basic::Compression;
+use parquet::basic::{Compression, Encoding, ZstdLevel};
+use parquet::schema::types::ColumnPath;
 
 #[derive(Parser, Debug)]
 #[command(version, about="Stream a text file or TCP feed into Hive-partitioned Parquet with Zstd compression")]
@@ -106,8 +108,9 @@ struct PartKey {
 }
 
 impl PartKey {
-    fn from_now(source: &str) -> Self {
-        let now = Utc::now();
+    fn from_minute(source: &str, minute_id: u64) -> Self {
+        let minute_time = UNIX_EPOCH + Duration::from_secs(minute_id * 60);
+        let now: chrono::DateTime<Utc> = minute_time.into();
         PartKey {
             source: source.to_string(),
             year: now.year(),
@@ -187,10 +190,9 @@ impl S3Storage {
             .with_context(|| format!("Failed to read file metadata: {}", local_path.display()))?;
         let file_size = file_metadata.len();
         
-        let file_content = tokio::fs::read(local_path).await
-            .with_context(|| format!("Failed to read file (size: {} bytes): {}", file_size, local_path.display()))?;
-
-        let body = ByteStream::from(file_content);
+        let body = ByteStream::from_path(local_path)
+            .await
+            .with_context(|| format!("Failed to stream file (size: {} bytes): {}", file_size, local_path.display()))?;
 
         self.client
             .put_object()
@@ -231,10 +233,14 @@ struct BatchBuf {
     ts: TimestampMillisecondBuilder,
     payload: StringBuilder,
     schema: std::sync::Arc<Schema>,
+    row_capacity: usize,
+    byte_capacity: usize,
 }
 
 impl BatchBuf {
-    fn new() -> Self {
+    fn new(max_rows: Option<usize>) -> Self {
+        let row_capacity = max_rows.unwrap_or(4096);
+        let byte_capacity = row_capacity.saturating_mul(128);
         let fields = vec![
             Field::new(
                 "ts",
@@ -244,9 +250,11 @@ impl BatchBuf {
             Field::new("payload", DataType::Utf8, false),
         ];
         BatchBuf {
-            ts: TimestampMillisecondBuilder::new(),
-            payload: StringBuilder::new(),
+            ts: TimestampMillisecondBuilder::with_capacity(row_capacity),
+            payload: StringBuilder::with_capacity(row_capacity, byte_capacity),
             schema: std::sync::Arc::new(Schema::new(fields)),
+            row_capacity,
+            byte_capacity,
         }
     }
 
@@ -264,12 +272,14 @@ impl BatchBuf {
     }
 
     fn to_record_batch(&mut self) -> Result<RecordBatch> {
-        let ts_array = std::mem::take(&mut self.ts).finish();
-        let ts = std::sync::Arc::new(
-            TimestampMillisecondArray::from_iter_values(ts_array.iter().map(|v| v.unwrap()))
-                .with_timezone_opt(Some(std::sync::Arc::from("UTC")))
-        ) as std::sync::Arc<dyn arrow::array::Array>;
-        let payload = std::sync::Arc::new(std::mem::take(&mut self.payload).finish()) as std::sync::Arc<dyn arrow::array::Array>;
+        let ts_array = self.ts.finish().with_timezone_opt(Some(std::sync::Arc::from("UTC")));
+        let payload_array = self.payload.finish();
+
+        self.ts = TimestampMillisecondBuilder::with_capacity(self.row_capacity);
+        self.payload = StringBuilder::with_capacity(self.row_capacity, self.byte_capacity);
+
+        let ts = std::sync::Arc::new(ts_array) as std::sync::Arc<dyn arrow::array::Array>;
+        let payload = std::sync::Arc::new(payload_array) as std::sync::Arc<dyn arrow::array::Array>;
         RecordBatch::try_new(self.schema.clone(), vec![ts, payload])
             .context("building RecordBatch")
     }
@@ -280,8 +290,13 @@ fn open_writer(path: &Path, schema: &std::sync::Arc<Schema>) -> Result<ArrowWrit
         fs::create_dir_all(parent).with_context(|| format!("mkdir -p {}", parent.display()))?;
     }
     let file = File::create(path).with_context(|| format!("create {}", path.display()))?;
+    let zstd_level = ZstdLevel::try_new(5).unwrap_or_default();
     let props = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(parquet::basic::ZstdLevel::default()))
+        .set_compression(Compression::ZSTD(zstd_level))
+        .set_column_encoding(ColumnPath::from("ts"), Encoding::DELTA_BINARY_PACKED)
+        .set_column_encoding(ColumnPath::from("payload"), Encoding::DELTA_LENGTH_BYTE_ARRAY)
+        .set_column_dictionary_enabled(ColumnPath::from("ts"), false)
+        .set_column_dictionary_enabled(ColumnPath::from("payload"), false)
         .build();
     Ok(ArrowWriter::try_new(file, schema.clone(), Some(props))
         .context("creating Parquet ArrowWriter")?)
@@ -531,7 +546,7 @@ async fn main() -> Result<()> {
     };
 
     // Determine source name and create appropriate reader for file/TCP
-    let (source, reader): (String, Box<dyn BufRead>) = match (&args.input, &args.tcp_host, &args.tcp_port) {
+    let (source, reader): (String, BufReader<Box<dyn AsyncRead + Unpin + Send>>) = match (&args.input, &args.tcp_host, &args.tcp_port) {
         (Some(input_path), None, None) => {
             // File input
             let source = args.source.unwrap_or_else(|| {
@@ -540,19 +555,17 @@ async fn main() -> Result<()> {
                     .unwrap_or("unknown")
                     .to_string()
             });
-            let file = File::open(input_path)
+            let file = tokio::fs::File::open(input_path).await
                 .with_context(|| format!("open input {}", input_path.display()))?;
-            (source, Box::new(BufReader::new(file)))
+            (source, BufReader::new(Box::new(file)))
         },
         (None, Some(host), Some(port)) => {
             // TCP input
             let source = args.source.unwrap_or_else(|| "tcp".to_string());
-            let stream = TcpStream::connect(format!("{}:{}", host, port))
+            let stream = TcpStream::connect(format!("{}:{}", host, port)).await
                 .with_context(|| format!("connect to TCP {}:{}", host, port))?;
-            stream
-                .set_read_timeout(Some(Duration::from_secs(1)))
-                .context("set TCP read timeout")?;
-            (source, Box::new(BufReader::new(stream)))
+            stream.set_nodelay(true).context("set TCP nodelay")?;
+            (source, BufReader::new(Box::new(stream)))
         },
         _ => {
             return Err(anyhow::anyhow!("Must specify either --input <file> or --tcp-host <host> --tcp-port <port>"));
@@ -589,20 +602,19 @@ async fn main() -> Result<()> {
         }
     });
 
-    let mut current_key = PartKey::from_now(&source);
-    let mut buf = BatchBuf::new();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
+    let mut current_minute_id = now.as_secs() / 60;
+    let mut current_key = PartKey::from_minute(&source, current_minute_id);
+    let mut buf = BatchBuf::new(args.max_rows);
     let mut rows_in_file = 0usize;
-    let mut processed_count = 0usize;
+    let mut last_health_update = Instant::now();
 
-    // Create channel for background uploads (buffer up to 10 pending uploads)
-    let (upload_tx, mut upload_rx) = tokio::sync::mpsc::channel::<(PathBuf, String)>(10);
-    
-    // Spawn background upload worker
-    let s3_storage_worker = s3_storage.clone();
-    let _upload_worker = tokio::spawn(async move {
-        while let Some((path, s3_key)) = upload_rx.recv().await {
-            if let Some(s3) = &s3_storage_worker {
-                match s3.upload_file(&path, &s3_key).await {
+    // Create channel and spawn background upload worker only if S3 is configured
+    let (upload_tx, upload_worker) = if let Some(s3_storage_worker) = s3_storage.clone() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(PathBuf, String)>(10);
+        let worker = tokio::spawn(async move {
+            while let Some((path, s3_key)) = rx.recv().await {
+                match s3_storage_worker.upload_file(&path, &s3_key).await {
                     Ok(_) => {}
                     Err(e) => {
                         eprintln!("⚠️  Background upload failed: {}", e);
@@ -610,8 +622,11 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-        }
-    });
+        });
+        (Some(tx), Some(worker))
+    } else {
+        (None, None)
+    };
 
     // Mark as healthy when starting
     update_health_status(true)?;
@@ -624,84 +639,84 @@ async fn main() -> Result<()> {
         }
 
         line.clear();
-        let read_result = reader.read_line(&mut line);
+        let read_result = tokio::time::timeout(Duration::from_secs(1), reader.read_line(&mut line)).await;
         match read_result {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(e) => {
-                if e.kind() == io::ErrorKind::TimedOut || e.kind() == io::ErrorKind::WouldBlock {
-                    continue;
+            Ok(Ok(0)) => break,
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => {
+                if last_health_update.elapsed() >= Duration::from_secs(1) {
+                    update_health_status(true)
+                        .unwrap_or_else(|e| eprintln!("Failed to update health status: {}", e));
+                    last_health_update = Instant::now();
                 }
-                return Err(e.into());
+                continue;
             }
         }
 
         let payload = line.trim_end_matches(&['\r', '\n'][..]);
-        
+
         // Echo the payload to stdout as it's received
         // println!("{}", payload);
-        
-        let now = Utc::now();
-        let minute_changed = now.year() != current_key.year
-            || now.month() != current_key.month
-            || now.day() != current_key.day
-            || now.hour() != current_key.hour
-            || now.minute() != current_key.minute;
+
+        let duration = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|_| Duration::from_secs(0));
+        let now_ms = duration.as_millis() as i64;
+        let minute_id = duration.as_secs() / 60;
 
         // If the minute boundary (or source) changed, flush.
-        if minute_changed {
+        if minute_id != current_minute_id {
             if !buf.is_empty() {
-                flush_batch(&args.out_dir, &current_key, &mut buf, &s3_storage, &upload_tx).await?;
+                flush_batch(&args.out_dir, &current_key, &mut buf, upload_tx.as_ref()).await?;
                 rows_in_file = 0;
             }
-            current_key = PartKey {
-                source: source.clone(),
-                year: now.year(),
-                month: now.month(),
-                day: now.day(),
-                hour: now.hour(),
-                minute: now.minute(),
-            };
+            current_minute_id = minute_id;
+            current_key = PartKey::from_minute(&source, current_minute_id);
         }
 
-        buf.push(now.timestamp_millis(), payload);
+        buf.push(now_ms, payload);
         rows_in_file += 1;
-        processed_count += 1;
 
-        // Update health status every 100 processed lines
-        if processed_count % 100 == 0 {
-            update_health_status(true).unwrap_or_else(|e| eprintln!("Failed to update health status: {}", e));
+        if last_health_update.elapsed() >= Duration::from_secs(1) {
+            update_health_status(true)
+                .unwrap_or_else(|e| eprintln!("Failed to update health status: {}", e));
+            last_health_update = Instant::now();
         }
 
         if let Some(max_rows) = args.max_rows {
             if rows_in_file >= max_rows {
-                flush_batch(&args.out_dir, &current_key, &mut buf, &s3_storage, &upload_tx).await?;
+                flush_batch(&args.out_dir, &current_key, &mut buf, upload_tx.as_ref()).await?;
                 rows_in_file = 0;
             }
         }
     }
 
     if !buf.is_empty() {
-        flush_batch(&args.out_dir, &current_key, &mut buf, &s3_storage, &upload_tx).await?;
+        flush_batch(&args.out_dir, &current_key, &mut buf, upload_tx.as_ref()).await?;
     }
 
     // Close the upload channel and wait for all uploads to complete
-    drop(upload_tx);
-    println!("Waiting for background uploads to complete...");
-    let drain_timeout = Duration::from_secs(args.upload_drain_timeout_seconds);
-    match tokio::time::timeout(drain_timeout, _upload_worker).await {
-        Ok(join_result) => {
-            if let Err(e) = join_result {
-                eprintln!("Upload worker failed: {}", e);
-            } else {
-                println!("All uploads completed");
+    if let Some(upload_tx) = upload_tx {
+        drop(upload_tx);
+        if let Some(upload_worker) = upload_worker {
+            println!("Waiting for background uploads to complete...");
+            let drain_timeout = Duration::from_secs(args.upload_drain_timeout_seconds);
+            match tokio::time::timeout(drain_timeout, upload_worker).await {
+                Ok(join_result) => {
+                    if let Err(e) = join_result {
+                        eprintln!("Upload worker failed: {}", e);
+                    } else {
+                        println!("All uploads completed");
+                    }
+                }
+                Err(_) => {
+                    eprintln!(
+                        "Upload drain timed out after {} seconds. Exiting.",
+                        args.upload_drain_timeout_seconds
+                    );
+                }
             }
-        }
-        Err(_) => {
-            eprintln!(
-                "Upload drain timed out after {} seconds. Exiting.",
-                args.upload_drain_timeout_seconds
-            );
         }
     }
 
@@ -712,8 +727,7 @@ async fn flush_batch(
     root: &Path, 
     key: &PartKey, 
     buf: &mut BatchBuf, 
-    s3_storage: &Option<S3Storage>,
-    upload_tx: &tokio::sync::mpsc::Sender<(PathBuf, String)>
+    upload_tx: Option<&tokio::sync::mpsc::Sender<(PathBuf, String)>>
 ) -> Result<()> {
     let dir = key.dir_path(root);
     let filename = parquet_file_name();
@@ -726,7 +740,7 @@ async fn flush_batch(
     println!("✅ Wrote {} rows to {} (queued for upload)", batch.num_rows(), path.display());
 
     // Queue upload to S3 if configured (non-blocking)
-    if s3_storage.is_some() {
+    if let Some(upload_tx) = upload_tx {
         let s3_key = key.s3_key(&filename);
 
         // Send to background worker (non-blocking)

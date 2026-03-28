@@ -23,10 +23,14 @@ rm -rf "$DATA_DIR"
 mkdir -p "$DATA_DIR"
 
 echo "Starting capture with file input: $INPUT_FILE"
+start_time=$(date +%s)
 cargo run --release -- \
   --input "$INPUT_FILE" \
   --source test-file-local \
   --out-dir "$DATA_DIR"
+end_time=$(date +%s)
+elapsed=$((end_time - start_time))
+echo "Ingestion duration: ${elapsed}s"
 
 parquet_files=("$DATA_DIR"/source=*/**/*.parquet)
 
