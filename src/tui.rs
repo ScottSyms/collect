@@ -35,7 +35,6 @@ pub struct TuiConfig {
     pub s3_bucket: String,
     pub s3_endpoint: String,
     pub s3_region: String,
-    pub s3_key_prefix: String,
     pub s3_access_key: String,
     pub s3_secret_key: String,
     pub s3_disable_tls: bool,
@@ -54,7 +53,6 @@ impl Default for TuiConfig {
             s3_bucket: String::new(),
             s3_endpoint: String::new(),
             s3_region: "us-east-1".to_string(),
-            s3_key_prefix: String::new(),
             s3_access_key: String::new(),
             s3_secret_key: String::new(),
             s3_disable_tls: false,
@@ -84,9 +82,6 @@ impl TuiConfig {
         }
         if let Ok(val) = std::env::var("S3_REGION") {
             config.s3_region = val;
-        }
-        if let Ok(val) = std::env::var("S3_KEY_PREFIX") {
-            config.s3_key_prefix = val;
         }
         if let Ok(val) = std::env::var("AWS_ACCESS_KEY_ID") {
             config.s3_access_key = val;
@@ -159,10 +154,6 @@ impl TuiConfig {
         }
         args.push("--s3-region".to_string());
         args.push(self.s3_region.clone());
-        if !self.s3_key_prefix.is_empty() {
-            args.push("--s3-key-prefix".to_string());
-            args.push(self.s3_key_prefix.clone());
-        }
         if !self.s3_access_key.is_empty() {
             args.push("--s3-access-key".to_string());
             args.push(self.s3_access_key.clone());
@@ -231,7 +222,6 @@ impl App {
                 ("S3 Bucket", self.config.s3_bucket.clone(), false),
                 ("S3 Endpoint", self.config.s3_endpoint.clone(), false),
                 ("S3 Region", self.config.s3_region.clone(), false),
-                ("S3 Key Prefix", self.config.s3_key_prefix.clone(), false),
                 ("S3 Access Key", self.config.s3_access_key.clone(), false),
                 ("S3 Secret Key", "***".to_string(), false),
                 (
@@ -266,9 +256,8 @@ impl App {
             (2, 0) => Some("e.g., my-bucket-name"),
             (2, 1) => Some("e.g., https://s3.example.com (for MinIO, R2, etc.)"),
             (2, 2) => Some("e.g., us-east-1, us-west-2, eu-central-1"),
-            (2, 3) => Some("e.g., ais-data/, production/ (optional prefix)"),
-            (2, 4) => Some("AWS Access Key ID"),
-            (2, 5) => Some("AWS Secret Access Key (hidden)"),
+            (2, 3) => Some("AWS Access Key ID"),
+            (2, 4) => Some("AWS Secret Access Key (hidden)"),
 
             // Config tab
             (3, 0) => Some("Path to save/load JSON config file"),
@@ -405,10 +394,9 @@ impl App {
                 0 => self.config.s3_bucket = value,
                 1 => self.config.s3_endpoint = value,
                 2 => self.config.s3_region = value,
-                3 => self.config.s3_key_prefix = value,
-                4 => self.config.s3_access_key = value,
-                5 => self.config.s3_secret_key = value,
-                6 => self.config.s3_disable_tls = !self.config.s3_disable_tls,
+                3 => self.config.s3_access_key = value,
+                4 => self.config.s3_secret_key = value,
+                5 => self.config.s3_disable_tls = !self.config.s3_disable_tls,
                 _ => {}
             },
             3 => match field_idx {
@@ -436,7 +424,7 @@ impl App {
                         }
                     }
                     2 => {
-                        if self.current_field == 6 {
+                        if self.current_field == 5 {
                             self.config.s3_disable_tls = !self.config.s3_disable_tls;
                         }
                     }

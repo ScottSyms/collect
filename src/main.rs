@@ -595,20 +595,15 @@ async fn main() -> Result<()> {
     let mut processed_count = 0usize;
 
     // Create channel for background uploads (buffer up to 10 pending uploads)
-    let (upload_tx, mut upload_rx) = tokio::sync::mpsc::channel::<(PathBuf, String, bool)>(10);
+    let (upload_tx, mut upload_rx) = tokio::sync::mpsc::channel::<(PathBuf, String)>(10);
     
     // Spawn background upload worker
     let s3_storage_worker = s3_storage.clone();
     let _upload_worker = tokio::spawn(async move {
-        while let Some((path, s3_key, should_keep_local)) = upload_rx.recv().await {
+        while let Some((path, s3_key)) = upload_rx.recv().await {
             if let Some(s3) = &s3_storage_worker {
                 match s3.upload_file(&path, &s3_key).await {
-                    Ok(_) => {
-                        if !should_keep_local {
-                            let _ = std::fs::remove_file(&path);
-                            println!("🗑️  Removed local file: {}", path.display());
-                        }
-                    }
+                    Ok(_) => {}
                     Err(e) => {
                         eprintln!("⚠️  Background upload failed: {}", e);
                         eprintln!("   📁 File preserved on disk for retry: {}", path.display());
@@ -630,47 +625,46 @@ async fn main() -> Result<()> {
 
         line.clear();
         let read_result = reader.read_line(&mut line);
-        let bytes = match read_result {
+        match read_result {
             Ok(0) => break,
-            Ok(n) => n,
+            Ok(_) => {}
             Err(e) => {
                 if e.kind() == io::ErrorKind::TimedOut || e.kind() == io::ErrorKind::WouldBlock {
                     continue;
                 }
                 return Err(e.into());
             }
-        };
-
-        if bytes == 0 {
-            break;
         }
 
-        let payload = line.trim_end_matches(&['\r', '\n'][..]).to_string();
+        let payload = line.trim_end_matches(&['\r', '\n'][..]);
         
         // Echo the payload to stdout as it's received
         // println!("{}", payload);
         
         let now = Utc::now();
-        let key = PartKey {
-            source: source.clone(),
-            year: now.year(),
-            month: now.month(),
-            day: now.day(),
-            hour: now.hour(),
-            minute: now.minute(),
-        };
+        let minute_changed = now.year() != current_key.year
+            || now.month() != current_key.month
+            || now.day() != current_key.day
+            || now.hour() != current_key.hour
+            || now.minute() != current_key.minute;
 
         // If the minute boundary (or source) changed, flush.
-        if key != current_key && !buf.is_empty() {
-            flush_batch(&args.out_dir, &current_key, &mut buf, &s3_storage, &upload_tx).await?;
-            rows_in_file = 0;
-            current_key = key.clone();
-        } else {
-            // Keep current key if unchanged
-            current_key = key.clone();
+        if minute_changed {
+            if !buf.is_empty() {
+                flush_batch(&args.out_dir, &current_key, &mut buf, &s3_storage, &upload_tx).await?;
+                rows_in_file = 0;
+            }
+            current_key = PartKey {
+                source: source.clone(),
+                year: now.year(),
+                month: now.month(),
+                day: now.day(),
+                hour: now.hour(),
+                minute: now.minute(),
+            };
         }
 
-        buf.push(now.timestamp_millis(), &payload);
+        buf.push(now.timestamp_millis(), payload);
         rows_in_file += 1;
         processed_count += 1;
 
@@ -719,7 +713,7 @@ async fn flush_batch(
     key: &PartKey, 
     buf: &mut BatchBuf, 
     s3_storage: &Option<S3Storage>,
-    upload_tx: &tokio::sync::mpsc::Sender<(PathBuf, String, bool)>
+    upload_tx: &tokio::sync::mpsc::Sender<(PathBuf, String)>
 ) -> Result<()> {
     let dir = key.dir_path(root);
     let filename = parquet_file_name();
@@ -734,10 +728,9 @@ async fn flush_batch(
     // Queue upload to S3 if configured (non-blocking)
     if s3_storage.is_some() {
         let s3_key = key.s3_key(&filename);
-        let should_keep_local = s3_storage.as_ref().map(|s| s.keep_local).unwrap_or(true);
-        
+
         // Send to background worker (non-blocking)
-        upload_tx.send((path, s3_key, should_keep_local)).await
+        upload_tx.send((path, s3_key)).await
             .context("Failed to queue upload task")?;
     }
 

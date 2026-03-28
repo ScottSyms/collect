@@ -5,6 +5,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATA_DIR="${SCRIPT_DIR}/data"
 INPUT_FILE="${SCRIPT_DIR}/norway.nmea"
 
+echo "Building release binary..."
+cargo build --release
+
 if [[ -z "$DATA_DIR" || "$DATA_DIR" == "/" ]]; then
   echo "Refusing to clean invalid data directory: '$DATA_DIR'"
   exit 1
@@ -19,18 +22,12 @@ echo "Cleaning data directory: $DATA_DIR"
 rm -rf "$DATA_DIR"
 mkdir -p "$DATA_DIR"
 
-if [[ ! -x "${SCRIPT_DIR}/target/release/capture" ]]; then
-  echo "Building release binary..."
-  cargo build --release
-fi
-
 echo "Starting capture with file input: $INPUT_FILE"
 cargo run --release -- \
   --input "$INPUT_FILE" \
   --source test-file-local \
   --out-dir "$DATA_DIR"
 
-shopt -s globstar nullglob
 parquet_files=("$DATA_DIR"/source=*/**/*.parquet)
 
 if (( ${#parquet_files[@]} > 0 )); then
