@@ -2,19 +2,16 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use std::error::Error;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::net::TcpStream;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::time::{SystemTime, UNIX_EPOCH, Duration};
 
 use aws_config::Region;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::{Client as S3Client, Config as S3Config};
 use aws_sdk_s3::primitives::ByteStream;
-
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
-use futures_util::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
 
 use chrono::{Datelike, Timelike, Utc};
 
@@ -56,6 +53,10 @@ struct Args {
     #[arg(long)]
     max_rows: Option<usize>,
 
+    /// Seconds to wait for background uploads on shutdown
+    #[arg(long, default_value_t = 60)]
+    upload_drain_timeout_seconds: u64,
+
     /// Run health check and exit (for Docker HEALTHCHECK)
     #[arg(long)]
     health_check: bool,
@@ -88,50 +89,6 @@ struct Args {
     #[arg(long)]
     s3_disable_tls: bool,
 
-    /// WebSocket URL to connect to (e.g., wss://stream.aisstream.io/v0/stream)
-    #[arg(long, conflicts_with_all = ["input", "tcp_host", "tcp_port"])]
-    ws_url: Option<String>,
-
-    /// API key for WebSocket authentication (for AISStream.io)
-    #[arg(long, requires = "ws_url")]
-    ws_api_key: Option<String>,
-
-    /// Bounding box for WebSocket subscription (format: lat1,lon1,lat2,lon2) 
-    /// Can be specified multiple times for multiple boxes. Default: entire world
-    #[arg(long, requires = "ws_url")]
-    ws_bbox: Vec<String>,
-
-    /// Filter WebSocket messages by MMSI (can be specified multiple times, max 50)
-    #[arg(long, requires = "ws_url")]
-    ws_mmsi_filter: Vec<String>,
-
-    /// Filter WebSocket messages by message type (e.g., PositionReport)
-    #[arg(long, requires = "ws_url")]
-    ws_message_type_filter: Vec<String>,
-
-    /// Enable debug mode for WebSocket connections
-    #[arg(long)]
-    ws_debug: bool,
-
-    /// Kafka bootstrap servers (comma-separated, e.g., localhost:9092,broker2:9092)
-    #[arg(long, conflicts_with_all = ["input", "tcp_host", "tcp_port", "ws_url"])]
-    kafka_brokers: Option<String>,
-
-    /// Kafka topic to consume from
-    #[arg(long, requires = "kafka_brokers")]
-    kafka_topic: Option<String>,
-
-    /// Kafka consumer group ID
-    #[arg(long, requires = "kafka_brokers")]
-    kafka_group_id: Option<String>,
-
-    /// Kafka Schema Registry URL for Avro schemas (e.g., http://localhost:8081)
-    #[arg(long, requires = "kafka_brokers")]
-    kafka_schema_registry: Option<String>,
-
-    /// Enable debug mode for Kafka connections
-    #[arg(long)]
-    kafka_debug: bool,
 
     /// Launch interactive TUI for configuration
     #[arg(long)]
@@ -269,467 +226,6 @@ impl S3Storage {
     }
 }
 
-// Kafka Consumer with Avro support
-pub struct KafkaConsumer {
-    brokers: String,
-    topic: String,
-    group_id: String,
-    schema_registry_url: Option<String>,
-    debug: bool,
-}
-
-impl KafkaConsumer {
-    pub fn new(
-        brokers: String,
-        topic: String,
-        group_id: String,
-        schema_registry_url: Option<String>,
-        debug: bool,
-    ) -> Self {
-        KafkaConsumer {
-            brokers,
-            topic,
-            group_id,
-            schema_registry_url,
-            debug,
-        }
-    }
-
-    pub async fn consume_and_stream(
-        &self,
-    ) -> Result<impl futures_util::Stream<Item = Result<String>>> {
-        use rdkafka::config::ClientConfig;
-        use rdkafka::consumer::{Consumer, StreamConsumer};
-        use rdkafka::Message;
-
-        let consumer: StreamConsumer = ClientConfig::new()
-            .set("bootstrap.servers", &self.brokers)
-            .set("group.id", &self.group_id)
-            .set("enable.auto.commit", "true")
-            .set("auto.offset.reset", "earliest")
-            .set("session.timeout.ms", "6000")
-            .set("enable.partition.eof", "false")
-            .create()
-            .with_context(|| format!("Failed to create Kafka consumer"))?;
-
-        consumer
-            .subscribe(&[&self.topic])
-            .with_context(|| format!("Failed to subscribe to topic: {}", self.topic))?;
-
-        println!("✅ Subscribed to Kafka topic: {}", self.topic);
-
-        let debug = self.debug;
-        let schema_registry_url_clone = self.schema_registry_url.clone();
-
-        Ok(futures_util::stream::unfold(
-            (consumer, schema_registry_url_clone),
-            move |(consumer, schema_registry_url)| async move {
-                match consumer.recv().await {
-                    Ok(message) => {
-                        if let Some(payload) = message.payload() {
-                            // Try to deserialize Avro and convert to JSON
-                            let json_result = Self::avro_to_json(payload, &schema_registry_url, debug);
-                            
-                            match json_result {
-                                Ok(json_str) => {
-                                    if debug {
-                                        println!("📨 Kafka message: {}", 
-                                            if json_str.len() > 200 { 
-                                                format!("{}...", &json_str[..200]) 
-                                            } else { 
-                                                json_str.clone() 
-                                            }
-                                        );
-                                    }
-                                    Some((Ok(json_str), (consumer, schema_registry_url)))
-                                }
-                                Err(e) => {
-                                    if debug {
-                                        eprintln!("⚠️  Failed to deserialize Avro message: {}", e);
-                                    }
-                                    // Continue processing next message
-                                    Some((Err(e), (consumer, schema_registry_url)))
-                                }
-                            }
-                        } else {
-                            if debug {
-                                eprintln!("⚠️  Received message with no payload");
-                            }
-                            // Continue to next message
-                            Some((Err(anyhow::anyhow!("Empty payload")), (consumer, schema_registry_url)))
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("❌ Kafka consumer error: {}", e);
-                        Some((Err(anyhow::anyhow!("Kafka error: {}", e)), (consumer, schema_registry_url)))
-                    }
-                }
-            },
-        ))
-    }
-
-    fn avro_to_json(
-        avro_bytes: &[u8],
-        _schema_registry_url: &Option<String>,
-        debug: bool,
-    ) -> Result<String> {
-        // Try to deserialize Avro without schema (for schema-embedded messages)
-        match apache_avro::Reader::new(avro_bytes) {
-            Ok(reader) => {
-                // Read first record
-                for value_result in reader {
-                    match value_result {
-                        Ok(value) => {
-                            // Convert Avro value to JSON
-                            let json_value = Self::avro_value_to_json(&value)?;
-                            return serde_json::to_string(&json_value)
-                                .with_context(|| "Failed to serialize to JSON");
-                        }
-                        Err(e) => {
-                            return Err(anyhow::anyhow!("Failed to read Avro record: {}", e));
-                        }
-                    }
-                }
-                Err(anyhow::anyhow!("No records in Avro message"))
-            }
-            Err(e) => {
-                if debug {
-                    eprintln!("⚠️  Avro deserialization error: {}. Trying raw bytes as fallback...", e);
-                }
-                // Fallback: treat as raw bytes and encode as JSON string
-                let base64_str = base64::Engine::encode(
-                    &base64::engine::general_purpose::STANDARD,
-                    avro_bytes,
-                );
-                Ok(serde_json::json!({
-                    "raw_data": base64_str,
-                    "note": "Could not deserialize as Avro, stored as base64"
-                })
-                .to_string())
-            }
-        }
-    }
-
-    fn avro_value_to_json(avro_value: &apache_avro::types::Value) -> Result<serde_json::Value> {
-        use apache_avro::types::Value;
-        
-        match avro_value {
-            Value::Null => Ok(serde_json::Value::Null),
-            Value::Boolean(b) => Ok(serde_json::Value::Bool(*b)),
-            Value::Int(i) => Ok(serde_json::Value::Number((*i).into())),
-            Value::Long(l) => Ok(serde_json::Value::Number((*l).into())),
-            Value::Float(f) => {
-                serde_json::Number::from_f64(*f as f64)
-                    .map(serde_json::Value::Number)
-                    .ok_or_else(|| anyhow::anyhow!("Invalid float value"))
-            }
-            Value::Double(d) => {
-                serde_json::Number::from_f64(*d)
-                    .map(serde_json::Value::Number)
-                    .ok_or_else(|| anyhow::anyhow!("Invalid double value"))
-            }
-            Value::Bytes(b) | Value::Fixed(_, b) => {
-                Ok(serde_json::Value::String(
-                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b)
-                ))
-            }
-            Value::String(s) => Ok(serde_json::Value::String(s.clone())),
-            Value::Array(arr) => {
-                let json_arr: Result<Vec<_>> = arr.iter().map(Self::avro_value_to_json).collect();
-                Ok(serde_json::Value::Array(json_arr?))
-            }
-            Value::Map(map) => {
-                let mut json_map = serde_json::Map::new();
-                for (k, v) in map.iter() {
-                    json_map.insert(k.clone(), Self::avro_value_to_json(v)?);
-                }
-                Ok(serde_json::Value::Object(json_map))
-            }
-            Value::Record(fields) => {
-                let mut json_map = serde_json::Map::new();
-                for (name, value) in fields {
-                    json_map.insert(name.clone(), Self::avro_value_to_json(value)?);
-                }
-                Ok(serde_json::Value::Object(json_map))
-            }
-            Value::Enum(_, symbol) => Ok(serde_json::Value::String(symbol.clone())),
-            Value::Union(_, boxed_value) => Self::avro_value_to_json(boxed_value),
-            Value::Date(d) => Ok(serde_json::Value::Number((*d).into())),
-            Value::Decimal(d) => Ok(serde_json::Value::String(format!("{:?}", d))),
-            Value::TimeMillis(t) => Ok(serde_json::Value::Number((*t).into())),
-            Value::TimeMicros(t) => Ok(serde_json::Value::Number((*t).into())),
-            Value::TimestampMillis(t) => Ok(serde_json::Value::Number((*t).into())),
-            Value::TimestampMicros(t) => Ok(serde_json::Value::Number((*t).into())),
-            Value::LocalTimestampMillis(t) => Ok(serde_json::Value::Number((*t).into())),
-            Value::LocalTimestampMicros(t) => Ok(serde_json::Value::Number((*t).into())),
-            Value::Duration(d) => {
-                Ok(serde_json::Value::String(format!("{:?}", d)))
-            }
-            Value::Uuid(u) => Ok(serde_json::Value::String(u.to_string())),
-        }
-    }
-}
-
-#[derive(Serialize, Debug)]
-struct WebSocketSubscription {
-    #[serde(rename = "APIKey")]
-    api_key: String,
-    #[serde(rename = "BoundingBoxes")]
-    bounding_boxes: Vec<Vec<Vec<f64>>>,
-    #[serde(rename = "FiltersShipMMSI", skip_serializing_if = "Vec::is_empty")]
-    filters_ship_mmsi: Vec<String>,
-    #[serde(rename = "FilterMessageTypes", skip_serializing_if = "Vec::is_empty")]
-    filter_message_types: Vec<String>,
-}
-
-#[derive(Deserialize, Debug)]
-struct AISMessage {
-    #[serde(rename = "MessageType")]
-    message_type: String,
-    #[serde(rename = "Message")]
-    message: serde_json::Value,
-    #[serde(rename = "MetaData")]
-    metadata: Option<serde_json::Value>,
-}
-
-pub struct WebSocketClient {
-    url: String,
-    subscription: WebSocketSubscription,
-    debug: bool,
-}
-
-impl WebSocketClient {
-    pub fn new(
-        url: String,
-        api_key: String,
-        bounding_boxes: Vec<String>,
-        mmsi_filters: Vec<String>,
-        message_type_filters: Vec<String>,
-        debug: bool,
-    ) -> Result<Self> {
-        // Parse bounding boxes from "lat1,lon1,lat2,lon2" format
-        let parsed_boxes: Result<Vec<Vec<Vec<f64>>>, _> = bounding_boxes
-            .iter()
-            .map(|bbox| {
-                let coords: Vec<f64> = bbox.split(',').map(|s| s.parse()).collect::<Result<Vec<_>, _>>()?;
-                if coords.len() != 4 {
-                    return Err(anyhow::anyhow!("Bounding box must have 4 coordinates: lat1,lon1,lat2,lon2"));
-                }
-                Ok(vec![vec![coords[0], coords[1]], vec![coords[2], coords[3]]])
-            })
-            .collect();
-
-        let bounding_boxes = match parsed_boxes {
-            Ok(boxes) if !boxes.is_empty() => boxes,
-            _ => {
-                println!("⚠️  No valid bounding boxes specified, using entire world: [[-90,-180],[90,180]]");
-                vec![vec![vec![-90.0, -180.0], vec![90.0, 180.0]]]
-            }
-        };
-
-        let subscription = WebSocketSubscription {
-            api_key,
-            bounding_boxes,
-            filters_ship_mmsi: mmsi_filters,
-            filter_message_types: message_type_filters,
-        };
-
-        Ok(WebSocketClient { url, subscription, debug })
-    }
-
-    pub async fn connect_and_stream(&self) -> Result<impl futures_util::Stream<Item = Result<String>>> {
-        // Add connection timeout and retry logic
-        let mut retry_count = 0;
-        const MAX_RETRIES: u32 = 3;
-        const RETRY_DELAY: u64 = 5; // seconds
-
-        loop {
-            match self.try_connect().await {
-                Ok(stream) => return Ok(stream),
-                Err(e) => {
-                    retry_count += 1;
-                    if retry_count > MAX_RETRIES {
-                        return Err(e.context(format!("Failed to connect after {} attempts", MAX_RETRIES)));
-                    }
-                    
-                    eprintln!("⚠️  WebSocket connection failed (attempt {}/{}): {}", retry_count, MAX_RETRIES, e);
-                    eprintln!("🔄 Retrying in {} seconds...", RETRY_DELAY);
-                    
-                    tokio::time::sleep(tokio::time::Duration::from_secs(RETRY_DELAY)).await;
-                }
-            }
-        }
-    }
-
-    async fn try_connect(&self) -> Result<impl futures_util::Stream<Item = Result<String>>> {
-        println!("🔄 Attempting WebSocket connection to: {}", self.url);
-        
-        // Connect with timeout
-        let connect_future = connect_async(&self.url);
-        let (ws_stream, response) = tokio::time::timeout(
-            tokio::time::Duration::from_secs(30),
-            connect_future
-        ).await
-        .context("WebSocket connection timed out after 30 seconds")?
-        .with_context(|| format!("Failed to connect to WebSocket: {}", self.url))?;
-
-        println!("✅ WebSocket connected, response status: {:?}", response.status());
-
-        let (mut write, read) = ws_stream.split();
-
-        // Send subscription message
-        let subscription_json = serde_json::to_string(&self.subscription)
-            .context("Failed to serialize subscription message")?;
-        
-        println!("� Sending WebSocket subscription: {}", subscription_json);
-        
-        // Send subscription with timeout
-        let send_future = write.send(Message::Text(subscription_json));
-        tokio::time::timeout(
-            tokio::time::Duration::from_secs(10),
-            send_future
-        ).await
-        .context("Subscription message send timed out")?
-        .context("Failed to send subscription message")?;
-
-        println!("✅ Subscription message sent successfully");
-
-        // Capture debug flag to avoid borrowing self in closure
-        let debug = self.debug;
-
-        // Return the read stream with improved error handling
-        Ok(read.filter_map(move |msg| async move {
-            match msg {
-                Ok(Message::Text(text)) => {
-                    // Log first few messages for debugging
-                    static mut MESSAGE_COUNT: u32 = 0;
-                    unsafe {
-                        MESSAGE_COUNT += 1;
-                        if debug || MESSAGE_COUNT <= 3 {
-                            println!("📨 WebSocket message #{}: {}", MESSAGE_COUNT, 
-                                if text.len() > 200 { format!("{}...", &text[..200]) } else { text.clone() });
-                        }
-                    }
-                    
-                    // Check for authentication/error messages first
-                    if text.contains("error") || text.contains("Error") || text.contains("unauthorized") || text.contains("Unauthorized") {
-                        eprintln!("❌ WebSocket authentication/error: {}", text);
-                        return Some(Err(anyhow::anyhow!("WebSocket authentication error: {}", text)));
-                    }
-                    
-                    // Check for success/acknowledgment messages
-                    if text.contains("subscribed") || text.contains("success") || text.contains("acknowledged") {
-                        println!("✅ WebSocket subscription acknowledged: {}", text);
-                        return None; // Don't process as data
-                    }
-                    
-                    // Try to parse as AIS message
-                    match serde_json::from_str::<AISMessage>(&text) {
-                        Ok(_ais_msg) => {
-                            if debug {
-                                println!("📊 Processing valid AIS message");
-                            }
-                            Some(Ok(text)) // Valid AIS message
-                        },
-                        Err(parse_error) => {
-                            // Log parsing errors for first few messages only to avoid spam
-                            static mut ERROR_COUNT: u32 = 0;
-                            unsafe {
-                                ERROR_COUNT += 1;
-                                if debug || ERROR_COUNT <= 5 {
-                                    eprintln!("⚠️  Message parsing error #{}: {} | Message: {}", 
-                                        ERROR_COUNT, parse_error, 
-                                        if text.len() > 100 { format!("{}...", &text[..100]) } else { text });
-                                } else if ERROR_COUNT == 6 && !debug {
-                                    eprintln!("⚠️  Suppressing further parsing error messages (use --ws-debug for all errors)...");
-                                }
-                            }
-                            None // Skip unparseable messages but continue
-                        }
-                    }
-                },
-                Ok(Message::Close(close_frame)) => {
-                    let reason = close_frame.as_ref()
-                        .map(|cf| format!("code: {}, reason: {}", cf.code, cf.reason))
-                        .unwrap_or_else(|| "no reason provided".to_string());
-                    eprintln!("🔌 WebSocket connection closed: {}", reason);
-                    Some(Err(anyhow::anyhow!("WebSocket connection closed: {}", reason)))
-                },
-                Ok(Message::Ping(_)) => {
-                    // Ping messages are handled automatically by the WebSocket library
-                    None
-                },
-                Ok(Message::Pong(_)) => {
-                    // Pong responses
-                    None
-                },
-                Ok(Message::Binary(data)) => {
-                    if debug {
-                        println!("📦 Received binary WebSocket message ({} bytes)", data.len());
-                    }
-                    
-                    // Try to decode binary data as UTF-8 text
-                    match String::from_utf8(data.clone()) {
-                        Ok(text) => {
-                            if debug {
-                                println!("📝 Binary message decoded as text: {}", 
-                                    if text.len() > 200 { format!("{}...", &text[..200]) } else { text.clone() });
-                            }
-                            
-                            // Process the decoded text like a regular text message
-                            // Check for authentication/error messages first
-                            if text.contains("error") || text.contains("Error") || text.contains("unauthorized") || text.contains("Unauthorized") {
-                                eprintln!("❌ WebSocket authentication/error (binary): {}", text);
-                                return Some(Err(anyhow::anyhow!("WebSocket authentication error: {}", text)));
-                            }
-                            
-                            // Check for success/acknowledgment messages
-                            if text.contains("subscribed") || text.contains("success") || text.contains("acknowledged") {
-                                println!("✅ WebSocket subscription acknowledged (binary): {}", text);
-                                return None; // Don't process as data
-                            }
-                            
-                            // Try to parse as AIS message
-                            match serde_json::from_str::<AISMessage>(&text) {
-                                Ok(_ais_msg) => {
-                                    if debug {
-                                        println!("📊 Processing valid AIS message from binary format");
-                                    }
-                                    Some(Ok(text)) // Valid AIS message
-                                },
-                                Err(parse_error) => {
-                                    if debug {
-                                        eprintln!("⚠️  Binary message parsing error: {} | Message: {}", 
-                                            parse_error, 
-                                            if text.len() > 100 { format!("{}...", &text[..100]) } else { text });
-                                    }
-                                    None // Skip unparseable messages but continue
-                                }
-                            }
-                        },
-                        Err(utf8_error) => {
-                            if debug {
-                                eprintln!("⚠️  Binary message is not valid UTF-8: {} | First 50 bytes: {:?}", 
-                                    utf8_error, &data[..std::cmp::min(50, data.len())]);
-                            }
-                            // Could be compressed data or other binary format
-                            // For now, we'll ignore non-UTF8 binary messages
-                            None
-                        }
-                    }
-                },
-                Ok(Message::Frame(_)) => {
-                    // Raw frame messages - ignore these
-                    None
-                },
-                Err(e) => {
-                    eprintln!("❌ WebSocket protocol error: {}", e);
-                    Some(Err(anyhow::anyhow!("WebSocket protocol error: {}", e)))
-                },
-            }
-        }))
-    }
-}
 
 struct BatchBuf {
     ts: TimestampMillisecondBuilder,
@@ -906,6 +402,14 @@ async fn main() -> Result<()> {
             args.max_rows = max_rows_env.parse().ok();
         }
     }
+
+    if args.upload_drain_timeout_seconds == 60 {
+        if let Ok(timeout_env) = std::env::var("UPLOAD_DRAIN_TIMEOUT_SECONDS") {
+            if let Ok(parsed) = timeout_env.parse::<u64>() {
+                args.upload_drain_timeout_seconds = parsed;
+            }
+        }
+    }
     
     // Health check environment variable
     if !args.health_check {
@@ -952,78 +456,9 @@ async fn main() -> Result<()> {
         }
     }
     
-    // WebSocket configuration environment variables
-    if args.ws_url.is_none() {
-        if let Ok(ws_url_env) = std::env::var("WS_URL") {
-            args.ws_url = Some(ws_url_env);
-        }
-    }
-    
-    if args.ws_api_key.is_none() {
-        if let Ok(api_key_env) = std::env::var("WS_API_KEY") {
-            args.ws_api_key = Some(api_key_env);
-        }
-    }
-    
-    // Handle comma-separated environment variables for Vec fields
-    if args.ws_bbox.is_empty() {
-        if let Ok(bbox_env) = std::env::var("WS_BBOX") {
-            args.ws_bbox = bbox_env.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-        }
-    }
-    
-    if args.ws_mmsi_filter.is_empty() {
-        if let Ok(mmsi_env) = std::env::var("WS_MMSI_FILTER") {
-            args.ws_mmsi_filter = mmsi_env.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-        }
-    }
-    
-    if args.ws_message_type_filter.is_empty() {
-        if let Ok(msg_type_env) = std::env::var("WS_MESSAGE_TYPE_FILTER") {
-            args.ws_message_type_filter = msg_type_env.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-        }
-    }
-
-    if !args.ws_debug {
-        if let Ok(debug_env) = std::env::var("WS_DEBUG") {
-            args.ws_debug = debug_env.to_lowercase() == "true" || debug_env == "1";
-        }
-    }
-
     if !args.s3_disable_tls {
         if let Ok(disable_tls_env) = std::env::var("S3_DISABLE_TLS") {
             args.s3_disable_tls = disable_tls_env.to_lowercase() == "true" || disable_tls_env == "1";
-        }
-    }
-
-    // Kafka configuration environment variables
-    if args.kafka_brokers.is_none() {
-        if let Ok(brokers_env) = std::env::var("KAFKA_BROKERS") {
-            args.kafka_brokers = Some(brokers_env);
-        }
-    }
-
-    if args.kafka_topic.is_none() {
-        if let Ok(topic_env) = std::env::var("KAFKA_TOPIC") {
-            args.kafka_topic = Some(topic_env);
-        }
-    }
-
-    if args.kafka_group_id.is_none() {
-        if let Ok(group_env) = std::env::var("KAFKA_GROUP_ID") {
-            args.kafka_group_id = Some(group_env);
-        }
-    }
-
-    if args.kafka_schema_registry.is_none() {
-        if let Ok(registry_env) = std::env::var("KAFKA_SCHEMA_REGISTRY") {
-            args.kafka_schema_registry = Some(registry_env);
-        }
-    }
-
-    if !args.kafka_debug {
-        if let Ok(debug_env) = std::env::var("KAFKA_DEBUG") {
-            args.kafka_debug = debug_env.to_lowercase() == "true" || debug_env == "1";
         }
     }
 
@@ -1035,7 +470,7 @@ async fn main() -> Result<()> {
 
     // Echo all configuration parameters at startup
     println!("═══════════════════════════════════════════════════════════");
-    println!("🚀 AIS Capture Configuration");
+    println!("🚀 Capture Configuration");
     println!("═══════════════════════════════════════════════════════════");
     
     // Input source configuration
@@ -1044,33 +479,6 @@ async fn main() -> Result<()> {
         println!("   File: {}", input.display());
     } else if let Some(host) = &args.tcp_host {
         println!("   TCP: {}:{}", host, args.tcp_port.unwrap_or(0));
-    } else if let Some(kafka_brokers) = &args.kafka_brokers {
-        println!("   Kafka Brokers: {}", kafka_brokers);
-        if let Some(topic) = &args.kafka_topic {
-            println!("   Topic: {}", topic);
-        }
-        if let Some(group_id) = &args.kafka_group_id {
-            println!("   Consumer Group: {}", group_id);
-        }
-        if let Some(registry) = &args.kafka_schema_registry {
-            println!("   Schema Registry: {}", registry);
-        }
-        println!("   Debug Mode: {}", args.kafka_debug);
-    } else if let Some(ws_url) = &args.ws_url {
-        println!("   WebSocket: {}", ws_url);
-        if args.ws_api_key.is_some() {
-            println!("   API Key: *** (configured)");
-        }
-        if !args.ws_bbox.is_empty() {
-            println!("   Bounding Boxes: {:?}", args.ws_bbox);
-        }
-        if !args.ws_mmsi_filter.is_empty() {
-            println!("   MMSI Filters: {:?}", args.ws_mmsi_filter);
-        }
-        if !args.ws_message_type_filter.is_empty() {
-            println!("   Message Type Filters: {:?}", args.ws_message_type_filter);
-        }
-        println!("   Debug Mode: {}", args.ws_debug);
     } else {
         println!("   None specified");
     }
@@ -1083,6 +491,7 @@ async fn main() -> Result<()> {
     } else {
         println!("   Max Rows Per File: unlimited (flush on minute boundary)");
     }
+    println!("   Upload Drain Timeout: {}s", args.upload_drain_timeout_seconds);
     
     println!("\n☁️  S3 Configuration:");
     if let Some(bucket) = &args.s3_bucket {
@@ -1121,49 +530,6 @@ async fn main() -> Result<()> {
         None
     };
 
-    // Handle Kafka input separately
-    if let Some(kafka_brokers) = &args.kafka_brokers {
-        let kafka_topic = args.kafka_topic.clone()
-            .ok_or_else(|| anyhow::anyhow!("Kafka topic is required"))?;
-        let kafka_group_id = args.kafka_group_id.clone()
-            .ok_or_else(|| anyhow::anyhow!("Kafka consumer group ID is required"))?;
-        
-        let source = args.source.unwrap_or_else(|| "kafka".to_string());
-        
-        return handle_kafka_input(
-            kafka_brokers.clone(),
-            kafka_topic,
-            kafka_group_id,
-            args.kafka_schema_registry.clone(),
-            args.kafka_debug,
-            source,
-            args.out_dir.clone(),
-            args.max_rows,
-            s3_storage,
-        ).await;
-    }
-
-    // Handle WebSocket input separately
-    if let Some(ws_url) = &args.ws_url {
-        let api_key = args.ws_api_key.clone()
-            .ok_or_else(|| anyhow::anyhow!("WebSocket API key is required"))?;
-        
-        let source = args.source.unwrap_or_else(|| "websocket".to_string());
-        
-        return handle_websocket_input(
-            ws_url.clone(),
-            api_key,
-            args.ws_bbox.clone(),
-            args.ws_mmsi_filter.clone(),
-            args.ws_message_type_filter.clone(),
-            args.ws_debug,
-            source,
-            args.out_dir.clone(),
-            args.max_rows,
-            s3_storage,
-        ).await;
-    }
-
     // Determine source name and create appropriate reader for file/TCP
     let (source, reader): (String, Box<dyn BufRead>) = match (&args.input, &args.tcp_host, &args.tcp_port) {
         (Some(input_path), None, None) => {
@@ -1183,12 +549,45 @@ async fn main() -> Result<()> {
             let source = args.source.unwrap_or_else(|| "tcp".to_string());
             let stream = TcpStream::connect(format!("{}:{}", host, port))
                 .with_context(|| format!("connect to TCP {}:{}", host, port))?;
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .context("set TCP read timeout")?;
             (source, Box::new(BufReader::new(stream)))
         },
         _ => {
-            return Err(anyhow::anyhow!("Must specify either --input <file>, --tcp-host <host> --tcp-port <port>, or --ws-url <url>"));
+            return Err(anyhow::anyhow!("Must specify either --input <file> or --tcp-host <host> --tcp-port <port>"));
         }
     };
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_signal = shutdown.clone();
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = match signal(SignalKind::terminate()) {
+                Ok(signal) => signal,
+                Err(e) => {
+                    eprintln!("Failed to register SIGTERM handler: {}", e);
+                    return;
+                }
+            };
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = sigterm.recv() => {},
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+
+        shutdown_signal.store(true, Ordering::SeqCst);
+        eprintln!("Shutdown signal received. Flushing buffers and draining uploads...");
+        if let Err(e) = update_health_status(false) {
+            eprintln!("Failed to update health status: {}", e);
+        }
+    });
 
     let mut current_key = PartKey::from_now(&source);
     let mut buf = BatchBuf::new();
@@ -1222,8 +621,31 @@ async fn main() -> Result<()> {
     // Mark as healthy when starting
     update_health_status(true)?;
 
-    for line in reader.lines() {
-        let payload = line?;
+    let mut reader = reader;
+    let mut line = String::new();
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+
+        line.clear();
+        let read_result = reader.read_line(&mut line);
+        let bytes = match read_result {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
+                if e.kind() == io::ErrorKind::TimedOut || e.kind() == io::ErrorKind::WouldBlock {
+                    continue;
+                }
+                return Err(e.into());
+            }
+        };
+
+        if bytes == 0 {
+            break;
+        }
+
+        let payload = line.trim_end_matches(&['\r', '\n'][..]).to_string();
         
         // Echo the payload to stdout as it's received
         // println!("{}", payload);
@@ -1271,9 +693,23 @@ async fn main() -> Result<()> {
 
     // Close the upload channel and wait for all uploads to complete
     drop(upload_tx);
-    println!("⏳ Waiting for background uploads to complete...");
-    let _ = _upload_worker.await;
-    println!("✅ All uploads completed");
+    println!("Waiting for background uploads to complete...");
+    let drain_timeout = Duration::from_secs(args.upload_drain_timeout_seconds);
+    match tokio::time::timeout(drain_timeout, _upload_worker).await {
+        Ok(join_result) => {
+            if let Err(e) = join_result {
+                eprintln!("Upload worker failed: {}", e);
+            } else {
+                println!("All uploads completed");
+            }
+        }
+        Err(_) => {
+            eprintln!(
+                "Upload drain timed out after {} seconds. Exiting.",
+                args.upload_drain_timeout_seconds
+            );
+        }
+    }
 
     Ok(())
 }
@@ -1306,258 +742,4 @@ async fn flush_batch(
     }
 
     Ok(())
-}
-
-async fn handle_kafka_input(
-    kafka_brokers: String,
-    kafka_topic: String,
-    kafka_group_id: String,
-    kafka_schema_registry: Option<String>,
-    kafka_debug: bool,
-    source: String,
-    out_dir: PathBuf,
-    max_rows: Option<usize>,
-    s3_storage: Option<S3Storage>,
-) -> Result<()> {
-    println!("🔄 Connecting to Kafka brokers: {}", kafka_brokers);
-    
-    let kafka_consumer = KafkaConsumer::new(
-        kafka_brokers,
-        kafka_topic.clone(),
-        kafka_group_id,
-        kafka_schema_registry,
-        kafka_debug,
-    );
-
-    let mut current_key = PartKey::from_now(&source);
-    let mut buf = BatchBuf::new();
-    let mut rows_in_file = 0usize;
-    let mut processed_count = 0usize;
-
-    // Create channel for background uploads (buffer up to 10 pending uploads)
-    let (upload_tx, mut upload_rx) = tokio::sync::mpsc::channel::<(PathBuf, String, bool)>(10);
-    
-    // Spawn background upload worker (Kafka loop)
-    let s3_storage_worker = s3_storage.clone();
-    let _upload_worker = tokio::spawn(async move {
-        while let Some((path, s3_key, should_keep_local)) = upload_rx.recv().await {
-            if let Some(s3) = &s3_storage_worker {
-                match s3.upload_file(&path, &s3_key).await {
-                    Ok(_) => {
-                        if !should_keep_local {
-                            let _ = std::fs::remove_file(&path);
-                            println!("🗑️  Removed local file: {}", path.display());
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("⚠️  Background upload failed: {}", e);
-                        eprintln!("   📁 File preserved on disk for retry: {}", path.display());
-                    }
-                }
-            }
-        }
-    });
-
-    // Mark as healthy when starting
-    update_health_status(true)?;
-
-    // Consume messages from Kafka
-    let stream = kafka_consumer.consume_and_stream().await?;
-    tokio::pin!(stream);
-    
-    println!("✅ Kafka consumer started, processing messages from topic: {}", kafka_topic);
-
-    while let Some(payload_result) = StreamExt::next(&mut stream).await {
-        let payload = match payload_result {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("⚠️  Kafka message error: {}", e);
-                continue; // Skip this message, continue processing
-            }
-        };
-
-        let now = Utc::now();
-        let key = PartKey {
-            source: source.clone(),
-            year: now.year(),
-            month: now.month(),
-            day: now.day(),
-            hour: now.hour(),
-            minute: now.minute(),
-        };
-
-        // If the minute boundary changed, flush
-        if key != current_key && !buf.is_empty() {
-            flush_batch(&out_dir, &current_key, &mut buf, &s3_storage, &upload_tx).await?;
-            rows_in_file = 0;
-            current_key = key.clone();
-        } else {
-            current_key = key.clone();
-        }
-
-        buf.push(now.timestamp_millis(), &payload);
-        rows_in_file += 1;
-        processed_count += 1;
-
-        // Update health status every 100 processed messages
-        if processed_count % 100 == 0 {
-            update_health_status(true).unwrap_or_else(|e| eprintln!("Failed to update health status: {}", e));
-        }
-
-        if let Some(max_rows) = max_rows {
-            if rows_in_file >= max_rows {
-                flush_batch(&out_dir, &current_key, &mut buf, &s3_storage, &upload_tx).await?;
-                rows_in_file = 0;
-            }
-        }
-    }
-
-    // Flush any remaining buffered data
-    if !buf.is_empty() {
-        flush_batch(&out_dir, &current_key, &mut buf, &s3_storage, &upload_tx).await?;
-    }
-
-    // Signal upload worker to finish and wait for pending uploads
-    drop(upload_tx);
-    println!("⏳ Waiting for background uploads to complete...");
-    let _ = _upload_worker.await;
-    println!("✅ All Kafka uploads completed");
-
-    Ok(())
-}
-
-async fn handle_websocket_input(
-    ws_url: String,
-    api_key: String,
-    bounding_boxes: Vec<String>,
-    mmsi_filters: Vec<String>,
-    message_type_filters: Vec<String>,
-    ws_debug: bool,
-    source: String,
-    out_dir: PathBuf,
-    max_rows: Option<usize>,
-    s3_storage: Option<S3Storage>,
-) -> Result<()> {
-    println!("🔄 Connecting to WebSocket: {}", ws_url);
-    
-    let ws_client = WebSocketClient::new(
-        ws_url,
-        api_key,
-        bounding_boxes,
-        mmsi_filters,
-        message_type_filters,
-        ws_debug,
-    )?;
-
-    let mut current_key = PartKey::from_now(&source);
-    let mut buf = BatchBuf::new();
-    let mut rows_in_file = 0usize;
-    let mut processed_count = 0usize;
-
-    // Create channel for background uploads (buffer up to 10 pending uploads)
-    let (upload_tx, mut upload_rx) = tokio::sync::mpsc::channel::<(PathBuf, String, bool)>(10);
-    
-    // Spawn background upload worker
-    let s3_storage_worker = s3_storage.clone();
-    let _upload_worker = tokio::spawn(async move {
-        while let Some((path, s3_key, should_keep_local)) = upload_rx.recv().await {
-            if let Some(s3) = &s3_storage_worker {
-                match s3.upload_file(&path, &s3_key).await {
-                    Ok(_) => {
-                        if !should_keep_local {
-                            let _ = std::fs::remove_file(&path);
-                            println!("🗑️  Removed local file: {}", path.display());
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("⚠️  Background upload failed: {}", e);
-                        eprintln!("   📁 File preserved on disk for retry: {}", path.display());
-                    }
-                }
-            }
-        }
-    });
-
-    // Mark as healthy when starting
-    update_health_status(true)?;
-
-    // Main connection loop with automatic reconnection
-    loop {
-        let stream = ws_client.connect_and_stream().await?;
-        tokio::pin!(stream);
-        
-        println!("✅ WebSocket connected, processing messages...");
-
-        while let Some(message_result) = StreamExt::next(&mut stream).await {
-            let payload = match message_result {
-                Ok(payload) => payload,
-                Err(e) => {
-                    eprintln!("❌ WebSocket stream error: {}", e);
-                    
-                    // Check if this is a connection error that we should recover from
-                    let error_str = format!("{}", e);
-                    if error_str.contains("Connection reset") || 
-                       error_str.contains("connection closed") ||
-                       error_str.contains("protocol error") ||
-                       error_str.contains("timed out") {
-                        
-                        eprintln!("🔄 Connection lost, attempting to reconnect...");
-                        break; // Break inner loop, reconnect in outer loop
-                    } else {
-                        // For other types of errors, propagate them
-                        return Err(e);
-                    }
-                }
-            };
-        
-        // Echo the payload to stdout as it's received (only in debug mode)
-        if ws_debug {
-            println!("{}", payload);
-        }
-        
-        let now = Utc::now();
-        let key = PartKey {
-            source: source.clone(),
-            year: now.year(),
-            month: now.month(),
-            day: now.day(),
-            hour: now.hour(),
-            minute: now.minute(),
-        };
-
-        // If the minute boundary changed, flush
-        if key != current_key && !buf.is_empty() {
-            flush_batch(&out_dir, &current_key, &mut buf, &s3_storage, &upload_tx).await?;
-            rows_in_file = 0;
-            current_key = key.clone();
-        } else {
-            current_key = key.clone();
-        }
-
-        buf.push(now.timestamp_millis(), &payload);
-        rows_in_file += 1;
-        processed_count += 1;
-
-        // Update health status every 100 processed lines
-        if processed_count % 100 == 0 {
-            update_health_status(true).unwrap_or_else(|e| eprintln!("Failed to update health status: {}", e));
-        }
-
-            if let Some(max_rows) = max_rows {
-                if rows_in_file >= max_rows {
-                    flush_batch(&out_dir, &current_key, &mut buf, &s3_storage, &upload_tx).await?;
-                    rows_in_file = 0;
-                }
-            }
-        }
-        
-        // Connection was lost, wait a moment before reconnecting
-        eprintln!("⏳ Waiting 5 seconds before reconnection attempt...");
-        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-        
-        // Flush any buffered data before reconnecting
-        if !buf.is_empty() {
-            flush_batch(&out_dir, &current_key, &mut buf, &s3_storage, &upload_tx).await?;
-        }
-    }
 }

@@ -13,10 +13,10 @@ use ratatui::{
     Frame, Terminal,
 };
 use serde::{Deserialize, Serialize};
-use std::io;
 use std::fs;
+use std::io;
 
-const TABS: [&str; 7] = ["Input", "Output", "S3", "WebSocket", "Kafka", "Config", "Run"];
+const TABS: [&str; 5] = ["Input", "Output", "S3", "Config", "Run"];
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TuiConfig {
@@ -25,12 +25,12 @@ pub struct TuiConfig {
     pub tcp_host: String,
     pub tcp_port: String,
     pub source: String,
-    
+
     // Output tab
     pub out_dir: String,
     pub max_rows: String,
     pub keep_local: bool,
-    
+
     // S3 tab
     pub s3_bucket: String,
     pub s3_endpoint: String,
@@ -39,21 +39,6 @@ pub struct TuiConfig {
     pub s3_access_key: String,
     pub s3_secret_key: String,
     pub s3_disable_tls: bool,
-    
-    // WebSocket tab
-    pub ws_url: String,
-    pub ws_api_key: String,
-    pub ws_bbox: String,
-    pub ws_mmsi_filter: String,
-    pub ws_message_type_filter: String,
-    pub ws_debug: bool,
-    
-    // Kafka tab
-    pub kafka_brokers: String,
-    pub kafka_topic: String,
-    pub kafka_group_id: String,
-    pub kafka_schema_registry: String,
-    pub kafka_debug: bool,
 }
 
 impl Default for TuiConfig {
@@ -73,17 +58,6 @@ impl Default for TuiConfig {
             s3_access_key: String::new(),
             s3_secret_key: String::new(),
             s3_disable_tls: false,
-            ws_url: String::new(),
-            ws_api_key: String::new(),
-            ws_bbox: String::new(),
-            ws_mmsi_filter: String::new(),
-            ws_message_type_filter: String::new(),
-            ws_debug: false,
-            kafka_brokers: String::new(),
-            kafka_topic: String::new(),
-            kafka_group_id: String::new(),
-            kafka_schema_registry: String::new(),
-            kafka_debug: false,
         }
     }
 }
@@ -91,7 +65,7 @@ impl Default for TuiConfig {
 impl TuiConfig {
     pub fn from_env() -> Self {
         let mut config = Self::default();
-        
+
         // Load from environment variables
         if let Ok(val) = std::env::var("SOURCE") {
             config.source = val;
@@ -126,49 +100,25 @@ impl TuiConfig {
         if let Ok(val) = std::env::var("S3_DISABLE_TLS") {
             config.s3_disable_tls = val.parse().unwrap_or(false);
         }
-        if let Ok(val) = std::env::var("WS_URL") {
-            config.ws_url = val;
-        }
-        if let Ok(val) = std::env::var("WS_API_KEY") {
-            config.ws_api_key = val;
-        }
-        if let Ok(val) = std::env::var("WS_DEBUG") {
-            config.ws_debug = val.parse().unwrap_or(false);
-        }
-        if let Ok(val) = std::env::var("KAFKA_BROKERS") {
-            config.kafka_brokers = val;
-        }
-        if let Ok(val) = std::env::var("KAFKA_TOPIC") {
-            config.kafka_topic = val;
-        }
-        if let Ok(val) = std::env::var("KAFKA_GROUP_ID") {
-            config.kafka_group_id = val;
-        }
-        if let Ok(val) = std::env::var("KAFKA_SCHEMA_REGISTRY") {
-            config.kafka_schema_registry = val;
-        }
-        if let Ok(val) = std::env::var("KAFKA_DEBUG") {
-            config.kafka_debug = val.parse().unwrap_or(false);
-        }
-        
+
         config
     }
-    
+
     pub fn save_to_file(&self, path: &str) -> Result<()> {
         let json = serde_json::to_string_pretty(self)?;
         fs::write(path, json)?;
         Ok(())
     }
-    
+
     pub fn load_from_file(path: &str) -> Result<Self> {
         let json = fs::read_to_string(path)?;
         let config: TuiConfig = serde_json::from_str(&json)?;
         Ok(config)
     }
-    
+
     pub fn to_cli_args(&self) -> Vec<String> {
         let mut args = vec![];
-        
+
         // Input
         if !self.input_file.is_empty() {
             args.push("--input".to_string());
@@ -186,7 +136,7 @@ impl TuiConfig {
             args.push("--source".to_string());
             args.push(self.source.clone());
         }
-        
+
         // Output
         args.push("--out-dir".to_string());
         args.push(self.out_dir.clone());
@@ -197,7 +147,7 @@ impl TuiConfig {
         if self.keep_local {
             args.push("--keep-local".to_string());
         }
-        
+
         // S3
         if !self.s3_bucket.is_empty() {
             args.push("--s3-bucket".to_string());
@@ -224,65 +174,7 @@ impl TuiConfig {
         if self.s3_disable_tls {
             args.push("--s3-disable-tls".to_string());
         }
-        
-        // WebSocket
-        if !self.ws_url.is_empty() {
-            args.push("--ws-url".to_string());
-            args.push(self.ws_url.clone());
-        }
-        if !self.ws_api_key.is_empty() {
-            args.push("--ws-api-key".to_string());
-            args.push(self.ws_api_key.clone());
-        }
-        if !self.ws_bbox.is_empty() {
-            for bbox in self.ws_bbox.split(',') {
-                if !bbox.trim().is_empty() {
-                    args.push("--ws-bbox".to_string());
-                    args.push(bbox.trim().to_string());
-                }
-            }
-        }
-        if !self.ws_mmsi_filter.is_empty() {
-            for mmsi in self.ws_mmsi_filter.split(',') {
-                if !mmsi.trim().is_empty() {
-                    args.push("--ws-mmsi-filter".to_string());
-                    args.push(mmsi.trim().to_string());
-                }
-            }
-        }
-        if !self.ws_message_type_filter.is_empty() {
-            for msg_type in self.ws_message_type_filter.split(',') {
-                if !msg_type.trim().is_empty() {
-                    args.push("--ws-message-type-filter".to_string());
-                    args.push(msg_type.trim().to_string());
-                }
-            }
-        }
-        if self.ws_debug {
-            args.push("--ws-debug".to_string());
-        }
-        
-        // Kafka
-        if !self.kafka_brokers.is_empty() {
-            args.push("--kafka-brokers".to_string());
-            args.push(self.kafka_brokers.clone());
-        }
-        if !self.kafka_topic.is_empty() {
-            args.push("--kafka-topic".to_string());
-            args.push(self.kafka_topic.clone());
-        }
-        if !self.kafka_group_id.is_empty() {
-            args.push("--kafka-group-id".to_string());
-            args.push(self.kafka_group_id.clone());
-        }
-        if !self.kafka_schema_registry.is_empty() {
-            args.push("--kafka-schema-registry".to_string());
-            args.push(self.kafka_schema_registry.clone());
-        }
-        if self.kafka_debug {
-            args.push("--kafka-debug".to_string());
-        }
-        
+
         args
     }
 }
@@ -317,7 +209,7 @@ impl App {
             config_file_path: "capture-config.json".to_string(),
         }
     }
-    
+
     fn fields_for_tab(&self, tab: usize) -> Vec<(&str, String, bool)> {
         match tab {
             0 => vec![
@@ -329,7 +221,11 @@ impl App {
             1 => vec![
                 ("Output Directory", self.config.out_dir.clone(), false),
                 ("Max Rows per File", self.config.max_rows.clone(), false),
-                ("Keep Local Files", format!("{}", self.config.keep_local), true),
+                (
+                    "Keep Local Files",
+                    format!("{}", self.config.keep_local),
+                    true,
+                ),
             ],
             2 => vec![
                 ("S3 Bucket", self.config.s3_bucket.clone(), false),
@@ -338,33 +234,22 @@ impl App {
                 ("S3 Key Prefix", self.config.s3_key_prefix.clone(), false),
                 ("S3 Access Key", self.config.s3_access_key.clone(), false),
                 ("S3 Secret Key", "***".to_string(), false),
-                ("Disable TLS", format!("{}", self.config.s3_disable_tls), true),
+                (
+                    "Disable TLS",
+                    format!("{}", self.config.s3_disable_tls),
+                    true,
+                ),
             ],
             3 => vec![
-                ("WebSocket URL", self.config.ws_url.clone(), false),
-                ("API Key", if self.config.ws_api_key.is_empty() { String::new() } else { "***".to_string() }, false),
-                ("Bounding Box (csv)", self.config.ws_bbox.clone(), false),
-                ("MMSI Filter (csv)", self.config.ws_mmsi_filter.clone(), false),
-                ("Message Type Filter (csv)", self.config.ws_message_type_filter.clone(), false),
-                ("Debug Mode", format!("{}", self.config.ws_debug), true),
-            ],
-            4 => vec![
-                ("Kafka Brokers", self.config.kafka_brokers.clone(), false),
-                ("Kafka Topic", self.config.kafka_topic.clone(), false),
-                ("Consumer Group ID", self.config.kafka_group_id.clone(), false),
-                ("Schema Registry URL", self.config.kafka_schema_registry.clone(), false),
-                ("Debug Mode", format!("{}", self.config.kafka_debug), true),
-            ],
-            5 => vec![
                 ("Config File Path", self.config_file_path.clone(), false),
                 ("Save Config", "Press Enter".to_string(), false),
                 ("Load Config", "Press Enter".to_string(), false),
             ],
-            6 => vec![], // Run tab
+            4 => vec![], // Run tab
             _ => vec![],
         }
     }
-    
+
     fn get_field_hint(&self, tab: usize, field: usize) -> Option<&str> {
         match (tab, field) {
             // Input tab
@@ -372,11 +257,11 @@ impl App {
             (0, 1) => Some("e.g., 153.44.253.27"),
             (0, 2) => Some("e.g., 5631"),
             (0, 3) => Some("e.g., norway, test-data (optional label)"),
-            
+
             // Output tab
             (1, 0) => Some("e.g., data, /mnt/storage/parquet"),
             (1, 1) => Some("e.g., 10000 (optional, flushes on minute boundary by default)"),
-            
+
             // S3 tab
             (2, 0) => Some("e.g., my-bucket-name"),
             (2, 1) => Some("e.g., https://s3.example.com (for MinIO, R2, etc.)"),
@@ -384,102 +269,81 @@ impl App {
             (2, 3) => Some("e.g., ais-data/, production/ (optional prefix)"),
             (2, 4) => Some("AWS Access Key ID"),
             (2, 5) => Some("AWS Secret Access Key (hidden)"),
-            
-            // WebSocket tab
-            (3, 0) => Some("e.g., wss://stream.aisstream.io/v0/stream"),
-            (3, 1) => Some("API key for authentication"),
-            (3, 2) => Some("e.g., [[lat1,lon1],[lat2,lon2]] or multiple boxes"),
-            (3, 3) => Some("e.g., 123456789,987654321 (comma-separated, max 50)"),
-            (3, 4) => Some("e.g., PositionReport,ShipStaticData"),
-            
-            // Kafka tab
-            (4, 0) => Some("e.g., localhost:9092 or broker1:9092,broker2:9092"),
-            (4, 1) => Some("e.g., ais-messages"),
-            (4, 2) => Some("e.g., capture-consumer-group"),
-            (4, 3) => Some("e.g., http://localhost:8081 (optional for Avro)"),
-            
+
             // Config tab
-            (5, 0) => Some("Path to save/load JSON config file"),
-            (5, 1) => Some("Save current configuration to file"),
-            (5, 2) => Some("Load configuration from file"),
-            
+            (3, 0) => Some("Path to save/load JSON config file"),
+            (3, 1) => Some("Save current configuration to file"),
+            (3, 2) => Some("Load configuration from file"),
+
             _ => None,
         }
     }
-    
+
     fn validate_config(&mut self) -> bool {
         self.validation_errors.clear();
-        
+
         // Check for at least one input source
-        let has_input = !self.config.input_file.is_empty()
-            || !self.config.tcp_host.is_empty()
-            || !self.config.ws_url.is_empty()
-            || !self.config.kafka_brokers.is_empty();
-        
+        let has_input = !self.config.input_file.is_empty() || !self.config.tcp_host.is_empty();
+
         if !has_input {
-            self.validation_errors.push("⚠ No input source configured. Choose one: File, TCP, WebSocket, or Kafka".to_string());
+            self.validation_errors
+                .push("⚠ No input source configured. Choose one: File or TCP".to_string());
         }
-        
+
         // Check for multiple input sources
         let input_count = [
             !self.config.input_file.is_empty(),
             !self.config.tcp_host.is_empty(),
-            !self.config.ws_url.is_empty(),
-            !self.config.kafka_brokers.is_empty(),
-        ].iter().filter(|&&x| x).count();
-        
+        ]
+        .iter()
+        .filter(|&&x| x)
+        .count();
+
         if input_count > 1 {
-            self.validation_errors.push("⚠ Multiple input sources configured. Only one can be active at a time".to_string());
+            self.validation_errors.push(
+                "⚠ Multiple input sources configured. Only one can be active at a time".to_string(),
+            );
         }
-        
+
         // TCP validation
         if !self.config.tcp_host.is_empty() && self.config.tcp_port.is_empty() {
-            self.validation_errors.push("⚠ TCP Port required when TCP Host is specified".to_string());
+            self.validation_errors
+                .push("⚠ TCP Port required when TCP Host is specified".to_string());
         }
-        
+
         if !self.config.tcp_port.is_empty() {
             if let Err(_) = self.config.tcp_port.parse::<u16>() {
-                self.validation_errors.push("⚠ TCP Port must be a valid number (1-65535)".to_string());
+                self.validation_errors
+                    .push("⚠ TCP Port must be a valid number (1-65535)".to_string());
             }
         }
-        
-        // WebSocket validation
-        if !self.config.ws_url.is_empty() {
-            if !self.config.ws_url.starts_with("ws://") && !self.config.ws_url.starts_with("wss://") {
-                self.validation_errors.push("⚠ WebSocket URL must start with ws:// or wss://".to_string());
-            }
-        }
-        
-        // Kafka validation
-        if !self.config.kafka_brokers.is_empty() {
-            if self.config.kafka_topic.is_empty() {
-                self.validation_errors.push("⚠ Kafka Topic required when Kafka Brokers is specified".to_string());
-            }
-            if self.config.kafka_group_id.is_empty() {
-                self.validation_errors.push("⚠ Kafka Consumer Group ID required when Kafka Brokers is specified".to_string());
-            }
-        }
-        
+
         // Max rows validation
         if !self.config.max_rows.is_empty() {
             if let Err(_) = self.config.max_rows.parse::<usize>() {
-                self.validation_errors.push("⚠ Max Rows must be a valid positive number".to_string());
+                self.validation_errors
+                    .push("⚠ Max Rows must be a valid positive number".to_string());
             }
         }
-        
+
         // S3 validation
         if !self.config.s3_bucket.is_empty() {
             if self.config.s3_access_key.is_empty() || self.config.s3_secret_key.is_empty() {
                 // Check environment variables as fallback
-                if std::env::var("AWS_ACCESS_KEY_ID").is_err() || std::env::var("AWS_SECRET_ACCESS_KEY").is_err() {
-                    self.validation_errors.push("⚠ S3 credentials required (access key + secret key or env vars)".to_string());
+                if std::env::var("AWS_ACCESS_KEY_ID").is_err()
+                    || std::env::var("AWS_SECRET_ACCESS_KEY").is_err()
+                {
+                    self.validation_errors.push(
+                        "⚠ S3 credentials required (access key + secret key or env vars)"
+                            .to_string(),
+                    );
                 }
             }
         }
-        
+
         self.validation_errors.is_empty()
     }
-    
+
     fn save_config(&mut self) {
         match self.config.save_to_file(&self.config_file_path) {
             Ok(_) => {
@@ -490,19 +354,20 @@ impl App {
             }
         }
     }
-    
+
     fn load_config(&mut self) {
         match TuiConfig::load_from_file(&self.config_file_path) {
             Ok(config) => {
                 self.config = config;
-                self.status_message = Some(format!("✓ Config loaded from {}", self.config_file_path));
+                self.status_message =
+                    Some(format!("✓ Config loaded from {}", self.config_file_path));
             }
             Err(e) => {
                 self.status_message = Some(format!("✗ Failed to load config: {}", e));
             }
         }
     }
-    
+
     fn start_editing(&mut self) {
         let fields = self.fields_for_tab(self.selected_tab);
         if self.current_field < fields.len() {
@@ -517,11 +382,11 @@ impl App {
             }
         }
     }
-    
+
     fn finish_editing(&mut self) {
         let field_idx = self.current_field;
         let value = self.input_buffer.clone();
-        
+
         match self.selected_tab {
             0 => match field_idx {
                 0 => self.config.input_file = value,
@@ -547,23 +412,6 @@ impl App {
                 _ => {}
             },
             3 => match field_idx {
-                0 => self.config.ws_url = value,
-                1 => self.config.ws_api_key = value,
-                2 => self.config.ws_bbox = value,
-                3 => self.config.ws_mmsi_filter = value,
-                4 => self.config.ws_message_type_filter = value,
-                5 => self.config.ws_debug = !self.config.ws_debug,
-                _ => {}
-            },
-            4 => match field_idx {
-                0 => self.config.kafka_brokers = value,
-                1 => self.config.kafka_topic = value,
-                2 => self.config.kafka_group_id = value,
-                3 => self.config.kafka_schema_registry = value,
-                4 => self.config.kafka_debug = !self.config.kafka_debug,
-                _ => {}
-            },
-            5 => match field_idx {
                 0 => self.config_file_path = value,
                 1 => self.save_config(),
                 2 => self.load_config(),
@@ -571,21 +419,27 @@ impl App {
             },
             _ => {}
         }
-        
+
         self.editing = false;
         self.input_buffer.clear();
     }
-    
+
     fn toggle_bool(&mut self) {
         let fields = self.fields_for_tab(self.selected_tab);
         if self.current_field < fields.len() {
             let (_, _, is_bool) = &fields[self.current_field];
             if *is_bool {
                 match self.selected_tab {
-                    1 => if self.current_field == 2 { self.config.keep_local = !self.config.keep_local; },
-                    2 => if self.current_field == 6 { self.config.s3_disable_tls = !self.config.s3_disable_tls; },
-                    3 => if self.current_field == 5 { self.config.ws_debug = !self.config.ws_debug; },
-                    4 => if self.current_field == 4 { self.config.kafka_debug = !self.config.kafka_debug; },
+                    1 => {
+                        if self.current_field == 2 {
+                            self.config.keep_local = !self.config.keep_local;
+                        }
+                    }
+                    2 => {
+                        if self.current_field == 6 {
+                            self.config.s3_disable_tls = !self.config.s3_disable_tls;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -684,19 +538,19 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
                         }
                     }
                     KeyCode::Enter => {
-                        if app.selected_tab == 6 {
+                        if app.selected_tab == 4 {
                             // Run tab - validate first
                             if app.validate_config() {
                                 app.run = true;
                                 return Ok(());
                             }
-                        } else if app.selected_tab == 5 {
+                        } else if app.selected_tab == 3 {
                             // Config tab - special handling
                             let field_idx = app.current_field;
                             match field_idx {
                                 0 => app.start_editing(), // Edit file path
-                                1 => app.save_config(),    // Save config
-                                2 => app.load_config(),    // Load config
+                                1 => app.save_config(),   // Save config
+                                2 => app.load_config(),   // Load config
                                 _ => {}
                             }
                         } else {
@@ -739,30 +593,31 @@ fn ui(f: &mut Frame, app: &App) {
         Constraint::Min(10),   // Content
         Constraint::Length(3), // Footer
     ];
-    
+
     // Add space for status message if present
     if app.status_message.is_some() {
         constraints.insert(2, Constraint::Length(3));
     }
-    
+
     // Add space for validation errors if present
     if !app.validation_errors.is_empty() {
         let error_lines = app.validation_errors.len().min(5) as u16 + 2;
         constraints.insert(2, Constraint::Length(error_lines));
     }
-    
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
         .constraints(constraints)
         .split(f.area());
-    
+
     let mut chunk_idx = 0;
 
     // Title
-    let title = Paragraph::new("Capture Configuration - Press '?' for help, 'v' to validate, 'q' to quit")
-        .style(Style::default().fg(Color::Cyan))
-        .block(Block::default().borders(Borders::ALL));
+    let title =
+        Paragraph::new("Capture Configuration - Press '?' for help, 'v' to validate, 'q' to quit")
+            .style(Style::default().fg(Color::Cyan))
+            .block(Block::default().borders(Borders::ALL));
     f.render_widget(title, chunks[chunk_idx]);
     chunk_idx += 1;
 
@@ -778,7 +633,7 @@ fn ui(f: &mut Frame, app: &App) {
         .highlight_style(
             Style::default()
                 .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
+                .add_modifier(Modifier::BOLD),
         );
 
     let inner_chunks = Layout::default()
@@ -790,26 +645,32 @@ fn ui(f: &mut Frame, app: &App) {
     f.render_widget(tabs, inner_chunks[0]);
 
     // Content
-    if app.selected_tab == 6 {
+    if app.selected_tab == 4 {
         render_run_tab(f, inner_chunks[1], app);
     } else {
         render_fields_tab(f, inner_chunks[1], app);
     }
-    
+
     // Validation errors
     if !app.validation_errors.is_empty() {
-        let error_text: Vec<Line> = app.validation_errors.iter()
+        let error_text: Vec<Line> = app
+            .validation_errors
+            .iter()
             .take(5)
             .map(|e| Line::from(Span::styled(e.as_str(), Style::default().fg(Color::Red))))
             .collect();
-        
+
         let errors = Paragraph::new(error_text)
             .style(Style::default().fg(Color::Red))
-            .block(Block::default().borders(Borders::ALL).title("Validation Errors"));
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Validation Errors"),
+            );
         f.render_widget(errors, chunks[chunk_idx]);
         chunk_idx += 1;
     }
-    
+
     // Status message
     if let Some(ref msg) = app.status_message {
         let color = if msg.starts_with('✓') {
@@ -819,7 +680,7 @@ fn ui(f: &mut Frame, app: &App) {
         } else {
             Color::Yellow
         };
-        
+
         let status = Paragraph::new(msg.as_str())
             .style(Style::default().fg(color))
             .block(Block::default().borders(Borders::ALL).title("Status"));
@@ -843,7 +704,7 @@ fn ui(f: &mut Frame, app: &App) {
 
 fn render_fields_tab(f: &mut Frame, area: Rect, app: &App) {
     let fields = app.fields_for_tab(app.selected_tab);
-    
+
     // Split area to show hint at bottom if available
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -853,9 +714,9 @@ fn render_fields_tab(f: &mut Frame, area: Rect, app: &App) {
             vec![Constraint::Min(5)]
         })
         .split(area);
-    
+
     let list_area = chunks[0];
-    
+
     let items: Vec<ListItem> = fields
         .iter()
         .enumerate()
@@ -867,27 +728,33 @@ fn render_fields_tab(f: &mut Frame, area: Rect, app: &App) {
             } else {
                 format!("{}: {}", name, value)
             };
-            
+
             let style = if i == app.current_field {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
             };
-            
+
             ListItem::new(Line::from(display_value)).style(style)
         })
         .collect();
 
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(TABS[app.selected_tab]))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(TABS[app.selected_tab]),
+        )
         .highlight_style(
             Style::default()
                 .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
+                .add_modifier(Modifier::BOLD),
         );
 
     f.render_widget(list, list_area);
-    
+
     // Show hint for current field if help is enabled
     if app.show_help && chunks.len() > 1 {
         if let Some(hint) = app.get_field_hint(app.selected_tab, app.current_field) {
@@ -903,37 +770,48 @@ fn render_fields_tab(f: &mut Frame, area: Rect, app: &App) {
 fn render_run_tab(f: &mut Frame, area: Rect, app: &App) {
     let args = app.config.to_cli_args();
     let cmd = format!("./capture {}", args.join(" "));
-    
+
     let text = vec![
         Line::from(""),
-        Line::from(Span::styled("Ready to run with the following configuration:", Style::default().fg(Color::Green))),
+        Line::from(Span::styled(
+            "Ready to run with the following configuration:",
+            Style::default().fg(Color::Green),
+        )),
         Line::from(""),
-        Line::from(Span::styled("Command:", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled(
+            "Command:",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
         Line::from(""),
     ];
-    
+
     let mut all_lines = text;
-    
+
     // Wrap command for display
     for line in wrap_text(&cmd, area.width.saturating_sub(4) as usize) {
         all_lines.push(Line::from(line));
     }
-    
+
     all_lines.push(Line::from(""));
     all_lines.push(Line::from(""));
-    all_lines.push(Line::from(Span::styled("Press Enter to run, or 'q' to quit", Style::default().fg(Color::Yellow))));
-    
+    all_lines.push(Line::from(Span::styled(
+        "Press Enter to run, or 'q' to quit",
+        Style::default().fg(Color::Yellow),
+    )));
+
     let paragraph = Paragraph::new(all_lines)
         .block(Block::default().borders(Borders::ALL).title("Run"))
         .wrap(Wrap { trim: false });
-    
+
     f.render_widget(paragraph, area);
 }
 
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
     let mut lines = Vec::new();
     let mut current_line = String::new();
-    
+
     for word in text.split_whitespace() {
         if current_line.len() + word.len() + 1 > width {
             if !current_line.is_empty() {
@@ -954,10 +832,10 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
             current_line.push_str(word);
         }
     }
-    
+
     if !current_line.is_empty() {
         lines.push(current_line);
     }
-    
+
     lines
 }

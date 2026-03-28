@@ -89,8 +89,8 @@ echo "Many environment variables:"
     OUT_DIR=/tmp \
     S3_BUCKET=test \
     S3_REGION=us-east-1 \
-    WS_BBOX="1,2,3,4" \
-    WS_MMSI_FILTER="123,456,789" \
+    TCP_HOST=153.44.253.27 \
+    TCP_PORT=5631 \
     KEEP_LOCAL=true \
     ./target/release/hive_parquet_ingest --health-check \
     2>&1 | tee "$RESULTS_DIR/many_env_vars.txt"

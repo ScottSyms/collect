@@ -1,9 +1,9 @@
 # capture
 
-A high-performance Rust application for ingesting data streams into Hive-partitioned Parquet files with Zstd compression. Supports multiple input sources (files, TCP streams, WebSocket feeds) and remote storage (S3/MinIO).
+A high-performance Rust application for ingesting data streams into Hive-partitioned Parquet files with Zstd compression. Supports file and TCP inputs with optional remote storage (S3/MinIO).
 
 ## Features
-- **Multiple Input Sources**: File, TCP stream, or WebSocket (AISStream.io compatible)
+- **Multiple Input Sources**: File or TCP stream
 - **Hive Partitioning**: Automatic partitioning by source, year, month, day, hour, and minute
 - **Parquet Format**: Efficient columnar storage with Zstd compression
 - **S3 Integration**: Upload to AWS S3 or S3-compatible storage (MinIO) with optional TLS
@@ -19,11 +19,10 @@ A high-performance Rust application for ingesting data streams into Hive-partiti
 ### Using Environment Variables (Recommended for Docker)
 
 ```bash
-# WebSocket AIS Stream with S3
-export WS_URL="wss://stream.aisstream.io/v0/stream"
-export WS_API_KEY="your-api-key"
-export WS_BBOX="37.9,-122.6,37.6,-122.3"
-export SOURCE="ais-sf-bay"
+# TCP stream with S3
+export TCP_HOST="153.44.253.27"
+export TCP_PORT="5631"
+export SOURCE="norway-tcp"
 export S3_BUCKET="maritime-data"
 export S3_REGION="us-west-2"
 
@@ -39,12 +38,8 @@ export S3_REGION="us-west-2"
 # TCP stream
 ./capture --tcp-host 153.44.253.27 --tcp-port 5631 --source norway-tcp
 
-# WebSocket AIS stream
-./capture \
-  --ws-url wss://stream.aisstream.io/v0/stream \
-  --ws-api-key your-api-key \
-  --ws-bbox "37.9,-122.6,37.6,-122.3" \
-  --source ais-sf-bay
+# File input with S3
+./capture --input data.txt --source mydata --s3-bucket maritime-data
 ```
 
 ## Environment Variables
@@ -56,14 +51,10 @@ All command-line parameters can be configured using environment variables:
 | `INPUT_FILE` | `--input` | Input text file path |
 | `TCP_HOST` | `--tcp-host` | TCP host address |
 | `TCP_PORT` | `--tcp-port` | TCP port number |
-| `WS_URL` | `--ws-url` | WebSocket URL |
-| `WS_API_KEY` | `--ws-api-key` | WebSocket API key |
-| `WS_BBOX` | `--ws-bbox` | Bounding box (comma-separated) |
-| `WS_MMSI_FILTER` | `--ws-mmsi-filter` | MMSI filter (comma-separated) |
-| `WS_MESSAGE_TYPE_FILTER` | `--ws-message-type-filter` | Message type filter |
 | `SOURCE` | `--source` | Logical source label |
 | `OUT_DIR` | `--out-dir` | Output directory |
 | `MAX_ROWS` | `--max-rows` | Max rows per file |
+| `UPLOAD_DRAIN_TIMEOUT_SECONDS` | `--upload-drain-timeout-seconds` | Max seconds to wait for upload drain |
 | `HEALTH_CHECK` | `--health-check` | Run health check |
 | `S3_BUCKET` | `--s3-bucket` | S3 bucket name |
 | `S3_ENDPOINT` | `--s3-endpoint` | S3 endpoint URL |
@@ -72,7 +63,6 @@ All command-line parameters can be configured using environment variables:
 | `S3_SECRET_KEY` | `--s3-secret-key` | S3 secret key |
 | `KEEP_LOCAL` | `--keep-local` | Keep local files |
 | `S3_DISABLE_TLS` | `--s3-disable-tls` | Disable TLS for S3 (use HTTP) |
-| `WS_DEBUG` | `--ws-debug` | Enable WebSocket debug mode |
 
 See [ENVIRONMENT_VARIABLES.md](ENVIRONMENT_VARIABLES.md) for detailed usage examples.
 
@@ -88,11 +78,10 @@ services:
     build: .
     image: capture:latest
     environment:
-      # WebSocket AIS Stream
-      - WS_URL=wss://stream.aisstream.io/v0/stream
-      - WS_API_KEY=${AIS_API_KEY}
-      - WS_BBOX=37.9,-122.6,37.6,-122.3
-      - SOURCE=ais-sf-bay
+      # TCP Stream
+      - TCP_HOST=153.44.253.27
+      - TCP_PORT=5631
+      - SOURCE=norway-tcp
       
       # S3 Configuration  
       - S3_BUCKET=maritime-data
@@ -117,15 +106,6 @@ docker build -t capture .
 ### Running with Docker
 
 ```bash
-# WebSocket with environment variables
-docker run -d \
-  --name data-ingest \
-  -e WS_URL="wss://stream.aisstream.io/v0/stream" \
-  -e WS_API_KEY="your-api-key" \
-  -e SOURCE="ais-data" \
-  -v $(pwd)/output:/data \
-  capture:latest
-
 # TCP stream with environment variables
 docker run -d \
   --name data-ingest \
@@ -152,7 +132,7 @@ Data is organized in Hive-partitioned directories:
 
 ```
 data/
-├── source=ais-sf-bay/
+├── source=file-ingest/
 │   └── year=2025/
 │       └── month=01/
 │           └── day=15/
@@ -213,20 +193,6 @@ export S3_DISABLE_TLS="true"  # Use HTTP instead of HTTPS
 
 See [S3_INTEGRATION.md](S3_INTEGRATION.md) for detailed configuration.
 
-## WebSocket Integration
-
-Full support for AISStream.io and other WebSocket feeds:
-
-```bash
-export WS_URL="wss://stream.aisstream.io/v0/stream"
-export WS_API_KEY="your-api-key"
-export WS_BBOX="37.9,-122.6,37.6,-122.3,40.7,-74.0,40.6,-73.9"
-export WS_MMSI_FILTER="123456789,987654321"
-export WS_MESSAGE_TYPE_FILTER="PositionReport,StaticAndVoyageRelatedData"
-```
-
-See [WEBSOCKET_AIS.md](WEBSOCKET_AIS.md) for detailed WebSocket configuration.
-
 ## Building from Source
 
 ```bash
@@ -267,7 +233,6 @@ cargo clean && cargo build --release
 
 ### Connection Issues
 - **TCP**: Verify host/port accessibility: `telnet 153.44.253.27 5631`
-- **WebSocket**: Check URL and API key validity
 - **S3**: Validate credentials and bucket permissions
 
 See individual documentation files for detailed troubleshooting guides.

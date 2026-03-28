@@ -6,7 +6,7 @@ The `capture` tool includes an interactive Terminal User Interface (TUI) for eas
 
 ## Key Features
 
-- ✅ **6 Configuration Tabs**: Input, Output, S3, WebSocket, Kafka, Config, Run
+- ✅ **5 Configuration Tabs**: Input, Output, S3, Config, Run
 - ✅ **Field Validation**: Automatic validation before running
 - ✅ **Helpful Hints**: Press `?` to see examples for each field
 - ✅ **Save/Load Configs**: Export and reuse configurations
@@ -54,7 +54,7 @@ Configure the data source:
 - **TCP Port**: TCP port number
 - **Source Label**: Logical name for this data source
 
-*Note: Only one input method should be configured (File OR TCP OR WebSocket OR Kafka)*
+*Note: Only one input method should be configured (File OR TCP)*
 
 ### 2. Output Tab
 Configure local file storage:
@@ -72,24 +72,7 @@ Configure cloud storage:
 - **S3 Secret Key**: AWS secret access key (masked)
 - **Disable TLS**: [X] to use HTTP instead of HTTPS
 
-### 4. WebSocket Tab
-Configure WebSocket streaming (e.g., AISStream.io):
-- **WebSocket URL**: wss:// URL to connect to
-- **API Key**: Authentication key (masked)
-- **Bounding Box (csv)**: Comma-separated bbox values (can specify multiple)
-- **MMSI Filter (csv)**: Comma-separated MMSI numbers (max 50)
-- **Message Type Filter (csv)**: Comma-separated message types
-- **Debug Mode**: [X] to enable verbose logging
-
-### 5. Kafka Tab
-Configure Kafka consumer:
-- **Kafka Brokers**: Comma-separated broker addresses
-- **Kafka Topic**: Topic name to consume from
-- **Consumer Group ID**: Consumer group identifier
-- **Schema Registry URL**: Optional schema registry for Avro
-- **Debug Mode**: [X] to enable verbose logging
-
-### 6. Config Tab
+### 4. Config Tab
 Save and load configurations:
 - **Config File Path**: Path to JSON config file (default: `capture-config.json`)
 - **Save Config**: Press Enter to save current settings to file
@@ -97,7 +80,7 @@ Save and load configurations:
 
 *Saved configs can be version controlled or shared with team members.*
 
-### 7. Run Tab
+### 5. Run Tab
 Review the final configuration and launch:
 - Displays the full command line that will be executed
 - **Automatic validation** runs before execution
@@ -112,8 +95,6 @@ The TUI includes automatic validation that checks:
 - ✅ At least one input source is configured
 - ✅ Only one input source is active (no conflicts)
 - ✅ Required fields are present (e.g., TCP port with TCP host)
-- ✅ Kafka requires topic and group ID when brokers specified
-- ✅ WebSocket URL format is correct (ws:// or wss://)
 - ✅ Numeric fields contain valid numbers
 - ✅ S3 credentials available (fields or environment)
 
@@ -130,7 +111,6 @@ Press `?` or `F1` to toggle the help/hints display:
 Examples:
 - Input File: `e.g., /path/to/data.txt (one record per line)`
 - TCP Port: `e.g., 5631`
-- Kafka Brokers: `e.g., localhost:9092 or broker1:9092,broker2:9092`
 
 ## Config File Management
 
@@ -185,7 +165,8 @@ Set environment variables first:
 ```bash
 export S3_BUCKET=my-bucket
 export S3_REGION=us-west-2
-export KAFKA_BROKERS=localhost:9092
+export TCP_HOST=153.44.253.27
+export TCP_PORT=5631
 ./capture --tui
 ```
 
@@ -200,7 +181,7 @@ Provide some options via CLI, configure rest in TUI:
 ## Tips
 
 1. **Boolean Fields**: Use Space or Enter to toggle checkboxes
-2. **CSV Fields**: For multi-value fields (bbox, MMSI, etc.), separate with commas
+2. **Numeric Fields**: Ensure ports and max rows are valid numbers
 3. **Passwords**: Secret keys are masked with `***` in display but are preserved
 4. **Validation**: Press `v` anytime to check your configuration before running
 5. **Hints**: Press `?` to see examples for each field as you navigate
@@ -234,7 +215,7 @@ Provide some options via CLI, configure rest in TUI:
 - Check terminal's Unicode support for proper rendering
 
 ### Values not loading
-- Verify environment variables are set: `env | grep -E "(S3|KAFKA|WS)_"`
+- Verify environment variables are set: `env | grep -E "(S3|TCP)_"`
 - Check that CLI arguments are before the `--tui` flag
 
 ## Advanced: Scripting
@@ -245,9 +226,8 @@ You can programmatically generate configurations by setting environment variable
 #!/bin/bash
 export S3_BUCKET=production-bucket
 export S3_REGION=us-east-1
-export KAFKA_BROKERS=kafka1:9092,kafka2:9092
-export KAFKA_TOPIC=ais-stream
-export KAFKA_GROUP_ID=capture-consumer-1
+export TCP_HOST=153.44.253.27
+export TCP_PORT=5631
 
 # Launch TUI with pre-configured values
 ./capture --tui
