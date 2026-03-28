@@ -5,6 +5,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATA_DIR="${SCRIPT_DIR}/data"
 DURATION_SECONDS=60
 
+echo "Building release binary..."
+cargo build --release
+
 if [[ -z "$DATA_DIR" || "$DATA_DIR" == "/" ]]; then
   echo "Refusing to clean invalid data directory: '$DATA_DIR'"
   exit 1
@@ -13,11 +16,6 @@ fi
 echo "Cleaning data directory: $DATA_DIR"
 rm -rf "$DATA_DIR"
 mkdir -p "$DATA_DIR"
-
-if [[ ! -x "${SCRIPT_DIR}/target/release/capture" ]]; then
-  echo "Building release binary..."
-  cargo build --release
-fi
 
 echo "Starting capture for ${DURATION_SECONDS}s..."
 cargo run --release -- \
@@ -36,7 +34,6 @@ fi
 
 wait "$app_pid" || true
 
-shopt -s globstar nullglob
 parquet_files=("$DATA_DIR"/source=*/**/*.parquet)
 
 if (( ${#parquet_files[@]} > 0 )); then
