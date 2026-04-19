@@ -211,6 +211,7 @@ cargo build --release
 ## Performance Tuning
 
 - **MAX_ROWS**: Control memory usage vs file size (default: flush on minute boundary)
+- **MAX_PAYLOAD_BYTES**: Flush before buffered string data grows too large for Arrow offsets (default: `268435456`)
 - **Compression**: Uses Zstd for optimal compression ratio and speed
 - **Async Processing**: Leverages Tokio for high-performance async I/O
 - **Resource Limits**: Set appropriate memory limits in Docker for large datasets

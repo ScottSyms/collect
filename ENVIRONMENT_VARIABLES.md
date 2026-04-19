@@ -36,6 +36,10 @@ All command-line parameters can be configured using environment variables, makin
   - Example: `MAX_ROWS=10000`
   - Default: flush on minute boundary only
 
+- `MAX_PAYLOAD_BYTES`: Maximum payload bytes to buffer per Parquet file before flush
+  - Example: `MAX_PAYLOAD_BYTES=268435456`
+  - Default: `268435456`
+
 - `HEALTH_CHECK`: Run health check and exit (for Docker HEALTHCHECK)
   - Example: `HEALTH_CHECK=true`
   - Default: `false`
