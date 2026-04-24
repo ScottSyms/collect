@@ -215,12 +215,14 @@ fn collect_input_jobs(root: &Path) -> Result<Vec<InputJob>> {
 }
 
 fn expand_input_path(path: &Path) -> Result<Vec<InputJob>> {
-    if is_tar_like_path(path) {
-        bail!("tar archives are not supported: {}", path.display());
-    }
-
     match detect_input_format(path)? {
-        InputFormat::Plain => Ok(vec![InputJob::plain(path.to_path_buf())]),
+        InputFormat::Plain => {
+            if is_tar_like_path(path) {
+                bail!("tar archives are not supported: {}", path.display());
+            }
+
+            Ok(vec![InputJob::plain(path.to_path_buf())])
+        }
         InputFormat::Gzip => Ok(vec![InputJob::gzip(path.to_path_buf())]),
         InputFormat::Bzip2 => Ok(vec![InputJob::bzip2(path.to_path_buf())]),
         InputFormat::Zip => collect_zip_jobs(path),
@@ -428,9 +430,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_tar_like_paths() {
-        let dir = tempdir().expect("tempdir");
+    async fn accepts_gzip_with_tar_like_name() -> Result<()> {
+        let dir = tempdir()?;
         let path = dir.path().join("archive.tar.gz");
+        write_gzip_file(&path, "gzip-1\n").await?;
+
+        let mut source = FileInputSource::new(path, "source".to_string())?;
+        let lines = collect_all_lines(&mut source, 1024).await?;
+
+        assert_eq!(lines, vec!["gzip-1"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn accepts_zip_with_tar_like_name() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("archive.tar.gz");
+        write_zip_file(&path)?;
+
+        let mut source = FileInputSource::new(path, "source".to_string())?;
+        let lines = collect_all_lines(&mut source, 1024).await?;
+
+        assert_eq!(lines, vec!["zip-1", "zip-2"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_plain_tar_like_paths() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("archive.tar");
         write_text_file(&path, "not used\n").expect("write file");
 
         let error = FileInputSource::new(path, "source".to_string())
