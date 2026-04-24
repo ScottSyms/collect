@@ -1,9 +1,10 @@
-# capture
+# collect
 
-A high-performance Rust application for ingesting data streams into Hive-partitioned Parquet files with Zstd compression. Supports file and TCP inputs with optional remote storage (S3/MinIO).
+A Rust workspace for ingesting data into Hive-partitioned Parquet files with Zstd compression. It provides `collect-file` for recursive plain/compressed file ingestion and `collect-socket` for TCP line ingestion, with optional remote storage (S3/MinIO).
 
 ## Features
-- **Multiple Input Sources**: File or TCP stream
+- **Multiple Input Sources**: Plain, compressed, or TCP stream
+- **Compressed Inputs**: Plain text, gzip, bzip2, and zip files
 - **Hive Partitioning**: Automatic partitioning by source, year, month, day, hour, and minute
 - **Parquet Format**: Efficient columnar storage with Zstd compression
 - **S3 Integration**: Upload to AWS S3 or S3-compatible storage (MinIO) with optional TLS
@@ -26,21 +27,23 @@ export SOURCE="norway-tcp"
 export S3_BUCKET="maritime-data"
 export S3_REGION="us-west-2"
 
-./capture
+cargo run -p collect-socket --
 ```
 
 ### Using Command Line Arguments
 
 ```bash
 # File input
-./capture --input data.txt --source mydata
+cargo run -p collect-file -- --input data.txt --source mydata
 
 # TCP stream
-./capture --tcp-host 153.44.253.27 --tcp-port 5631 --source norway-tcp
+cargo run -p collect-socket -- --tcp-host 153.44.253.27 --tcp-port 5631 --source norway-tcp
 
 # File input with S3
-./capture --input data.txt --source mydata --s3-bucket maritime-data
+cargo run -p collect-file -- --input data.txt --source mydata --s3-bucket maritime-data
 ```
+
+`collect-file` auto-detects plain text, gzip, bzip2, and zip inputs. Zip archives are read entry-by-entry in archive order. Tar and 7z archives are not supported.
 
 ## Environment Variables
 
@@ -48,7 +51,7 @@ All command-line parameters can be configured using environment variables:
 
 | Environment Variable | CLI Argument | Description |
 |---------------------|--------------|-------------|
-| `INPUT_FILE` | `--input` | Input text file path |
+| `INPUT_PATH` / `INPUT_FILE` | `--input` | Input file or directory path |
 | `TCP_HOST` | `--tcp-host` | TCP host address |
 | `TCP_PORT` | `--tcp-port` | TCP port number |
 | `SOURCE` | `--source` | Logical source label |
@@ -76,7 +79,7 @@ version: '3.8'
 services:
   data-ingest:
     build: .
-    image: capture:latest
+    image: collect:latest
     environment:
       # TCP Stream
       - TCP_HOST=153.44.253.27
@@ -91,7 +94,7 @@ services:
     volumes:
       - ./output:/data
     healthcheck:
-      test: ["CMD", "/usr/local/bin/capture", "--health-check"]
+      test: ["CMD", "/usr/local/bin/collect-socket", "--health-check"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -100,7 +103,7 @@ services:
 ### Building the Docker Image
 
 ```bash
-docker build -t capture .
+docker build -t collect .
 ```
 
 ### Running with Docker
@@ -113,8 +116,10 @@ docker run -d \
   -e TCP_PORT="5631" \
   -e SOURCE="norway-tcp" \
   -v $(pwd)/output:/data \
-  capture:latest
+  collect:latest
 ```
+
+The image defaults to `collect-socket`; use `--entrypoint /usr/local/bin/collect-file` for file ingestion.
 
 ## Configuration Precedence
 
@@ -125,6 +130,17 @@ Configuration values are applied in the following order (highest to lowest prece
 3. **Default values** (lowest precedence)
 
 This allows you to set base configuration via environment variables and override specific values with command-line arguments when needed.
+
+## TUI
+
+Both binaries include an interactive console setup flow:
+
+```bash
+cargo run -p collect-file -- --tui
+cargo run -p collect-socket -- --tui
+```
+
+The file binary saves to `collect-file-config.json` by default. The socket binary saves to `collect-socket-config.json` by default.
 
 ## Output Structure
 
@@ -155,13 +171,13 @@ The application includes health check functionality for container orchestration:
 
 ```bash
 # Check health status
-./capture --health-check
+./target/release/collect-socket --health-check
 
 # Or using environment variable
-HEALTH_CHECK=true ./capture
+HEALTH_CHECK=true ./target/release/collect-socket
 ```
 
-Health status is tracked in `/tmp/health_status` with timestamps and status information.
+Health status is tracked in `/tmp/collect-socket.health` for the socket binary and `/tmp/collect-file.health` for the file binary.
 
 ## S3 Integration
 
@@ -201,11 +217,12 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 # Clone and build
 git clone <repository-url>
-cd capture
-cargo build --release
+cd collect
+cargo build --release --workspace
 
 # Run
-./target/release/capture --help
+./target/release/collect-file --help
+./target/release/collect-socket --help
 ```
 
 ## Performance Tuning
@@ -228,7 +245,7 @@ cargo build --release
 rustup update
 
 # Clean and rebuild
-cargo clean && cargo build --release
+cargo clean && cargo build --release --workspace
 ```
 
 ### Connection Issues

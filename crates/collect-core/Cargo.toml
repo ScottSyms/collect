@@ -1,0 +1,18 @@
+[package]
+name = "collect-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+arrow.workspace = true
+aws-config.workspace = true
+aws-credential-types.workspace = true
+aws-sdk-s3.workspace = true
+chrono.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+parquet.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
