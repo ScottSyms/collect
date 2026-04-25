@@ -5,6 +5,7 @@ use aws_config::Region;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::{Client as S3Client, Config as S3Config};
+use futures_util::stream::{self, StreamExt};
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use walkdir::WalkDir;
@@ -117,9 +118,13 @@ impl StorageLocation {
         }
     }
 
-    pub async fn delete_rel_paths(&self, rel_paths: &[String]) -> Result<()> {
-        for rel_path in rel_paths {
-            self.delete_rel_path(rel_path).await?;
+    pub async fn delete_rel_paths(&self, rel_paths: &[String], concurrency: usize) -> Result<()> {
+        let mut stream = stream::iter(rel_paths.iter().cloned())
+            .map(|rel_path| async move { self.delete_rel_path(&rel_path).await })
+            .buffer_unordered(concurrency.max(1));
+
+        while let Some(result) = stream.next().await {
+            result?;
         }
         Ok(())
     }
@@ -168,6 +173,13 @@ impl LocalStorage {
             .replace('\\', "/"))
     }
 
+    fn should_ignore(rel_path: &str) -> bool {
+        Path::new(rel_path)
+            .file_name()
+            .and_then(|value| value.to_str())
+            == Some(".DS_Store")
+    }
+
     fn list_entries<F>(&self, on_progress: &mut F) -> Result<Vec<DatasetEntry>>
     where
         F: FnMut(usize),
@@ -204,6 +216,9 @@ impl LocalStorage {
 
             let metadata = item.metadata().context("reading file metadata")?;
             let rel_path = self.rel_path_from_abs(item.path())?;
+            if Self::should_ignore(&rel_path) {
+                continue;
+            }
             let kind = classify_entry(&rel_path, metadata.len());
             entries.push(DatasetEntry {
                 rel_path: rel_path.clone(),
@@ -349,6 +364,9 @@ impl S3Storage {
                 let Some(key) = object.key() else { continue; };
                 let Some(rel_path) = self.rel_from_key(key) else { continue; };
                 if rel_path.is_empty() {
+                    continue;
+                }
+                if LocalStorage::should_ignore(&rel_path) {
                     continue;
                 }
                 let size = object.size().unwrap_or(0).max(0) as u64;

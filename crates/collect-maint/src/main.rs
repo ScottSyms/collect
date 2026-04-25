@@ -9,6 +9,13 @@ use commands::{compact, inspect, validate, vacuum};
 use progress::report;
 use storage::{StorageConfig, StorageLocation};
 
+fn default_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(|count| count.get().saturating_mul(2))
+        .unwrap_or(8)
+        .clamp(4, 16)
+}
+
 #[derive(Parser, Debug)]
 #[command(
     version,
@@ -17,6 +24,10 @@ use storage::{StorageConfig, StorageLocation};
 struct Cli {
     #[command(flatten)]
     storage: StorageArgs,
+
+    /// Maximum number of concurrent maintenance workers
+    #[arg(long, global = true, default_value_t = default_concurrency())]
+    concurrency: usize,
 
     #[command(subcommand)]
     command: Command,
@@ -60,7 +71,11 @@ struct StorageArgs {
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Summarize partitions, file counts, and sizes
-    Inspect,
+    Inspect {
+        /// Print per-partition details
+        #[arg(long)]
+        verbose: bool,
+    },
 
     /// Validate parquet files and partition timestamps
     Validate,
@@ -88,7 +103,15 @@ enum Command {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let storage = cli.storage.into_location().await?;
-    report("collect-maint", format!("loading dataset entries from {}", storage.dataset_label()));
+    let concurrency = cli.concurrency.max(1);
+    report(
+        "collect-maint",
+        format!(
+            "loading dataset entries from {} with {} workers",
+            storage.dataset_label(),
+            concurrency
+        ),
+    );
     let entries = storage
         .list_entries(|count| {
             if count > 0 {
@@ -100,13 +123,13 @@ async fn main() -> Result<()> {
     report("collect-maint", format!("loaded {} entries", entries.len()));
 
     match cli.command {
-        Command::Inspect => inspect(&storage, &entries).await,
-        Command::Validate => validate(&storage, &entries).await,
+        Command::Inspect { verbose } => inspect(&storage, &entries, concurrency, verbose).await,
+        Command::Validate => validate(&storage, &entries, concurrency).await,
         Command::Compact {
             target_file_size_bytes,
             apply,
-        } => compact(&storage, &entries, target_file_size_bytes, apply).await,
-        Command::Vacuum { apply } => vacuum(&storage, &entries, apply).await,
+        } => compact(&storage, &entries, target_file_size_bytes, apply, concurrency).await,
+        Command::Vacuum { apply } => vacuum(&storage, &entries, apply, concurrency).await,
     }
 }
 

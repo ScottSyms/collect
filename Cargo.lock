@@ -1086,6 +1086,7 @@ dependencies = [
  "chrono",
  "clap",
  "collect-core",
+ "futures-util",
  "parquet",
  "serde",
  "serde_json",
