@@ -32,6 +32,7 @@ pub use tokio_util::codec::LinesCodecError;
 const DEFAULT_OUT_DIR: &str = "data";
 const DEFAULT_UPLOAD_DRAIN_TIMEOUT_SECONDS: u64 = 60;
 const DEFAULT_MAX_LINE_LENGTH: usize = 65_536;
+const DEFAULT_MAX_BATCH_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_S3_REGION: &str = "us-east-1";
 const DEFAULT_HEALTH_STALE_WINDOW_SECONDS: u64 = 60;
 const DEFAULT_UPLOAD_QUEUE_CAPACITY: usize = 128;
@@ -48,6 +49,10 @@ pub struct CommonCliArgs {
     /// Max rows to buffer per Parquet file before flush (default: flush on minute boundary only)
     #[arg(long)]
     pub max_rows: Option<usize>,
+
+    /// Max payload bytes to buffer per Parquet file before flush
+    #[arg(long)]
+    pub max_batch_bytes: Option<usize>,
 
     /// Seconds to wait for background uploads on shutdown
     #[arg(long, default_value_t = DEFAULT_UPLOAD_DRAIN_TIMEOUT_SECONDS)]
@@ -97,6 +102,7 @@ pub struct S3CliArgs {
 pub struct CommonOptions {
     pub out_dir: PathBuf,
     pub max_rows: Option<usize>,
+    pub max_batch_bytes: usize,
     pub upload_drain_timeout_seconds: u64,
     pub max_line_length: usize,
     pub health_check: bool,
@@ -167,6 +173,12 @@ impl CommonCliArgs {
             }
         }
 
+        if self.max_batch_bytes.is_none() {
+            if let Ok(value) = std::env::var("MAX_BATCH_BYTES") {
+                self.max_batch_bytes = value.parse().ok();
+            }
+        }
+
         if self.upload_drain_timeout_seconds == DEFAULT_UPLOAD_DRAIN_TIMEOUT_SECONDS {
             if let Ok(value) = std::env::var("UPLOAD_DRAIN_TIMEOUT_SECONDS") {
                 if let Ok(parsed) = value.parse::<u64>() {
@@ -194,6 +206,7 @@ impl CommonCliArgs {
         CommonOptions {
             out_dir: self.out_dir.clone(),
             max_rows: self.max_rows,
+            max_batch_bytes: self.max_batch_bytes.unwrap_or(DEFAULT_MAX_BATCH_BYTES),
             upload_drain_timeout_seconds: self.upload_drain_timeout_seconds,
             max_line_length: self.max_line_length,
             health_check: self.health_check,
@@ -352,7 +365,7 @@ where
     let now = now_unix_duration();
     let mut current_minute_id = now.as_secs() / 60;
     let mut current_key = PartKey::from_minute(source.source_name(), current_minute_id);
-    let mut buf = BatchBuf::new(common.max_rows);
+    let mut buf = BatchBuf::new(common.max_rows, common.max_batch_bytes);
     let mut rows_in_file = 0usize;
 
     let (upload_tx, upload_worker) = spawn_upload_worker(s3_storage.clone());
@@ -379,6 +392,7 @@ where
                         let duration = now_unix_duration();
                         let now_ms = duration.as_millis() as i64;
                         let minute_id = duration.as_secs() / 60;
+                        let payload_len = payload.len();
 
                         if minute_id != current_minute_id {
                             if !buf.is_empty() {
@@ -389,8 +403,19 @@ where
                             current_key = PartKey::from_minute(source.source_name(), current_minute_id);
                         }
 
+                        // Keep each batch well below Arrow's string offset limit.
+                        if buf.would_exceed_batch_bytes(payload_len, common.max_batch_bytes) {
+                            flush_batch(&common.out_dir, &current_key, &mut buf, upload_tx.as_ref()).await?;
+                            rows_in_file = 0;
+                        }
+
                         buf.push(now_ms, &payload);
                         rows_in_file += 1;
+
+                        if buf.payload_bytes() >= common.max_batch_bytes {
+                            flush_batch(&common.out_dir, &current_key, &mut buf, upload_tx.as_ref()).await?;
+                            rows_in_file = 0;
+                        }
 
                         if let Some(max_rows) = common.max_rows {
                             if rows_in_file >= max_rows {
@@ -654,12 +679,13 @@ struct BatchBuf {
     schema: Arc<Schema>,
     row_capacity: usize,
     byte_capacity: usize,
+    payload_bytes: usize,
 }
 
 impl BatchBuf {
-    fn new(max_rows: Option<usize>) -> Self {
+    fn new(max_rows: Option<usize>, max_batch_bytes: usize) -> Self {
         let row_capacity = max_rows.unwrap_or(4096);
-        let byte_capacity = row_capacity.saturating_mul(128);
+        let byte_capacity = row_capacity.saturating_mul(128).min(max_batch_bytes.max(1));
         let fields = vec![
             Field::new(
                 "ts",
@@ -674,12 +700,14 @@ impl BatchBuf {
             schema: Arc::new(Schema::new(fields)),
             row_capacity,
             byte_capacity,
+            payload_bytes: 0,
         }
     }
 
     fn push(&mut self, ts_ms: i64, payload: &str) {
         self.ts.append_value(ts_ms);
         self.payload.append_value(payload);
+        self.payload_bytes = self.payload_bytes.saturating_add(payload.len());
     }
 
     fn len(&self) -> usize {
@@ -690,12 +718,21 @@ impl BatchBuf {
         self.len() == 0
     }
 
+    fn payload_bytes(&self) -> usize {
+        self.payload_bytes
+    }
+
+    fn would_exceed_batch_bytes(&self, next_payload_bytes: usize, max_batch_bytes: usize) -> bool {
+        !self.is_empty() && self.payload_bytes.saturating_add(next_payload_bytes) > max_batch_bytes
+    }
+
     fn to_record_batch(&mut self) -> Result<RecordBatch> {
         let ts_array = self.ts.finish().with_timezone_opt(Some(Arc::from("UTC")));
         let payload_array = self.payload.finish();
 
         self.ts = TimestampMillisecondBuilder::with_capacity(self.row_capacity);
         self.payload = StringBuilder::with_capacity(self.row_capacity, self.byte_capacity);
+        self.payload_bytes = 0;
 
         let ts = Arc::new(ts_array) as Arc<dyn arrow::array::Array>;
         let payload = Arc::new(payload_array) as Arc<dyn arrow::array::Array>;

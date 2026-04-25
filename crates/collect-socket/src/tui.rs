@@ -2,12 +2,14 @@ use collect_tui::{FieldKind, FieldState, TuiModel};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TuiConfig {
     pub tcp_host: String,
     pub tcp_port: String,
     pub source: String,
     pub out_dir: String,
     pub max_rows: String,
+    pub max_batch_bytes: String,
     pub keep_local: bool,
     pub s3_bucket: String,
     pub s3_endpoint: String,
@@ -25,6 +27,7 @@ impl Default for TuiConfig {
             source: String::new(),
             out_dir: "data".to_string(),
             max_rows: String::new(),
+            max_batch_bytes: String::new(),
             keep_local: false,
             s3_bucket: String::new(),
             s3_endpoint: String::new(),
@@ -54,6 +57,9 @@ impl TuiConfig {
         }
         if let Some(value) = env_value(&["MAX_ROWS"]) {
             config.max_rows = value;
+        }
+        if let Some(value) = env_value(&["MAX_BATCH_BYTES"]) {
+            config.max_batch_bytes = value;
         }
         if let Some(value) = env_value(&["S3_BUCKET"]) {
             config.s3_bucket = value;
@@ -129,6 +135,11 @@ impl TuiModel for TuiConfig {
                     kind: FieldKind::Text,
                 },
                 FieldState {
+                    label: "Max Batch Bytes",
+                    value: self.max_batch_bytes.clone(),
+                    kind: FieldKind::Text,
+                },
+                FieldState {
                     label: "Keep Local Files",
                     value: self.keep_local.to_string(),
                     kind: FieldKind::Bool,
@@ -181,6 +192,7 @@ impl TuiModel for TuiConfig {
             (0, 2) => Some("e.g., norway-tcp, telemetry, or leave blank"),
             (1, 0) => Some("e.g., data, /mnt/storage/parquet"),
             (1, 1) => Some("e.g., 10000 (optional, flushes on minute boundary by default)"),
+            (1, 2) => Some("e.g., 67108864 (optional, defaults to 64 MiB)"),
             (2, 0) => Some("e.g., my-bucket-name"),
             (2, 1) => Some("e.g., https://s3.example.com (for MinIO, R2, etc.)"),
             (2, 2) => Some("e.g., us-east-1, us-west-2, eu-central-1"),
@@ -205,6 +217,10 @@ impl TuiModel for TuiConfig {
 
         if !self.max_rows.is_empty() && self.max_rows.parse::<usize>().is_err() {
             errors.push("⚠ Max Rows must be a valid positive number".to_string());
+        }
+
+        if !self.max_batch_bytes.is_empty() && self.max_batch_bytes.parse::<usize>().is_err() {
+            errors.push("⚠ Max Batch Bytes must be a valid positive number".to_string());
         }
 
         if !self.s3_bucket.is_empty() {
@@ -234,7 +250,8 @@ impl TuiModel for TuiConfig {
             1 => match field {
                 0 => self.out_dir = value,
                 1 => self.max_rows = value,
-                2 => self.keep_local = !self.keep_local,
+                2 => self.max_batch_bytes = value,
+                3 => self.keep_local = !self.keep_local,
                 _ => {}
             },
             2 => match field {
@@ -252,7 +269,7 @@ impl TuiModel for TuiConfig {
 
     fn toggle_field(&mut self, tab: usize, field: usize) {
         match tab {
-            1 if field == 2 => self.keep_local = !self.keep_local,
+            1 if field == 3 => self.keep_local = !self.keep_local,
             2 if field == 5 => self.s3_disable_tls = !self.s3_disable_tls,
             _ => {}
         }
@@ -279,6 +296,10 @@ impl TuiModel for TuiConfig {
         if !self.max_rows.is_empty() {
             args.push("--max-rows".to_string());
             args.push(self.max_rows.clone());
+        }
+        if !self.max_batch_bytes.is_empty() {
+            args.push("--max-batch-bytes".to_string());
+            args.push(self.max_batch_bytes.clone());
         }
         if self.keep_local {
             args.push("--keep-local".to_string());

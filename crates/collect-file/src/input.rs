@@ -397,12 +397,14 @@ fn zip_error_to_io(path: &Path, entry_name: &str, error: zip::result::ZipError) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use collect_core::{run_ingest, CommonOptions, IngestOptions};
     use futures_util::StreamExt;
     use std::fs::File as StdFile;
     use std::io::Write;
     use std::sync::atomic::AtomicBool;
     use tempfile::tempdir;
     use tokio::io::AsyncWriteExt;
+    use walkdir::WalkDir;
 
     #[tokio::test]
     async fn reads_plain_gzip_bzip2_and_zip_entries_in_order() -> Result<()> {
@@ -424,6 +426,54 @@ mod tests {
         assert_eq!(
             lines,
             vec!["plain-1", "plain-2", "gzip-1", "bzip-1", "zip-1", "zip-2"]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn flushes_when_batch_bytes_are_small() -> Result<()> {
+        let dir = tempdir()?;
+        let input_path = dir.path().join("big.txt");
+        let out_dir = dir.path().join("out");
+        let health_file = dir.path().join("health");
+
+        let mut contents = String::new();
+        for i in 0..200 {
+            contents.push_str(&format!("line-{i:04} {}\n", "x".repeat(80)));
+        }
+        write_text_file(&input_path, &contents)?;
+
+        let mut source = FileInputSource::new(input_path, "source".to_string())?;
+        run_ingest(
+            &mut source,
+            IngestOptions {
+                common: CommonOptions {
+                    out_dir: out_dir.clone(),
+                    max_rows: None,
+                    max_batch_bytes: 1024,
+                    upload_drain_timeout_seconds: 1,
+                    max_line_length: 1024,
+                    health_check: false,
+                },
+                s3: None,
+                health_file,
+            },
+        )
+        .await?;
+
+        let parquet_files = WalkDir::new(&out_dir)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.file_type().is_file()
+                    && entry.path().extension().and_then(|ext| ext.to_str()) == Some("parquet")
+            })
+            .count();
+
+        assert!(
+            parquet_files > 1,
+            "expected multiple Parquet files, found {parquet_files}"
         );
 
         Ok(())

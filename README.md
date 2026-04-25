@@ -57,6 +57,7 @@ All command-line parameters can be configured using environment variables:
 | `SOURCE` | `--source` | Logical source label |
 | `OUT_DIR` | `--out-dir` | Output directory |
 | `MAX_ROWS` | `--max-rows` | Max rows per file |
+| `MAX_BATCH_BYTES` | `--max-batch-bytes` | Max payload bytes per Parquet file |
 | `UPLOAD_DRAIN_TIMEOUT_SECONDS` | `--upload-drain-timeout-seconds` | Max seconds to wait for upload drain |
 | `HEALTH_CHECK` | `--health-check` | Run health check |
 | `S3_BUCKET` | `--s3-bucket` | S3 bucket name |

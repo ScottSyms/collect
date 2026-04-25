@@ -7,8 +7,8 @@ All command-line parameters can be configured using environment variables, makin
 ### Input Source Configuration (Choose One)
 
 #### File Input
-- `INPUT_FILE`: Path to input text file (one record per line)
-  - Example: `INPUT_FILE=/input/data.txt`
+- `INPUT_PATH` / `INPUT_FILE`: Path to input file or directory
+  - Example: `INPUT_PATH=/input/data.txt`
   - Conflicts with TCP options
 
 #### TCP Input  
@@ -35,6 +35,10 @@ All command-line parameters can be configured using environment variables, makin
 - `MAX_ROWS`: Maximum rows to buffer per Parquet file before flush
   - Example: `MAX_ROWS=10000`
   - Default: flush on minute boundary only
+
+- `MAX_BATCH_BYTES`: Maximum payload bytes to buffer per Parquet file before flush
+  - Example: `MAX_BATCH_BYTES=67108864`
+  - Default: `67108864` (64 MiB)
 
 - `HEALTH_CHECK`: Run health check and exit (for Docker HEALTHCHECK)
   - Example: `HEALTH_CHECK=true`
@@ -119,7 +123,7 @@ services:
   data-ingest:
     image: hive-parquet-ingest:latest
     environment:
-      - INPUT_FILE=/input/data.txt
+      - INPUT_PATH=/input/data.txt
       - SOURCE=batch-data
       - S3_BUCKET=data-lake
       - S3_ENDPOINT=http://minio:9000
@@ -155,14 +159,14 @@ The application supports Docker health checks via the `HEALTH_CHECK` environment
 
 ```dockerfile
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=10s \
-  CMD ["/usr/local/bin/hive_parquet_ingest", "--health-check"]
+  CMD ["/usr/local/bin/collect-socket", "--health-check"]
 ```
 
 Or using environment variables:
 
 ```yaml
 healthcheck:
-  test: ["CMD", "/usr/local/bin/hive_parquet_ingest"]
+  test: ["CMD", "/usr/local/bin/collect-socket"]
   environment:
     - HEALTH_CHECK=true
   interval: 30s
