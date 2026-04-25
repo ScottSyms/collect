@@ -28,6 +28,10 @@ All command-line parameters can be configured using environment variables, makin
   - Example: `SOURCE=ais-sf-bay`
   - Default: input file stem or "tcp" for network input
 
+- `AIS`: Use NMEA `c:<epoch>` tag block timestamps when present, otherwise fall back to ingest time
+  - Example: `AIS=true`
+  - Default: `false`
+
 - `OUT_DIR`: Output root directory for Parquet files
   - Example: `OUT_DIR=/data`
   - Default: `data`

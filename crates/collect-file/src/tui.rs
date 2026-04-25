@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 pub struct TuiConfig {
     pub input_path: String,
     pub source: String,
+    pub ais: bool,
     pub out_dir: String,
     pub max_rows: String,
     pub max_batch_bytes: String,
@@ -23,6 +24,7 @@ impl Default for TuiConfig {
         Self {
             input_path: String::new(),
             source: String::new(),
+            ais: false,
             out_dir: "data".to_string(),
             max_rows: String::new(),
             max_batch_bytes: String::new(),
@@ -46,6 +48,9 @@ impl TuiConfig {
         }
         if let Some(value) = env_value(&["SOURCE"]) {
             config.source = value;
+        }
+        if let Some(value) = bool_env(&["AIS"]) {
+            config.ais = value;
         }
         if let Some(value) = env_value(&["OUT_DIR"]) {
             config.out_dir = value;
@@ -111,6 +116,11 @@ impl TuiModel for TuiConfig {
                     label: "Source Label",
                     value: self.source.clone(),
                     kind: FieldKind::Text,
+                },
+                FieldState {
+                    label: "AIS Tag Blocks",
+                    value: self.ais.to_string(),
+                    kind: FieldKind::Bool,
                 },
             ],
             1 => vec![
@@ -179,6 +189,7 @@ impl TuiModel for TuiConfig {
         match (tab, field) {
             (0, 0) => Some("e.g., /path/to/data or /path/to/directory"),
             (0, 1) => Some("e.g., test-data, norway, or leave blank to auto-detect"),
+            (0, 2) => Some("Use NMEA c:<epoch> tag blocks when present"),
             (1, 0) => Some("e.g., data, /mnt/storage/parquet"),
             (1, 1) => Some("e.g., 10000 (optional, flushes on minute boundary by default)"),
             (1, 2) => Some("e.g., 67108864 (optional, defaults to 64 MiB)"),
@@ -227,6 +238,7 @@ impl TuiModel for TuiConfig {
             0 => match field {
                 0 => self.input_path = value,
                 1 => self.source = value,
+                2 => self.ais = matches!(value.to_ascii_lowercase().as_str(), "true" | "1"),
                 _ => {}
             },
             1 => match field {
@@ -251,6 +263,7 @@ impl TuiModel for TuiConfig {
 
     fn toggle_field(&mut self, tab: usize, field: usize) {
         match tab {
+            0 if field == 2 => self.ais = !self.ais,
             1 if field == 3 => self.keep_local = !self.keep_local,
             2 if field == 5 => self.s3_disable_tls = !self.s3_disable_tls,
             _ => {}
@@ -267,6 +280,10 @@ impl TuiModel for TuiConfig {
         if !self.source.is_empty() {
             args.push("--source".to_string());
             args.push(self.source.clone());
+        }
+
+        if self.ais {
+            args.push("--ais".to_string());
         }
 
         args.push("--out-dir".to_string());

@@ -5,6 +5,7 @@ A Rust workspace for ingesting data into Hive-partitioned Parquet files with Zst
 ## Features
 - **Multiple Input Sources**: Plain, compressed, or TCP stream
 - **Compressed Inputs**: Plain text, gzip, bzip2, and zip files
+- **AIS Timestamps**: Optional NMEA tag block timestamping for legacy captures
 - **Hive Partitioning**: Automatic partitioning by source, year, month, day, hour, and minute
 - **Parquet Format**: Efficient columnar storage with Zstd compression
 - **S3 Integration**: Upload to AWS S3 or S3-compatible storage (MinIO) with optional TLS
@@ -43,7 +44,7 @@ cargo run -p collect-socket -- --tcp-host 153.44.253.27 --tcp-port 5631 --source
 cargo run -p collect-file -- --input data.txt --source mydata --s3-bucket maritime-data
 ```
 
-`collect-file` auto-detects plain text, gzip, bzip2, and zip inputs. Zip archives are read entry-by-entry in archive order. Tar and 7z archives are not supported.
+`collect-file` auto-detects plain text, gzip, bzip2, and zip inputs. Zip archives are read entry-by-entry in archive order. Tar and 7z archives are not supported. Use `--ais` to prefer NMEA `c:<epoch>` tag block timestamps when present; otherwise it falls back to ingest time.
 
 ## Environment Variables
 
@@ -55,6 +56,7 @@ All command-line parameters can be configured using environment variables:
 | `TCP_HOST` | `--tcp-host` | TCP host address |
 | `TCP_PORT` | `--tcp-port` | TCP port number |
 | `SOURCE` | `--source` | Logical source label |
+| `AIS` | `--ais` | Use NMEA `c:<epoch>` tag block timestamps |
 | `OUT_DIR` | `--out-dir` | Output directory |
 | `MAX_ROWS` | `--max-rows` | Max rows per file |
 | `MAX_BATCH_BYTES` | `--max-batch-bytes` | Max payload bytes per Parquet file |

@@ -5,8 +5,11 @@ edition.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+arrow.workspace = true
 clap.workspace = true
+chrono.workspace = true
 futures-util.workspace = true
+parquet.workspace = true
 serde.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

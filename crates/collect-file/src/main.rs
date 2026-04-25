@@ -13,7 +13,7 @@ mod tui;
 #[derive(Parser, Debug)]
 #[command(
     version,
-    about = "Recursively ingest plain, gzip, bzip2, and zip files into Hive-partitioned Parquet with Zstd compression"
+    about = "Recursively ingest plain, gzip, bzip2, and zip files into Hive-partitioned Parquet with Zstd compression, with optional AIS tag-block timestamps"
 )]
 struct Args {
     /// Input file or directory to ingest
@@ -23,6 +23,10 @@ struct Args {
     /// Logical source label; defaults to input file stem or directory name
     #[arg(short, long)]
     source: Option<String>,
+
+    /// Use AIS NMEA tag block timestamps when present
+    #[arg(long)]
+    ais: bool,
 
     #[command(flatten)]
     common: CommonCliArgs,
@@ -69,6 +73,12 @@ async fn main() -> Result<()> {
         }
     }
 
+    if !args.ais {
+        if let Ok(value) = std::env::var("AIS") {
+            args.ais = matches!(value.to_ascii_lowercase().as_str(), "true" | "1");
+        }
+    }
+
     args.common.apply_env();
     args.s3.apply_env();
 
@@ -80,7 +90,7 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| default_source_from_path(&input));
 
     let health_file = health_file_path("collect-file");
-    let mut source = input::FileInputSource::new(input, source_name)?;
+    let mut source = input::FileInputSource::new(input, source_name, args.ais)?;
 
     run_ingest(
         &mut source,

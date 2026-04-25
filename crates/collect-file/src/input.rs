@@ -15,6 +15,7 @@ use walkdir::WalkDir;
 #[derive(Debug)]
 pub(crate) struct FileInputSource {
     source: String,
+    ais: bool,
     jobs: Vec<InputJob>,
     cursor: usize,
 }
@@ -39,7 +40,7 @@ struct InputJob {
 }
 
 impl FileInputSource {
-    pub(crate) fn new(input: PathBuf, source: String) -> Result<Self> {
+    pub(crate) fn new(input: PathBuf, source: String, ais: bool) -> Result<Self> {
         let input_display = input.display().to_string();
         let mut jobs = if input.is_file() {
             expand_input_path(&input)?
@@ -67,6 +68,7 @@ impl FileInputSource {
 
         Ok(Self {
             source,
+            ais,
             jobs,
             cursor: 0,
         })
@@ -90,6 +92,14 @@ impl FileInputSource {
 impl LineSource for FileInputSource {
     fn source_name(&self) -> &str {
         &self.source
+    }
+
+    fn timestamp_for_payload(&self, payload: &str) -> Option<i64> {
+        if self.ais {
+            ais_timestamp_ms(payload)
+        } else {
+            None
+        }
     }
 
     async fn open(&mut self, max_line_length: usize) -> Result<LineReader> {
@@ -334,6 +344,27 @@ fn is_bzip2_magic(prefix: &[u8]) -> bool {
     prefix.starts_with(b"BZh")
 }
 
+fn ais_timestamp_ms(payload: &str) -> Option<i64> {
+    let sentence_start = payload
+        .char_indices()
+        .find(|(_, ch)| *ch == '!' || *ch == '$')
+        .map(|(idx, _)| idx)
+        .unwrap_or(payload.len());
+    let prefix = &payload[..sentence_start];
+    let idx = prefix.find("c:")?;
+    let digits = prefix[idx + 2..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+
+    if digits.is_empty() {
+        return None;
+    }
+
+    let seconds = digits.parse::<u64>().ok()?;
+    Some(seconds.saturating_mul(1_000) as i64)
+}
+
 fn open_zip_entry_reader(
     path: PathBuf,
     entry_index: usize,
@@ -397,8 +428,11 @@ fn zip_error_to_io(path: &Path, entry_name: &str, error: zip::result::ZipError) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::StringArray;
+    use chrono::{Datelike, TimeZone, Timelike, Utc};
     use collect_core::{run_ingest, CommonOptions, IngestOptions};
     use futures_util::StreamExt;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use std::fs::File as StdFile;
     use std::io::Write;
     use std::sync::atomic::AtomicBool;
@@ -420,7 +454,7 @@ mod tests {
             .context("write bzip2 fixture")?;
         write_zip_file(&root.join("d_archive.zip"))?;
 
-        let mut source = FileInputSource::new(root.to_path_buf(), "source".to_string())?;
+        let mut source = FileInputSource::new(root.to_path_buf(), "source".to_string(), false)?;
         let lines = collect_all_lines(&mut source, 1024).await?;
 
         assert_eq!(
@@ -444,7 +478,7 @@ mod tests {
         }
         write_text_file(&input_path, &contents)?;
 
-        let mut source = FileInputSource::new(input_path, "source".to_string())?;
+        let mut source = FileInputSource::new(input_path, "source".to_string(), false)?;
         run_ingest(
             &mut source,
             IngestOptions {
@@ -485,7 +519,7 @@ mod tests {
         let path = dir.path().join("archive.tar.gz");
         write_gzip_file(&path, "gzip-1\n").await?;
 
-        let mut source = FileInputSource::new(path, "source".to_string())?;
+        let mut source = FileInputSource::new(path, "source".to_string(), false)?;
         let lines = collect_all_lines(&mut source, 1024).await?;
 
         assert_eq!(lines, vec!["gzip-1"]);
@@ -498,7 +532,7 @@ mod tests {
         let path = dir.path().join("archive.tar.gz");
         write_zip_file(&path)?;
 
-        let mut source = FileInputSource::new(path, "source".to_string())?;
+        let mut source = FileInputSource::new(path, "source".to_string(), false)?;
         let lines = collect_all_lines(&mut source, 1024).await?;
 
         assert_eq!(lines, vec!["zip-1", "zip-2"]);
@@ -511,9 +545,102 @@ mod tests {
         let path = dir.path().join("archive.tar");
         write_text_file(&path, "not used\n").expect("write file");
 
-        let error = FileInputSource::new(path, "source".to_string())
+        let error = FileInputSource::new(path, "source".to_string(), false)
             .expect_err("tar files should be rejected");
         assert!(error.to_string().contains("tar archives are not supported"));
+    }
+
+    #[tokio::test]
+    async fn parses_ais_timestamp_when_enabled() {
+        let source = FileInputSource {
+            source: "source".to_string(),
+            ais: true,
+            jobs: vec![],
+            cursor: 0,
+        };
+
+        assert_eq!(
+            source.timestamp_for_payload("c:1643588424!AIVDM,1,1,,A,HELLO,0"),
+            Some(1_643_588_424_000)
+        );
+        assert_eq!(source.timestamp_for_payload("!AIVDM,1,1,,A,HELLO,0"), None);
+        assert_eq!(
+            source.timestamp_for_payload("c:bad!AIVDM,1,1,,A,HELLO,0"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn uses_ais_timestamp_for_partitioning_and_keeps_payload() -> Result<()> {
+        let dir = tempdir()?;
+        let input_path = dir.path().join("ais.txt");
+        let out_dir = dir.path().join("out");
+        let health_file = dir.path().join("health");
+        let ais_line = "c:1609459200!AIVDM,1,1,,A,HELLO,0\n";
+
+        write_text_file(&input_path, ais_line)?;
+
+        let mut source = FileInputSource::new(input_path, "ais-source".to_string(), true)?;
+        assert_eq!(
+            source.timestamp_for_payload(ais_line.trim_end()),
+            Some(1_609_459_200_000)
+        );
+
+        run_ingest(
+            &mut source,
+            IngestOptions {
+                common: CommonOptions {
+                    out_dir: out_dir.clone(),
+                    max_rows: Some(1),
+                    max_batch_bytes: 1024 * 1024,
+                    upload_drain_timeout_seconds: 1,
+                    max_line_length: 1024,
+                    health_check: false,
+                },
+                s3: None,
+                health_file,
+            },
+        )
+        .await?;
+
+        let expected = Utc
+            .timestamp_opt(1_609_459_200, 0)
+            .single()
+            .expect("valid AIS timestamp");
+        let expected_partition = format!(
+            "source=ais-source/year={:04}/month={:02}/day={:02}/hour={:02}/minute={:02}",
+            expected.year(),
+            expected.month(),
+            expected.day(),
+            expected.hour(),
+            expected.minute()
+        );
+        let expected_dir = out_dir.join(expected_partition);
+
+        let parquet_file = WalkDir::new(&expected_dir)
+            .into_iter()
+            .filter_map(Result::ok)
+            .find(|entry| {
+                entry.file_type().is_file()
+                    && entry.path().extension().and_then(|ext| ext.to_str()) == Some("parquet")
+            })
+            .map(|entry| entry.into_path())
+            .context("missing parquet output")?;
+
+        let file = StdFile::open(&parquet_file)?;
+        let mut reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+        let batch = reader
+            .next()
+            .transpose()?
+            .context("missing parquet batch")?;
+        let payload = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .context("missing payload column")?;
+
+        assert_eq!(payload.value(0), ais_line.trim_end());
+        Ok(())
     }
 
     async fn collect_all_lines(

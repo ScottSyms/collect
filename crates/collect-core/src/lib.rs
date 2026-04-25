@@ -137,6 +137,10 @@ pub enum ReaderTransition {
 pub trait LineSource {
     fn source_name(&self) -> &str;
 
+    fn timestamp_for_payload(&self, _payload: &str) -> Option<i64> {
+        None
+    }
+
     async fn open(&mut self, max_line_length: usize) -> Result<LineReader>;
 
     async fn on_stream_end(
@@ -363,7 +367,7 @@ where
     });
 
     let now = now_unix_duration();
-    let mut current_minute_id = now.as_secs() / 60;
+    let mut current_minute_id = minute_id_from_millis(now.as_millis() as i64);
     let mut current_key = PartKey::from_minute(source.source_name(), current_minute_id);
     let mut buf = BatchBuf::new(common.max_rows, common.max_batch_bytes);
     let mut rows_in_file = 0usize;
@@ -391,7 +395,8 @@ where
                     Some(Ok(payload)) => {
                         let duration = now_unix_duration();
                         let now_ms = duration.as_millis() as i64;
-                        let minute_id = duration.as_secs() / 60;
+                        let row_ts_ms = source.timestamp_for_payload(&payload).unwrap_or(now_ms);
+                        let minute_id = minute_id_from_millis(row_ts_ms);
                         let payload_len = payload.len();
 
                         if minute_id != current_minute_id {
@@ -409,7 +414,7 @@ where
                             rows_in_file = 0;
                         }
 
-                        buf.push(now_ms, &payload);
+                        buf.push(row_ts_ms, &payload);
                         rows_in_file += 1;
 
                         if buf.payload_bytes() >= common.max_batch_bytes {
@@ -904,4 +909,8 @@ fn now_unix_duration() -> Duration {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|_| Duration::from_secs(0))
+}
+
+fn minute_id_from_millis(timestamp_ms: i64) -> u64 {
+    timestamp_ms.max(0) as u64 / 1_000 / 60
 }
