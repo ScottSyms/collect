@@ -1,5 +1,7 @@
 # TUI Enhancements Summary
 
+> Legacy documentation for the pre-workspace single-binary layout. The current workspace focuses on `collect-file` and `collect-socket`.
+
 ## Overview
 Enhanced the Terminal User Interface (TUI) with validation, hints, and configuration file management capabilities.
 

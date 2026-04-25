@@ -9,11 +9,11 @@ The application now supports a `--health-check` flag that can be used by Docker'
 
 ```bash
 # Manual health check
-./hive_parquet_ingest --health-check
+./target/release/collect-socket --health-check
 ```
 
 ### 2. Health Status Tracking
-- The application maintains a health status file at `/tmp/app_health`
+- The application maintains a health status file at `/tmp/collect-socket.health` (socket binary) or `/tmp/collect-file.health` (file binary)
 - Status is updated every 100 processed records
 - Health check considers the application healthy if:
   - Status file exists
@@ -24,7 +24,7 @@ The application now supports a `--health-check` flag that can be used by Docker'
 
 #### Building the Docker Image
 ```bash
-docker build -t hive-parquet-ingest .
+docker build -t collect .
 ```
 
 #### Running with Docker Compose
@@ -45,13 +45,14 @@ docker inspect --format='{{json .State.Health}}' data-ingest | jq
 ```bash
 docker run -d \
   --name data-ingest \
+  --entrypoint /usr/local/bin/collect-file \
   -v $(pwd)/input:/input:ro \
   -v $(pwd)/output:/data \
-  --health-cmd "/usr/local/bin/hive_parquet_ingest --health-check" \
+  --health-cmd "/usr/local/bin/collect-file --health-check" \
   --health-interval 30s \
   --health-timeout 10s \
   --health-retries 3 \
-  hive-parquet-ingest \
+  collect \
   --input /input/data.txt --source mydata
 ```
 
@@ -60,11 +61,11 @@ docker run -d \
 docker run -d \
   --name data-ingest \
   -v $(pwd)/output:/data \
-  --health-cmd "/usr/local/bin/hive_parquet_ingest --health-check" \
+  --health-cmd "/usr/local/bin/collect-socket --health-check" \
   --health-interval 30s \
   --health-timeout 10s \
   --health-retries 3 \
-  hive-parquet-ingest \
+  collect \
   --tcp-host 153.44.253.27 --tcp-port 5631 --source norway-tcp
 ```
 
@@ -93,7 +94,7 @@ You can expose health metrics by parsing the health status file:
 
 ```bash
 # Example metric export
-echo "app_healthy{service=\"data-ingest\"} $([ -f /tmp/app_health ] && echo 1 || echo 0)"
+echo "app_healthy{service=\"data-ingest\"} $([ -f /tmp/collect-socket.health ] && echo 1 || echo 0)"
 ```
 
 #### Alerting Examples
@@ -114,7 +115,7 @@ services:
 livenessProbe:
   exec:
     command:
-    - /usr/local/bin/hive_parquet_ingest
+    - /usr/local/bin/collect-socket
     - --health-check
   initialDelaySeconds: 30
   periodSeconds: 30
@@ -124,7 +125,7 @@ livenessProbe:
 readinessProbe:
   exec:
     command:
-    - /usr/local/bin/hive_parquet_ingest  
+    - /usr/local/bin/collect-socket  
     - --health-check
   initialDelaySeconds: 5
   periodSeconds: 10
@@ -137,7 +138,7 @@ readinessProbe:
 #### Viewing Health Status
 ```bash
 # Check current health status
-docker exec data-ingest cat /tmp/app_health
+docker exec data-ingest cat /tmp/collect-socket.health
 
 # View container health history
 docker inspect data-ingest | jq '.State.Health.Log'
@@ -149,12 +150,12 @@ docker-compose logs -f data-ingest
 #### Common Issues
 1. **Health check failing**: Check if the application is actually processing data
 2. **Stale timestamps**: Application may be stuck in a loop or blocked on input
-3. **Permission issues**: Ensure the application can write to `/tmp/app_health`
+3. **Permission issues**: Ensure the application can write to the relevant `/tmp/collect-*.health` file
 
 #### Debug Mode
 ```bash
 # Run with debug output
-docker run --rm -it hive-parquet-ingest --health-check
+docker run --rm -it collect --health-check
 ```
 
 This health check system provides comprehensive monitoring for Docker environments, ensuring your data ingestion pipeline maintains high availability and can be automatically managed by orchestration systems.

@@ -3,7 +3,7 @@ FROM rust:1.91.1 AS builder
 
 WORKDIR /usr/src/app
 COPY Cargo.toml Cargo.lock ./
-COPY src ./src
+COPY crates ./crates
 
 
 RUN apt-get update && apt-get install -y musl-tools pkg-config build-essential libssl-dev && rm -rf /var/lib/apt/lists/*
@@ -12,8 +12,8 @@ RUN apt-get update && apt-get install -y musl-tools pkg-config build-essential l
 # ENV RUSTFLAGS="-C target-feature=-crt-static"
 # ENV OPENSSL_DIR=/usr/lib/x86_64-linux-gnu
 
-# Build the application
-RUN cargo build --release # --target=x86_64-unknown-linux-musl
+# Build the workspace binaries
+RUN cargo build --release --workspace
 
 # Runtime stage
 FROM debian:latest
@@ -26,8 +26,9 @@ RUN apt-get update && apt-get install -y \
 # Create app user
 RUN useradd -m -u 1000 appuser
 
-# Copy the binary from builder stage
-COPY --from=builder /usr/src/app/target/release/capture /usr/local/bin/capture
+# Copy the binaries from the builder stage
+COPY --from=builder /usr/src/app/target/release/collect-file /usr/local/bin/collect-file
+COPY --from=builder /usr/src/app/target/release/collect-socket /usr/local/bin/collect-socket
 
 # Create data directory
 RUN mkdir -p /data && chown appuser:appuser /data
@@ -38,9 +39,5 @@ USER appuser
 # Set working directory
 WORKDIR /data
 
-# Add health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD /usr/local/bin/capture --health-check
-
 # Default command (override with docker run arguments)
-ENTRYPOINT ["/usr/local/bin/capture"]
+ENTRYPOINT ["/usr/local/bin/collect-socket"]

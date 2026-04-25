@@ -1,5 +1,7 @@
 # TUI (Terminal User Interface) Guide
 
+> Legacy documentation for the pre-workspace single-binary layout. The current workspace focuses on `collect-file` and `collect-socket`.
+
 ## Overview
 
 The `capture` tool includes an interactive Terminal User Interface (TUI) for easy configuration of all available options. The TUI provides a tab-based interface with validation, hints, and config file support.

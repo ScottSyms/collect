@@ -1,5 +1,7 @@
 # Profiling Guide for Hive Parquet Ingest
 
+> Legacy guide for the pre-workspace single-binary layout.
+
 This guide covers various methods to profile the compute and memory resources used by the `hive_parquet_ingest` executable.
 
 ## Quick Overview

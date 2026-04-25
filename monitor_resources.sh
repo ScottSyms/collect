@@ -1,4 +1,5 @@
 #!/bin/bash
+# Legacy helper for the pre-workspace single-binary layout.
 # Real-time resource monitor for hive_parquet_ingest
 
 if [ -z "$1" ]; then

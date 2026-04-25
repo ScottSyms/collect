@@ -11,7 +11,7 @@ export AWS_ACCESS_KEY_ID=your-access-key
 export AWS_SECRET_ACCESS_KEY=your-secret-key
 
 # Run with S3 upload enabled
-./capture \
+cargo run -p collect-socket -- \
     --tcp-host 153.44.253.27 --tcp-port 5631 \
     --source norway-tcp \
     --s3-bucket my-data-bucket \
@@ -20,7 +20,7 @@ export AWS_SECRET_ACCESS_KEY=your-secret-key
 
 ### AWS S3 (using command line)
 ```bash
-./capture \
+cargo run -p collect-socket -- \
     --tcp-host 153.44.253.27 --tcp-port 5631 \
     --source norway-tcp \
     --s3-bucket my-data-bucket \
@@ -31,7 +31,7 @@ export AWS_SECRET_ACCESS_KEY=your-secret-key
 
 ### MinIO (self-hosted S3-compatible storage)
 ```bash
-./capture \
+cargo run -p collect-file -- \
     --input data.txt \
     --source mydata \
     --s3-bucket data-lake \
@@ -45,7 +45,7 @@ export AWS_SECRET_ACCESS_KEY=your-secret-key
 
 ### Other S3-compatible services (Wasabi, DigitalOcean Spaces, etc.)
 ```bash
-./capture \
+cargo run -p collect-socket -- \
     --tcp-host 153.44.253.27 --tcp-port 5631 \
     --s3-bucket my-bucket \
     --s3-endpoint https://s3.wasabisys.com \

@@ -1,5 +1,7 @@
 # Quick Profiling Guide
 
+> Legacy guide for the pre-workspace single-binary layout.
+
 ## Immediate Resource Monitoring
 
 ### 1. Basic Resource Usage

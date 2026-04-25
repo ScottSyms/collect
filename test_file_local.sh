@@ -6,7 +6,7 @@ DATA_DIR="${SCRIPT_DIR}/data"
 INPUT_FILE="${SCRIPT_DIR}/norway.nmea"
 
 echo "Building release binary..."
-cargo build --release
+cargo build --release -p collect-file
 
 if [[ -z "$DATA_DIR" || "$DATA_DIR" == "/" ]]; then
   echo "Refusing to clean invalid data directory: '$DATA_DIR'"
@@ -24,7 +24,7 @@ mkdir -p "$DATA_DIR"
 
 echo "Starting capture with file input: $INPUT_FILE"
 start_time=$(date +%s)
-cargo run --release -- \
+cargo run --release -p collect-file -- \
   --input "$INPUT_FILE" \
   --source test-file-local \
   --out-dir "$DATA_DIR"
