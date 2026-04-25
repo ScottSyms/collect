@@ -19,7 +19,8 @@ fn default_concurrency() -> usize {
 #[derive(Parser, Debug)]
 #[command(
     version,
-    about = "Maintain hive-partitioned Parquet collections stored locally or on S3"
+    about = "Maintain hive-partitioned Parquet collections stored locally or on S3",
+    after_help = "Examples:\n  collect-maint --root data inspect\n  collect-maint --root data compact\n  collect-maint --root data compact --apply\n  collect-maint --root data vacuum\n  collect-maint --root data vacuum --apply\n\nNotes:\n  compact and vacuum are dry-run by default. Re-run with --apply to make changes."
 )]
 struct Cli {
     #[command(flatten)]
@@ -80,20 +81,20 @@ enum Command {
     /// Validate parquet files and partition timestamps
     Validate,
 
-    /// Compact small parquet files within a single partition
+    /// Compact small parquet files within a single partition (dry run by default; use --apply to execute)
     Compact {
         /// Target maximum bytes per compacted file
         #[arg(long, default_value_t = 268_435_456)]
         target_file_size_bytes: u64,
 
-        /// Apply changes instead of only showing the plan
+        /// Actually apply changes (dry run by default)
         #[arg(long)]
         apply: bool,
     },
 
-    /// Clean up temporary files and interrupted compaction manifests
+    /// Clean up temporary files and interrupted compaction manifests (dry run by default; use --apply to execute)
     Vacuum {
-        /// Apply changes instead of only showing the plan
+        /// Actually apply changes (dry run by default)
         #[arg(long)]
         apply: bool,
     },

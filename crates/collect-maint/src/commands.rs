@@ -13,9 +13,10 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use parquet::schema::types::ColumnPath;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File as StdFile;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 const SMALL_PARQUET_FILE_BYTES: u64 = 256 * 1024 * 1024;
 
@@ -346,6 +347,10 @@ pub async fn compact(
     apply: bool,
     concurrency: usize,
 ) -> Result<()> {
+    report(
+        "compact",
+        format!("planning compaction for {} entries", count(entries.len())),
+    );
     let jobs = plan_compaction(entries, target_file_size_bytes);
     if jobs.is_empty() {
         println!("No compactable partitions found");
@@ -357,6 +362,12 @@ pub async fn compact(
         "compact",
         format!("planned {} job(s) with {} workers", count(jobs.len()), count(concurrency.max(1))),
     );
+
+    if apply {
+        report("compact", "applying changes (--apply)");
+    } else {
+        report("compact", "dry run only; re-run with --apply to execute");
+    }
 
     if !apply {
         for (index, job) in jobs.iter().enumerate() {
@@ -419,6 +430,12 @@ pub async fn vacuum(
         format!("scanning {} entries with {} workers", count(entries.len()), count(concurrency.max(1))),
     );
 
+    if apply {
+        report("vacuum", "applying changes (--apply)");
+    } else {
+        report("vacuum", "dry run only; re-run with --apply to execute");
+    }
+
     let total = entries.len();
     let mut completed = 0usize;
     let mut results = Vec::with_capacity(entries.len());
@@ -459,25 +476,91 @@ pub async fn vacuum(
 
 fn plan_compaction(entries: &[DatasetEntry], target_file_size_bytes: u64) -> Vec<CompactionJob> {
     let mut by_partition: BTreeMap<PartitionKey, Vec<DatasetEntry>> = BTreeMap::new();
+    let mut blocked_partitions: BTreeSet<PartitionKey> = BTreeSet::new();
+    let total_entries = entries.len();
+    let heartbeat_interval = Duration::from_secs(5);
+    let mut last_report = Instant::now();
 
-    for entry in entries {
+    for (index, entry) in entries.iter().enumerate() {
         if entry.kind != EntryKind::Parquet {
+            if let Some(partition) = entry.partition.clone() {
+                blocked_partitions.insert(partition);
+            }
+            if index == 0 || index + 1 == total_entries || last_report.elapsed() >= heartbeat_interval {
+                report(
+                    "compact",
+                    format!(
+                        "planning compaction: indexed {} / {} entries across {} partition(s)",
+                        count(index + 1),
+                        count(total_entries),
+                        count(by_partition.len())
+                    ),
+                );
+                last_report = Instant::now();
+            }
             continue;
         }
         let Some(partition) = entry.partition.clone() else {
+            if index == 0 || index + 1 == total_entries || last_report.elapsed() >= heartbeat_interval {
+                report(
+                    "compact",
+                    format!(
+                        "planning compaction: indexed {} / {} entries across {} partition(s)",
+                        count(index + 1),
+                        count(total_entries),
+                        count(by_partition.len())
+                    ),
+                );
+                last_report = Instant::now();
+            }
             continue;
         };
         by_partition.entry(partition).or_default().push(entry.clone());
+
+        if index == 0 || index + 1 == total_entries || last_report.elapsed() >= heartbeat_interval {
+            report(
+                "compact",
+                format!(
+                    "planning compaction: indexed {} / {} entries across {} partition(s)",
+                    count(index + 1),
+                    count(total_entries),
+                    count(by_partition.len())
+                ),
+            );
+            last_report = Instant::now();
+        }
     }
 
-    let mut jobs = Vec::new();
+    report(
+        "compact",
+        format!(
+            "planning compaction: partition index ready with {} partition(s)",
+            count(by_partition.len())
+        ),
+    );
 
-    for (partition, mut files) in by_partition {
-        let has_non_parquet_artifacts = entries.iter().any(|entry| {
-            entry.partition.as_ref() == Some(&partition)
-                && matches!(entry.kind, EntryKind::Manifest | EntryKind::Temp | EntryKind::CompactedParquet | EntryKind::Other)
-        });
-        if has_non_parquet_artifacts || files.len() < 2 {
+    let mut jobs = Vec::new();
+    let total_partitions = by_partition.len();
+    let mut partition_report = Instant::now();
+
+    for (partition_index, (partition, mut files)) in by_partition.into_iter().enumerate() {
+        if partition_index == 0
+            || partition_index + 1 == total_partitions
+            || partition_report.elapsed() >= heartbeat_interval
+        {
+            report(
+                "compact",
+                format!(
+                    "planning compaction: evaluated {} / {} partition(s), planned {} job(s)",
+                    count(partition_index + 1),
+                    count(total_partitions),
+                    count(jobs.len())
+                ),
+            );
+                partition_report = Instant::now();
+        }
+
+        if blocked_partitions.contains(&partition) || files.len() < 2 {
             continue;
         }
 

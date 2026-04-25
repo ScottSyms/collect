@@ -46,6 +46,27 @@ cargo run -p collect-file -- --input data.txt --source mydata --s3-bucket mariti
 
 `collect-file` auto-detects plain text, gzip, bzip2, and zip inputs. Zip archives are read entry-by-entry in archive order. Tar and 7z archives are not supported. Use `--ais` to prefer NMEA `c:<epoch>` tag block timestamps when present; otherwise it falls back to ingest time.
 
+## Maintenance
+
+`collect-maint` inspects and repairs hive-partitioned datasets. `compact` and `vacuum` are dry-run by default; add `--apply` to make changes.
+
+```bash
+# Read-only inspection
+cargo run -p collect-maint -- --root data inspect
+
+# Dry-run compaction plan
+cargo run -p collect-maint -- --root data compact
+
+# Real compaction run
+cargo run -p collect-maint -- --root data compact --apply
+
+# Dry-run cleanup plan
+cargo run -p collect-maint -- --root data vacuum
+
+# Real cleanup run
+cargo run -p collect-maint -- --root data vacuum --apply
+```
+
 ## Environment Variables
 
 All command-line parameters can be configured using environment variables:
