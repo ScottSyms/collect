@@ -24,7 +24,7 @@ struct Args {
     #[arg(short, long)]
     source: Option<String>,
 
-    /// Use AIS NMEA tag block timestamps when present
+    /// Use AIS NMEA tag block timestamps when present, including grouped \g fragments
     #[arg(long)]
     ais: bool,
 

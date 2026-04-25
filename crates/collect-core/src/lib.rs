@@ -144,7 +144,7 @@ pub enum ReaderTransition {
 pub trait LineSource {
     fn source_name(&self) -> &str;
 
-    fn timestamp_for_payload(&self, _payload: &str) -> Option<i64> {
+    fn timestamp_for_payload(&mut self, _payload: &str) -> Option<i64> {
         None
     }
 

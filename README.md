@@ -44,7 +44,7 @@ cargo run -p collect-socket -- --tcp-host 153.44.253.27 --tcp-port 5631 --source
 cargo run -p collect-file -- --input data.txt --source mydata --s3-bucket maritime-data
 ```
 
-`collect-file` auto-detects plain text, gzip, bzip2, and zip inputs. Zip archives are read entry-by-entry in archive order. Tar and 7z archives are not supported. Use `--ais` to prefer NMEA `c:<epoch>` tag block timestamps when present; otherwise it falls back to ingest time.
+`collect-file` auto-detects plain text, gzip, bzip2, and zip inputs. Zip archives are read entry-by-entry in archive order. Tar and 7z archives are not supported. Use `--ais` to prefer NMEA `c:<epoch>` tag block timestamps when present; grouped `\g:` fragments reuse the first sentence timestamp for the whole AIS message; otherwise it falls back to ingest time.
 
 ## Maintenance
 

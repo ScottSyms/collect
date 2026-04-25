@@ -2,6 +2,7 @@ use anyhow::{bail, Context, Result};
 use async_compression::tokio::bufread::{BzDecoder, GzipDecoder};
 use bytes::Bytes;
 use collect_core::{format_count, line_reader_from_async_read, IngestProgress, LineReader, LineSource, ReaderTransition};
+use std::collections::HashMap;
 use std::cmp::Ordering;
 use std::fs::File as StdFile;
 use std::io::{self, Read};
@@ -16,6 +17,7 @@ use walkdir::WalkDir;
 pub(crate) struct FileInputSource {
     source: String,
     ais: bool,
+    ais_group_timestamps: HashMap<String, i64>,
     jobs: Vec<InputJob>,
     cursor: usize,
 }
@@ -69,6 +71,7 @@ impl FileInputSource {
         Ok(Self {
             source,
             ais,
+            ais_group_timestamps: HashMap::new(),
             jobs,
             cursor: 0,
         })
@@ -80,6 +83,10 @@ impl FileInputSource {
             .get(self.cursor)
             .cloned()
             .context("no more input files to open")?;
+
+        if self.cursor > 0 {
+            self.ais_group_timestamps.clear();
+        }
 
         let current_index = self.cursor + 1;
         let total = self.jobs.len();
@@ -114,12 +121,23 @@ impl LineSource for FileInputSource {
         })
     }
 
-    fn timestamp_for_payload(&self, payload: &str) -> Option<i64> {
-        if self.ais {
-            ais_timestamp_ms(payload)
-        } else {
-            None
+    fn timestamp_for_payload(&mut self, payload: &str) -> Option<i64> {
+        if !self.ais {
+            return None;
         }
+
+        let tag_block = parse_ais_tag_block(payload);
+
+        if let Some(timestamp_ms) = tag_block.timestamp_ms {
+            if let Some(group_id) = tag_block.group_id {
+                self.ais_group_timestamps.insert(group_id, timestamp_ms);
+            }
+            return Some(timestamp_ms);
+        }
+
+        tag_block
+            .group_id
+            .and_then(|group_id| self.ais_group_timestamps.get(&group_id).copied())
     }
 
     async fn open(&mut self, max_line_length: usize) -> Result<LineReader> {
@@ -364,15 +382,41 @@ fn is_bzip2_magic(prefix: &[u8]) -> bool {
     prefix.starts_with(b"BZh")
 }
 
-fn ais_timestamp_ms(payload: &str) -> Option<i64> {
+#[derive(Debug, Default)]
+struct AisTagBlock {
+    timestamp_ms: Option<i64>,
+    group_id: Option<String>,
+}
+
+fn parse_ais_tag_block(payload: &str) -> AisTagBlock {
     let sentence_start = payload
         .char_indices()
         .find(|(_, ch)| *ch == '!' || *ch == '$')
         .map(|(idx, _)| idx)
         .unwrap_or(payload.len());
     let prefix = &payload[..sentence_start];
-    let idx = prefix.find("c:")?;
-    let digits = prefix[idx + 2..]
+    let mut tag_block = AisTagBlock::default();
+
+    for raw_field in prefix.split(',') {
+        let field = raw_field.trim_matches('\\');
+        let field = field.split('*').next().unwrap_or(field).trim();
+
+        if let Some(value) = field.strip_prefix("c:") {
+            if tag_block.timestamp_ms.is_none() {
+                tag_block.timestamp_ms = parse_ais_timestamp_ms(value);
+            }
+        } else if let Some(value) = field.strip_prefix("g:") {
+            if tag_block.group_id.is_none() {
+                tag_block.group_id = parse_ais_group_id(value);
+            }
+        }
+    }
+
+    tag_block
+}
+
+fn parse_ais_timestamp_ms(value: &str) -> Option<i64> {
+    let digits = value
         .chars()
         .take_while(|ch| ch.is_ascii_digit())
         .collect::<String>();
@@ -383,6 +427,21 @@ fn ais_timestamp_ms(payload: &str) -> Option<i64> {
 
     let seconds = digits.parse::<u64>().ok()?;
     Some(seconds.saturating_mul(1_000) as i64)
+}
+
+fn parse_ais_group_id(value: &str) -> Option<String> {
+    let candidate = value
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .last()
+        .unwrap_or(value)
+        .trim();
+
+    if candidate.is_empty() {
+        None
+    } else {
+        Some(candidate.to_string())
+    }
 }
 
 fn open_zip_entry_reader(
@@ -455,6 +514,7 @@ mod tests {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use std::fs::File as StdFile;
     use std::io::Write;
+    use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
     use tempfile::tempdir;
@@ -573,9 +633,10 @@ mod tests {
 
     #[tokio::test]
     async fn parses_ais_timestamp_when_enabled() {
-        let source = FileInputSource {
+        let mut source = FileInputSource {
             source: "source".to_string(),
             ais: true,
+            ais_group_timestamps: HashMap::new(),
             jobs: vec![],
             cursor: 0,
         };
@@ -592,10 +653,47 @@ mod tests {
     }
 
     #[test]
+    fn reuses_ais_group_timestamp_for_follow_on_fragments() {
+        let mut source = FileInputSource {
+            source: "source".to_string(),
+            ais: true,
+            ais_group_timestamps: HashMap::new(),
+            jobs: vec![],
+            cursor: 0,
+        };
+
+        let first = r"\g:1-2-6287,c:1609459200*56\!AIVDM,2,1,0,A,P0,4*72";
+        let second = r"\g:2-2-6287*56\!AIVDM,2,2,0,A,P0,4*72";
+
+        assert_eq!(source.timestamp_for_payload(first), Some(1_609_459_200_000));
+        assert_eq!(source.timestamp_for_payload(second), Some(1_609_459_200_000));
+    }
+
+    #[test]
+    fn reuses_ais_group_timestamp_for_three_fragment_messages() {
+        let mut source = FileInputSource {
+            source: "source".to_string(),
+            ais: true,
+            ais_group_timestamps: HashMap::new(),
+            jobs: vec![],
+            cursor: 0,
+        };
+
+        let first = r"\g:1-3-2655,c:1609459200*56\!AIVDM,3,1,9,A,first,0*00";
+        let second = r"\g:2-3-2655*58\!AIVDM,3,2,9,A,second,0*00";
+        let third = r"\g:3-3-2655*58\!AIVDM,3,3,9,A,third,0*00";
+
+        assert_eq!(source.timestamp_for_payload(first), Some(1_609_459_200_000));
+        assert_eq!(source.timestamp_for_payload(second), Some(1_609_459_200_000));
+        assert_eq!(source.timestamp_for_payload(third), Some(1_609_459_200_000));
+    }
+
+    #[test]
     fn reports_current_input_progress() {
         let source = FileInputSource {
             source: "source".to_string(),
             ais: false,
+            ais_group_timestamps: HashMap::new(),
             jobs: vec![InputJob::plain(PathBuf::from("/tmp/input.txt"))],
             cursor: 1,
         };
