@@ -6,7 +6,7 @@ mod storage;
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use commands::{compact, inspect, validate, vacuum};
-use progress::report;
+use progress::{count, report};
 use storage::{StorageConfig, StorageLocation};
 
 fn default_concurrency() -> usize {
@@ -109,18 +109,18 @@ async fn main() -> Result<()> {
         format!(
             "loading dataset entries from {} with {} workers",
             storage.dataset_label(),
-            concurrency
+            count(concurrency)
         ),
     );
     let entries = storage
-        .list_entries(|count| {
-            if count > 0 {
-                report("collect-maint", format!("listed {} entries so far", count));
+        .list_entries(|listed| {
+            if listed > 0 {
+                report("collect-maint", format!("listed {} entries so far", count(listed)));
             }
         })
         .await
         .context("listing dataset entries")?;
-    report("collect-maint", format!("loaded {} entries", entries.len()));
+    report("collect-maint", format!("loaded {} entries", count(entries.len())));
 
     match cli.command {
         Command::Inspect { verbose } => inspect(&storage, &entries, concurrency, verbose).await,

@@ -1,7 +1,7 @@
 use crate::partition::{
     compaction_output_name, manifest_path_for_output, CompactionManifest, EntryKind, PartitionKey,
 };
-use crate::progress::{report, report_step, should_report, SCAN_REPORT_INTERVAL};
+use crate::progress::{count, decimal, report, report_step, should_report, SCAN_REPORT_INTERVAL};
 use crate::storage::{DatasetEntry, StorageLocation};
 use anyhow::{bail, Context, Result};
 use arrow::array::{Array, StringArray, TimestampMillisecondArray};
@@ -100,7 +100,7 @@ pub async fn inspect(
 
     report(
         "inspect",
-        format!("scanning {} entries with {} workers", total, concurrency.max(1)),
+        format!("scanning {} entries with {} workers", count(total), count(concurrency.max(1))),
     );
 
     let mut stream = stream::iter(entries.iter().cloned())
@@ -211,16 +211,19 @@ fn print_inspection_report(
 
     println!("Dataset: {}", dataset_label);
     println!(
-        "Summary: {} partition(s), {} file(s), {} rows, {} bytes ({})",
-        partitions,
-        parquet_files + compacted_files + manifests + temp_files + other_files,
-        rows,
-        bytes,
+        "Summary: {} partition(s), {} file(s), {} rows, size {}",
+        count(partitions),
+        count(parquet_files + compacted_files + manifests + temp_files + other_files),
+        count(rows),
         human_bytes(bytes),
     );
     println!(
         "Files: parquet={} compacted={} manifests={} temp={} other={}",
-        parquet_files, compacted_files, manifests, temp_files, other_files
+        count(parquet_files),
+        count(compacted_files),
+        count(manifests),
+        count(temp_files),
+        count(other_files)
     );
 
     let min_ts = min_ts_ms
@@ -241,32 +244,32 @@ fn print_inspection_report(
             let majority = if compact_majority_small > 0 {
                 format!(
                     "; {} of those partitions ({}%) are dominated by files under 256 MiB",
-                    compact_majority_small,
-                    percent(compact_majority_small, compact_candidates)
+                    count(compact_majority_small),
+                    count(percent(compact_majority_small, compact_candidates))
                 )
             } else {
                 String::new()
             };
             println!(
                 "- compact: {} partition(s) have more than one parquet file{}",
-                compact_candidates,
+                count(compact_candidates),
                 majority
             );
         }
         if vacuum_candidates > 0 {
             println!(
                 "- vacuum: {} partition(s) have temp or manifest files",
-                vacuum_candidates
+                count(vacuum_candidates)
             );
         }
         if validate_candidates > 0 {
             println!(
                 "- validate: {} partition(s) have scan issues or unrecognized files",
-                validate_candidates
+                count(validate_candidates)
             );
         }
         if scan_issues > 0 {
-            println!("  scan issues detected: {}", scan_issues);
+            println!("  scan issues detected: {}", count(scan_issues));
         }
         if !verbose {
             println!("Use --verbose for per-partition detail.");
@@ -293,7 +296,7 @@ pub async fn validate(
 
     report(
         "validate",
-        format!("scanning {} entries with {} workers", total, concurrency.max(1)),
+        format!("scanning {} entries with {} workers", count(total), count(concurrency.max(1))),
     );
 
     let mut stream = stream::iter(entries.iter().cloned())
@@ -331,8 +334,8 @@ pub async fn validate(
         for issue in &issues {
             eprintln!("✗ {}", issue);
         }
-        report("validate", format!("failed with {} issue(s)", issues.len()));
-        bail!("validation failed with {} issue(s)", issues.len())
+        report("validate", format!("failed with {} issue(s)", count(issues.len())));
+        bail!("validation failed with {} issue(s)", count(issues.len()))
     }
 }
 
@@ -352,7 +355,7 @@ pub async fn compact(
 
     report(
         "compact",
-        format!("planned {} job(s) with {} workers", jobs.len(), concurrency.max(1)),
+        format!("planned {} job(s) with {} workers", count(jobs.len()), count(concurrency.max(1))),
     );
 
     if !apply {
@@ -365,7 +368,7 @@ pub async fn compact(
             );
             println!(
                 "Would compact {} file(s) in {} -> {}",
-                job.inputs.len(),
+                count(job.inputs.len()),
                 job.partition.relative_dir(),
                 job.output_rel
             );
@@ -413,7 +416,7 @@ pub async fn vacuum(
 
     report(
         "vacuum",
-        format!("scanning {} entries with {} workers", entries.len(), concurrency.max(1)),
+        format!("scanning {} entries with {} workers", count(entries.len()), count(concurrency.max(1))),
     );
 
     let total = entries.len();
@@ -551,7 +554,9 @@ async fn compact_job(
         "compact",
         format!(
             "{}/{} writing manifest {}",
-            job_index, job_total, job.manifest_rel
+            count(job_index),
+            count(job_total),
+            job.manifest_rel
         ),
     );
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
@@ -566,12 +571,12 @@ async fn compact_job(
 
     report(
         "compact",
-        format!("{}/{} writing compacted output {}", job_index, job_total, job.output_rel),
+        format!("{}/{} writing compacted output {}", count(job_index), count(job_total), job.output_rel),
     );
     write_compacted_output(&materialized, &temp_output_path)?;
     report(
         "compact",
-        format!("{}/{} validating compacted output {}", job_index, job_total, job.output_rel),
+        format!("{}/{} validating compacted output {}", count(job_index), count(job_total), job.output_rel),
     );
     let scan = scan_parquet_file(&temp_output_path, Some(&job.partition))?;
     if !scan.issues.is_empty() {
@@ -586,10 +591,10 @@ async fn compact_job(
         "compact",
         format!(
             "{}/{} publishing {} and deleting {} source file(s)",
-            job_index,
-            job_total,
+            count(job_index),
+            count(job_total),
             job.output_rel,
-            job.inputs.len()
+            count(job.inputs.len())
         ),
     );
     storage.publish_file(&temp_output_path, &job.output_rel).await?;
@@ -601,10 +606,10 @@ async fn compact_job(
     storage.delete_rel_paths(&input_paths, concurrency).await?;
     storage.delete_rel_path(&job.manifest_rel).await?;
 
-    println!("Compacted {} file(s) into {}", job.inputs.len(), job.output_rel);
+    println!("Compacted {} file(s) into {}", count(job.inputs.len()), job.output_rel);
     report(
         "compact",
-        format!("{}/{} complete", job_index, job_total),
+        format!("{}/{} complete", count(job_index), count(job_total)),
     );
 
     Ok(())
@@ -630,10 +635,10 @@ async fn materialize_group(
                         "compact",
                         format!(
                             "{}/{} downloading {}/{} {}",
-                            job_index,
-                            job_total,
-                            index + 1,
-                            total,
+                            count(job_index),
+                            count(job_total),
+                            count(index + 1),
+                            count(total),
                             input.rel_path
                         ),
                     );
@@ -746,11 +751,11 @@ fn scan_parquet_file(path: &Path, expected_partition: Option<&PartitionKey>) -> 
     while let Some(batch) = reader.next().transpose()? {
         saw_any_batch = true;
         if batch.num_columns() < 2 {
-            issues.push(format!("unexpected column count: {}", batch.num_columns()));
+            issues.push(format!("unexpected column count: {}", count(batch.num_columns())));
             continue;
         }
         if batch.num_columns() != 2 {
-            issues.push(format!("unexpected column count: {}", batch.num_columns()));
+            issues.push(format!("unexpected column count: {}", count(batch.num_columns())));
         }
 
         let schema = batch.schema();
@@ -791,7 +796,7 @@ fn scan_parquet_file(path: &Path, expected_partition: Option<&PartitionKey>) -> 
                 if !partition.matches_timestamp_ms(ts_ms) {
                     issues.push(format!(
                         "timestamp {} does not match partition {}",
-                        ts_ms,
+                        count(ts_ms),
                         partition.relative_dir()
                     ));
                     break;
@@ -879,7 +884,7 @@ async fn vacuum_entry(
 
             report(
                 "vacuum",
-                format!("checking manifest {} ({} input(s))", entry.rel_path, manifest.inputs.len()),
+                format!("checking manifest {} ({} input(s))", entry.rel_path, count(manifest.inputs.len())),
             );
 
             let output_entry = entry_map.get(&manifest.output);
@@ -909,7 +914,7 @@ async fn vacuum_entry(
                         format!(
                             "finalizing manifest {} and deleting {} input(s)",
                             entry.rel_path,
-                            manifest.inputs.len()
+                            count(manifest.inputs.len())
                         ),
                     );
                     storage.delete_rel_paths(&manifest.inputs, concurrency).await?;
@@ -918,7 +923,7 @@ async fn vacuum_entry(
                     issues.push(format!(
                         "would finalize manifest {} and delete {} input file(s)",
                         entry.rel_path,
-                        manifest.inputs.len()
+                        count(manifest.inputs.len())
                     ));
                 }
             } else if apply {
@@ -953,26 +958,26 @@ fn partition_label(entry: &DatasetEntry) -> String {
 
 fn format_partition_status(partition: &str, bucket: &PartitionSummary) -> String {
     let mut details = vec![
-        format!("parquet={}", bucket.parquet_files),
-        format!("compacted={}", bucket.compacted_files),
-        format!("manifests={}", bucket.manifests),
-        format!("temp={}", bucket.temp_files),
-        format!("other={}", bucket.other_files),
-        format!("rows={}", bucket.rows),
+        format!("parquet={}", count(bucket.parquet_files)),
+        format!("compacted={}", count(bucket.compacted_files)),
+        format!("manifests={}", count(bucket.manifests)),
+        format!("temp={}", count(bucket.temp_files)),
+        format!("other={}", count(bucket.other_files)),
+        format!("rows={}", count(bucket.rows)),
         format!("bytes={}", human_bytes(bucket.bytes)),
     ];
 
     if bucket.parquet_files > 0 && bucket.small_parquet_files > 0 {
         details.push(format!(
             "small_parquet={}/{} ({}%)",
-            bucket.small_parquet_files,
-            bucket.parquet_files,
-            percent(bucket.small_parquet_files, bucket.parquet_files),
+            count(bucket.small_parquet_files),
+            count(bucket.parquet_files),
+            count(percent(bucket.small_parquet_files, bucket.parquet_files)),
         ));
     }
 
     if bucket.scan_issues > 0 {
-        details.push(format!("scan_issues={}", bucket.scan_issues));
+        details.push(format!("scan_issues={}", count(bucket.scan_issues)));
     }
 
     let mut actions = Vec::new();
@@ -1004,9 +1009,9 @@ fn human_bytes(bytes: u64) -> String {
     }
 
     if unit == 0 {
-        format!("{} {}", bytes, UNITS[unit])
+        format!("{} {}", count(bytes), UNITS[unit])
     } else {
-        format!("{:.1} {}", value, UNITS[unit])
+        format!("{} {}", decimal(value, 1), UNITS[unit])
     }
 }
 

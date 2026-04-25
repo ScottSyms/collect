@@ -128,6 +128,13 @@ pub struct IngestOptions {
 
 pub type LineReader = FramedRead<Box<dyn AsyncRead + Unpin + Send>, LinesCodec>;
 
+#[derive(Clone, Debug)]
+pub struct IngestProgress {
+    pub current_input: String,
+    pub current_input_index: usize,
+    pub input_total: usize,
+}
+
 pub enum ReaderTransition {
     Continue(LineReader),
     Stop,
@@ -138,6 +145,10 @@ pub trait LineSource {
     fn source_name(&self) -> &str;
 
     fn timestamp_for_payload(&self, _payload: &str) -> Option<i64> {
+        None
+    }
+
+    fn ingest_progress(&self) -> Option<IngestProgress> {
         None
     }
 
@@ -306,6 +317,32 @@ pub fn default_source_from_path(path: &Path) -> String {
         .to_string()
 }
 
+pub fn format_count(value: usize) -> String {
+    let raw = value.to_string();
+    let mut grouped = String::with_capacity(raw.len() + raw.len() / 3);
+
+    for (index, ch) in raw.chars().rev().enumerate() {
+        if index != 0 && index % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(ch);
+    }
+
+    grouped.chars().rev().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_count;
+
+    #[test]
+    fn formats_counts_with_thousands_separators() {
+        assert_eq!(format_count(0), "0");
+        assert_eq!(format_count(1_234), "1,234");
+        assert_eq!(format_count(12_345_678), "12,345,678");
+    }
+}
+
 pub fn line_reader_from_async_read<R>(reader: R, max_line_length: usize) -> LineReader
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -371,6 +408,8 @@ where
     let mut current_key = PartKey::from_minute(source.source_name(), current_minute_id);
     let mut buf = BatchBuf::new(common.max_rows, common.max_batch_bytes);
     let mut rows_in_file = 0usize;
+    let mut rows_processed = 0usize;
+    let mut files_flushed = 0usize;
 
     let (upload_tx, upload_worker) = spawn_upload_worker(s3_storage.clone());
 
@@ -378,6 +417,10 @@ where
 
     let mut heartbeat = tokio::time::interval(HEALTH_UPDATE_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    let mut progress_heartbeat = tokio::time::interval(Duration::from_secs(5));
+    progress_heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    progress_heartbeat.tick().await;
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -389,6 +432,15 @@ where
                 if let Err(error) = update_health_status_async(&health_file, true).await {
                     eprintln!("Failed to update health status: {}", error);
                 }
+            }
+            _ = progress_heartbeat.tick() => {
+                emit_ingest_progress(
+                    source,
+                    rows_processed,
+                    rows_in_file,
+                    buf.payload_bytes(),
+                    files_flushed,
+                );
             }
             maybe_line = reader.next() => {
                 match maybe_line {
@@ -403,6 +455,7 @@ where
                             if !buf.is_empty() {
                                 flush_batch(&common.out_dir, &current_key, &mut buf, upload_tx.as_ref()).await?;
                                 rows_in_file = 0;
+                                files_flushed += 1;
                             }
                             current_minute_id = minute_id;
                             current_key = PartKey::from_minute(source.source_name(), current_minute_id);
@@ -412,25 +465,32 @@ where
                         if buf.would_exceed_batch_bytes(payload_len, common.max_batch_bytes) {
                             flush_batch(&common.out_dir, &current_key, &mut buf, upload_tx.as_ref()).await?;
                             rows_in_file = 0;
+                            files_flushed += 1;
                         }
 
                         buf.push(row_ts_ms, &payload);
                         rows_in_file += 1;
+                        rows_processed += 1;
 
                         if buf.payload_bytes() >= common.max_batch_bytes {
                             flush_batch(&common.out_dir, &current_key, &mut buf, upload_tx.as_ref()).await?;
                             rows_in_file = 0;
+                            files_flushed += 1;
                         }
 
                         if let Some(max_rows) = common.max_rows {
                             if rows_in_file >= max_rows {
                                 flush_batch(&common.out_dir, &current_key, &mut buf, upload_tx.as_ref()).await?;
                                 rows_in_file = 0;
+                                files_flushed += 1;
                             }
                         }
                     }
                     Some(Err(LinesCodecError::MaxLineLengthExceeded)) => {
-                        eprintln!("⚠️  Dropped oversized input line (>{} bytes)", common.max_line_length);
+                        eprintln!(
+                            "⚠️  Dropped oversized input line (>{} bytes)",
+                            format_count(common.max_line_length)
+                        );
                     }
                     Some(Err(error)) => {
                         match source.on_stream_error(&error, &shutdown, common.max_line_length).await? {
@@ -884,7 +944,7 @@ async fn flush_batch(
 
     println!(
         "✅ Wrote {} rows to {} (queued for upload)",
-        batch_rows,
+        format_count(batch_rows),
         path.display()
     );
 
@@ -897,6 +957,29 @@ async fn flush_batch(
     }
 
     Ok(())
+}
+
+fn emit_ingest_progress<S: LineSource>(
+    source: &S,
+    rows_processed: usize,
+    rows_in_file: usize,
+    buffered_bytes: usize,
+    files_flushed: usize,
+) {
+    let Some(progress) = source.ingest_progress() else {
+        return;
+    };
+
+    eprintln!(
+        "📈 Processing {}/{} {} | rows={} batch_rows={} buffered_bytes={} flushed_files={}",
+        format_count(progress.current_input_index),
+        format_count(progress.input_total),
+        progress.current_input,
+        format_count(rows_processed),
+        format_count(rows_in_file),
+        format_count(buffered_bytes),
+        format_count(files_flushed),
+    );
 }
 
 fn parse_bool_env(name: &str) -> Option<bool> {

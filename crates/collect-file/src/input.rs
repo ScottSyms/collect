@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use async_compression::tokio::bufread::{BzDecoder, GzipDecoder};
 use bytes::Bytes;
-use collect_core::{line_reader_from_async_read, LineReader, LineSource, ReaderTransition};
+use collect_core::{format_count, line_reader_from_async_read, IngestProgress, LineReader, LineSource, ReaderTransition};
 use std::cmp::Ordering;
 use std::fs::File as StdFile;
 use std::io::{self, Read};
@@ -81,8 +81,15 @@ impl FileInputSource {
             .cloned()
             .context("no more input files to open")?;
 
+        let current_index = self.cursor + 1;
+        let total = self.jobs.len();
         self.cursor += 1;
-        println!("📄 Reading {}", job.display);
+        println!(
+            "📄 Reading {}/{} {}",
+            format_count(current_index),
+            format_count(total),
+            job.display
+        );
 
         job.open(max_line_length).await
     }
@@ -92,6 +99,19 @@ impl FileInputSource {
 impl LineSource for FileInputSource {
     fn source_name(&self) -> &str {
         &self.source
+    }
+
+    fn ingest_progress(&self) -> Option<IngestProgress> {
+        if self.cursor == 0 || self.cursor > self.jobs.len() {
+            return None;
+        }
+
+        let job = self.jobs.get(self.cursor - 1)?;
+        Some(IngestProgress {
+            current_input: job.display.clone(),
+            current_input_index: self.cursor,
+            input_total: self.jobs.len(),
+        })
     }
 
     fn timestamp_for_payload(&self, payload: &str) -> Option<i64> {
@@ -435,6 +455,7 @@ mod tests {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use std::fs::File as StdFile;
     use std::io::Write;
+    use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
     use tempfile::tempdir;
     use tokio::io::AsyncWriteExt;
@@ -568,6 +589,21 @@ mod tests {
             source.timestamp_for_payload("c:bad!AIVDM,1,1,,A,HELLO,0"),
             None
         );
+    }
+
+    #[test]
+    fn reports_current_input_progress() {
+        let source = FileInputSource {
+            source: "source".to_string(),
+            ais: false,
+            jobs: vec![InputJob::plain(PathBuf::from("/tmp/input.txt"))],
+            cursor: 1,
+        };
+
+        let progress = source.ingest_progress().expect("expected progress snapshot");
+        assert_eq!(progress.current_input, "/tmp/input.txt");
+        assert_eq!(progress.current_input_index, 1);
+        assert_eq!(progress.input_total, 1);
     }
 
     #[tokio::test]
