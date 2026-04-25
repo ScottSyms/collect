@@ -1,6 +1,7 @@
 use crate::partition::{
     compaction_output_name, manifest_path_for_output, CompactionManifest, EntryKind, PartitionKey,
 };
+use crate::progress::{report, report_step, should_report, SCAN_REPORT_INTERVAL};
 use crate::storage::{DatasetEntry, StorageLocation};
 use anyhow::{bail, Context, Result};
 use arrow::array::{Array, StringArray, TimestampMillisecondArray};
@@ -72,7 +73,10 @@ pub async fn inspect(storage: &StorageLocation, entries: &[DatasetEntry]) -> Res
     let workspace = tempfile::tempdir()?;
     let mut summary = BTreeMap::<String, PartitionSummary>::new();
 
-    for entry in entries {
+    report("inspect", format!("scanning {} entries", entries.len()));
+
+    for (index, entry) in entries.iter().enumerate() {
+        report_step("inspect", index + 1, entries.len(), &entry.rel_path);
         let label = partition_label(entry);
         let bucket = summary.entry(label).or_insert_with(PartitionSummary::new);
         bucket.bytes += entry.size;
@@ -124,6 +128,8 @@ pub async fn inspect(storage: &StorageLocation, entries: &[DatasetEntry]) -> Res
         );
     }
 
+    report("inspect", "complete");
+
     Ok(())
 }
 
@@ -131,7 +137,10 @@ pub async fn validate(storage: &StorageLocation, entries: &[DatasetEntry]) -> Re
     let workspace = tempfile::tempdir()?;
     let mut issues = Vec::new();
 
-    for entry in entries {
+    report("validate", format!("scanning {} entries", entries.len()));
+
+    for (index, entry) in entries.iter().enumerate() {
+        report_step("validate", index + 1, entries.len(), &entry.rel_path);
         match entry.kind {
             EntryKind::Parquet | EntryKind::CompactedParquet => {
                 let Some(path) = materialize_entry(storage, entry, workspace.path()).await? else {
@@ -152,11 +161,13 @@ pub async fn validate(storage: &StorageLocation, entries: &[DatasetEntry]) -> Re
 
     if issues.is_empty() {
         println!("Validation passed");
+        report("validate", "complete");
         Ok(())
     } else {
         for issue in &issues {
             eprintln!("✗ {}", issue);
         }
+        report("validate", format!("failed with {} issue(s)", issues.len()));
         bail!("validation failed with {} issue(s)", issues.len())
     }
 }
@@ -170,11 +181,20 @@ pub async fn compact(
     let jobs = plan_compaction(entries, target_file_size_bytes);
     if jobs.is_empty() {
         println!("No compactable partitions found");
+        report("compact", "no compactable partitions found");
         return Ok(());
     }
 
+    report("compact", format!("planned {} job(s)", jobs.len()));
+
     if !apply {
-        for job in &jobs {
+        for (index, job) in jobs.iter().enumerate() {
+            report_step(
+                "compact",
+                index + 1,
+                jobs.len(),
+                format!("would compact {} -> {}", job.partition.relative_dir(), job.output_rel),
+            );
             println!(
                 "Would compact {} file(s) in {} -> {}",
                 job.inputs.len(),
@@ -182,13 +202,22 @@ pub async fn compact(
                 job.output_rel
             );
         }
+        report("compact", "dry run complete");
         return Ok(());
     }
 
     let workspace = tempfile::tempdir()?;
-    for job in jobs {
-        compact_job(storage, &job, workspace.path()).await?;
+    for (index, job) in jobs.iter().enumerate() {
+        report_step(
+            "compact",
+            index + 1,
+            jobs.len(),
+            format!("compacting {} -> {}", job.partition.relative_dir(), job.output_rel),
+        );
+        compact_job(storage, job, workspace.path(), index + 1, jobs.len()).await?;
     }
+
+    report("compact", "complete");
 
     Ok(())
 }
@@ -201,10 +230,14 @@ pub async fn vacuum(storage: &StorageLocation, entries: &[DatasetEntry], apply: 
         .map(|entry| (entry.rel_path.clone(), entry))
         .collect();
 
-    for entry in entries {
+    report("vacuum", format!("scanning {} entries", entries.len()));
+
+    for (index, entry) in entries.iter().enumerate() {
+        report_step("vacuum", index + 1, entries.len(), &entry.rel_path);
         match entry.kind {
             EntryKind::Temp => {
                 if apply {
+                    report("vacuum", format!("deleting temp {}", entry.rel_path));
                     storage.delete_rel_path(&entry.rel_path).await?;
                 } else {
                     issues.push(format!("would remove temp file {}", entry.rel_path));
@@ -215,6 +248,11 @@ pub async fn vacuum(storage: &StorageLocation, entries: &[DatasetEntry], apply: 
                 let manifest: CompactionManifest = serde_json::from_slice(&manifest_bytes)
                     .with_context(|| format!("parse manifest {}", entry.rel_path))?;
                 manifest.validate()?;
+
+                report(
+                    "vacuum",
+                    format!("checking manifest {} ({} input(s))", entry.rel_path, manifest.inputs.len()),
+                );
 
                 let output_entry = entry_map.get(&manifest.output);
                 let output_exists = output_entry.is_some();
@@ -241,6 +279,14 @@ pub async fn vacuum(storage: &StorageLocation, entries: &[DatasetEntry], apply: 
                     }
 
                     if apply {
+                        report(
+                            "vacuum",
+                            format!(
+                                "finalizing manifest {} and deleting {} input(s)",
+                                entry.rel_path,
+                                manifest.inputs.len()
+                            ),
+                        );
                         storage.delete_rel_paths(&manifest.inputs).await?;
                         storage.delete_rel_path(&entry.rel_path).await?;
                     } else {
@@ -251,6 +297,7 @@ pub async fn vacuum(storage: &StorageLocation, entries: &[DatasetEntry], apply: 
                         ));
                     }
                 } else if apply {
+                    report("vacuum", format!("removing stale manifest {}", entry.rel_path));
                     storage.delete_rel_path(&entry.rel_path).await?;
                 } else {
                     issues.push(format!("would remove stale manifest {}", entry.rel_path));
@@ -259,6 +306,7 @@ pub async fn vacuum(storage: &StorageLocation, entries: &[DatasetEntry], apply: 
             EntryKind::Parquet | EntryKind::CompactedParquet | EntryKind::Other => {
                 if entry.size == 0 {
                     if apply {
+                        report("vacuum", format!("deleting zero-byte file {}", entry.rel_path));
                         storage.delete_rel_path(&entry.rel_path).await?;
                     } else {
                         issues.push(format!("would remove zero-byte file {}", entry.rel_path));
@@ -270,10 +318,12 @@ pub async fn vacuum(storage: &StorageLocation, entries: &[DatasetEntry], apply: 
 
     if apply {
         println!("Vacuum complete");
+        report("vacuum", "complete");
     } else {
         for issue in &issues {
             println!("{}", issue);
         }
+        report("vacuum", "dry run complete");
     }
 
     Ok(())
@@ -358,23 +408,44 @@ fn make_job(partition: &PartitionKey, group_index: usize, inputs: Vec<DatasetEnt
     }
 }
 
-async fn compact_job(storage: &StorageLocation, job: &CompactionJob, workspace: &Path) -> Result<()> {
+async fn compact_job(
+    storage: &StorageLocation,
+    job: &CompactionJob,
+    workspace: &Path,
+    job_index: usize,
+    job_total: usize,
+) -> Result<()> {
     let manifest = CompactionManifest::new(
         &job.partition,
         job.output_rel.clone(),
         job.inputs.iter().map(|entry| entry.rel_path.clone()).collect(),
     );
 
+    report(
+        "compact",
+        format!(
+            "{}/{} writing manifest {}",
+            job_index, job_total, job.manifest_rel
+        ),
+    );
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
     storage.write_bytes(&job.manifest_rel, &manifest_bytes).await?;
 
-    let materialized = materialize_group(storage, &job.inputs, workspace).await?;
+    let materialized = materialize_group(storage, &job.inputs, workspace, job_index, job_total).await?;
     let temp_output_path = storage.temp_output_path(workspace, &job.output_rel);
     if let Some(parent) = temp_output_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
+    report(
+        "compact",
+        format!("{}/{} writing compacted output {}", job_index, job_total, job.output_rel),
+    );
     write_compacted_output(&materialized, &temp_output_path)?;
+    report(
+        "compact",
+        format!("{}/{} validating compacted output {}", job_index, job_total, job.output_rel),
+    );
     let scan = scan_parquet_file(&temp_output_path, Some(&job.partition))?;
     if !scan.issues.is_empty() {
         bail!(
@@ -384,14 +455,24 @@ async fn compact_job(storage: &StorageLocation, job: &CompactionJob, workspace: 
         );
     }
 
+    report(
+        "compact",
+        format!(
+            "{}/{} publishing {} and deleting {} source file(s)",
+            job_index,
+            job_total,
+            job.output_rel,
+            job.inputs.len()
+        ),
+    );
     storage.publish_file(&temp_output_path, &job.output_rel).await?;
     storage.delete_rel_paths(&job.inputs.iter().map(|entry| entry.rel_path.clone()).collect::<Vec<_>>()).await?;
     storage.delete_rel_path(&job.manifest_rel).await?;
 
-    println!(
-        "Compacted {} file(s) into {}",
-        job.inputs.len(),
-        job.output_rel
+    println!("Compacted {} file(s) into {}", job.inputs.len(), job.output_rel);
+    report(
+        "compact",
+        format!("{}/{} complete", job_index, job_total),
     );
 
     Ok(())
@@ -401,9 +482,24 @@ async fn materialize_group(
     storage: &StorageLocation,
     inputs: &[DatasetEntry],
     workspace: &Path,
+    job_index: usize,
+    job_total: usize,
 ) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
-    for input in inputs {
+    for (index, input) in inputs.iter().enumerate() {
+        if should_report(index + 1, inputs.len(), SCAN_REPORT_INTERVAL) {
+            report(
+                "compact",
+                format!(
+                    "{}/{} downloading {}/{} {}",
+                    job_index,
+                    job_total,
+                    index + 1,
+                    inputs.len(),
+                    input.rel_path
+                ),
+            );
+        }
         if let Some(path) = materialize_entry(storage, input, workspace).await? {
             paths.push(path);
         }

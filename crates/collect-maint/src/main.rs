@@ -1,10 +1,12 @@
 mod commands;
 mod partition;
+mod progress;
 mod storage;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use commands::{compact, inspect, validate, vacuum};
+use progress::report;
 use storage::{StorageConfig, StorageLocation};
 
 #[derive(Parser, Debug)]
@@ -86,7 +88,16 @@ enum Command {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let storage = cli.storage.into_location().await?;
-    let entries = storage.list_entries().await.context("listing dataset entries")?;
+    report("collect-maint", format!("loading dataset entries from {}", storage.dataset_label()));
+    let entries = storage
+        .list_entries(|count| {
+            if count > 0 {
+                report("collect-maint", format!("listed {} entries so far", count));
+            }
+        })
+        .await
+        .context("listing dataset entries")?;
+    report("collect-maint", format!("loaded {} entries", entries.len()));
 
     match cli.command {
         Command::Inspect => inspect(&storage, &entries).await,

@@ -1,4 +1,5 @@
 use crate::partition::{classify_entry, EntryKind, PartitionKey};
+use crate::progress::LIST_REPORT_INTERVAL;
 use anyhow::{Context, Result};
 use aws_config::Region;
 use aws_credential_types::Credentials;
@@ -70,10 +71,14 @@ impl StorageConfig {
 }
 
 impl StorageLocation {
-    pub async fn list_entries(&self) -> Result<Vec<DatasetEntry>> {
+    pub async fn list_entries<F>(&self, on_progress: F) -> Result<Vec<DatasetEntry>>
+    where
+        F: FnMut(usize),
+    {
+        let mut on_progress = on_progress;
         match self {
-            StorageLocation::Local(local) => local.list_entries(),
-            StorageLocation::S3(s3) => s3.list_entries().await,
+            StorageLocation::Local(local) => local.list_entries(&mut on_progress),
+            StorageLocation::S3(s3) => s3.list_entries(&mut on_progress).await,
         }
     }
 
@@ -163,7 +168,10 @@ impl LocalStorage {
             .replace('\\', "/"))
     }
 
-    fn list_entries(&self) -> Result<Vec<DatasetEntry>> {
+    fn list_entries<F>(&self, on_progress: &mut F) -> Result<Vec<DatasetEntry>>
+    where
+        F: FnMut(usize),
+    {
         if !self.root.exists() {
             return Ok(Vec::new());
         }
@@ -177,6 +185,7 @@ impl LocalStorage {
                 .unwrap_or("dataset.parquet")
                 .to_string();
             let kind = classify_entry(&rel_path, metadata.len());
+            on_progress(1);
             return Ok(vec![DatasetEntry {
                 rel_path,
                 size: metadata.len(),
@@ -186,6 +195,7 @@ impl LocalStorage {
         }
 
         let mut entries = Vec::new();
+        let mut last_reported = 0usize;
         for item in WalkDir::new(&self.root) {
             let item = item.context("walking dataset root")?;
             if !item.file_type().is_file() {
@@ -201,6 +211,15 @@ impl LocalStorage {
                 kind,
                 partition: PartitionKey::parse(&rel_path),
             });
+
+            if entries.len() == 1 || entries.len() % LIST_REPORT_INTERVAL == 0 {
+                on_progress(entries.len());
+                last_reported = entries.len();
+            }
+        }
+
+        if entries.len() != last_reported {
+            on_progress(entries.len());
         }
 
         Ok(entries)
@@ -309,7 +328,10 @@ impl S3Storage {
         key.strip_prefix(&prefix).map(|value| value.to_string())
     }
 
-    async fn list_entries(&self) -> Result<Vec<DatasetEntry>> {
+    async fn list_entries<F>(&self, on_progress: &mut F) -> Result<Vec<DatasetEntry>>
+    where
+        F: FnMut(usize),
+    {
         let mut entries = Vec::new();
         let mut continuation_token = None;
 
@@ -337,6 +359,8 @@ impl S3Storage {
                     partition: PartitionKey::parse(&rel_path),
                 });
             }
+
+            on_progress(entries.len());
 
             if response.is_truncated().unwrap_or(false) {
                 continuation_token = response
