@@ -28,7 +28,7 @@ All command-line parameters can be configured using environment variables, makin
   - Example: `SOURCE=ais-sf-bay`
   - Default: input file stem or "tcp" for network input
 
-- `AIS`: Use NMEA `c:<epoch>` tag block timestamps when present, otherwise fall back to ingest time
+- `AIS`: Use NMEA `c:<epoch>` tag block timestamps when present; grouped `\g:` fragments reuse the first sentence timestamp for the whole AIS message, otherwise fall back to ingest time
   - Example: `AIS=true`
   - Default: `false`
 

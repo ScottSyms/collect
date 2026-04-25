@@ -61,13 +61,6 @@ impl FileInputSource {
                 .then(left.sort_index.cmp(&right.sort_index))
         });
 
-        if jobs.is_empty() {
-            return Err(anyhow::anyhow!(
-                "no files found under input path: {}",
-                input_display
-            ));
-        }
-
         Ok(Self {
             source,
             ais,
@@ -78,6 +71,10 @@ impl FileInputSource {
     }
 
     async fn open_next(&mut self, max_line_length: usize) -> Result<LineReader> {
+        if self.jobs.is_empty() {
+            return Ok(line_reader_from_async_read(tokio::io::empty(), max_line_length));
+        }
+
         let job = self
             .jobs
             .get(self.cursor)
@@ -255,6 +252,9 @@ fn collect_input_jobs(root: &Path) -> Result<Vec<InputJob>> {
     for entry in WalkDir::new(root) {
         let entry = entry.context("walking input directory")?;
         if entry.file_type().is_file() {
+            if is_hidden_file(entry.path()) {
+                continue;
+            }
             jobs.extend(expand_input_path(entry.path())?);
         }
     }
@@ -263,6 +263,10 @@ fn collect_input_jobs(root: &Path) -> Result<Vec<InputJob>> {
 }
 
 fn expand_input_path(path: &Path) -> Result<Vec<InputJob>> {
+    if is_hidden_file(path) {
+        return Ok(Vec::new());
+    }
+
     match detect_input_format(path)? {
         InputFormat::Plain => {
             if is_tar_like_path(path) {
@@ -290,6 +294,9 @@ fn collect_zip_jobs(path: &Path) -> Result<Vec<InputJob>> {
             .with_context(|| format!("read zip entry {} in {}", entry_index, path.display()))?;
         let entry_name = entry.name().to_string();
         if entry_name.ends_with('/') {
+            continue;
+        }
+        if is_hidden_entry_name(&entry_name) {
             continue;
         }
         jobs.push(InputJob::zip_entry(
@@ -380,6 +387,25 @@ fn is_gzip_magic(prefix: &[u8]) -> bool {
 
 fn is_bzip2_magic(prefix: &[u8]) -> bool {
     prefix.starts_with(b"BZh")
+}
+
+fn is_hidden_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .map(is_hidden_file_name)
+        .unwrap_or(false)
+}
+
+fn is_hidden_file_name(name: &str) -> bool {
+    matches!(name.as_bytes().first(), Some(b'.')) && name != "." && name != ".."
+}
+
+fn is_hidden_entry_name(entry_name: &str) -> bool {
+    Path::new(entry_name)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(is_hidden_file_name)
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Default)]
@@ -543,6 +569,34 @@ mod tests {
             vec!["plain-1", "plain-2", "gzip-1", "bzip-1", "zip-1", "zip-2"]
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn silently_ignores_hidden_input_file() -> Result<()> {
+        let dir = tempdir()?;
+        let hidden = dir.path().join(".hidden.txt");
+        write_text_file(&hidden, "hidden-1\nhidden-2\n")?;
+
+        let mut source = FileInputSource::new(hidden, "source".to_string(), false)?;
+        let lines = collect_all_lines(&mut source, 1024).await?;
+
+        assert!(lines.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn silently_ignores_hidden_files_in_directories() -> Result<()> {
+        let dir = tempdir()?;
+        let root = dir.path();
+
+        write_text_file(&root.join(".hidden.txt"), "hidden-1\n")?;
+        write_text_file(&root.join("visible.txt"), "visible-1\n")?;
+
+        let mut source = FileInputSource::new(root.to_path_buf(), "source".to_string(), false)?;
+        let lines = collect_all_lines(&mut source, 1024).await?;
+
+        assert_eq!(lines, vec!["visible-1"]);
         Ok(())
     }
 

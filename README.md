@@ -1,6 +1,6 @@
 # collect
 
-A Rust workspace for ingesting data into Hive-partitioned Parquet files with Zstd compression. It provides `collect-file` for recursive plain/compressed file ingestion and `collect-socket` for TCP line ingestion, with optional remote storage (S3/MinIO).
+A Rust workspace for ingesting data into Hive-partitioned Parquet files with Zstd compression. It provides `collect-file` for recursive plain/compressed file ingestion, `collect-socket` for TCP line ingestion, and `collect-maint` for dataset inspection and maintenance, with optional remote storage (S3/MinIO).
 
 ## Features
 - **Multiple Input Sources**: Plain, compressed, or TCP stream
@@ -10,6 +10,7 @@ A Rust workspace for ingesting data into Hive-partitioned Parquet files with Zst
 - **Parquet Format**: Efficient columnar storage with Zstd compression
 - **S3 Integration**: Upload to AWS S3 or S3-compatible storage (MinIO) with optional TLS
 - **Background Uploads**: Non-blocking S3 uploads to prevent data collection pauses
+- **Maintenance CLI**: Inspect, validate, compact, and vacuum hive-partitioned datasets
 - **Docker Support**: Full Docker and docker-compose integration with health checks
 - **Environment Variables**: Complete environment variable support for containerized deployments
 - **Real-time Processing**: Async processing with configurable buffering
@@ -44,7 +45,7 @@ cargo run -p collect-socket -- --tcp-host 153.44.253.27 --tcp-port 5631 --source
 cargo run -p collect-file -- --input data.txt --source mydata --s3-bucket maritime-data
 ```
 
-`collect-file` auto-detects plain text, gzip, bzip2, and zip inputs. Zip archives are read entry-by-entry in archive order. Tar and 7z archives are not supported. Use `--ais` to prefer NMEA `c:<epoch>` tag block timestamps when present; grouped `\g:` fragments reuse the first sentence timestamp for the whole AIS message; otherwise it falls back to ingest time.
+`collect-file` auto-detects plain text, gzip, bzip2, and zip inputs. Zip archives are read entry-by-entry in archive order. Tar and 7z archives are not supported. Hidden dotfiles are skipped silently. Use `--ais` to prefer NMEA `c:<epoch>` tag block timestamps when present; grouped `\g:` fragments reuse the first sentence timestamp for the whole AIS message; otherwise it falls back to ingest time.
 
 ## Maintenance
 
@@ -247,6 +248,7 @@ cargo build --release --workspace
 # Run
 ./target/release/collect-file --help
 ./target/release/collect-socket --help
+./target/release/collect-maint --help
 ```
 
 ## Performance Tuning
