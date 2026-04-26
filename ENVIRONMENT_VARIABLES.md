@@ -32,7 +32,7 @@ Most `collect-file` and `collect-socket` command-line parameters can be configur
   - Example: `PARTITION=hour`
   - Default: `minute`
 
-- `AIS`: Use NMEA `c:<epoch>` tag block timestamps when present; grouped `\g:` fragments reuse the first sentence timestamp for the whole AIS message, otherwise fall back to ingest time. File ingestion only.
+- `AIS`: Use NMEA `c:<epoch>` tag blocks or `$PGHP` capture timestamps when present; grouped `\g:` fragments reuse the first sentence timestamp for the whole AIS message, otherwise fall back to ingest time. File ingestion only.
   - Example: `AIS=true`
   - Default: `false`
 

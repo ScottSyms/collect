@@ -124,7 +124,7 @@ impl TuiModel for TuiConfig {
                     kind: FieldKind::Text,
                 },
                 FieldState {
-                    label: "AIS Tag Blocks",
+                    label: "AIS Timestamping",
                     value: self.ais.to_string(),
                     kind: FieldKind::Bool,
                 },
@@ -200,7 +200,9 @@ impl TuiModel for TuiConfig {
         match (tab, field) {
             (0, 0) => Some("e.g., /path/to/data or /path/to/directory"),
             (0, 1) => Some("e.g., test-data, norway, or leave blank to auto-detect"),
-            (0, 2) => Some("Use NMEA c:<epoch> tag blocks when present"),
+            (0, 2) => {
+                Some("Use NMEA c:<epoch> tag blocks or $PGHP capture timestamps when present")
+            }
             (1, 0) => Some("e.g., data, /mnt/storage/parquet"),
             (1, 1) => Some("minute, hour, day, month, or year"),
             (1, 2) => Some("e.g., 10000 (optional, flushes on the selected boundary)"),

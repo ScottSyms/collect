@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use async_compression::tokio::bufread::{BzDecoder, GzipDecoder};
 use bytes::Bytes;
+use chrono::{TimeZone, Utc};
 use collect_core::{
     format_count, line_reader_from_async_read, IngestProgress, LineReader, LineSource,
     ReaderTransition,
@@ -21,6 +22,7 @@ pub(crate) struct FileInputSource {
     source: String,
     ais: bool,
     ais_group_timestamps: HashMap<String, i64>,
+    ais_pending_timestamp_ms: Option<i64>,
     jobs: Vec<InputJob>,
     cursor: usize,
 }
@@ -68,6 +70,7 @@ impl FileInputSource {
             source,
             ais,
             ais_group_timestamps: HashMap::new(),
+            ais_pending_timestamp_ms: None,
             jobs,
             cursor: 0,
         })
@@ -89,6 +92,7 @@ impl FileInputSource {
 
         if self.cursor > 0 {
             self.ais_group_timestamps.clear();
+            self.ais_pending_timestamp_ms = None;
         }
 
         let current_index = self.cursor + 1;
@@ -129,18 +133,83 @@ impl LineSource for FileInputSource {
             return None;
         }
 
+        let sentence = nmea_sentence(payload);
+
+        if let Some(timestamp_ms) = parse_pghp_timestamp_ms(sentence) {
+            self.ais_pending_timestamp_ms = Some(timestamp_ms);
+            return Some(timestamp_ms);
+        }
+
         let tag_block = parse_ais_tag_block(payload);
+        let sentence = parse_ais_sentence_metadata(sentence);
+
+        if !sentence.is_ais {
+            return None;
+        }
 
         if let Some(timestamp_ms) = tag_block.timestamp_ms {
-            if let Some(group_id) = tag_block.group_id {
-                self.ais_group_timestamps.insert(group_id, timestamp_ms);
+            self.ais_pending_timestamp_ms = None;
+            if sentence.is_fragmented() {
+                cache_timestamp_for_groups(
+                    &mut self.ais_group_timestamps,
+                    timestamp_ms,
+                    tag_block.group_id.as_deref(),
+                    sentence.group_id.as_deref(),
+                );
             }
             return Some(timestamp_ms);
         }
 
-        tag_block
+        if let Some(timestamp_ms) = lookup_timestamp_for_groups(
+            &self.ais_group_timestamps,
+            tag_block.group_id.as_deref(),
+            sentence.group_id.as_deref(),
+        ) {
+            self.ais_pending_timestamp_ms = None;
+            if sentence.is_final_fragment() {
+                remove_timestamp_for_groups(
+                    &mut self.ais_group_timestamps,
+                    tag_block.group_id.as_deref(),
+                    sentence.group_id.as_deref(),
+                );
+            }
+            return Some(timestamp_ms);
+        }
+
+        let Some(timestamp_ms) = self.ais_pending_timestamp_ms else {
+            return None;
+        };
+
+        if tag_block
             .group_id
-            .and_then(|group_id| self.ais_group_timestamps.get(&group_id).copied())
+            .as_deref()
+            .or(sentence.group_id.as_deref())
+            .is_some()
+        {
+            if sentence.is_fragmented() && sentence.fragment_number == Some(1) {
+                cache_timestamp_for_groups(
+                    &mut self.ais_group_timestamps,
+                    timestamp_ms,
+                    tag_block.group_id.as_deref(),
+                    sentence.group_id.as_deref(),
+                );
+                self.ais_pending_timestamp_ms = None;
+            } else if sentence.is_final_fragment() || !sentence.is_fragmented() {
+                self.ais_pending_timestamp_ms = None;
+            }
+
+            return Some(timestamp_ms);
+        }
+
+        if sentence.is_fragmented() {
+            if sentence.is_final_fragment() {
+                self.ais_pending_timestamp_ms = None;
+            }
+            return Some(timestamp_ms);
+        }
+
+        self.ais_pending_timestamp_ms = None;
+        Some(timestamp_ms)
     }
 
     async fn open(&mut self, max_line_length: usize) -> Result<LineReader> {
@@ -414,10 +483,28 @@ fn is_hidden_entry_name(entry_name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn nmea_sentence(payload: &str) -> &str {
+    let sentence_start = payload
+        .char_indices()
+        .find(|(_, ch)| *ch == '!' || *ch == '$')
+        .map(|(idx, _)| idx)
+        .unwrap_or(payload.len());
+
+    &payload[sentence_start..]
+}
+
 #[derive(Debug, Default)]
 struct AisTagBlock {
     timestamp_ms: Option<i64>,
     group_id: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct AisSentenceMetadata {
+    is_ais: bool,
+    group_id: Option<String>,
+    fragment_count: Option<usize>,
+    fragment_number: Option<usize>,
 }
 
 fn parse_ais_tag_block(payload: &str) -> AisTagBlock {
@@ -447,6 +534,80 @@ fn parse_ais_tag_block(payload: &str) -> AisTagBlock {
     tag_block
 }
 
+fn parse_ais_sentence_metadata(sentence: &str) -> AisSentenceMetadata {
+    let mut fields = sentence.split(',').map(normalize_sentence_field);
+    let Some(sentence_type) = fields.next() else {
+        return AisSentenceMetadata::default();
+    };
+
+    if !is_ais_sentence_type(sentence_type) {
+        return AisSentenceMetadata::default();
+    }
+
+    let fragment_count = fields.next().and_then(|value| value.parse::<usize>().ok());
+    let fragment_number = fields.next().and_then(|value| value.parse::<usize>().ok());
+    let sequence_id = fields
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let channel = fields.next().map(str::trim).unwrap_or_default();
+
+    let group_id = match (fragment_count, sequence_id) {
+        (Some(fragment_count), Some(sequence_id)) if fragment_count > 1 => Some(format!(
+            "{}:{}:{}:{}",
+            sentence_type, fragment_count, sequence_id, channel
+        )),
+        _ => None,
+    };
+
+    AisSentenceMetadata {
+        is_ais: true,
+        group_id,
+        fragment_count,
+        fragment_number,
+    }
+}
+
+impl AisSentenceMetadata {
+    fn is_fragmented(&self) -> bool {
+        matches!(self.fragment_count, Some(count) if count > 1)
+    }
+
+    fn is_final_fragment(&self) -> bool {
+        matches!((self.fragment_count, self.fragment_number), (Some(count), Some(number)) if count == number)
+    }
+}
+
+fn parse_pghp_timestamp_ms(sentence: &str) -> Option<i64> {
+    let mut fields = sentence.split(',').map(normalize_sentence_field);
+    let sentence_type = fields.next()?;
+
+    if sentence_type != "$PGHP" {
+        return None;
+    }
+
+    let _message_type = fields.next()?;
+    let year = fields.next()?.parse::<i32>().ok()?;
+    let month = fields.next()?.parse::<u32>().ok()?;
+    let day = fields.next()?.parse::<u32>().ok()?;
+    let hour = fields.next()?.parse::<u32>().ok()?;
+    let minute = fields.next()?.parse::<u32>().ok()?;
+    let second = fields.next()?.parse::<u32>().ok()?;
+    let millisecond = fields.next()?.parse::<u32>().ok()?;
+
+    if millisecond >= 1_000 {
+        return None;
+    }
+
+    let timestamp_ms = Utc
+        .with_ymd_and_hms(year, month, day, hour, minute, second)
+        .single()?
+        .timestamp_millis();
+
+    Some(timestamp_ms.saturating_add(i64::from(millisecond)))
+}
+
 fn parse_ais_timestamp_ms(value: &str) -> Option<i64> {
     let digits = value
         .chars()
@@ -473,6 +634,51 @@ fn parse_ais_group_id(value: &str) -> Option<String> {
         None
     } else {
         Some(candidate.to_string())
+    }
+}
+
+fn is_ais_sentence_type(sentence_type: &str) -> bool {
+    sentence_type.ends_with("VDM") || sentence_type.ends_with("VDO")
+}
+
+fn normalize_sentence_field(field: &str) -> &str {
+    field.split('*').next().unwrap_or(field).trim()
+}
+
+fn cache_timestamp_for_groups(
+    timestamps: &mut HashMap<String, i64>,
+    timestamp_ms: i64,
+    tag_group_id: Option<&str>,
+    sentence_group_id: Option<&str>,
+) {
+    if let Some(group_id) = tag_group_id {
+        timestamps.insert(group_id.to_string(), timestamp_ms);
+    }
+    if let Some(group_id) = sentence_group_id {
+        timestamps.insert(group_id.to_string(), timestamp_ms);
+    }
+}
+
+fn lookup_timestamp_for_groups(
+    timestamps: &HashMap<String, i64>,
+    tag_group_id: Option<&str>,
+    sentence_group_id: Option<&str>,
+) -> Option<i64> {
+    tag_group_id
+        .and_then(|group_id| timestamps.get(group_id).copied())
+        .or_else(|| sentence_group_id.and_then(|group_id| timestamps.get(group_id).copied()))
+}
+
+fn remove_timestamp_for_groups(
+    timestamps: &mut HashMap<String, i64>,
+    tag_group_id: Option<&str>,
+    sentence_group_id: Option<&str>,
+) {
+    if let Some(group_id) = tag_group_id {
+        timestamps.remove(group_id);
+    }
+    if let Some(group_id) = sentence_group_id {
+        timestamps.remove(group_id);
     }
 }
 
@@ -539,7 +745,7 @@ fn zip_error_to_io(path: &Path, entry_name: &str, error: zip::result::ZipError) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::StringArray;
+    use arrow::array::{StringArray, TimestampMillisecondArray};
     use chrono::{Datelike, TimeZone, Timelike, Utc};
     use collect_core::{run_ingest, CommonOptions, IngestOptions};
     use futures_util::StreamExt;
@@ -698,6 +904,7 @@ mod tests {
             source: "source".to_string(),
             ais: true,
             ais_group_timestamps: HashMap::new(),
+            ais_pending_timestamp_ms: None,
             jobs: vec![],
             cursor: 0,
         };
@@ -719,6 +926,7 @@ mod tests {
             source: "source".to_string(),
             ais: true,
             ais_group_timestamps: HashMap::new(),
+            ais_pending_timestamp_ms: None,
             jobs: vec![],
             cursor: 0,
         };
@@ -739,6 +947,7 @@ mod tests {
             source: "source".to_string(),
             ais: true,
             ais_group_timestamps: HashMap::new(),
+            ais_pending_timestamp_ms: None,
             jobs: vec![],
             cursor: 0,
         };
@@ -761,6 +970,7 @@ mod tests {
             source: "source".to_string(),
             ais: false,
             ais_group_timestamps: HashMap::new(),
+            ais_pending_timestamp_ms: None,
             jobs: vec![InputJob::plain(PathBuf::from("/tmp/input.txt"))],
             cursor: 1,
         };
@@ -774,19 +984,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uses_ais_timestamp_for_partitioning_and_keeps_payload() -> Result<()> {
+    async fn uses_pghp_timestamp_for_partitioning_and_keeps_payload() -> Result<()> {
         let dir = tempdir()?;
         let input_path = dir.path().join("ais.txt");
         let out_dir = dir.path().join("out");
         let health_file = dir.path().join("health");
-        let ais_line = "c:1609459200!AIVDM,1,1,,A,HELLO,0\n";
+        let lines = vec![
+            "$PGHP,1,2013,1,9,4,37,45,298,,110,,1,26*19",
+            "!AIVDM,1,1,0,A,13aER4hjP00D@FLMU<r@0?wB0000,0*26",
+            "$PGHP,1,2013,1,9,4,37,46,120,,110,,1,75*18",
+            "!AIVDM,2,1,3,A,569qcJP000000000000P4V1QDr3777800000000o0p=220DP03888888,0*49",
+            "!AIVDM,2,2,3,A,88881CRR@CACP08,2*3C",
+        ];
+        let ais_input = format!("{}\n", lines.join("\n"));
 
-        write_text_file(&input_path, ais_line)?;
+        write_text_file(&input_path, &ais_input)?;
 
         let mut source = FileInputSource::new(input_path, "ais-source".to_string(), true)?;
+
+        let expected_ts_one = Utc
+            .with_ymd_and_hms(2013, 1, 9, 4, 37, 45)
+            .single()
+            .expect("valid AIS timestamp")
+            .timestamp_millis()
+            .saturating_add(298);
+        let expected_ts_two = Utc
+            .with_ymd_and_hms(2013, 1, 9, 4, 37, 46)
+            .single()
+            .expect("valid AIS timestamp")
+            .timestamp_millis()
+            .saturating_add(120);
+
         assert_eq!(
-            source.timestamp_for_payload(ais_line.trim_end()),
-            Some(1_609_459_200_000)
+            source.timestamp_for_payload(lines[0]),
+            Some(expected_ts_one)
+        );
+        assert_eq!(
+            source.timestamp_for_payload(lines[1]),
+            Some(expected_ts_one)
+        );
+        assert_eq!(
+            source.timestamp_for_payload(lines[2]),
+            Some(expected_ts_two)
+        );
+        assert_eq!(
+            source.timestamp_for_payload(lines[3]),
+            Some(expected_ts_two)
+        );
+        assert_eq!(
+            source.timestamp_for_payload(lines[4]),
+            Some(expected_ts_two)
         );
 
         run_ingest(
@@ -795,7 +1042,7 @@ mod tests {
                 common: CommonOptions {
                     out_dir: out_dir.clone(),
                     partition: collect_core::PartitionGranularity::Minute,
-                    max_rows: Some(1),
+                    max_rows: Some(10),
                     max_batch_bytes: 1024 * 1024,
                     upload_drain_timeout_seconds: 1,
                     max_line_length: 1024,
@@ -808,7 +1055,7 @@ mod tests {
         .await?;
 
         let expected = Utc
-            .timestamp_opt(1_609_459_200, 0)
+            .timestamp_opt(expected_ts_one / 1_000, 0)
             .single()
             .expect("valid AIS timestamp");
         let expected_partition = format!(
@@ -837,14 +1084,63 @@ mod tests {
             .next()
             .transpose()?
             .context("missing parquet batch")?;
+        let timestamps = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .context("missing timestamp column")?;
         let payload = batch
             .column(1)
             .as_any()
             .downcast_ref::<StringArray>()
             .context("missing payload column")?;
 
-        assert_eq!(payload.value(0), ais_line.trim_end());
+        assert_eq!(batch.num_rows(), lines.len());
+        assert_eq!(timestamps.value(0), expected_ts_one);
+        assert_eq!(timestamps.value(1), expected_ts_one);
+        assert_eq!(timestamps.value(2), expected_ts_two);
+        assert_eq!(timestamps.value(3), expected_ts_two);
+        assert_eq!(timestamps.value(4), expected_ts_two);
+        assert_eq!(payload.value(0), lines[0]);
+        assert_eq!(payload.value(1), lines[1]);
+        assert_eq!(payload.value(2), lines[2]);
+        assert_eq!(payload.value(3), lines[3]);
+        assert_eq!(payload.value(4), lines[4]);
         Ok(())
+    }
+
+    #[test]
+    fn reuses_pghp_capture_timestamp_for_follow_on_fragments() {
+        let mut source = FileInputSource {
+            source: "source".to_string(),
+            ais: true,
+            ais_group_timestamps: HashMap::new(),
+            ais_pending_timestamp_ms: None,
+            jobs: vec![],
+            cursor: 0,
+        };
+
+        let timestamp = "$PGHP,1,2013,1,9,4,37,45,298,,110,,1,26*19";
+        let first_fragment =
+            "!AIVDM,2,1,3,A,569qcJP000000000000P4V1QDr3777800000000o0p=220DP03888888,0*49";
+        let second_fragment = "!AIVDM,2,2,3,A,88881CRR@CACP08,2*3C";
+
+        let expected_ts = Utc
+            .with_ymd_and_hms(2013, 1, 9, 4, 37, 45)
+            .single()
+            .expect("valid AIS timestamp")
+            .timestamp_millis()
+            .saturating_add(298);
+
+        assert_eq!(source.timestamp_for_payload(timestamp), Some(expected_ts));
+        assert_eq!(
+            source.timestamp_for_payload(first_fragment),
+            Some(expected_ts)
+        );
+        assert_eq!(
+            source.timestamp_for_payload(second_fragment),
+            Some(expected_ts)
+        );
     }
 
     async fn collect_all_lines(

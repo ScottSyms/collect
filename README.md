@@ -5,7 +5,7 @@ A Rust workspace for ingesting data into Hive-partitioned Parquet files with Zst
 ## Features
 - **Multiple Input Sources**: Plain, compressed, or TCP stream
 - **Compressed Inputs**: Plain text, gzip, bzip2, and zip files
-- **AIS Timestamps**: Optional NMEA tag block timestamping for file ingestion
+- **AIS Timestamps**: Optional AIS capture timestamping for file ingestion
 - **Hive Partitioning**: Automatic partitioning by source and selected time granularity
 - **Parquet Format**: Efficient columnar storage with Zstd compression
 - **S3 Integration**: Upload to AWS S3 or S3-compatible storage (MinIO) with optional TLS
@@ -45,7 +45,7 @@ cargo run -p collect-socket -- --tcp-host 153.44.253.27 --tcp-port 5631 --source
 cargo run -p collect-file -- --input data.txt --source mydata --s3-bucket maritime-data
 ```
 
-`collect-file` auto-detects plain text, gzip, bzip2, and zip inputs. Zip archives are read entry-by-entry in archive order. Hidden dotfiles are skipped silently. `--ais` applies to `collect-file` only; it prefers NMEA `c:<epoch>` tag block timestamps when present and reuses the first sentence timestamp for grouped `\g:` fragments.
+`collect-file` auto-detects plain text, gzip, bzip2, and zip inputs. Zip archives are read entry-by-entry in archive order. Hidden dotfiles are skipped silently. `--ais` applies to `collect-file` only; it prefers NMEA `c:<epoch>` tag block timestamps and `$PGHP` capture timestamps when present, and reuses the first sentence timestamp for grouped `\g:` fragments.
 
 ## Maintenance
 
@@ -79,7 +79,7 @@ Most `collect-file` and `collect-socket` command-line parameters can be configur
 | `TCP_PORT` | `--tcp-port` | TCP port number |
 | `SOURCE` | `--source` | Logical source label |
 | `PARTITION` | `--partition` | Partition granularity for ingest layout |
-| `AIS` | `--ais` | Use NMEA `c:<epoch>` tag block timestamps (collect-file only) |
+| `AIS` | `--ais` | Use NMEA `c:<epoch>` tag blocks or `$PGHP` capture timestamps (collect-file only) |
 | `OUT_DIR` | `--out-dir` | Output directory |
 | `MAX_ROWS` | `--max-rows` | Max rows per file |
 | `MAX_BATCH_BYTES` | `--max-batch-bytes` | Max payload bytes per Parquet file |

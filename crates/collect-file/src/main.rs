@@ -13,7 +13,7 @@ mod tui;
 #[derive(Parser, Debug)]
 #[command(
     version,
-    about = "Recursively ingest plain, gzip, bzip2, and zip files into Hive-partitioned Parquet with Zstd compression, with optional AIS tag-block timestamps"
+    about = "Recursively ingest plain, gzip, bzip2, and zip files into Hive-partitioned Parquet with Zstd compression, with optional AIS capture timestamps"
 )]
 struct Args {
     /// Input file or directory to ingest
@@ -24,7 +24,7 @@ struct Args {
     #[arg(short, long)]
     source: Option<String>,
 
-    /// Use AIS NMEA tag block timestamps when present, including grouped \g fragments
+    /// Use AIS capture timestamps when present, including NMEA c:<epoch> tag blocks, grouped \g fragments, and $PGHP capture lines
     #[arg(long)]
     ais: bool,
 
