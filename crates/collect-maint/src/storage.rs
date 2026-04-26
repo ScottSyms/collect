@@ -5,6 +5,7 @@ use aws_config::Region;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::{Client as S3Client, Config as S3Config};
+use collect_core::PartitionGranularity;
 use futures_util::stream::{self, StreamExt};
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -72,14 +73,18 @@ impl StorageConfig {
 }
 
 impl StorageLocation {
-    pub async fn list_entries<F>(&self, on_progress: F) -> Result<Vec<DatasetEntry>>
+    pub async fn list_entries<F>(
+        &self,
+        granularity: PartitionGranularity,
+        on_progress: F,
+    ) -> Result<Vec<DatasetEntry>>
     where
         F: FnMut(usize),
     {
         let mut on_progress = on_progress;
         match self {
-            StorageLocation::Local(local) => local.list_entries(&mut on_progress),
-            StorageLocation::S3(s3) => s3.list_entries(&mut on_progress).await,
+            StorageLocation::Local(local) => local.list_entries(granularity, &mut on_progress),
+            StorageLocation::S3(s3) => s3.list_entries(granularity, &mut on_progress).await,
         }
     }
 
@@ -180,7 +185,11 @@ impl LocalStorage {
             == Some(".DS_Store")
     }
 
-    fn list_entries<F>(&self, on_progress: &mut F) -> Result<Vec<DatasetEntry>>
+    fn list_entries<F>(
+        &self,
+        granularity: PartitionGranularity,
+        on_progress: &mut F,
+    ) -> Result<Vec<DatasetEntry>>
     where
         F: FnMut(usize),
     {
@@ -224,7 +233,7 @@ impl LocalStorage {
                 rel_path: rel_path.clone(),
                 size: metadata.len(),
                 kind,
-                partition: PartitionKey::parse(&rel_path),
+                partition: PartitionKey::parse(&rel_path, granularity),
             });
 
             if entries.len() == 1 || entries.len() % LIST_REPORT_INTERVAL == 0 {
@@ -252,7 +261,9 @@ impl LocalStorage {
         }
         tokio::fs::rename(temp_path, &final_path)
             .await
-            .with_context(|| format!("rename {} to {}", temp_path.display(), final_path.display()))?;
+            .with_context(|| {
+                format!("rename {} to {}", temp_path.display(), final_path.display())
+            })?;
         Ok(())
     }
 
@@ -295,8 +306,8 @@ impl S3Storage {
         secret_key: Option<String>,
         disable_tls: bool,
     ) -> Result<Self> {
-        let mut config_builder = aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .region(Region::new(region));
+        let mut config_builder =
+            aws_config::defaults(aws_config::BehaviorVersion::latest()).region(Region::new(region));
 
         if let Some(mut endpoint_url) = endpoint {
             if disable_tls
@@ -343,7 +354,11 @@ impl S3Storage {
         key.strip_prefix(&prefix).map(|value| value.to_string())
     }
 
-    async fn list_entries<F>(&self, on_progress: &mut F) -> Result<Vec<DatasetEntry>>
+    async fn list_entries<F>(
+        &self,
+        granularity: PartitionGranularity,
+        on_progress: &mut F,
+    ) -> Result<Vec<DatasetEntry>>
     where
         F: FnMut(usize),
     {
@@ -361,8 +376,12 @@ impl S3Storage {
 
             let response = request.send().await?;
             for object in response.contents() {
-                let Some(key) = object.key() else { continue; };
-                let Some(rel_path) = self.rel_from_key(key) else { continue; };
+                let Some(key) = object.key() else {
+                    continue;
+                };
+                let Some(rel_path) = self.rel_from_key(key) else {
+                    continue;
+                };
                 if rel_path.is_empty() {
                     continue;
                 }
@@ -374,7 +393,7 @@ impl S3Storage {
                     rel_path: rel_path.clone(),
                     size,
                     kind: classify_entry(&rel_path, size),
-                    partition: PartitionKey::parse(&rel_path),
+                    partition: PartitionKey::parse(&rel_path, granularity),
                 });
             }
 

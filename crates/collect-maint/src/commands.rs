@@ -7,6 +7,7 @@ use anyhow::{bail, Context, Result};
 use arrow::array::{Array, StringArray, TimestampMillisecondArray};
 use arrow::datatypes::{DataType, TimeUnit};
 use chrono::{DateTime, Utc};
+use collect_core::PartitionGranularity;
 use futures_util::stream::{self, StreamExt};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
@@ -101,7 +102,11 @@ pub async fn inspect(
 
     report(
         "inspect",
-        format!("scanning {} entries with {} workers", count(total), count(concurrency.max(1))),
+        format!(
+            "scanning {} entries with {} workers",
+            count(total),
+            count(concurrency.max(1))
+        ),
     );
 
     let mut stream = stream::iter(entries.iter().cloned())
@@ -297,7 +302,11 @@ pub async fn validate(
 
     report(
         "validate",
-        format!("scanning {} entries with {} workers", count(total), count(concurrency.max(1))),
+        format!(
+            "scanning {} entries with {} workers",
+            count(total),
+            count(concurrency.max(1))
+        ),
     );
 
     let mut stream = stream::iter(entries.iter().cloned())
@@ -335,7 +344,10 @@ pub async fn validate(
         for issue in &issues {
             eprintln!("✗ {}", issue);
         }
-        report("validate", format!("failed with {} issue(s)", count(issues.len())));
+        report(
+            "validate",
+            format!("failed with {} issue(s)", count(issues.len())),
+        );
         bail!("validation failed with {} issue(s)", count(issues.len()))
     }
 }
@@ -360,7 +372,11 @@ pub async fn compact(
 
     report(
         "compact",
-        format!("planned {} job(s) with {} workers", count(jobs.len()), count(concurrency.max(1))),
+        format!(
+            "planned {} job(s) with {} workers",
+            count(jobs.len()),
+            count(concurrency.max(1))
+        ),
     );
 
     if apply {
@@ -375,7 +391,11 @@ pub async fn compact(
                 "compact",
                 index + 1,
                 jobs.len(),
-                format!("would compact {} -> {}", job.partition.relative_dir(), job.output_rel),
+                format!(
+                    "would compact {} -> {}",
+                    job.partition.relative_dir(),
+                    job.output_rel
+                ),
             );
             println!(
                 "Would compact {} file(s) in {} -> {}",
@@ -416,6 +436,7 @@ pub async fn compact(
 pub async fn vacuum(
     storage: &StorageLocation,
     entries: &[DatasetEntry],
+    partition: PartitionGranularity,
     apply: bool,
     concurrency: usize,
 ) -> Result<()> {
@@ -427,7 +448,11 @@ pub async fn vacuum(
 
     report(
         "vacuum",
-        format!("scanning {} entries with {} workers", count(entries.len()), count(concurrency.max(1))),
+        format!(
+            "scanning {} entries with {} workers",
+            count(entries.len()),
+            count(concurrency.max(1))
+        ),
     );
 
     if apply {
@@ -444,7 +469,8 @@ pub async fn vacuum(
         .map(|(index, entry)| {
             let entry_map = &entry_map;
             async move {
-                let issues = vacuum_entry(storage, &entry, entry_map, apply, concurrency).await?;
+                let issues =
+                    vacuum_entry(storage, &entry, entry_map, partition, apply, concurrency).await?;
                 Ok::<_, anyhow::Error>((index, entry.rel_path, issues))
             }
         })
@@ -486,7 +512,10 @@ fn plan_compaction(entries: &[DatasetEntry], target_file_size_bytes: u64) -> Vec
             if let Some(partition) = entry.partition.clone() {
                 blocked_partitions.insert(partition);
             }
-            if index == 0 || index + 1 == total_entries || last_report.elapsed() >= heartbeat_interval {
+            if index == 0
+                || index + 1 == total_entries
+                || last_report.elapsed() >= heartbeat_interval
+            {
                 report(
                     "compact",
                     format!(
@@ -501,7 +530,10 @@ fn plan_compaction(entries: &[DatasetEntry], target_file_size_bytes: u64) -> Vec
             continue;
         }
         let Some(partition) = entry.partition.clone() else {
-            if index == 0 || index + 1 == total_entries || last_report.elapsed() >= heartbeat_interval {
+            if index == 0
+                || index + 1 == total_entries
+                || last_report.elapsed() >= heartbeat_interval
+            {
                 report(
                     "compact",
                     format!(
@@ -515,7 +547,10 @@ fn plan_compaction(entries: &[DatasetEntry], target_file_size_bytes: u64) -> Vec
             }
             continue;
         };
-        by_partition.entry(partition).or_default().push(entry.clone());
+        by_partition
+            .entry(partition)
+            .or_default()
+            .push(entry.clone());
 
         if index == 0 || index + 1 == total_entries || last_report.elapsed() >= heartbeat_interval {
             report(
@@ -557,7 +592,7 @@ fn plan_compaction(entries: &[DatasetEntry], target_file_size_bytes: u64) -> Vec
                     count(jobs.len())
                 ),
             );
-                partition_report = Instant::now();
+            partition_report = Instant::now();
         }
 
         if blocked_partitions.contains(&partition) || files.len() < 2 {
@@ -604,7 +639,11 @@ fn plan_compaction(entries: &[DatasetEntry], target_file_size_bytes: u64) -> Vec
     jobs
 }
 
-fn make_job(partition: &PartitionKey, group_index: usize, inputs: Vec<DatasetEntry>) -> CompactionJob {
+fn make_job(
+    partition: &PartitionKey,
+    group_index: usize,
+    inputs: Vec<DatasetEntry>,
+) -> CompactionJob {
     let output_rel = format!(
         "{}/{}",
         partition.relative_dir(),
@@ -630,7 +669,10 @@ async fn compact_job(
     let manifest = CompactionManifest::new(
         &job.partition,
         job.output_rel.clone(),
-        job.inputs.iter().map(|entry| entry.rel_path.clone()).collect(),
+        job.inputs
+            .iter()
+            .map(|entry| entry.rel_path.clone())
+            .collect(),
     );
 
     report(
@@ -643,10 +685,19 @@ async fn compact_job(
         ),
     );
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
-    storage.write_bytes(&job.manifest_rel, &manifest_bytes).await?;
+    storage
+        .write_bytes(&job.manifest_rel, &manifest_bytes)
+        .await?;
 
-    let materialized =
-        materialize_group(storage, &job.inputs, workspace, job_index, job_total, concurrency).await?;
+    let materialized = materialize_group(
+        storage,
+        &job.inputs,
+        workspace,
+        job_index,
+        job_total,
+        concurrency,
+    )
+    .await?;
     let temp_output_path = storage.temp_output_path(workspace, &job.output_rel);
     if let Some(parent) = temp_output_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -654,12 +705,22 @@ async fn compact_job(
 
     report(
         "compact",
-        format!("{}/{} writing compacted output {}", count(job_index), count(job_total), job.output_rel),
+        format!(
+            "{}/{} writing compacted output {}",
+            count(job_index),
+            count(job_total),
+            job.output_rel
+        ),
     );
     write_compacted_output(&materialized, &temp_output_path)?;
     report(
         "compact",
-        format!("{}/{} validating compacted output {}", count(job_index), count(job_total), job.output_rel),
+        format!(
+            "{}/{} validating compacted output {}",
+            count(job_index),
+            count(job_total),
+            job.output_rel
+        ),
     );
     let scan = scan_parquet_file(&temp_output_path, Some(&job.partition))?;
     if !scan.issues.is_empty() {
@@ -680,7 +741,9 @@ async fn compact_job(
             count(job.inputs.len())
         ),
     );
-    storage.publish_file(&temp_output_path, &job.output_rel).await?;
+    storage
+        .publish_file(&temp_output_path, &job.output_rel)
+        .await?;
     let input_paths = job
         .inputs
         .iter()
@@ -689,7 +752,11 @@ async fn compact_job(
     storage.delete_rel_paths(&input_paths, concurrency).await?;
     storage.delete_rel_path(&job.manifest_rel).await?;
 
-    println!("Compacted {} file(s) into {}", count(job.inputs.len()), job.output_rel);
+    println!(
+        "Compacted {} file(s) into {}",
+        count(job.inputs.len()),
+        job.output_rel
+    );
     report(
         "compact",
         format!("{}/{} complete", count(job_index), count(job_total)),
@@ -778,13 +845,14 @@ fn write_compacted_output(input_paths: &[PathBuf], output_path: &Path) -> Result
         .build();
 
     let mut output_file = Some(
-        StdFile::create(output_path).with_context(|| format!("create {}", output_path.display()))?,
+        StdFile::create(output_path)
+            .with_context(|| format!("create {}", output_path.display()))?,
     );
     let mut writer: Option<ArrowWriter<StdFile>> = None;
 
     for input_path in input_paths {
-        let input_file = StdFile::open(input_path)
-            .with_context(|| format!("open {}", input_path.display()))?;
+        let input_file =
+            StdFile::open(input_path).with_context(|| format!("open {}", input_path.display()))?;
         let mut reader = ParquetRecordBatchReaderBuilder::try_new(input_file)
             .with_context(|| format!("read parquet footer {}", input_path.display()))?
             .build()
@@ -834,11 +902,17 @@ fn scan_parquet_file(path: &Path, expected_partition: Option<&PartitionKey>) -> 
     while let Some(batch) = reader.next().transpose()? {
         saw_any_batch = true;
         if batch.num_columns() < 2 {
-            issues.push(format!("unexpected column count: {}", count(batch.num_columns())));
+            issues.push(format!(
+                "unexpected column count: {}",
+                count(batch.num_columns())
+            ));
             continue;
         }
         if batch.num_columns() != 2 {
-            issues.push(format!("unexpected column count: {}", count(batch.num_columns())));
+            issues.push(format!(
+                "unexpected column count: {}",
+                count(batch.num_columns())
+            ));
         }
 
         let schema = batch.schema();
@@ -847,14 +921,21 @@ fn scan_parquet_file(path: &Path, expected_partition: Option<&PartitionKey>) -> 
             let payload_field = schema.field(1);
             if ts_field.name() != "ts"
                 || payload_field.name() != "payload"
-                || !matches!(ts_field.data_type(), DataType::Timestamp(TimeUnit::Millisecond, Some(_)))
+                || !matches!(
+                    ts_field.data_type(),
+                    DataType::Timestamp(TimeUnit::Millisecond, Some(_))
+                )
                 || !matches!(payload_field.data_type(), DataType::Utf8)
             {
                 issues.push("unexpected schema".to_string());
             }
         }
 
-        let Some(ts_column) = batch.column(0).as_any().downcast_ref::<TimestampMillisecondArray>() else {
+        let Some(ts_column) = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+        else {
             issues.push("missing ts column".to_string());
             continue;
         };
@@ -912,8 +993,10 @@ async fn inspect_entry(
             };
 
             let partition = entry.partition.clone();
-            Ok(tokio::task::spawn_blocking(move || scan_parquet_file(&path, partition.as_ref()))
-                .await??)
+            Ok(
+                tokio::task::spawn_blocking(move || scan_parquet_file(&path, partition.as_ref()))
+                    .await??,
+            )
         }
         _ => Ok(FileScan::empty()),
     }
@@ -931,8 +1014,9 @@ async fn validate_entry(
             };
 
             let partition = entry.partition.clone();
-            let scan = tokio::task::spawn_blocking(move || scan_parquet_file(&path, partition.as_ref()))
-                .await??;
+            let scan =
+                tokio::task::spawn_blocking(move || scan_parquet_file(&path, partition.as_ref()))
+                    .await??;
             Ok(scan.issues)
         }
         EntryKind::Manifest => Ok(vec!["manifest present".to_string()]),
@@ -945,6 +1029,7 @@ async fn vacuum_entry(
     storage: &StorageLocation,
     entry: &DatasetEntry,
     entry_map: &BTreeMap<String, DatasetEntry>,
+    partition: PartitionGranularity,
     apply: bool,
     concurrency: usize,
 ) -> Result<Vec<String>> {
@@ -967,13 +1052,20 @@ async fn vacuum_entry(
 
             report(
                 "vacuum",
-                format!("checking manifest {} ({} input(s))", entry.rel_path, count(manifest.inputs.len())),
+                format!(
+                    "checking manifest {} ({} input(s))",
+                    entry.rel_path,
+                    count(manifest.inputs.len())
+                ),
             );
 
             let output_entry = entry_map.get(&manifest.output);
             if let Some(output_entry) = output_entry {
-                let partition = PartitionKey::parse(&format!("{}/dummy.parquet", manifest.partition))
-                    .with_context(|| format!("parse manifest partition {}", manifest.partition))?;
+                let partition = PartitionKey::parse(
+                    &format!("{}/dummy.parquet", manifest.partition),
+                    partition,
+                )
+                .with_context(|| format!("parse manifest partition {}", manifest.partition))?;
                 let workspace = tempfile::tempdir()?;
                 let output_path = materialize_entry(storage, output_entry, workspace.path())
                     .await?
@@ -1000,7 +1092,9 @@ async fn vacuum_entry(
                             count(manifest.inputs.len())
                         ),
                     );
-                    storage.delete_rel_paths(&manifest.inputs, concurrency).await?;
+                    storage
+                        .delete_rel_paths(&manifest.inputs, concurrency)
+                        .await?;
                     storage.delete_rel_path(&entry.rel_path).await?;
                 } else {
                     issues.push(format!(
@@ -1010,7 +1104,10 @@ async fn vacuum_entry(
                     ));
                 }
             } else if apply {
-                report("vacuum", format!("removing stale manifest {}", entry.rel_path));
+                report(
+                    "vacuum",
+                    format!("removing stale manifest {}", entry.rel_path),
+                );
                 storage.delete_rel_path(&entry.rel_path).await?;
             } else {
                 issues.push(format!("would remove stale manifest {}", entry.rel_path));
@@ -1019,7 +1116,10 @@ async fn vacuum_entry(
         EntryKind::Parquet | EntryKind::CompactedParquet | EntryKind::Other => {
             if entry.size == 0 {
                 if apply {
-                    report("vacuum", format!("deleting zero-byte file {}", entry.rel_path));
+                    report(
+                        "vacuum",
+                        format!("deleting zero-byte file {}", entry.rel_path),
+                    );
                     storage.delete_rel_path(&entry.rel_path).await?;
                 } else {
                     issues.push(format!("would remove zero-byte file {}", entry.rel_path));

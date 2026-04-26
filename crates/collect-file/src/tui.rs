@@ -1,3 +1,4 @@
+use collect_core::PartitionGranularity;
 use collect_tui::{FieldKind, FieldState, TuiModel};
 use serde::{Deserialize, Serialize};
 
@@ -8,6 +9,7 @@ pub struct TuiConfig {
     pub source: String,
     pub ais: bool,
     pub out_dir: String,
+    pub partition: String,
     pub max_rows: String,
     pub max_batch_bytes: String,
     pub keep_local: bool,
@@ -26,6 +28,7 @@ impl Default for TuiConfig {
             source: String::new(),
             ais: false,
             out_dir: "data".to_string(),
+            partition: "minute".to_string(),
             max_rows: String::new(),
             max_batch_bytes: String::new(),
             keep_local: false,
@@ -54,6 +57,9 @@ impl TuiConfig {
         }
         if let Some(value) = env_value(&["OUT_DIR"]) {
             config.out_dir = value;
+        }
+        if let Some(value) = env_value(&["PARTITION"]) {
+            config.partition = value;
         }
         if let Some(value) = env_value(&["MAX_ROWS"]) {
             config.max_rows = value;
@@ -130,6 +136,11 @@ impl TuiModel for TuiConfig {
                     kind: FieldKind::Text,
                 },
                 FieldState {
+                    label: "Partition Granularity",
+                    value: self.partition.clone(),
+                    kind: FieldKind::Text,
+                },
+                FieldState {
                     label: "Max Rows per File",
                     value: self.max_rows.clone(),
                     kind: FieldKind::Text,
@@ -191,8 +202,9 @@ impl TuiModel for TuiConfig {
             (0, 1) => Some("e.g., test-data, norway, or leave blank to auto-detect"),
             (0, 2) => Some("Use NMEA c:<epoch> tag blocks when present"),
             (1, 0) => Some("e.g., data, /mnt/storage/parquet"),
-            (1, 1) => Some("e.g., 10000 (optional, flushes on minute boundary by default)"),
-            (1, 2) => Some("e.g., 67108864 (optional, defaults to 64 MiB)"),
+            (1, 1) => Some("minute, hour, day, month, or year"),
+            (1, 2) => Some("e.g., 10000 (optional, flushes on the selected boundary)"),
+            (1, 3) => Some("e.g., 67108864 (optional, defaults to 64 MiB)"),
             (2, 0) => Some("e.g., my-bucket-name"),
             (2, 1) => Some("e.g., https://s3.example.com (for MinIO, R2, etc.)"),
             (2, 2) => Some("e.g., us-east-1, us-west-2, eu-central-1"),
@@ -211,6 +223,10 @@ impl TuiModel for TuiConfig {
 
         if !self.max_rows.is_empty() && self.max_rows.parse::<usize>().is_err() {
             errors.push("⚠ Max Rows must be a valid positive number".to_string());
+        }
+
+        if self.partition.parse::<PartitionGranularity>().is_err() {
+            errors.push("⚠ Partition must be minute, hour, day, month, or year".to_string());
         }
 
         if !self.max_batch_bytes.is_empty() && self.max_batch_bytes.parse::<usize>().is_err() {
@@ -243,9 +259,10 @@ impl TuiModel for TuiConfig {
             },
             1 => match field {
                 0 => self.out_dir = value,
-                1 => self.max_rows = value,
-                2 => self.max_batch_bytes = value,
-                3 => self.keep_local = !self.keep_local,
+                1 => self.partition = value,
+                2 => self.max_rows = value,
+                3 => self.max_batch_bytes = value,
+                4 => self.keep_local = !self.keep_local,
                 _ => {}
             },
             2 => match field {
@@ -264,7 +281,7 @@ impl TuiModel for TuiConfig {
     fn toggle_field(&mut self, tab: usize, field: usize) {
         match tab {
             0 if field == 2 => self.ais = !self.ais,
-            1 if field == 3 => self.keep_local = !self.keep_local,
+            1 if field == 4 => self.keep_local = !self.keep_local,
             2 if field == 5 => self.s3_disable_tls = !self.s3_disable_tls,
             _ => {}
         }
@@ -288,6 +305,10 @@ impl TuiModel for TuiConfig {
 
         args.push("--out-dir".to_string());
         args.push(self.out_dir.clone());
+        if !self.partition.is_empty() {
+            args.push("--partition".to_string());
+            args.push(self.partition.clone());
+        }
         if !self.max_rows.is_empty() {
             args.push("--max-rows".to_string());
             args.push(self.max_rows.clone());

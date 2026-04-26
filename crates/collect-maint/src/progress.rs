@@ -9,7 +9,10 @@ pub fn report(stage: &str, message: impl Display) {
 
 pub fn report_step(stage: &str, current: usize, total: usize, detail: impl Display) {
     if should_report(current, total, SCAN_REPORT_INTERVAL) {
-        report(stage, format!("{}/{} {}", count(current), count(total), detail));
+        report(
+            stage,
+            format!("{}/{} {}", count(current), count(total), detail),
+        );
     }
 }
 

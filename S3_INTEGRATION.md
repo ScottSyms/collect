@@ -72,6 +72,8 @@ cargo run -p collect-socket -- \
 
 Files are uploaded to S3 using the same Hive partitioning structure:
 
+The `source/year/month/...` depth matches the selected `--partition` setting (`minute`, `hour`, `day`, `month`, or `year`).
+
 ```
 s3://bucket-name/source=norway-tcp/year=2025/month=10/day=15/hour=14/minute=32/part-20251015T143245123.parquet
 ```
@@ -87,6 +89,7 @@ The application supports standard AWS environment variables plus custom ones:
 - `S3_ENDPOINT` - Custom S3 endpoint URL
 - `S3_DISABLE_TLS` - Set to `true` or `1` to use HTTP instead of HTTPS
 - `KEEP_LOCAL` - Set to `true` or `1` to keep local files after upload
+- `PARTITION` - Partition granularity for the dataset layout
 
 ## Docker Configuration
 

@@ -61,7 +61,8 @@ Configure the data source:
 ### 2. Output Tab
 Configure local file storage:
 - **Output Directory**: Where to write Parquet files (default: `data`)
-- **Max Rows per File**: Optional limit before flushing to new file
+- **Partition Granularity**: `minute`, `hour`, `day`, `month`, or `year`
+- **Max Rows per File**: Optional limit before flushing to the selected boundary
 - **Keep Local Files**: [X] to retain files after S3 upload
 
 ### 3. S3 Tab
@@ -97,6 +98,7 @@ The TUI includes automatic validation that checks:
 - ✅ At least one input source is configured
 - ✅ Only one input source is active (no conflicts)
 - ✅ Required fields are present (e.g., TCP port with TCP host)
+- ✅ Partition granularity is one of `minute`, `hour`, `day`, `month`, or `year`
 - ✅ Numeric fields contain valid numbers
 - ✅ S3 credentials available (fields or environment)
 
@@ -128,6 +130,7 @@ Saved configs are JSON files containing all settings:
 {
   "input_file": "/path/to/data.txt",
   "source": "my-source",
+  "partition": "minute",
   "out_dir": "data",
   "s3_bucket": "my-bucket",
   ...

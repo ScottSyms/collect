@@ -28,6 +28,10 @@ Most `collect-file` and `collect-socket` command-line parameters can be configur
   - Example: `SOURCE=ais-sf-bay`
   - Default: input file stem or "tcp" for network input
 
+- `PARTITION`: Partition granularity for the dataset layout
+  - Example: `PARTITION=hour`
+  - Default: `minute`
+
 - `AIS`: Use NMEA `c:<epoch>` tag block timestamps when present; grouped `\g:` fragments reuse the first sentence timestamp for the whole AIS message, otherwise fall back to ingest time. File ingestion only.
   - Example: `AIS=true`
   - Default: `false`
@@ -38,7 +42,7 @@ Most `collect-file` and `collect-socket` command-line parameters can be configur
 
 - `MAX_ROWS`: Maximum rows to buffer per Parquet file before flush
   - Example: `MAX_ROWS=10000`
-  - Default: flush on minute boundary only
+  - Default: flush on the selected partition boundary only
 
 - `MAX_BATCH_BYTES`: Maximum payload bytes to buffer per Parquet file before flush
   - Example: `MAX_BATCH_BYTES=67108864`
@@ -159,7 +163,7 @@ This allows for flexible configuration where you can:
 The application gracefully handles missing environment variables:
 
 - **Optional parameters** (like `S3_BUCKET`): Missing environment variables are treated as unset/empty
-- **Parameters with defaults** (like `S3_REGION`, `OUT_DIR`): Use their default values when environment variable is missing
+- **Parameters with defaults** (like `S3_REGION`, `OUT_DIR`, `PARTITION`): Use their default values when environment variable is missing
 - **Boolean parameters** (like `HEALTH_CHECK`, `KEEP_LOCAL`): Default to `false` when environment variable is missing
 ## Docker Health Checks
 

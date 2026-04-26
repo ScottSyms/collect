@@ -5,7 +5,8 @@ mod storage;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
-use commands::{compact, inspect, validate, vacuum};
+use collect_core::PartitionGranularity;
+use commands::{compact, inspect, vacuum, validate};
 use progress::{count, report};
 use storage::{StorageConfig, StorageLocation};
 
@@ -20,11 +21,15 @@ fn default_concurrency() -> usize {
 #[command(
     version,
     about = "Maintain hive-partitioned Parquet collections stored locally or on S3",
-    after_help = "Examples:\n  collect-maint --root data inspect\n  collect-maint --root data compact\n  collect-maint --root data compact --apply\n  collect-maint --root data vacuum\n  collect-maint --root data vacuum --apply\n\nNotes:\n  compact and vacuum are dry-run by default. Re-run with --apply to make changes."
+    after_help = "Examples:\n  collect-maint --root data --partition minute inspect\n  collect-maint --root data --partition hour compact\n  collect-maint --root data --partition day compact --apply\n  collect-maint --root data --partition month vacuum\n  collect-maint --root data --partition year vacuum --apply\n\nNotes:\n  partition is required and must match the dataset layout. compact and vacuum are dry-run by default. Re-run with --apply to make changes."
 )]
 struct Cli {
     #[command(flatten)]
     storage: StorageArgs,
+
+    /// Partition granularity of the dataset layout
+    #[arg(long, value_enum)]
+    partition: PartitionGranularity,
 
     /// Maximum number of concurrent maintenance workers
     #[arg(long, global = true, default_value_t = default_concurrency())]
@@ -114,14 +119,20 @@ async fn main() -> Result<()> {
         ),
     );
     let entries = storage
-        .list_entries(|listed| {
+        .list_entries(cli.partition, |listed| {
             if listed > 0 {
-                report("collect-maint", format!("listed {} entries so far", count(listed)));
+                report(
+                    "collect-maint",
+                    format!("listed {} entries so far", count(listed)),
+                );
             }
         })
         .await
         .context("listing dataset entries")?;
-    report("collect-maint", format!("loaded {} entries", count(entries.len())));
+    report(
+        "collect-maint",
+        format!("loaded {} entries", count(entries.len())),
+    );
 
     match cli.command {
         Command::Inspect { verbose } => inspect(&storage, &entries, concurrency, verbose).await,
@@ -129,8 +140,19 @@ async fn main() -> Result<()> {
         Command::Compact {
             target_file_size_bytes,
             apply,
-        } => compact(&storage, &entries, target_file_size_bytes, apply, concurrency).await,
-        Command::Vacuum { apply } => vacuum(&storage, &entries, apply, concurrency).await,
+        } => {
+            compact(
+                &storage,
+                &entries,
+                target_file_size_bytes,
+                apply,
+                concurrency,
+            )
+            .await
+        }
+        Command::Vacuum { apply } => {
+            vacuum(&storage, &entries, cli.partition, apply, concurrency).await
+        }
     }
 }
 

@@ -1,9 +1,12 @@
 use anyhow::{bail, Context, Result};
 use async_compression::tokio::bufread::{BzDecoder, GzipDecoder};
 use bytes::Bytes;
-use collect_core::{format_count, line_reader_from_async_read, IngestProgress, LineReader, LineSource, ReaderTransition};
-use std::collections::HashMap;
+use collect_core::{
+    format_count, line_reader_from_async_read, IngestProgress, LineReader, LineSource,
+    ReaderTransition,
+};
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::fs::File as StdFile;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -72,7 +75,10 @@ impl FileInputSource {
 
     async fn open_next(&mut self, max_line_length: usize) -> Result<LineReader> {
         if self.jobs.is_empty() {
-            return Ok(line_reader_from_async_read(tokio::io::empty(), max_line_length));
+            return Ok(line_reader_from_async_read(
+                tokio::io::empty(),
+                max_line_length,
+            ));
         }
 
         let job = self
@@ -538,9 +544,9 @@ mod tests {
     use collect_core::{run_ingest, CommonOptions, IngestOptions};
     use futures_util::StreamExt;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use std::collections::HashMap;
     use std::fs::File as StdFile;
     use std::io::Write;
-    use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
     use tempfile::tempdir;
@@ -619,6 +625,7 @@ mod tests {
             IngestOptions {
                 common: CommonOptions {
                     out_dir: out_dir.clone(),
+                    partition: collect_core::PartitionGranularity::Minute,
                     max_rows: None,
                     max_batch_bytes: 1024,
                     upload_drain_timeout_seconds: 1,
@@ -720,7 +727,10 @@ mod tests {
         let second = r"\g:2-2-6287*56\!AIVDM,2,2,0,A,P0,4*72";
 
         assert_eq!(source.timestamp_for_payload(first), Some(1_609_459_200_000));
-        assert_eq!(source.timestamp_for_payload(second), Some(1_609_459_200_000));
+        assert_eq!(
+            source.timestamp_for_payload(second),
+            Some(1_609_459_200_000)
+        );
     }
 
     #[test]
@@ -738,7 +748,10 @@ mod tests {
         let third = r"\g:3-3-2655*58\!AIVDM,3,3,9,A,third,0*00";
 
         assert_eq!(source.timestamp_for_payload(first), Some(1_609_459_200_000));
-        assert_eq!(source.timestamp_for_payload(second), Some(1_609_459_200_000));
+        assert_eq!(
+            source.timestamp_for_payload(second),
+            Some(1_609_459_200_000)
+        );
         assert_eq!(source.timestamp_for_payload(third), Some(1_609_459_200_000));
     }
 
@@ -752,7 +765,9 @@ mod tests {
             cursor: 1,
         };
 
-        let progress = source.ingest_progress().expect("expected progress snapshot");
+        let progress = source
+            .ingest_progress()
+            .expect("expected progress snapshot");
         assert_eq!(progress.current_input, "/tmp/input.txt");
         assert_eq!(progress.current_input_index, 1);
         assert_eq!(progress.input_total, 1);
@@ -779,6 +794,7 @@ mod tests {
             IngestOptions {
                 common: CommonOptions {
                     out_dir: out_dir.clone(),
+                    partition: collect_core::PartitionGranularity::Minute,
                     max_rows: Some(1),
                     max_batch_bytes: 1024 * 1024,
                     upload_drain_timeout_seconds: 1,

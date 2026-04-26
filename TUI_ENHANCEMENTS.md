@@ -18,6 +18,7 @@ December 21, 2025
 - ✅ No conflicting input sources (file/TCP)
 - ✅ TCP port required when TCP host specified
 - ✅ TCP port is valid number (1-65535)
+- ✅ Partition granularity is valid
 - ✅ Max rows is valid positive number
 - ✅ S3 credentials available (fields or environment)
 
@@ -32,7 +33,7 @@ December 21, 2025
 
 **Coverage**: Hints for all fields across 5 tabs:
 - **Input Tab**: File paths, TCP addresses, ports
-- **Output Tab**: Directory paths, row limits
+- **Output Tab**: Directory paths, partition granularity, row limits
 - **S3 Tab**: Bucket names, endpoints, regions, prefixes
 - **Config Tab**: File operations
 

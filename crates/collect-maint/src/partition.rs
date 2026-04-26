@@ -1,11 +1,13 @@
 use anyhow::{bail, Result};
-use chrono::{TimeZone, Utc};
+use chrono::Utc;
+use collect_core::PartitionGranularity;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct PartitionKey {
     pub source: String,
+    pub granularity: PartitionGranularity,
     pub year: i32,
     pub month: u32,
     pub day: u32,
@@ -14,56 +16,70 @@ pub struct PartitionKey {
 }
 
 impl PartitionKey {
-    pub fn parse(rel_path: &str) -> Option<Self> {
+    pub fn parse(rel_path: &str, granularity: PartitionGranularity) -> Option<Self> {
         let parent = Path::new(rel_path).parent()?;
         let parts: Vec<String> = parent
             .iter()
             .map(|part| part.to_string_lossy().to_string())
             .collect();
 
-        if parts.len() < 6 {
-            return None;
-        }
-
-        let start = parts.len().saturating_sub(6);
-        parse_partition_parts(&parts[start..])
+        parse_partition_parts(&parts, granularity)
     }
 
     pub fn relative_dir(&self) -> String {
         format_partition_dir(self)
     }
 
-    pub fn minute_id(&self) -> Result<u64> {
-        let dt = Utc
-            .with_ymd_and_hms(self.year, self.month, self.day, self.hour, self.minute, 0)
-            .single()
-            .ok_or_else(|| anyhow::anyhow!("invalid partition timestamp: {}", self.relative_dir()))?;
-        Ok(dt.timestamp().max(0) as u64 / 60)
-    }
-
     pub fn matches_timestamp_ms(&self, timestamp_ms: i64) -> bool {
-        minute_id_from_timestamp_ms(timestamp_ms) == self.minute_id().unwrap_or(u64::MAX)
+        let (year, month, day, hour, minute) =
+            self.granularity.components_from_timestamp(timestamp_ms);
+        (self.year, self.month, self.day, self.hour, self.minute)
+            == (year, month, day, hour, minute)
     }
 }
 
-pub fn minute_id_from_timestamp_ms(timestamp_ms: i64) -> u64 {
-    timestamp_ms.max(0) as u64 / 1_000 / 60
-}
-
-fn parse_partition_parts(parts: &[String]) -> Option<PartitionKey> {
-    if parts.len() != 6 {
+fn parse_partition_parts(
+    parts: &[String],
+    granularity: PartitionGranularity,
+) -> Option<PartitionKey> {
+    if parts.len() != granularity.depth() + 1 {
         return None;
     }
 
     let source = parse_partition_value(&parts[0], "source")?.to_string();
     let year = parse_partition_value(&parts[1], "year")?.parse().ok()?;
-    let month = parse_partition_value(&parts[2], "month")?.parse().ok()?;
-    let day = parse_partition_value(&parts[3], "day")?.parse().ok()?;
-    let hour = parse_partition_value(&parts[4], "hour")?.parse().ok()?;
-    let minute = parse_partition_value(&parts[5], "minute")?.parse().ok()?;
+    let month = match granularity {
+        PartitionGranularity::Year => 1,
+        PartitionGranularity::Month
+        | PartitionGranularity::Day
+        | PartitionGranularity::Hour
+        | PartitionGranularity::Minute => {
+            parse_partition_value(&parts[2], "month")?.parse().ok()?
+        }
+    };
+    let day = match granularity {
+        PartitionGranularity::Year | PartitionGranularity::Month => 1,
+        PartitionGranularity::Day | PartitionGranularity::Hour | PartitionGranularity::Minute => {
+            parse_partition_value(&parts[3], "day")?.parse().ok()?
+        }
+    };
+    let hour = match granularity {
+        PartitionGranularity::Year | PartitionGranularity::Month | PartitionGranularity::Day => 0,
+        PartitionGranularity::Hour | PartitionGranularity::Minute => {
+            parse_partition_value(&parts[4], "hour")?.parse().ok()?
+        }
+    };
+    let minute = match granularity {
+        PartitionGranularity::Minute => parse_partition_value(&parts[5], "minute")?.parse().ok()?,
+        PartitionGranularity::Year
+        | PartitionGranularity::Month
+        | PartitionGranularity::Day
+        | PartitionGranularity::Hour => 0,
+    };
 
     Some(PartitionKey {
         source,
+        granularity,
         year,
         month,
         day,
@@ -82,15 +98,32 @@ fn parse_partition_value<'a>(segment: &'a str, expected_key: &str) -> Option<&'a
 }
 
 pub fn format_partition_dir(partition: &PartitionKey) -> String {
-    format!(
-        "source={}/year={:04}/month={:02}/day={:02}/hour={:02}/minute={:02}",
-        partition.source,
-        partition.year,
-        partition.month,
-        partition.day,
-        partition.hour,
-        partition.minute
-    )
+    match partition.granularity {
+        PartitionGranularity::Year => {
+            format!("source={}/year={:04}", partition.source, partition.year)
+        }
+        PartitionGranularity::Month => format!(
+            "source={}/year={:04}/month={:02}",
+            partition.source, partition.year, partition.month
+        ),
+        PartitionGranularity::Day => format!(
+            "source={}/year={:04}/month={:02}/day={:02}",
+            partition.source, partition.year, partition.month, partition.day
+        ),
+        PartitionGranularity::Hour => format!(
+            "source={}/year={:04}/month={:02}/day={:02}/hour={:02}",
+            partition.source, partition.year, partition.month, partition.day, partition.hour
+        ),
+        PartitionGranularity::Minute => format!(
+            "source={}/year={:04}/month={:02}/day={:02}/hour={:02}/minute={:02}",
+            partition.source,
+            partition.year,
+            partition.month,
+            partition.day,
+            partition.hour,
+            partition.minute
+        ),
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -128,7 +161,10 @@ pub fn classify_entry(rel_path: &str, size: u64) -> EntryKind {
 pub fn compaction_output_name(group_index: usize) -> String {
     let timestamp_ms = Utc::now().timestamp_millis();
     let pid = std::process::id();
-    format!("compact-{}-{}-{:03}.parquet", timestamp_ms, pid, group_index)
+    format!(
+        "compact-{}-{}-{:03}.parquet",
+        timestamp_ms, pid, group_index
+    )
 }
 
 pub fn manifest_path_for_output(output_rel_path: &str) -> String {

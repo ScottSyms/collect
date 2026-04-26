@@ -6,8 +6,8 @@ use aws_config::Region;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::{Client as S3Client, Config as S3Config};
-use chrono::{Datelike, Timelike, Utc};
-use clap::Args;
+use chrono::{Datelike, TimeZone, Timelike, Utc};
+use clap::{Args, ValueEnum};
 use futures_util::StreamExt;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, Encoding, ZstdLevel};
@@ -16,6 +16,7 @@ use parquet::schema::types::ColumnPath;
 use std::error::Error;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -40,13 +41,98 @@ const DEFAULT_UPLOAD_CONCURRENCY: usize = 4;
 const DEFAULT_UPLOAD_RETRIES: usize = 3;
 const HEALTH_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, ValueEnum)]
+#[value(rename_all = "lower")]
+pub enum PartitionGranularity {
+    Minute,
+    Hour,
+    Day,
+    Month,
+    Year,
+}
+
+impl Default for PartitionGranularity {
+    fn default() -> Self {
+        Self::Minute
+    }
+}
+
+impl PartitionGranularity {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Minute => "minute",
+            Self::Hour => "hour",
+            Self::Day => "day",
+            Self::Month => "month",
+            Self::Year => "year",
+        }
+    }
+
+    pub const fn depth(self) -> usize {
+        match self {
+            Self::Year => 1,
+            Self::Month => 2,
+            Self::Day => 3,
+            Self::Hour => 4,
+            Self::Minute => 5,
+        }
+    }
+
+    pub fn components_from_timestamp(self, timestamp_ms: i64) -> (i32, u32, u32, u32, u32) {
+        let timestamp_ms = timestamp_ms.max(0);
+        let dt = Utc
+            .timestamp_millis_opt(timestamp_ms)
+            .single()
+            .unwrap_or_else(|| {
+                Utc.timestamp_opt(0, 0)
+                    .single()
+                    .expect("unix epoch should be valid")
+            });
+
+        match self {
+            Self::Minute => (dt.year(), dt.month(), dt.day(), dt.hour(), dt.minute()),
+            Self::Hour => (dt.year(), dt.month(), dt.day(), dt.hour(), 0),
+            Self::Day => (dt.year(), dt.month(), dt.day(), 0, 0),
+            Self::Month => (dt.year(), dt.month(), 1, 0, 0),
+            Self::Year => (dt.year(), 1, 1, 0, 0),
+        }
+    }
+}
+
+impl std::fmt::Display for PartitionGranularity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for PartitionGranularity {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "minute" => Ok(Self::Minute),
+            "hour" => Ok(Self::Hour),
+            "day" => Ok(Self::Day),
+            "month" => Ok(Self::Month),
+            "year" => Ok(Self::Year),
+            _ => Err(format!(
+                "invalid partition granularity: {value} (expected minute, hour, day, month, or year)"
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Args)]
 pub struct CommonCliArgs {
     /// Output root directory
     #[arg(short = 'o', long, default_value = "data")]
     pub out_dir: PathBuf,
 
-    /// Max rows to buffer per Parquet file before flush (default: flush on minute boundary only)
+    /// Partition granularity for dataset layout
+    #[arg(long, default_value_t = PartitionGranularity::Minute)]
+    pub partition: PartitionGranularity,
+
+    /// Max rows to buffer per Parquet file before flush (default: flush on the selected partition boundary)
     #[arg(long)]
     pub max_rows: Option<usize>,
 
@@ -101,6 +187,7 @@ pub struct S3CliArgs {
 #[derive(Clone, Debug)]
 pub struct CommonOptions {
     pub out_dir: PathBuf,
+    pub partition: PartitionGranularity,
     pub max_rows: Option<usize>,
     pub max_batch_bytes: usize,
     pub upload_drain_timeout_seconds: u64,
@@ -182,6 +269,14 @@ impl CommonCliArgs {
             }
         }
 
+        if self.partition == PartitionGranularity::Minute {
+            if let Ok(value) = std::env::var("PARTITION") {
+                if let Ok(parsed) = value.parse::<PartitionGranularity>() {
+                    self.partition = parsed;
+                }
+            }
+        }
+
         if self.max_rows.is_none() {
             if let Ok(value) = std::env::var("MAX_ROWS") {
                 self.max_rows = value.parse().ok();
@@ -220,6 +315,7 @@ impl CommonCliArgs {
     pub fn to_options(&self) -> CommonOptions {
         CommonOptions {
             out_dir: self.out_dir.clone(),
+            partition: self.partition,
             max_rows: self.max_rows,
             max_batch_bytes: self.max_batch_bytes.unwrap_or(DEFAULT_MAX_BATCH_BYTES),
             upload_drain_timeout_seconds: self.upload_drain_timeout_seconds,
@@ -333,13 +429,50 @@ pub fn format_count(value: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::format_count;
+    use super::{format_count, PartKey, PartitionGranularity};
+    use chrono::{TimeZone, Utc};
 
     #[test]
     fn formats_counts_with_thousands_separators() {
         assert_eq!(format_count(0), "0");
         assert_eq!(format_count(1_234), "1,234");
         assert_eq!(format_count(12_345_678), "12,345,678");
+    }
+
+    #[test]
+    fn truncates_partition_keys_by_granularity() {
+        let ts_one = Utc
+            .with_ymd_and_hms(2024, 2, 3, 4, 5, 6)
+            .single()
+            .expect("valid timestamp")
+            .timestamp_millis();
+        let ts_two = Utc
+            .with_ymd_and_hms(2024, 2, 3, 5, 59, 59)
+            .single()
+            .expect("valid timestamp")
+            .timestamp_millis();
+
+        let day_one = PartKey::from_timestamp("source", ts_one, PartitionGranularity::Day);
+        let day_two = PartKey::from_timestamp("source", ts_two, PartitionGranularity::Day);
+        assert_eq!(day_one, day_two);
+        assert_eq!(
+            day_one.relative_dir(),
+            "source=source/year=2024/month=02/day=03"
+        );
+
+        let hour_one = PartKey::from_timestamp("source", ts_one, PartitionGranularity::Hour);
+        let hour_two = PartKey::from_timestamp("source", ts_two, PartitionGranularity::Hour);
+        assert_ne!(hour_one, hour_two);
+        assert_eq!(
+            hour_one.relative_dir(),
+            "source=source/year=2024/month=02/day=03/hour=04"
+        );
+
+        let month = PartKey::from_timestamp("source", ts_one, PartitionGranularity::Month);
+        assert_eq!(month.relative_dir(), "source=source/year=2024/month=02");
+
+        let year = PartKey::from_timestamp("source", ts_one, PartitionGranularity::Year);
+        assert_eq!(year.relative_dir(), "source=source/year=2024");
     }
 }
 
@@ -404,8 +537,11 @@ where
     });
 
     let now = now_unix_duration();
-    let mut current_minute_id = minute_id_from_millis(now.as_millis() as i64);
-    let mut current_key = PartKey::from_minute(source.source_name(), current_minute_id);
+    let mut current_key = PartKey::from_timestamp(
+        source.source_name(),
+        now.as_millis() as i64,
+        common.partition,
+    );
     let mut buf = BatchBuf::new(common.max_rows, common.max_batch_bytes);
     let mut rows_in_file = 0usize;
     let mut rows_processed = 0usize;
@@ -448,17 +584,20 @@ where
                         let duration = now_unix_duration();
                         let now_ms = duration.as_millis() as i64;
                         let row_ts_ms = source.timestamp_for_payload(&payload).unwrap_or(now_ms);
-                        let minute_id = minute_id_from_millis(row_ts_ms);
+                        let row_key = PartKey::from_timestamp(
+                            source.source_name(),
+                            row_ts_ms,
+                            common.partition,
+                        );
                         let payload_len = payload.len();
 
-                        if minute_id != current_minute_id {
+                        if row_key != current_key {
                             if !buf.is_empty() {
                                 flush_batch(&common.out_dir, &current_key, &mut buf, upload_tx.as_ref()).await?;
                                 rows_in_file = 0;
                                 files_flushed += 1;
                             }
-                            current_minute_id = minute_id;
-                            current_key = PartKey::from_minute(source.source_name(), current_minute_id);
+                            current_key = row_key;
                         }
 
                         // Keep each batch well below Arrow's string offset limit.
@@ -593,6 +732,7 @@ pub fn check_health(health_file: &Path) -> Result<()> {
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct PartKey {
     source: String,
+    granularity: PartitionGranularity,
     year: i32,
     month: u32,
     day: u32,
@@ -601,33 +741,61 @@ pub struct PartKey {
 }
 
 impl PartKey {
-    pub fn from_minute(source: &str, minute_id: u64) -> Self {
-        let minute_time = UNIX_EPOCH + Duration::from_secs(minute_id * 60);
-        let now: chrono::DateTime<Utc> = minute_time.into();
+    pub fn from_timestamp(
+        source: &str,
+        timestamp_ms: i64,
+        granularity: PartitionGranularity,
+    ) -> Self {
+        let (year, month, day, hour, minute) = granularity.components_from_timestamp(timestamp_ms);
         PartKey {
             source: source.to_string(),
-            year: now.year(),
-            month: now.month(),
-            day: now.day(),
-            hour: now.hour(),
-            minute: now.minute(),
+            granularity,
+            year,
+            month,
+            day,
+            hour,
+            minute,
+        }
+    }
+
+    pub fn from_minute(source: &str, minute_id: u64) -> Self {
+        Self::from_timestamp(
+            source,
+            minute_id.saturating_mul(60_000) as i64,
+            PartitionGranularity::Minute,
+        )
+    }
+
+    fn relative_dir(&self) -> String {
+        match self.granularity {
+            PartitionGranularity::Year => {
+                format!("source={}/year={:04}", self.source, self.year)
+            }
+            PartitionGranularity::Month => format!(
+                "source={}/year={:04}/month={:02}",
+                self.source, self.year, self.month
+            ),
+            PartitionGranularity::Day => format!(
+                "source={}/year={:04}/month={:02}/day={:02}",
+                self.source, self.year, self.month, self.day
+            ),
+            PartitionGranularity::Hour => format!(
+                "source={}/year={:04}/month={:02}/day={:02}/hour={:02}",
+                self.source, self.year, self.month, self.day, self.hour
+            ),
+            PartitionGranularity::Minute => format!(
+                "source={}/year={:04}/month={:02}/day={:02}/hour={:02}/minute={:02}",
+                self.source, self.year, self.month, self.day, self.hour, self.minute
+            ),
         }
     }
 
     fn dir_path(&self, root: &Path) -> PathBuf {
-        root.join(format!("source={}", self.source))
-            .join(format!("year={:04}", self.year))
-            .join(format!("month={:02}", self.month))
-            .join(format!("day={:02}", self.day))
-            .join(format!("hour={:02}", self.hour))
-            .join(format!("minute={:02}", self.minute))
+        root.join(self.relative_dir())
     }
 
     fn s3_key(&self, filename: &str) -> String {
-        format!(
-            "source={}/year={:04}/month={:02}/day={:02}/hour={:02}/minute={:02}/{}",
-            self.source, self.year, self.month, self.day, self.hour, self.minute, filename
-        )
+        format!("{}/{}", self.relative_dir(), filename)
     }
 }
 
@@ -992,8 +1160,4 @@ fn now_unix_duration() -> Duration {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|_| Duration::from_secs(0))
-}
-
-fn minute_id_from_millis(timestamp_ms: i64) -> u64 {
-    timestamp_ms.max(0) as u64 / 1_000 / 60
 }
