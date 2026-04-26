@@ -1,6 +1,6 @@
 # Quick Profiling Guide
 
-> Legacy guide for the pre-workspace single-binary layout.
+> Legacy guide for the pre-workspace single-binary layout. Historical examples still refer to `hive_parquet_ingest`.
 
 ## Immediate Resource Monitoring
 

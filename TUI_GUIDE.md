@@ -1,10 +1,10 @@
 # TUI (Terminal User Interface) Guide
 
-> Legacy documentation for the pre-workspace single-binary layout. The current workspace focuses on `collect-file` and `collect-socket`.
+> Legacy documentation for the pre-workspace single-binary layout. The current workspace exposes the same TUI through `collect-file --tui` and `collect-socket --tui`.
 
 ## Overview
 
-The `capture` tool includes an interactive Terminal User Interface (TUI) for easy configuration of all available options. The TUI provides a tab-based interface with validation, hints, and config file support.
+The current `collect-file` and `collect-socket` binaries include an interactive Terminal User Interface (TUI) for easy configuration of all available options. The TUI provides a tab-based interface with validation, hints, and config file support.
 
 ## Key Features
 
@@ -18,7 +18,7 @@ The `capture` tool includes an interactive Terminal User Interface (TUI) for eas
 ## Launching the TUI
 
 ```bash
-./capture --tui
+cargo run -p collect-file -- --tui
 ```
 
 The TUI will automatically load values from:
@@ -76,7 +76,7 @@ Configure cloud storage:
 
 ### 4. Config Tab
 Save and load configurations:
-- **Config File Path**: Path to JSON config file (default: `capture-config.json`)
+- **Config File Path**: Path to JSON config file (default: `collect-file-config.json` for the file binary, `collect-socket-config.json` for the socket binary)
 - **Save Config**: Press Enter to save current settings to file
 - **Load Config**: Press Enter to load settings from file
 
@@ -119,9 +119,9 @@ Examples:
 ### Saving Configurations
 
 1. Navigate to **Config** tab
-2. Edit **Config File Path** if desired (default: `capture-config.json`)
+2. Edit **Config File Path** if desired (default: `collect-file-config.json` for the file binary, `collect-socket-config.json` for the socket binary)
 3. Select **Save Config** and press Enter
-4. Status message confirms save: `✓ Config saved to capture-config.json`
+4. Status message confirms save: `✓ Config saved to collect-file-config.json`
 
 Saved configs are JSON files containing all settings:
 ```json
@@ -140,17 +140,17 @@ Saved configs are JSON files containing all settings:
 2. Edit **Config File Path** to point to saved config
 3. Select **Load Config** and press Enter
 4. All fields update with loaded values
-5. Status message confirms: `✓ Config loaded from capture-config.json`
+5. Status message confirms: `✓ Config loaded from collect-file-config.json`
 
 ### Example Workflow
 
 ```bash
 # Session 1: Configure and save
-./capture --tui
+cargo run -p collect-file -- --tui
 # Configure settings, save to production-config.json
 
 # Session 2: Load and run
-./capture --tui
+cargo run -p collect-file -- --tui
 # Load production-config.json, verify, run
 ```
 
@@ -159,7 +159,7 @@ Saved configs are JSON files containing all settings:
 ### Basic Usage
 Start TUI with no preset values:
 ```bash
-./capture --tui
+cargo run -p collect-file -- --tui
 ```
 
 ### Pre-populated from Environment
@@ -169,7 +169,7 @@ export S3_BUCKET=my-bucket
 export S3_REGION=us-west-2
 export TCP_HOST=153.44.253.27
 export TCP_PORT=5631
-./capture --tui
+cargo run -p collect-file -- --tui
 ```
 
 The TUI will show these values pre-filled.
@@ -177,7 +177,7 @@ The TUI will show these values pre-filled.
 ### Mix CLI and TUI
 Provide some options via CLI, configure rest in TUI:
 ```bash
-./capture --out-dir /data/output --s3-bucket my-bucket --tui
+cargo run -p collect-file -- --out-dir /data/output --s3-bucket my-bucket --tui
 ```
 
 ## Tips
@@ -232,5 +232,5 @@ export TCP_HOST=153.44.253.27
 export TCP_PORT=5631
 
 # Launch TUI with pre-configured values
-./capture --tui
+cargo run -p collect-file -- --tui
 ```

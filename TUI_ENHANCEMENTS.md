@@ -1,6 +1,6 @@
 # TUI Enhancements Summary
 
-> Legacy documentation for the pre-workspace single-binary layout. The current workspace focuses on `collect-file` and `collect-socket`.
+> Legacy documentation for the pre-workspace single-binary layout. The current workspace exposes the same TUI through `collect-file --tui` and `collect-socket --tui`.
 
 ## Overview
 Enhanced the Terminal User Interface (TUI) with validation, hints, and configuration file management capabilities.
@@ -47,7 +47,7 @@ December 21, 2025
 
 **Features**:
 - Saves all settings to JSON file
-- Default filename: `capture-config.json`
+- Default filenames: `collect-file-config.json` and `collect-socket-config.json`
 - Customizable file path in Config tab
 - Pretty-printed JSON for readability
 - Success/error status messages
@@ -154,7 +154,7 @@ struct App {
 ### Test Procedure
 ```bash
 ./test-tui.sh           # Creates test config
-./target/release/capture --tui   # Launch TUI
+cargo run -p collect-file -- --tui   # Launch TUI
 # Navigate to Config tab
 # Load test-config.json
 # Press 'v' to validate
@@ -174,11 +174,11 @@ struct App {
 ### Example Usage
 ```bash
 # Configure once, save for reuse
-./capture --tui
+cargo run -p collect-file -- --tui
 # (Configure settings, save to prod-config.json)
 
 # Later sessions
-./capture --tui
+cargo run -p collect-file -- --tui
 # (Load prod-config.json, verify, run)
 ```
 

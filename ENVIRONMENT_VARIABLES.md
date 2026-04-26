@@ -1,6 +1,6 @@
 # Environment Variable Configuration
 
-All command-line parameters can be configured using environment variables, making Docker deployments much easier to manage. This document lists all available environment variables and their usage.
+Most `collect-file` and `collect-socket` command-line parameters can be configured using environment variables, making Docker deployments much easier to manage. `collect-maint` remains CLI-only. This document lists the supported environment variables and their usage.
 
 ## Environment Variable Reference
 
@@ -28,7 +28,7 @@ All command-line parameters can be configured using environment variables, makin
   - Example: `SOURCE=ais-sf-bay`
   - Default: input file stem or "tcp" for network input
 
-- `AIS`: Use NMEA `c:<epoch>` tag block timestamps when present; grouped `\g:` fragments reuse the first sentence timestamp for the whole AIS message, otherwise fall back to ingest time
+- `AIS`: Use NMEA `c:<epoch>` tag block timestamps when present; grouped `\g:` fragments reuse the first sentence timestamp for the whole AIS message, otherwise fall back to ingest time. File ingestion only.
   - Example: `AIS=true`
   - Default: `false`
 
@@ -44,11 +44,15 @@ All command-line parameters can be configured using environment variables, makin
   - Example: `MAX_BATCH_BYTES=67108864`
   - Default: `67108864` (64 MiB)
 
+- `MAX_LINE_LENGTH`: Maximum bytes allowed per input line
+  - Example: `MAX_LINE_LENGTH=65536`
+  - Default: `65536`
+
 - `HEALTH_CHECK`: Run health check and exit (for Docker HEALTHCHECK)
   - Example: `HEALTH_CHECK=true`
   - Default: `false`
 
-- `KEEP_LOCAL`: Keep local files after S3 upload
+- `KEEP_LOCAL`: Keep local files after successful S3 upload
   - Example: `KEEP_LOCAL=true`
   - Default: `false` (delete after successful upload)
 
@@ -86,7 +90,7 @@ version: '3.8'
 
 services:
   data-ingest:
-    image: hive-parquet-ingest:latest
+    image: collect:latest
     environment:
       - TCP_HOST=153.44.253.27
       - TCP_PORT=5631
@@ -107,7 +111,7 @@ version: '3.8'
 
 services:
   data-ingest:
-    image: hive-parquet-ingest:latest
+    image: collect:latest
     environment:
       - TCP_HOST=153.44.253.27
       - TCP_PORT=5631
@@ -125,7 +129,7 @@ version: '3.8'
 
 services:
   data-ingest:
-    image: hive-parquet-ingest:latest
+    image: collect:latest
     environment:
       - INPUT_PATH=/input/data.txt
       - SOURCE=batch-data
@@ -169,15 +173,20 @@ HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=10s \
 Or using environment variables:
 
 ```yaml
-healthcheck:
-  test: ["CMD", "/usr/local/bin/collect-socket"]
-  environment:
-    - HEALTH_CHECK=true
-  interval: 30s
-  timeout: 10s
-  retries: 3
-  start_period: 10s
+services:
+  data-ingest:
+    image: collect:latest
+    environment:
+      - HEALTH_CHECK=true
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/collect-socket"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
 ```
+
+The healthcheck command inherits the service environment, so `HEALTH_CHECK=true` is visible there. Swap `collect-socket` for `collect-file` if the container runs file ingestion.
 
 ## Best Practices
 

@@ -1,11 +1,11 @@
 # collect
 
-A Rust workspace for ingesting data into Hive-partitioned Parquet files with Zstd compression. It provides `collect-file` for recursive plain/compressed file ingestion, `collect-socket` for TCP line ingestion, and `collect-maint` for dataset inspection and maintenance, with optional remote storage (S3/MinIO).
+A Rust workspace for ingesting data into Hive-partitioned Parquet files with Zstd compression. It provides `collect-file` for recursive file ingestion, `collect-socket` for TCP line ingestion, and `collect-maint` for inspection, validation, compaction, and vacuuming, with optional remote storage (S3/MinIO).
 
 ## Features
 - **Multiple Input Sources**: Plain, compressed, or TCP stream
 - **Compressed Inputs**: Plain text, gzip, bzip2, and zip files
-- **AIS Timestamps**: Optional NMEA tag block timestamping for legacy captures
+- **AIS Timestamps**: Optional NMEA tag block timestamping for file ingestion
 - **Hive Partitioning**: Automatic partitioning by source, year, month, day, hour, and minute
 - **Parquet Format**: Efficient columnar storage with Zstd compression
 - **S3 Integration**: Upload to AWS S3 or S3-compatible storage (MinIO) with optional TLS
@@ -45,11 +45,11 @@ cargo run -p collect-socket -- --tcp-host 153.44.253.27 --tcp-port 5631 --source
 cargo run -p collect-file -- --input data.txt --source mydata --s3-bucket maritime-data
 ```
 
-`collect-file` auto-detects plain text, gzip, bzip2, and zip inputs. Zip archives are read entry-by-entry in archive order. Tar and 7z archives are not supported. Hidden dotfiles are skipped silently. Use `--ais` to prefer NMEA `c:<epoch>` tag block timestamps when present; grouped `\g:` fragments reuse the first sentence timestamp for the whole AIS message; otherwise it falls back to ingest time.
+`collect-file` auto-detects plain text, gzip, bzip2, and zip inputs. Zip archives are read entry-by-entry in archive order. Hidden dotfiles are skipped silently. `--ais` applies to `collect-file` only; it prefers NMEA `c:<epoch>` tag block timestamps when present and reuses the first sentence timestamp for grouped `\g:` fragments.
 
 ## Maintenance
 
-`collect-maint` inspects and repairs hive-partitioned datasets. `compact` and `vacuum` are dry-run by default; add `--apply` to make changes.
+`collect-maint` inspects, validates, compacts, and vacuums hive-partitioned datasets. `compact` and `vacuum` are dry-run by default; add `--apply` to make changes.
 
 ```bash
 # Read-only inspection
@@ -70,7 +70,7 @@ cargo run -p collect-maint -- --root data vacuum --apply
 
 ## Environment Variables
 
-All command-line parameters can be configured using environment variables:
+Most `collect-file` and `collect-socket` command-line parameters can be configured using environment variables. `collect-maint` remains CLI-only.
 
 | Environment Variable | CLI Argument | Description |
 |---------------------|--------------|-------------|
@@ -78,10 +78,11 @@ All command-line parameters can be configured using environment variables:
 | `TCP_HOST` | `--tcp-host` | TCP host address |
 | `TCP_PORT` | `--tcp-port` | TCP port number |
 | `SOURCE` | `--source` | Logical source label |
-| `AIS` | `--ais` | Use NMEA `c:<epoch>` tag block timestamps |
+| `AIS` | `--ais` | Use NMEA `c:<epoch>` tag block timestamps (collect-file only) |
 | `OUT_DIR` | `--out-dir` | Output directory |
 | `MAX_ROWS` | `--max-rows` | Max rows per file |
 | `MAX_BATCH_BYTES` | `--max-batch-bytes` | Max payload bytes per Parquet file |
+| `MAX_LINE_LENGTH` | `--max-line-length` | Max bytes per input line |
 | `UPLOAD_DRAIN_TIMEOUT_SECONDS` | `--upload-drain-timeout-seconds` | Max seconds to wait for upload drain |
 | `HEALTH_CHECK` | `--health-check` | Run health check |
 | `S3_BUCKET` | `--s3-bucket` | S3 bucket name |
@@ -253,7 +254,8 @@ cargo build --release --workspace
 
 ## Performance Tuning
 
-- **MAX_ROWS**: Control memory usage vs file size (default: flush on minute boundary)
+- **MAX_ROWS**: Cap rows per file when you want smaller Parquet chunks
+- **MAX_BATCH_BYTES**: Cap buffered payload size per Parquet file (default: 64 MiB)
 - **Compression**: Uses Zstd for optimal compression ratio and speed
 - **Async Processing**: Leverages Tokio for high-performance async I/O
 - **Resource Limits**: Set appropriate memory limits in Docker for large datasets
@@ -279,11 +281,3 @@ cargo clean && cargo build --release --workspace
 - **S3**: Validate credentials and bucket permissions
 
 See individual documentation files for detailed troubleshooting guides.
-
-## License
-
-[Add your license information here]
-
-## Contributing
-
-[Add contributing guidelines here]
