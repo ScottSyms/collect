@@ -48,6 +48,10 @@ Most `collect-file` and `collect-socket` command-line parameters can be configur
   - Example: `MAX_BATCH_BYTES=67108864`
   - Default: `67108864` (64 MiB)
 
+- `COMPRESSION_LEVEL`: Zstd compression level for Parquet output
+  - Example: `COMPRESSION_LEVEL=1`
+  - Default: `5`
+
 - `MAX_LINE_LENGTH`: Maximum bytes allowed per input line
   - Example: `MAX_LINE_LENGTH=65536`
   - Default: `65536`

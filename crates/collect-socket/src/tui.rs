@@ -12,6 +12,7 @@ pub struct TuiConfig {
     pub partition: String,
     pub max_rows: String,
     pub max_batch_bytes: String,
+    pub compression_level: String,
     pub keep_local: bool,
     pub s3_bucket: String,
     pub s3_endpoint: String,
@@ -31,6 +32,7 @@ impl Default for TuiConfig {
             partition: "minute".to_string(),
             max_rows: String::new(),
             max_batch_bytes: String::new(),
+            compression_level: String::new(),
             keep_local: false,
             s3_bucket: String::new(),
             s3_endpoint: String::new(),
@@ -66,6 +68,9 @@ impl TuiConfig {
         }
         if let Some(value) = env_value(&["MAX_BATCH_BYTES"]) {
             config.max_batch_bytes = value;
+        }
+        if let Some(value) = env_value(&["COMPRESSION_LEVEL"]) {
+            config.compression_level = value;
         }
         if let Some(value) = env_value(&["S3_BUCKET"]) {
             config.s3_bucket = value;
@@ -151,6 +156,11 @@ impl TuiModel for TuiConfig {
                     kind: FieldKind::Text,
                 },
                 FieldState {
+                    label: "Compression Level",
+                    value: self.compression_level.clone(),
+                    kind: FieldKind::Text,
+                },
+                FieldState {
                     label: "Keep Local Files",
                     value: self.keep_local.to_string(),
                     kind: FieldKind::Bool,
@@ -205,6 +215,7 @@ impl TuiModel for TuiConfig {
             (1, 1) => Some("minute, hour, day, month, or year"),
             (1, 2) => Some("e.g., 10000 (optional, flushes on the selected boundary)"),
             (1, 3) => Some("e.g., 67108864 (optional, defaults to 64 MiB)"),
+            (1, 4) => Some("e.g., 1-22 (optional, defaults to 5; lower is faster)"),
             (2, 0) => Some("e.g., my-bucket-name"),
             (2, 1) => Some("e.g., https://s3.example.com (for MinIO, R2, etc.)"),
             (2, 2) => Some("e.g., us-east-1, us-west-2, eu-central-1"),
@@ -239,6 +250,10 @@ impl TuiModel for TuiConfig {
             errors.push("⚠ Max Batch Bytes must be a valid positive number".to_string());
         }
 
+        if !self.compression_level.is_empty() && self.compression_level.parse::<i32>().is_err() {
+            errors.push("⚠ Compression Level must be a valid integer".to_string());
+        }
+
         if !self.s3_bucket.is_empty() {
             let access_key = !self.s3_access_key.is_empty()
                 || env_present(&["S3_ACCESS_KEY", "AWS_ACCESS_KEY_ID"]);
@@ -268,7 +283,8 @@ impl TuiModel for TuiConfig {
                 1 => self.partition = value,
                 2 => self.max_rows = value,
                 3 => self.max_batch_bytes = value,
-                4 => self.keep_local = !self.keep_local,
+                4 => self.compression_level = value,
+                5 => self.keep_local = !self.keep_local,
                 _ => {}
             },
             2 => match field {
@@ -286,7 +302,7 @@ impl TuiModel for TuiConfig {
 
     fn toggle_field(&mut self, tab: usize, field: usize) {
         match tab {
-            1 if field == 4 => self.keep_local = !self.keep_local,
+            1 if field == 5 => self.keep_local = !self.keep_local,
             2 if field == 5 => self.s3_disable_tls = !self.s3_disable_tls,
             _ => {}
         }
@@ -321,6 +337,10 @@ impl TuiModel for TuiConfig {
         if !self.max_batch_bytes.is_empty() {
             args.push("--max-batch-bytes".to_string());
             args.push(self.max_batch_bytes.clone());
+        }
+        if !self.compression_level.is_empty() {
+            args.push("--compression-level".to_string());
+            args.push(self.compression_level.clone());
         }
         if self.keep_local {
             args.push("--keep-local".to_string());

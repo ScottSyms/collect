@@ -6,6 +6,7 @@ use collect_core::{
     format_count, line_reader_from_async_read, IngestProgress, LineReader, LineSource,
     ReaderTransition,
 };
+use futures_util::stream::{self, StreamExt};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs::File as StdFile;
@@ -42,15 +43,19 @@ enum InputKind {
 struct InputJob {
     path: PathBuf,
     display: String,
+    estimated_size: u64,
     sort_index: usize,
     kind: InputKind,
 }
 
 impl FileInputSource {
+    #[cfg(test)]
     pub(crate) fn new(input: PathBuf, source: String, ais: bool) -> Result<Self> {
         let input_display = input.display().to_string();
         let mut jobs = if input.is_file() {
-            expand_input_path(&input)?
+            let metadata = std::fs::metadata(&input)
+                .with_context(|| format!("reading file metadata {}", input.display()))?;
+            expand_input_path(&input, metadata.len())?
         } else if input.is_dir() {
             collect_input_jobs(&input)?
         } else {
@@ -65,47 +70,94 @@ impl FileInputSource {
                 .cmp(&right.path)
                 .then(left.sort_index.cmp(&right.sort_index))
         });
+        Ok(Self::from_jobs(source, ais, jobs))
+    }
 
-        Ok(Self {
+    pub(crate) async fn new_parallel(input: PathBuf, source: String, ais: bool) -> Result<Self> {
+        let input_display = input.display().to_string();
+        let mut jobs = if input.is_file() {
+            let metadata = std::fs::metadata(&input)
+                .with_context(|| format!("reading file metadata {}", input.display()))?;
+            expand_input_path(&input, metadata.len())?
+        } else if input.is_dir() {
+            collect_input_jobs_parallel(&input, default_scan_concurrency()).await?
+        } else {
+            return Err(anyhow::anyhow!(
+                "input path does not exist or is not readable: {}",
+                input_display
+            ));
+        };
+
+        jobs.sort_by(|left, right| {
+            right
+                .estimated_size
+                .cmp(&left.estimated_size)
+                .then(left.path.cmp(&right.path))
+                .then(left.sort_index.cmp(&right.sort_index))
+        });
+
+        Ok(Self::from_jobs(source, ais, jobs))
+    }
+
+    fn from_jobs(source: String, ais: bool, jobs: Vec<InputJob>) -> Self {
+        Self {
             source,
             ais,
             ais_group_timestamps: HashMap::new(),
             ais_pending_timestamp_ms: None,
             jobs,
             cursor: 0,
-        })
+        }
+    }
+
+    pub(crate) fn job_count(&self) -> usize {
+        self.jobs.len()
+    }
+
+    pub(crate) fn into_job_sources(self) -> Vec<Self> {
+        let FileInputSource { source, ais, jobs, .. } = self;
+
+        jobs.into_iter()
+            .map(|job| FileInputSource::from_jobs(source.clone(), ais, vec![job]))
+            .collect()
     }
 
     async fn open_next(&mut self, max_line_length: usize) -> Result<LineReader> {
-        if self.jobs.is_empty() {
-            return Ok(line_reader_from_async_read(
-                tokio::io::empty(),
-                max_line_length,
-            ));
+        while self.cursor < self.jobs.len() {
+            let job = self
+                .jobs
+                .get(self.cursor)
+                .cloned()
+                .context("no more input files to open")?;
+
+            if self.cursor > 0 {
+                self.ais_group_timestamps.clear();
+                self.ais_pending_timestamp_ms = None;
+            }
+
+            let current_index = self.cursor + 1;
+            let total = self.jobs.len();
+            let display = job.display.clone();
+            self.cursor += 1;
+            println!(
+                "📄 Reading {}/{} {}",
+                format_count(current_index),
+                format_count(total),
+                display
+            );
+
+            match job.open(max_line_length).await {
+                Ok(reader) => return Ok(reader),
+                Err(error) => {
+                    eprintln!("⚠️  Skipping unreadable file {}: {}", display, error);
+                }
+            }
         }
 
-        let job = self
-            .jobs
-            .get(self.cursor)
-            .cloned()
-            .context("no more input files to open")?;
-
-        if self.cursor > 0 {
-            self.ais_group_timestamps.clear();
-            self.ais_pending_timestamp_ms = None;
-        }
-
-        let current_index = self.cursor + 1;
-        let total = self.jobs.len();
-        self.cursor += 1;
-        println!(
-            "📄 Reading {}/{} {}",
-            format_count(current_index),
-            format_count(total),
-            job.display
-        );
-
-        job.open(max_line_length).await
+        Ok(line_reader_from_async_read(
+            tokio::io::empty(),
+            max_line_length,
+        ))
     }
 }
 
@@ -229,44 +281,68 @@ impl LineSource for FileInputSource {
             Ok(ReaderTransition::Stop)
         }
     }
+
+    async fn on_stream_error(
+        &mut self,
+        _error: &collect_core::LinesCodecError,
+        _shutdown: &std::sync::atomic::AtomicBool,
+        max_line_length: usize,
+    ) -> Result<ReaderTransition> {
+        if self.cursor < self.jobs.len() {
+            Ok(ReaderTransition::Continue(
+                self.open_next(max_line_length).await?,
+            ))
+        } else {
+            Ok(ReaderTransition::Stop)
+        }
+    }
 }
 
 impl InputJob {
-    fn plain(path: PathBuf) -> Self {
+    fn plain(path: PathBuf, estimated_size: u64) -> Self {
         let display = path.display().to_string();
         Self {
             path,
             display,
+            estimated_size,
             sort_index: 0,
             kind: InputKind::Plain,
         }
     }
 
-    fn gzip(path: PathBuf) -> Self {
+    fn gzip(path: PathBuf, estimated_size: u64) -> Self {
         let display = path.display().to_string();
         Self {
             path,
             display,
+            estimated_size,
             sort_index: 0,
             kind: InputKind::Gzip,
         }
     }
 
-    fn bzip2(path: PathBuf) -> Self {
+    fn bzip2(path: PathBuf, estimated_size: u64) -> Self {
         let display = path.display().to_string();
         Self {
             path,
             display,
+            estimated_size,
             sort_index: 0,
             kind: InputKind::Bzip2,
         }
     }
 
-    fn zip_entry(path: PathBuf, entry_index: usize, entry_name: String) -> Self {
+    fn zip_entry(
+        path: PathBuf,
+        estimated_size: u64,
+        entry_index: usize,
+        entry_name: String,
+    ) -> Self {
         let display = format!("{}::{}", path.display(), entry_name);
         Self {
             path,
             display,
+            estimated_size,
             sort_index: entry_index + 1,
             kind: InputKind::ZipEntry {
                 entry_index,
@@ -280,10 +356,7 @@ impl InputJob {
 
         match kind {
             InputKind::Plain => {
-                let file = tokio::fs::File::open(&path)
-                    .await
-                    .with_context(|| format!("open input file {}", path.display()))?;
-                Ok(line_reader_from_async_read(file, max_line_length))
+                open_plain_file_reader(path, max_line_length)
             }
             InputKind::Gzip => {
                 let file = tokio::fs::File::open(&path)
@@ -321,6 +394,7 @@ impl PartialOrd for InputJob {
     }
 }
 
+#[cfg(test)]
 fn collect_input_jobs(root: &Path) -> Result<Vec<InputJob>> {
     let mut jobs = Vec::new();
 
@@ -330,30 +404,91 @@ fn collect_input_jobs(root: &Path) -> Result<Vec<InputJob>> {
             if is_hidden_file(entry.path()) {
                 continue;
             }
-            jobs.extend(expand_input_path(entry.path())?);
+            let metadata = entry.metadata().context("reading file metadata")?;
+            match expand_input_path(entry.path(), metadata.len()) {
+                Ok(expanded) => jobs.extend(expanded),
+                Err(error) if should_skip_input_error(&error) => {
+                    eprintln!("⚠️  Skipping unreadable file {}: {}", entry.path().display(), error);
+                }
+                Err(error) => return Err(error),
+            }
         }
     }
 
     Ok(jobs)
 }
 
-fn expand_input_path(path: &Path) -> Result<Vec<InputJob>> {
+async fn collect_input_jobs_parallel(root: &Path, concurrency: usize) -> Result<Vec<InputJob>> {
+    let mut paths = Vec::new();
+
+    for entry in WalkDir::new(root) {
+        let entry = entry.context("walking input directory")?;
+        if entry.file_type().is_file() {
+            if is_hidden_file(entry.path()) {
+                continue;
+            }
+            paths.push(entry.path().to_path_buf());
+        }
+    }
+
+    let mut jobs = Vec::new();
+    let mut stream = stream::iter(paths.into_iter())
+        .map(|path| async move {
+            let metadata = tokio::fs::metadata(&path)
+                .await
+                .with_context(|| format!("reading file metadata {}", path.display()))?;
+            expand_input_path(&path, metadata.len())
+        })
+        .buffer_unordered(concurrency.max(1));
+
+    while let Some(result) = stream.next().await {
+        match result {
+            Ok(expanded) => jobs.extend(expanded),
+            Err(error) if should_skip_input_error(&error) => {
+                eprintln!("⚠️  Skipping unreadable file: {}", error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(jobs)
+}
+
+fn expand_input_path(path: &Path, estimated_size: u64) -> Result<Vec<InputJob>> {
     if is_hidden_file(path) {
         return Ok(Vec::new());
     }
 
-    match detect_input_format(path)? {
-        InputFormat::Plain => {
+    match detect_input_format(path) {
+        Err(error) if should_skip_input_error(&error) => {
+            eprintln!("⚠️  Skipping unreadable file {}: {}", path.display(), error);
+            Ok(Vec::new())
+        }
+        Err(error) => Err(error),
+        Ok(InputFormat::Plain) => {
             if is_tar_like_path(path) {
                 bail!("tar archives are not supported: {}", path.display());
             }
 
-            Ok(vec![InputJob::plain(path.to_path_buf())])
+            Ok(vec![InputJob::plain(path.to_path_buf(), estimated_size)])
         }
-        InputFormat::Gzip => Ok(vec![InputJob::gzip(path.to_path_buf())]),
-        InputFormat::Bzip2 => Ok(vec![InputJob::bzip2(path.to_path_buf())]),
-        InputFormat::Zip => collect_zip_jobs(path),
+        Ok(InputFormat::Gzip) => Ok(vec![InputJob::gzip(path.to_path_buf(), estimated_size)]),
+        Ok(InputFormat::Bzip2) => Ok(vec![InputJob::bzip2(path.to_path_buf(), estimated_size)]),
+        Ok(InputFormat::Zip) => match collect_zip_jobs(path) {
+            Ok(jobs) => Ok(jobs),
+            Err(error) if should_skip_input_error(&error) => {
+                eprintln!("⚠️  Skipping unreadable file {}: {}", path.display(), error);
+                Ok(Vec::new())
+            }
+            Err(error) => Err(error),
+        },
     }
+}
+
+fn should_skip_input_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<io::Error>() || cause.is::<zip::result::ZipError>())
 }
 
 fn collect_zip_jobs(path: &Path) -> Result<Vec<InputJob>> {
@@ -362,6 +497,9 @@ fn collect_zip_jobs(path: &Path) -> Result<Vec<InputJob>> {
     let mut archive = zip::ZipArchive::new(file)
         .with_context(|| format!("read zip archive {}", path.display()))?;
     let mut jobs = Vec::new();
+    let estimated_size = std::fs::metadata(path)
+        .with_context(|| format!("reading file metadata {}", path.display()))?
+        .len();
 
     for entry_index in 0..archive.len() {
         let entry = archive
@@ -374,14 +512,17 @@ fn collect_zip_jobs(path: &Path) -> Result<Vec<InputJob>> {
         if is_hidden_entry_name(&entry_name) {
             continue;
         }
-        jobs.push(InputJob::zip_entry(
-            path.to_path_buf(),
-            entry_index,
-            entry_name,
-        ));
+        jobs.push(InputJob::zip_entry(path.to_path_buf(), estimated_size, entry_index, entry_name));
     }
 
     Ok(jobs)
+}
+
+fn default_scan_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(|count| count.get().saturating_mul(2))
+        .unwrap_or(8)
+        .clamp(4, 32)
 }
 
 enum InputFormat {
@@ -742,6 +883,42 @@ fn zip_error_to_io(path: &Path, entry_name: &str, error: zip::result::ZipError) 
     )
 }
 
+fn open_plain_file_reader(path: PathBuf, max_line_length: usize) -> Result<LineReader> {
+    let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(8);
+
+    let _ = tokio::task::spawn_blocking(move || {
+        let result: io::Result<()> = (|| {
+            let file = StdFile::open(&path)?;
+            let mut reader = io::BufReader::new(file);
+            let mut buffer = vec![0u8; 32 * 1024];
+
+            loop {
+                let read = reader.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+
+                if tx
+                    .blocking_send(Ok(Bytes::copy_from_slice(&buffer[..read])))
+                    .is_err()
+                {
+                    return Ok(());
+                }
+            }
+
+            Ok(())
+        })();
+
+        if let Err(error) = result {
+            let _ = tx.blocking_send(Err(error));
+        }
+    });
+
+    let stream = ReceiverStream::new(rx);
+    let reader = StreamReader::new(stream);
+    Ok(line_reader_from_async_read(reader, max_line_length))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -758,6 +935,8 @@ mod tests {
     use tempfile::tempdir;
     use tokio::io::AsyncWriteExt;
     use walkdir::WalkDir;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     #[tokio::test]
     async fn reads_plain_gzip_bzip2_and_zip_entries_in_order() -> Result<()> {
@@ -834,12 +1013,14 @@ mod tests {
                     partition: collect_core::PartitionGranularity::Minute,
                     max_rows: None,
                     max_batch_bytes: 1024,
+                    compression_level: 5,
                     upload_drain_timeout_seconds: 1,
                     max_line_length: 1024,
                     health_check: false,
                 },
                 s3: None,
                 health_file,
+                manage_health: true,
             },
         )
         .await?;
@@ -884,6 +1065,24 @@ mod tests {
         let lines = collect_all_lines(&mut source, 1024).await?;
 
         assert_eq!(lines, vec!["zip-1", "zip-2"]);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn skips_unreadable_files_in_directories() -> Result<()> {
+        let dir = tempdir()?;
+        let root = dir.path();
+
+        write_text_file(&root.join("a_readable.txt"), "good-1\n")?;
+        let unreadable = root.join("b_unreadable.txt");
+        write_text_file(&unreadable, "bad-1\n")?;
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0))?;
+
+        let mut source = FileInputSource::new(root.to_path_buf(), "source".to_string(), false)?;
+        let lines = collect_all_lines(&mut source, 1024).await?;
+
+        assert_eq!(lines, vec!["good-1"]);
         Ok(())
     }
 
@@ -971,7 +1170,7 @@ mod tests {
             ais: false,
             ais_group_timestamps: HashMap::new(),
             ais_pending_timestamp_ms: None,
-            jobs: vec![InputJob::plain(PathBuf::from("/tmp/input.txt"))],
+            jobs: vec![InputJob::plain(PathBuf::from("/tmp/input.txt"), 0)],
             cursor: 1,
         };
 
@@ -1044,12 +1243,14 @@ mod tests {
                     partition: collect_core::PartitionGranularity::Minute,
                     max_rows: Some(10),
                     max_batch_bytes: 1024 * 1024,
+                    compression_level: 5,
                     upload_drain_timeout_seconds: 1,
                     max_line_length: 1024,
                     health_check: false,
                 },
                 s3: None,
                 health_file,
+                manage_health: true,
             },
         )
         .await?;

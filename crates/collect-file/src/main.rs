@@ -1,10 +1,17 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use collect_core::{
-    default_source_from_path, health_file_path, run_ingest, CommonCliArgs, IngestOptions, S3CliArgs,
+    default_source_from_path, health_file_path, run_ingest, update_health_status_async,
+    CommonCliArgs, IngestOptions, S3CliArgs,
 };
 use collect_tui::{run_tui, TuiModel};
 use std::path::PathBuf;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::time::Duration;
+use tokio::sync::{mpsc, Mutex};
 
 mod input;
 
@@ -90,15 +97,166 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| default_source_from_path(&input));
 
     let health_file = health_file_path("collect-file");
-    let mut source = input::FileInputSource::new(input, source_name, args.ais)?;
+    let source = input::FileInputSource::new_parallel(input, source_name, args.ais).await?;
+    run_file_ingest(source, args.common.to_options(), args.s3.to_options(), health_file).await
+}
 
-    run_ingest(
-        &mut source,
-        IngestOptions {
-            common: args.common.to_options(),
-            s3: args.s3.to_options(),
-            health_file,
-        },
-    )
-    .await
+async fn run_file_ingest(
+    source: input::FileInputSource,
+    common: collect_core::CommonOptions,
+    s3: Option<collect_core::S3Options>,
+    health_file: PathBuf,
+) -> Result<()> {
+    if source.job_count() <= 1 {
+        let mut source = source;
+        return run_ingest(
+            &mut source,
+            IngestOptions {
+                common,
+                s3,
+                health_file,
+                manage_health: true,
+            },
+        )
+        .await;
+    }
+
+    let options = IngestOptions {
+        common,
+        s3,
+        health_file: health_file.clone(),
+        manage_health: false,
+    };
+    let sources = source.into_job_sources();
+    run_parallel_file_ingest(sources, options, health_file).await
+}
+
+async fn run_parallel_file_ingest(
+    sources: Vec<input::FileInputSource>,
+    options: IngestOptions,
+    health_file: PathBuf,
+) -> Result<()> {
+    let running = Arc::new(AtomicBool::new(true));
+    update_health_status_async(&health_file, true).await?;
+
+    let health_running = running.clone();
+    let health_file_for_task = health_file.clone();
+    let health_task = tokio::spawn(async move {
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        heartbeat.tick().await;
+
+        while health_running.load(Ordering::SeqCst) {
+            heartbeat.tick().await;
+            if let Err(error) = update_health_status_async(&health_file_for_task, true).await {
+                eprintln!("Failed to update health status: {}", error);
+            }
+        }
+    });
+
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let stop_for_signal = stop.clone();
+    let running_for_signal = running.clone();
+    let _signal_task = tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+
+            let mut sigterm = match signal(SignalKind::terminate()) {
+                Ok(signal) => signal,
+                Err(error) => {
+                    eprintln!("Failed to register SIGTERM handler: {}", error);
+                    return;
+                }
+            };
+
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = sigterm.recv() => {},
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+
+        stop_for_signal.store(true, Ordering::SeqCst);
+        running_for_signal.store(false, Ordering::SeqCst);
+        eprintln!("Shutdown signal received. Stopping file workers...");
+    });
+
+    let worker_limit = default_worker_limit().min(sources.len().max(1));
+    let (tx, rx) = mpsc::channel::<input::FileInputSource>(worker_limit * 2);
+    for source in sources {
+        tx.send(source).await.context("queueing file ingest work")?;
+    }
+    drop(tx);
+
+    let rx = Arc::new(Mutex::new(rx));
+    let mut tasks = tokio::task::JoinSet::new();
+
+    for _ in 0..worker_limit {
+        let rx = rx.clone();
+        let stop = stop.clone();
+        let worker_options = options.clone();
+        tasks.spawn(async move {
+            loop {
+                if stop.load(Ordering::SeqCst) {
+                    return Ok::<_, anyhow::Error>(());
+                }
+
+                let next_source = {
+                    let mut rx = rx.lock().await;
+                    rx.recv().await
+                };
+
+                let Some(mut source) = next_source else {
+                    return Ok(());
+                };
+
+                if stop.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+
+                if let Err(error) = run_ingest(&mut source, worker_options.clone()).await {
+                    stop.store(true, Ordering::SeqCst);
+                    return Err(error);
+                }
+            }
+        });
+    }
+
+    let mut first_error = None;
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                first_error = Some(error);
+                stop.store(true, Ordering::SeqCst);
+            }
+            Err(error) => {
+                first_error = Some(anyhow::anyhow!(error.to_string()));
+                stop.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    running.store(false, Ordering::SeqCst);
+    let _ = health_task.await;
+    update_health_status_async(&health_file, false).await?;
+
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+
+    Ok(())
+}
+
+fn default_worker_limit() -> usize {
+    std::thread::available_parallelism()
+        .map(|count| count.get().saturating_mul(2))
+        .unwrap_or(8)
+        .clamp(4, 32)
 }

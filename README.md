@@ -42,14 +42,14 @@ cargo run -p collect-file -- --input data.txt --source mydata
 cargo run -p collect-socket -- --tcp-host 153.44.253.27 --tcp-port 5631 --source norway-tcp
 
 # File input with S3
-cargo run -p collect-file -- --input data.txt --source mydata --s3-bucket maritime-data
+cargo run -p collect-file -- --input data.txt --source mydata --compression-level 1 --s3-bucket maritime-data
 ```
 
 `collect-file` auto-detects plain text, gzip, bzip2, and zip inputs. Zip archives are read entry-by-entry in archive order. Hidden dotfiles are skipped silently. `--ais` applies to `collect-file` only; it prefers NMEA `c:<epoch>` tag block timestamps and `$PGHP` capture timestamps when present, and reuses the first sentence timestamp for grouped `\g:` fragments.
 
 ## Maintenance
 
-`collect-maint` inspects, validates, compacts, and vacuums hive-partitioned datasets. It requires `--partition` so it can parse the on-disk layout. `compact` and `vacuum` are dry-run by default; add `--apply` to make changes.
+`collect-maint` inspects, validates, compacts, and vacuums hive-partitioned datasets. It requires `--partition` so it can parse the on-disk layout. `compact` and `vacuum` are dry-run by default; add `--apply` to make changes. `--compression-level` controls Zstd speed vs file size for ingest and compaction.
 
 ```bash
 # Read-only inspection
@@ -83,6 +83,7 @@ Most `collect-file` and `collect-socket` command-line parameters can be configur
 | `OUT_DIR` | `--out-dir` | Output directory |
 | `MAX_ROWS` | `--max-rows` | Max rows per file |
 | `MAX_BATCH_BYTES` | `--max-batch-bytes` | Max payload bytes per Parquet file |
+| `COMPRESSION_LEVEL` | `--compression-level` | Zstd compression level for Parquet output |
 | `MAX_LINE_LENGTH` | `--max-line-length` | Max bytes per input line |
 | `UPLOAD_DRAIN_TIMEOUT_SECONDS` | `--upload-drain-timeout-seconds` | Max seconds to wait for upload drain |
 | `HEALTH_CHECK` | `--health-check` | Run health check |

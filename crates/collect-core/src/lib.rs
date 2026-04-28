@@ -21,6 +21,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+use std::sync::atomic::AtomicU64;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncRead;
 use tokio::sync::{mpsc, Semaphore};
@@ -34,12 +35,14 @@ const DEFAULT_OUT_DIR: &str = "data";
 const DEFAULT_UPLOAD_DRAIN_TIMEOUT_SECONDS: u64 = 60;
 const DEFAULT_MAX_LINE_LENGTH: usize = 65_536;
 const DEFAULT_MAX_BATCH_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_COMPRESSION_LEVEL: i32 = 5;
 const DEFAULT_S3_REGION: &str = "us-east-1";
 const DEFAULT_HEALTH_STALE_WINDOW_SECONDS: u64 = 60;
 const DEFAULT_UPLOAD_QUEUE_CAPACITY: usize = 128;
 const DEFAULT_UPLOAD_CONCURRENCY: usize = 4;
 const DEFAULT_UPLOAD_RETRIES: usize = 3;
 const HEALTH_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
+static PARQUET_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, ValueEnum)]
 #[value(rename_all = "lower")]
@@ -140,6 +143,10 @@ pub struct CommonCliArgs {
     #[arg(long)]
     pub max_batch_bytes: Option<usize>,
 
+    /// Zstd compression level for Parquet output
+    #[arg(long)]
+    pub compression_level: Option<i32>,
+
     /// Seconds to wait for background uploads on shutdown
     #[arg(long, default_value_t = DEFAULT_UPLOAD_DRAIN_TIMEOUT_SECONDS)]
     pub upload_drain_timeout_seconds: u64,
@@ -190,6 +197,7 @@ pub struct CommonOptions {
     pub partition: PartitionGranularity,
     pub max_rows: Option<usize>,
     pub max_batch_bytes: usize,
+    pub compression_level: i32,
     pub upload_drain_timeout_seconds: u64,
     pub max_line_length: usize,
     pub health_check: bool,
@@ -211,6 +219,7 @@ pub struct IngestOptions {
     pub common: CommonOptions,
     pub s3: Option<S3Options>,
     pub health_file: PathBuf,
+    pub manage_health: bool,
 }
 
 pub type LineReader = FramedRead<Box<dyn AsyncRead + Unpin + Send>, LinesCodec>;
@@ -289,6 +298,12 @@ impl CommonCliArgs {
             }
         }
 
+        if self.compression_level.is_none() {
+            if let Ok(value) = std::env::var("COMPRESSION_LEVEL") {
+                self.compression_level = value.parse().ok();
+            }
+        }
+
         if self.upload_drain_timeout_seconds == DEFAULT_UPLOAD_DRAIN_TIMEOUT_SECONDS {
             if let Ok(value) = std::env::var("UPLOAD_DRAIN_TIMEOUT_SECONDS") {
                 if let Ok(parsed) = value.parse::<u64>() {
@@ -318,6 +333,7 @@ impl CommonCliArgs {
             partition: self.partition,
             max_rows: self.max_rows,
             max_batch_bytes: self.max_batch_bytes.unwrap_or(DEFAULT_MAX_BATCH_BYTES),
+            compression_level: self.compression_level.unwrap_or(DEFAULT_COMPRESSION_LEVEL),
             upload_drain_timeout_seconds: self.upload_drain_timeout_seconds,
             max_line_length: self.max_line_length,
             health_check: self.health_check,
@@ -492,6 +508,7 @@ where
         common,
         s3,
         health_file,
+        manage_health,
     } = options;
 
     if common.health_check {
@@ -549,7 +566,9 @@ where
 
     let (upload_tx, upload_worker) = spawn_upload_worker(s3_storage.clone());
 
-    update_health_status_async(&health_file, true).await?;
+    if options.manage_health {
+        update_health_status_async(&health_file, true).await?;
+    }
 
     let mut heartbeat = tokio::time::interval(HEALTH_UPDATE_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -565,8 +584,10 @@ where
 
         tokio::select! {
             _ = heartbeat.tick() => {
-                if let Err(error) = update_health_status_async(&health_file, true).await {
-                    eprintln!("Failed to update health status: {}", error);
+                if manage_health {
+                    if let Err(error) = update_health_status_async(&health_file, true).await {
+                        eprintln!("Failed to update health status: {}", error);
+                    }
                 }
             }
             _ = progress_heartbeat.tick() => {
@@ -581,9 +602,10 @@ where
             maybe_line = reader.next() => {
                 match maybe_line {
                     Some(Ok(payload)) => {
-                        let duration = now_unix_duration();
-                        let now_ms = duration.as_millis() as i64;
-                        let row_ts_ms = source.timestamp_for_payload(&payload).unwrap_or(now_ms);
+                        let row_ts_ms = match source.timestamp_for_payload(&payload) {
+                            Some(timestamp_ms) => timestamp_ms,
+                            None => now_unix_duration().as_millis() as i64,
+                        };
                         let row_key = PartKey::from_timestamp(
                             source.source_name(),
                             row_ts_ms,
@@ -593,7 +615,14 @@ where
 
                         if row_key != current_key {
                             if !buf.is_empty() {
-                                flush_batch(&common.out_dir, &current_key, &mut buf, upload_tx.as_ref()).await?;
+                                flush_batch(
+                                    &common.out_dir,
+                                    &current_key,
+                                    &mut buf,
+                                    upload_tx.as_ref(),
+                                    common.compression_level,
+                                )
+                                .await?;
                                 rows_in_file = 0;
                                 files_flushed += 1;
                             }
@@ -602,7 +631,14 @@ where
 
                         // Keep each batch well below Arrow's string offset limit.
                         if buf.would_exceed_batch_bytes(payload_len, common.max_batch_bytes) {
-                            flush_batch(&common.out_dir, &current_key, &mut buf, upload_tx.as_ref()).await?;
+                            flush_batch(
+                                &common.out_dir,
+                                &current_key,
+                                &mut buf,
+                                upload_tx.as_ref(),
+                                common.compression_level,
+                            )
+                            .await?;
                             rows_in_file = 0;
                             files_flushed += 1;
                         }
@@ -612,14 +648,28 @@ where
                         rows_processed += 1;
 
                         if buf.payload_bytes() >= common.max_batch_bytes {
-                            flush_batch(&common.out_dir, &current_key, &mut buf, upload_tx.as_ref()).await?;
+                            flush_batch(
+                                &common.out_dir,
+                                &current_key,
+                                &mut buf,
+                                upload_tx.as_ref(),
+                                common.compression_level,
+                            )
+                            .await?;
                             rows_in_file = 0;
                             files_flushed += 1;
                         }
 
                         if let Some(max_rows) = common.max_rows {
                             if rows_in_file >= max_rows {
-                                flush_batch(&common.out_dir, &current_key, &mut buf, upload_tx.as_ref()).await?;
+                                flush_batch(
+                                    &common.out_dir,
+                                    &current_key,
+                                    &mut buf,
+                                    upload_tx.as_ref(),
+                                    common.compression_level,
+                                )
+                                .await?;
                                 rows_in_file = 0;
                                 files_flushed += 1;
                             }
@@ -660,7 +710,14 @@ where
     }
 
     if !buf.is_empty() {
-        flush_batch(&common.out_dir, &current_key, &mut buf, upload_tx.as_ref()).await?;
+        flush_batch(
+            &common.out_dir,
+            &current_key,
+            &mut buf,
+            upload_tx.as_ref(),
+            common.compression_level,
+        )
+        .await?;
     }
 
     if let Some(upload_tx) = upload_tx {
@@ -686,7 +743,9 @@ where
         }
     }
 
-    update_health_status_async(&health_file, false).await?;
+    if options.manage_health {
+        update_health_status_async(&health_file, false).await?;
+    }
     Ok(())
 }
 
@@ -973,12 +1032,17 @@ impl BatchBuf {
     }
 }
 
-fn open_writer(path: &Path, schema: &Arc<Schema>) -> Result<ArrowWriter<File>> {
+fn open_writer(
+    path: &Path,
+    schema: &Arc<Schema>,
+    compression_level: i32,
+) -> Result<ArrowWriter<File>> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("mkdir -p {}", parent.display()))?;
     }
     let file = File::create(path).with_context(|| format!("create {}", path.display()))?;
-    let zstd_level = ZstdLevel::try_new(5).unwrap_or_default();
+    let zstd_level = ZstdLevel::try_new(compression_level)
+        .context("invalid Zstd compression level")?;
     let props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(zstd_level))
         .set_column_encoding(ColumnPath::from("ts"), Encoding::DELTA_BINARY_PACKED)
@@ -995,15 +1059,17 @@ fn open_writer(path: &Path, schema: &Arc<Schema>) -> Result<ArrowWriter<File>> {
 
 fn parquet_file_name() -> String {
     let now = Utc::now();
+    let counter = PARQUET_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!(
-        "part-{:04}{:02}{:02}T{:02}{:02}{:02}{:03}.parquet",
+        "part-{:04}{:02}{:02}T{:02}{:02}{:02}{:03}-{:06}.parquet",
         now.year(),
         now.month(),
         now.day(),
         now.hour(),
         now.minute(),
         now.second(),
-        now.timestamp_subsec_millis()
+        now.timestamp_subsec_millis(),
+        counter
     )
 }
 
@@ -1092,6 +1158,7 @@ async fn flush_batch(
     key: &PartKey,
     buf: &mut BatchBuf,
     upload_tx: Option<&mpsc::Sender<(PathBuf, String)>>,
+    compression_level: i32,
 ) -> Result<()> {
     let dir = key.dir_path(root);
     let filename = parquet_file_name();
@@ -1102,7 +1169,7 @@ async fn flush_batch(
     let batch_rows = batch.num_rows();
 
     tokio::task::spawn_blocking(move || -> Result<()> {
-        let mut writer = open_writer(&path_for_write, &schema)?;
+        let mut writer = open_writer(&path_for_write, &schema, compression_level)?;
         writer.write(&batch).context("writing batch to Parquet")?;
         writer.close().context("closing Parquet writer")?;
         Ok(())

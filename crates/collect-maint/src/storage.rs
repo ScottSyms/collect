@@ -76,6 +76,7 @@ impl StorageLocation {
     pub async fn list_entries<F>(
         &self,
         granularity: PartitionGranularity,
+        concurrency: usize,
         on_progress: F,
     ) -> Result<Vec<DatasetEntry>>
     where
@@ -83,7 +84,9 @@ impl StorageLocation {
     {
         let mut on_progress = on_progress;
         match self {
-            StorageLocation::Local(local) => local.list_entries(granularity, &mut on_progress),
+            StorageLocation::Local(local) => {
+                local.list_entries(granularity, concurrency, &mut on_progress).await
+            }
             StorageLocation::S3(s3) => s3.list_entries(granularity, &mut on_progress).await,
         }
     }
@@ -170,14 +173,6 @@ impl LocalStorage {
         self.root.join(format!("{}.tmp", rel_path))
     }
 
-    fn rel_path_from_abs(&self, path: &Path) -> Result<String> {
-        Ok(path
-            .strip_prefix(&self.root)
-            .with_context(|| format!("{} is outside root {}", path.display(), self.root.display()))?
-            .to_string_lossy()
-            .replace('\\', "/"))
-    }
-
     fn should_ignore(rel_path: &str) -> bool {
         Path::new(rel_path)
             .file_name()
@@ -185,9 +180,10 @@ impl LocalStorage {
             == Some(".DS_Store")
     }
 
-    fn list_entries<F>(
+    async fn list_entries<F>(
         &self,
         granularity: PartitionGranularity,
+        concurrency: usize,
         on_progress: &mut F,
     ) -> Result<Vec<DatasetEntry>>
     where
@@ -198,7 +194,9 @@ impl LocalStorage {
         }
 
         if self.root.is_file() {
-            let metadata = std::fs::metadata(&self.root)?;
+            let metadata = tokio::fs::metadata(&self.root)
+                .await
+                .with_context(|| format!("reading file metadata {}", self.root.display()))?;
             let rel_path = self
                 .root
                 .file_name()
@@ -217,28 +215,51 @@ impl LocalStorage {
 
         let mut entries = Vec::new();
         let mut last_reported = 0usize;
-        for item in WalkDir::new(&self.root) {
-            let item = item.context("walking dataset root")?;
-            if !item.file_type().is_file() {
-                continue;
-            }
+        let root = self.root.clone();
+        let mut stream = stream::iter(WalkDir::new(&root).into_iter())
+            .enumerate()
+            .map(|(_index, item)| {
+                let root = root.clone();
+                async move {
+                    let item = item.context("walking dataset root")?;
+                    if !item.file_type().is_file() {
+                        return Ok::<_, anyhow::Error>(None);
+                    }
 
-            let metadata = item.metadata().context("reading file metadata")?;
-            let rel_path = self.rel_path_from_abs(item.path())?;
-            if Self::should_ignore(&rel_path) {
-                continue;
-            }
-            let kind = classify_entry(&rel_path, metadata.len());
-            entries.push(DatasetEntry {
-                rel_path: rel_path.clone(),
-                size: metadata.len(),
-                kind,
-                partition: PartitionKey::parse(&rel_path, granularity),
-            });
+                    let rel_path = item
+                        .path()
+                        .strip_prefix(&root)
+                        .with_context(|| {
+                            format!("{} is outside root {}", item.path().display(), root.display())
+                        })?
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    if Self::should_ignore(&rel_path) {
+                        return Ok(None);
+                    }
 
-            if entries.len() == 1 || entries.len() % LIST_REPORT_INTERVAL == 0 {
-                on_progress(entries.len());
-                last_reported = entries.len();
+                    let metadata = tokio::fs::metadata(item.path())
+                        .await
+                        .with_context(|| format!("reading file metadata {}", item.path().display()))?;
+                    let size = metadata.len();
+                    let kind = classify_entry(&rel_path, size);
+                    Ok(Some(DatasetEntry {
+                        rel_path: rel_path.clone(),
+                        size,
+                        kind,
+                        partition: PartitionKey::parse(&rel_path, granularity),
+                    }))
+                }
+            })
+            .buffer_unordered(concurrency.max(1));
+
+        while let Some(result) = stream.next().await {
+            if let Some(entry) = result? {
+                entries.push(entry);
+                if entries.len() == 1 || entries.len() % LIST_REPORT_INTERVAL == 0 {
+                    on_progress(entries.len());
+                    last_reported = entries.len();
+                }
             }
         }
 

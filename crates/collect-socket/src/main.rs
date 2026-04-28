@@ -188,6 +188,7 @@ async fn main() -> Result<()> {
             common: args.common.to_options(),
             s3: args.s3.to_options(),
             health_file,
+            manage_health: true,
         },
     )
     .await

@@ -358,6 +358,7 @@ pub async fn compact(
     target_file_size_bytes: u64,
     apply: bool,
     concurrency: usize,
+    compression_level: i32,
 ) -> Result<()> {
     report(
         "compact",
@@ -416,7 +417,16 @@ pub async fn compact(
             let workspace = workspace.path().to_path_buf();
             async move {
                 let output_rel = job.output_rel.clone();
-                compact_job(storage, &job, &workspace, index + 1, total, concurrency).await?;
+                compact_job(
+                    storage,
+                    &job,
+                    &workspace,
+                    index + 1,
+                    total,
+                    concurrency,
+                    compression_level,
+                )
+                .await?;
                 Ok::<_, anyhow::Error>((index, output_rel))
             }
         })
@@ -665,6 +675,7 @@ async fn compact_job(
     job_index: usize,
     job_total: usize,
     concurrency: usize,
+    compression_level: i32,
 ) -> Result<()> {
     let manifest = CompactionManifest::new(
         &job.partition,
@@ -712,7 +723,7 @@ async fn compact_job(
             job.output_rel
         ),
     );
-    write_compacted_output(&materialized, &temp_output_path)?;
+    write_compacted_output(&materialized, &temp_output_path, compression_level)?;
     report(
         "compact",
         format!(
@@ -827,12 +838,17 @@ async fn materialize_entry(
     }
 }
 
-fn write_compacted_output(input_paths: &[PathBuf], output_path: &Path) -> Result<()> {
+fn write_compacted_output(
+    input_paths: &[PathBuf],
+    output_path: &Path,
+    compression_level: i32,
+) -> Result<()> {
     if input_paths.is_empty() {
         bail!("no input files to compact");
     }
 
-    let zstd_level = ZstdLevel::try_new(5).unwrap_or_default();
+    let zstd_level = ZstdLevel::try_new(compression_level)
+        .context("invalid Zstd compression level")?;
     let props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(zstd_level))
         .set_column_encoding(ColumnPath::from("ts"), Encoding::DELTA_BINARY_PACKED)

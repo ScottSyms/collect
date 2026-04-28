@@ -14,7 +14,7 @@ fn default_concurrency() -> usize {
     std::thread::available_parallelism()
         .map(|count| count.get().saturating_mul(2))
         .unwrap_or(8)
-        .clamp(4, 16)
+        .clamp(4, 32)
 }
 
 #[derive(Parser, Debug)]
@@ -34,6 +34,10 @@ struct Cli {
     /// Maximum number of concurrent maintenance workers
     #[arg(long, global = true, default_value_t = default_concurrency())]
     concurrency: usize,
+
+    /// Zstd compression level for compacted Parquet output
+    #[arg(long, global = true, default_value_t = 5)]
+    compression_level: i32,
 
     #[command(subcommand)]
     command: Command,
@@ -119,7 +123,7 @@ async fn main() -> Result<()> {
         ),
     );
     let entries = storage
-        .list_entries(cli.partition, |listed| {
+        .list_entries(cli.partition, concurrency, |listed| {
             if listed > 0 {
                 report(
                     "collect-maint",
@@ -147,6 +151,7 @@ async fn main() -> Result<()> {
                 target_file_size_bytes,
                 apply,
                 concurrency,
+                cli.compression_level,
             )
             .await
         }
