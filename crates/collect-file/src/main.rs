@@ -5,13 +5,13 @@ use collect_core::{
     CommonCliArgs, IngestOptions, S3CliArgs,
 };
 use collect_tui::{run_tui, TuiModel};
+use futures_util::stream::{self, StreamExt};
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
 use std::time::Duration;
-use tokio::sync::{mpsc, Mutex};
 
 mod input;
 
@@ -97,7 +97,9 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| default_source_from_path(&input));
 
     let health_file = health_file_path("collect-file");
+    eprintln!("🔎 Scanning input files...");
     let source = input::FileInputSource::new_parallel(input, source_name, args.ais).await?;
+    eprintln!("📦 Discovered {} input job(s)", source.job_count());
     run_file_ingest(source, args.common.to_options(), args.s3.to_options(), health_file).await
 }
 
@@ -108,6 +110,7 @@ async fn run_file_ingest(
     health_file: PathBuf,
 ) -> Result<()> {
     if source.job_count() <= 1 {
+        eprintln!("▶️  Starting single-worker ingest");
         let mut source = source;
         return run_ingest(
             &mut source,
@@ -127,17 +130,24 @@ async fn run_file_ingest(
         health_file: health_file.clone(),
         manage_health: false,
     };
+    let total_files = source.job_count();
     let sources = source.into_job_sources();
-    run_parallel_file_ingest(sources, options, health_file).await
+    eprintln!(
+        "🧵 Starting parallel ingest with {} worker(s)",
+        sources.len().min(default_worker_limit())
+    );
+    run_parallel_file_ingest(sources, options, health_file, total_files).await
 }
 
 async fn run_parallel_file_ingest(
     sources: Vec<input::FileInputSource>,
     options: IngestOptions,
     health_file: PathBuf,
+    total_files: usize,
 ) -> Result<()> {
     let running = Arc::new(AtomicBool::new(true));
     update_health_status_async(&health_file, true).await?;
+    let completed_files = Arc::new(AtomicUsize::new(0));
 
     let health_running = running.clone();
     let health_file_for_task = health_file.clone();
@@ -150,6 +160,30 @@ async fn run_parallel_file_ingest(
             heartbeat.tick().await;
             if let Err(error) = update_health_status_async(&health_file_for_task, true).await {
                 eprintln!("Failed to update health status: {}", error);
+            }
+        }
+    });
+
+    let progress_running = running.clone();
+    let progress_completed = completed_files.clone();
+    let progress_task = tokio::spawn(async move {
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        heartbeat.tick().await;
+
+        loop {
+            heartbeat.tick().await;
+            let completed = progress_completed.load(Ordering::SeqCst);
+            let percent = if total_files == 0 {
+                100
+            } else {
+                (completed.saturating_mul(100)) / total_files
+            };
+            if progress_running.load(Ordering::SeqCst) {
+                eprintln!("📊 Files processed: {}/{} ({}%)", completed, total_files, percent);
+            } else {
+                eprintln!("📊 Draining: {}/{} files complete ({}%)", completed, total_files, percent);
+                break;
             }
         }
     });
@@ -184,67 +218,45 @@ async fn run_parallel_file_ingest(
 
         stop_for_signal.store(true, Ordering::SeqCst);
         running_for_signal.store(false, Ordering::SeqCst);
-        eprintln!("Shutdown signal received. Stopping file workers...");
+        eprintln!("🛑 Shutdown signal received. Stopping file workers...");
     });
 
     let worker_limit = default_worker_limit().min(sources.len().max(1));
-    let (tx, rx) = mpsc::channel::<input::FileInputSource>(worker_limit * 2);
-    for source in sources {
-        tx.send(source).await.context("queueing file ingest work")?;
-    }
-    drop(tx);
-
-    let rx = Arc::new(Mutex::new(rx));
-    let mut tasks = tokio::task::JoinSet::new();
-
-    for _ in 0..worker_limit {
-        let rx = rx.clone();
-        let stop = stop.clone();
-        let worker_options = options.clone();
-        tasks.spawn(async move {
-            loop {
+    eprintln!("🚚 Dispatching file jobs to workers...");
+    let mut tasks = stream::iter(sources.into_iter())
+        .map(|source| {
+            let stop = stop.clone();
+            let completed_files = completed_files.clone();
+            let worker_options = options.clone();
+            async move {
                 if stop.load(Ordering::SeqCst) {
                     return Ok::<_, anyhow::Error>(());
                 }
 
-                let next_source = {
-                    let mut rx = rx.lock().await;
-                    rx.recv().await
-                };
-
-                let Some(mut source) = next_source else {
-                    return Ok(());
-                };
-
-                if stop.load(Ordering::SeqCst) {
-                    return Ok(());
-                }
-
-                if let Err(error) = run_ingest(&mut source, worker_options.clone()).await {
+                let mut source = source;
+                if let Err(error) = run_ingest(&mut source, worker_options).await {
                     stop.store(true, Ordering::SeqCst);
                     return Err(error);
                 }
+
+                completed_files.fetch_add(1, Ordering::SeqCst);
+
+                Ok(())
             }
-        });
-    }
+        })
+        .buffer_unordered(worker_limit);
 
     let mut first_error = None;
-    while let Some(result) = tasks.join_next().await {
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                first_error = Some(error);
-                stop.store(true, Ordering::SeqCst);
-            }
-            Err(error) => {
-                first_error = Some(anyhow::anyhow!(error.to_string()));
-                stop.store(true, Ordering::SeqCst);
-            }
+    while let Some(result) = tasks.next().await {
+        if let Err(error) = result {
+            first_error = Some(error);
+            stop.store(true, Ordering::SeqCst);
         }
     }
 
     running.store(false, Ordering::SeqCst);
     let _ = health_task.await;
+    let _ = progress_task.await;
     update_health_status_async(&health_file, false).await?;
 
     if let Some(error) = first_error {
