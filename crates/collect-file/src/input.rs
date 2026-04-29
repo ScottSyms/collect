@@ -3,8 +3,7 @@ use async_compression::tokio::bufread::{BzDecoder, GzipDecoder};
 use bytes::Bytes;
 use chrono::{TimeZone, Utc};
 use collect_core::{
-    format_count, line_reader_from_async_read, IngestProgress, LineReader, LineSource,
-    ReaderTransition,
+    line_reader_from_async_read, IngestProgress, LineReader, LineSource, ReaderTransition,
 };
 use futures_util::stream::{self, StreamExt};
 use std::cmp::Ordering;
@@ -12,6 +11,7 @@ use std::collections::HashMap;
 use std::fs::File as StdFile;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 use tokio::io::BufReader;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -65,7 +65,7 @@ impl FileInputSource {
             ));
         };
 
-        jobs.sort_by(|left, right| {
+        jobs.sort_unstable_by(|left, right| {
             left.path
                 .cmp(&right.path)
                 .then(left.sort_index.cmp(&right.sort_index))
@@ -88,7 +88,7 @@ impl FileInputSource {
             ));
         };
 
-        jobs.sort_by(|left, right| {
+        jobs.sort_unstable_by(|left, right| {
             right
                 .estimated_size
                 .cmp(&left.estimated_size)
@@ -118,6 +118,26 @@ impl FileInputSource {
         self.jobs.iter().map(|job| job.estimated_size).sum()
     }
 
+    pub(crate) fn completion_key(&self) -> Result<String> {
+        let job = self
+            .jobs
+            .first()
+            .context("missing input job for completion key")?;
+        let metadata = std::fs::metadata(&job.path)
+            .with_context(|| format!("reading file metadata {}", job.path.display()))?;
+        let modified_ms = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_millis())
+            .unwrap_or(0);
+
+        Ok(format!(
+            "{:?}|{}|{}|{}",
+            job.display, job.estimated_size, modified_ms, job.sort_index
+        ))
+    }
+
     pub(crate) fn into_job_sources(self) -> Vec<Self> {
         let FileInputSource { source, ais, jobs, .. } = self;
 
@@ -139,16 +159,8 @@ impl FileInputSource {
                 self.ais_pending_timestamp_ms = None;
             }
 
-            let current_index = self.cursor + 1;
-            let total = self.jobs.len();
             let display = job.display.clone();
             self.cursor += 1;
-            println!(
-                "📄 Reading {}/{} {}",
-                format_count(current_index),
-                format_count(total),
-                display
-            );
 
             match job.open(max_line_length).await {
                 Ok(reader) => return Ok(reader),
@@ -288,17 +300,19 @@ impl LineSource for FileInputSource {
 
     async fn on_stream_error(
         &mut self,
-        _error: &collect_core::LinesCodecError,
+        error: &collect_core::LinesCodecError,
         _shutdown: &std::sync::atomic::AtomicBool,
         max_line_length: usize,
     ) -> Result<ReaderTransition> {
-        if self.cursor < self.jobs.len() {
-            Ok(ReaderTransition::Continue(
-                self.open_next(max_line_length).await?,
-            ))
+        if let Some(job) = self.jobs.get(self.cursor.saturating_sub(1)) {
+            eprintln!("⚠️  Skipping failed file {}: {}", job.display, error);
         } else {
-            Ok(ReaderTransition::Stop)
+            eprintln!("⚠️  Skipping failed input: {}", error);
         }
+
+        Ok(ReaderTransition::Continue(
+            self.open_next(max_line_length).await?,
+        ))
     }
 }
 
@@ -1311,6 +1325,19 @@ mod tests {
         assert_eq!(payload.value(2), lines[2]);
         assert_eq!(payload.value(3), lines[3]);
         assert_eq!(payload.value(4), lines[4]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skips_invalid_gzip_inputs_without_failing() -> Result<()> {
+        let dir = tempdir()?;
+        let input_path = dir.path().join("broken.gz");
+        write_text_file(&input_path, "this is not gzip\n")?;
+
+        let mut source = FileInputSource::new(input_path, "broken".to_string(), false)?;
+        let lines = collect_all_lines(&mut source, 1024).await?;
+
+        assert!(lines.is_empty());
         Ok(())
     }
 

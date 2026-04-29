@@ -5,14 +5,16 @@ use collect_core::{
     CommonCliArgs, IngestOptions, S3CliArgs,
 };
 use collect_tui::{run_tui, TuiModel};
-use futures_util::stream::{self, StreamExt};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
 use std::time::Duration;
+use tokio::sync::Mutex;
 
+mod completion_manifest;
 mod input;
 
 mod tui;
@@ -115,36 +117,74 @@ async fn run_file_ingest(
     s3: Option<collect_core::S3Options>,
     health_file: PathBuf,
 ) -> Result<()> {
-    if source.job_count() <= 1 {
-        eprintln!("▶️  Starting single-worker ingest");
-        let mut source = source;
-        return run_ingest(
-            &mut source,
-            IngestOptions {
-                common,
-                s3,
-                health_file,
-                manage_health: true,
-            },
-        )
-        .await;
-    }
-
+    let manifest_path = completion_manifest::manifest_path(&common.out_dir);
+    let completed = match completion_manifest::load_completed(&manifest_path) {
+        Ok(completed) => completed,
+        Err(error) => {
+            eprintln!("⚠️  Failed to load completion manifest: {}", error);
+            Default::default()
+        }
+    };
     let options = IngestOptions {
         common,
         s3,
         health_file: health_file.clone(),
         manage_health: false,
     };
-    let total_files = source.job_count();
-    let total_bytes = source.estimated_size_bytes();
-    let sources = source.into_job_sources();
+    let mut sources: Vec<_> = source
+        .into_job_sources()
+        .into_iter()
+        .filter(|source| match source.completion_key() {
+            Ok(key) => !completed.contains(&key),
+            Err(error) => {
+                eprintln!("⚠️  Skipping file without completion key: {}", error);
+                true
+            }
+        })
+        .collect();
+
+    if sources.is_empty() {
+        eprintln!("✅ No unfinished input files found");
+        return Ok(());
+    }
+
+    let total_files = sources.len();
+    let total_bytes = sources
+        .iter()
+        .map(input::FileInputSource::estimated_size_bytes)
+        .sum();
     let worker_limit = default_worker_limit(total_files, total_bytes).min(sources.len().max(1));
     eprintln!(
         "🧵 Starting parallel ingest with {} worker(s)",
         worker_limit
     );
-    run_parallel_file_ingest(sources, options, health_file, total_files, worker_limit).await
+    if sources.len() == 1 {
+        eprintln!("▶️  Starting single-worker ingest");
+        let mut source = sources.pop().expect("single source");
+        let result = run_ingest(
+            &mut source,
+            IngestOptions {
+                common: options.common.clone(),
+                s3: options.s3.clone(),
+                health_file: health_file.clone(),
+                manage_health: true,
+            },
+        )
+        .await;
+
+        if result.is_ok() {
+            if let Ok(key) = source.completion_key() {
+                if let Err(error) = completion_manifest::append_completed(&manifest_path, &key) {
+                    eprintln!("⚠️  Failed to update completion manifest: {}", error);
+                }
+            }
+        }
+
+        return result;
+    }
+
+    run_parallel_file_ingest(sources, options, health_file, total_files, worker_limit, manifest_path)
+        .await
 }
 
 async fn run_parallel_file_ingest(
@@ -153,6 +193,7 @@ async fn run_parallel_file_ingest(
     health_file: PathBuf,
     total_files: usize,
     worker_limit: usize,
+    manifest_path: PathBuf,
 ) -> Result<()> {
     let running = Arc::new(AtomicBool::new(true));
     update_health_status_async(&health_file, true).await?;
@@ -206,6 +247,7 @@ async fn run_parallel_file_ingest(
     });
 
     let stop = Arc::new(AtomicBool::new(false));
+    let queue = Arc::new(Mutex::new(VecDeque::from(sources)));
 
     let stop_for_signal = stop.clone();
     let running_for_signal = running.clone();
@@ -242,20 +284,33 @@ async fn run_parallel_file_ingest(
 
     eprintln!("🚚 phase=dispatching file jobs to workers...");
     phase.store(PHASE_DISPATCHING, Ordering::SeqCst);
-    let mut tasks = stream::iter(sources.into_iter())
-        .map(|source| {
-            let stop = stop.clone();
-            let completed_files = completed_files.clone();
-            let phase = phase.clone();
-            let worker_options = options.clone();
-            async move {
+    let mut first_error = None;
+
+    let mut workers = Vec::with_capacity(worker_limit);
+    for _ in 0..worker_limit {
+        let queue = queue.clone();
+        let stop = stop.clone();
+        let completed_files = completed_files.clone();
+        let phase = phase.clone();
+        let manifest_path = manifest_path.clone();
+        let worker_options = options.clone();
+        workers.push(tokio::spawn(async move {
+            loop {
                 if stop.load(Ordering::SeqCst) {
-                    return Ok::<_, anyhow::Error>(());
+                    break;
                 }
 
-                let mut source = source;
+                let next_source = {
+                    let mut queue = queue.lock().await;
+                    queue.pop_front()
+                };
+
+                let Some(mut source) = next_source else {
+                    break;
+                };
+
                 phase.store(PHASE_INGESTING, Ordering::SeqCst);
-                if let Err(error) = run_ingest(&mut source, worker_options).await {
+                if let Err(error) = run_ingest(&mut source, worker_options.clone()).await {
                     stop.store(true, Ordering::SeqCst);
                     return Err(error);
                 }
@@ -265,16 +320,27 @@ async fn run_parallel_file_ingest(
                     phase.store(PHASE_DRAINING, Ordering::SeqCst);
                 }
 
-                Ok(())
+                if let Ok(key) = source.completion_key() {
+                    if let Err(error) = completion_manifest::append_completed(&manifest_path, &key) {
+                        eprintln!("⚠️  Failed to update completion manifest: {}", error);
+                    }
+                }
             }
-        })
-        .buffer_unordered(worker_limit);
 
-    let mut first_error = None;
-    while let Some(result) = tasks.next().await {
-        if let Err(error) = result {
-            first_error = Some(error);
-            stop.store(true, Ordering::SeqCst);
+            Ok::<_, anyhow::Error>(())
+        }));
+    }
+
+    for worker in workers {
+        match worker.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+                stop.store(true, Ordering::SeqCst);
+            }
+            Err(error) => return Err(error.into()),
         }
     }
 
