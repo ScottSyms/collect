@@ -17,6 +17,11 @@ mod input;
 
 mod tui;
 
+const PHASE_SCANNING: usize = 0;
+const PHASE_DISPATCHING: usize = 1;
+const PHASE_INGESTING: usize = 2;
+const PHASE_DRAINING: usize = 3;
+
 #[derive(Parser, Debug)]
 #[command(
     version,
@@ -97,6 +102,7 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| default_source_from_path(&input));
 
     let health_file = health_file_path("collect-file");
+    eprintln!("📍 phase=scanning files=0/0 (0%)");
     eprintln!("🔎 Scanning input files...");
     let source = input::FileInputSource::new_parallel(input, source_name, args.ais).await?;
     eprintln!("📦 Discovered {} input job(s)", source.job_count());
@@ -147,6 +153,7 @@ async fn run_parallel_file_ingest(
 ) -> Result<()> {
     let running = Arc::new(AtomicBool::new(true));
     update_health_status_async(&health_file, true).await?;
+    let phase = Arc::new(AtomicUsize::new(PHASE_DISPATCHING));
     let completed_files = Arc::new(AtomicUsize::new(0));
 
     let health_running = running.clone();
@@ -165,24 +172,31 @@ async fn run_parallel_file_ingest(
     });
 
     let progress_running = running.clone();
+    let progress_phase = phase.clone();
     let progress_completed = completed_files.clone();
     let progress_task = tokio::spawn(async move {
-        let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         heartbeat.tick().await;
 
         loop {
             heartbeat.tick().await;
+            let phase_label = phase_label(progress_phase.load(Ordering::SeqCst));
             let completed = progress_completed.load(Ordering::SeqCst);
-            let percent = if total_files == 0 {
-                100
-            } else {
-                (completed.saturating_mul(100)) / total_files
-            };
             if progress_running.load(Ordering::SeqCst) {
-                eprintln!("📊 Files processed: {}/{} ({}%)", completed, total_files, percent);
+                eprintln!(
+                    "📊 phase={} done={}/{}",
+                    phase_label,
+                    completed,
+                    total_files,
+                );
             } else {
-                eprintln!("📊 Draining: {}/{} files complete ({}%)", completed, total_files, percent);
+                eprintln!(
+                    "📊 phase={} done={}/{}",
+                    phase_label,
+                    completed,
+                    total_files,
+                );
                 break;
             }
         }
@@ -192,6 +206,7 @@ async fn run_parallel_file_ingest(
 
     let stop_for_signal = stop.clone();
     let running_for_signal = running.clone();
+    let phase_for_signal = phase.clone();
     let _signal_task = tokio::spawn(async move {
         #[cfg(unix)]
         {
@@ -218,15 +233,18 @@ async fn run_parallel_file_ingest(
 
         stop_for_signal.store(true, Ordering::SeqCst);
         running_for_signal.store(false, Ordering::SeqCst);
+        phase_for_signal.store(PHASE_DRAINING, Ordering::SeqCst);
         eprintln!("🛑 Shutdown signal received. Stopping file workers...");
     });
 
     let worker_limit = default_worker_limit().min(sources.len().max(1));
-    eprintln!("🚚 Dispatching file jobs to workers...");
+    eprintln!("🚚 phase=dispatching file jobs to workers...");
+    phase.store(PHASE_DISPATCHING, Ordering::SeqCst);
     let mut tasks = stream::iter(sources.into_iter())
         .map(|source| {
             let stop = stop.clone();
             let completed_files = completed_files.clone();
+            let phase = phase.clone();
             let worker_options = options.clone();
             async move {
                 if stop.load(Ordering::SeqCst) {
@@ -234,12 +252,16 @@ async fn run_parallel_file_ingest(
                 }
 
                 let mut source = source;
+                phase.store(PHASE_INGESTING, Ordering::SeqCst);
                 if let Err(error) = run_ingest(&mut source, worker_options).await {
                     stop.store(true, Ordering::SeqCst);
                     return Err(error);
                 }
 
-                completed_files.fetch_add(1, Ordering::SeqCst);
+                let completed = completed_files.fetch_add(1, Ordering::SeqCst) + 1;
+                if completed >= total_files {
+                    phase.store(PHASE_DRAINING, Ordering::SeqCst);
+                }
 
                 Ok(())
             }
@@ -255,6 +277,7 @@ async fn run_parallel_file_ingest(
     }
 
     running.store(false, Ordering::SeqCst);
+    phase.store(PHASE_DRAINING, Ordering::SeqCst);
     let _ = health_task.await;
     let _ = progress_task.await;
     update_health_status_async(&health_file, false).await?;
@@ -271,4 +294,14 @@ fn default_worker_limit() -> usize {
         .map(|count| count.get().saturating_mul(2))
         .unwrap_or(8)
         .clamp(4, 32)
+}
+
+fn phase_label(phase: usize) -> &'static str {
+    match phase {
+        PHASE_SCANNING => "scan",
+        PHASE_DISPATCHING => "dispatch",
+        PHASE_INGESTING => "ingest",
+        PHASE_DRAINING => "drain",
+        _ => "unknown",
+    }
 }
