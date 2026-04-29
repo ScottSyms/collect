@@ -68,10 +68,12 @@ pub(crate) fn spawn_status_tui(
     total_files: usize,
     completed_files: Arc<AtomicUsize>,
     running: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
     started_at: Instant,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        if let Err(error) = run_status_tui(total_files, completed_files, running, started_at) {
+        if let Err(error) = run_status_tui(total_files, completed_files, running, stop, started_at)
+        {
             eprintln!("⚠️  Status UI unavailable: {}", error);
         }
     })
@@ -81,6 +83,7 @@ fn run_status_tui(
     total_files: usize,
     completed_files: Arc<AtomicUsize>,
     running: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
     started_at: Instant,
 ) -> Result<()> {
     CANCELLED.store(0, Ordering::SeqCst);
@@ -96,6 +99,7 @@ fn run_status_tui(
         total_files,
         completed_files,
         running,
+        stop,
         started_at,
     )?;
     terminal.show_cursor()?;
@@ -117,6 +121,7 @@ fn run_status_loop(
     total_files: usize,
     completed_files: Arc<AtomicUsize>,
     running: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
     started_at: Instant,
 ) -> Result<()> {
     loop {
@@ -142,6 +147,8 @@ fn run_status_loop(
                             || matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)) =>
                 {
                     request_cancel();
+                    stop.store(true, Ordering::SeqCst);
+                    running.store(false, Ordering::SeqCst);
                     break;
                 }
                 _ => {}

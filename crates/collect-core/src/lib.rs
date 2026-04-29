@@ -223,6 +223,7 @@ pub struct IngestOptions {
     pub manage_health: bool,
     pub report_progress: bool,
     pub log_writes: bool,
+    pub shutdown: Option<Arc<AtomicBool>>,
 }
 
 pub type LineReader = FramedRead<Box<dyn AsyncRead + Unpin + Send>, LinesCodec>;
@@ -514,6 +515,7 @@ where
         manage_health,
         report_progress,
         log_writes,
+        shutdown: external_shutdown,
     } = options;
 
     if common.health_check {
@@ -528,7 +530,7 @@ where
 
     let mut reader = source.open(common.max_line_length).await?;
 
-    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown = external_shutdown.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     let shutdown_signal = shutdown.clone();
     let _shutdown_task = tokio::spawn(async move {
         #[cfg(unix)]

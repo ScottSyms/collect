@@ -191,6 +191,7 @@ async fn main() -> Result<()> {
             manage_health: true,
             report_progress: true,
             log_writes: true,
+            shutdown: None,
         },
     )
     .await

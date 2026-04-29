@@ -141,6 +141,7 @@ async fn run_file_ingest(
             Default::default()
         }
     };
+    let stop = Arc::new(AtomicBool::new(false));
     let options = IngestOptions {
         common,
         s3,
@@ -148,6 +149,7 @@ async fn run_file_ingest(
         manage_health: false,
         report_progress: false,
         log_writes: false,
+        shutdown: Some(stop.clone()),
     };
     let mut sources: Vec<_> = source
         .into_job_sources()
@@ -189,6 +191,7 @@ async fn run_file_ingest(
                 total_files,
                 completed_files.clone(),
                 running.clone(),
+                stop.clone(),
                 started_at,
             ))
         } else {
@@ -203,6 +206,7 @@ async fn run_file_ingest(
                 manage_health: true,
                 report_progress: false,
                 log_writes: false,
+                shutdown: Some(stop.clone()),
             },
         )
         .await;
@@ -236,6 +240,7 @@ async fn run_file_ingest(
         worker_limit,
         manifest_path,
         status_mode,
+        stop,
     )
     .await
 }
@@ -248,6 +253,7 @@ async fn run_parallel_file_ingest(
     worker_limit: usize,
     manifest_path: PathBuf,
     status_mode: status::StatusMode,
+    _stop: Arc<AtomicBool>,
 ) -> Result<()> {
     let running = Arc::new(AtomicBool::new(true));
     update_health_status_async(&health_file, true).await?;
@@ -269,18 +275,19 @@ async fn run_parallel_file_ingest(
         }
     });
 
+    let stop = Arc::new(AtomicBool::new(false));
     let status_task = if status_mode.is_tui() {
         Some(status::spawn_status_tui(
             total_files,
             completed_files.clone(),
             running.clone(),
+            stop.clone(),
             started_at,
         ))
     } else {
         None
     };
 
-    let stop = Arc::new(AtomicBool::new(false));
     let queue = Arc::new(Mutex::new(VecDeque::from(sources)));
 
     let stop_for_signal = stop.clone();
@@ -326,7 +333,7 @@ async fn run_parallel_file_ingest(
     let mut workers = Vec::with_capacity(worker_limit);
     for _ in 0..worker_limit {
         let queue = queue.clone();
-        let stop = stop.clone();
+        let stop = _stop.clone();
         let completed_files = completed_files.clone();
         let manifest_path = manifest_path.clone();
         let worker_options = options.clone();

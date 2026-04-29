@@ -85,7 +85,9 @@ impl StorageLocation {
         let mut on_progress = on_progress;
         match self {
             StorageLocation::Local(local) => {
-                local.list_entries(granularity, concurrency, &mut on_progress).await
+                local
+                    .list_entries(granularity, concurrency, &mut on_progress)
+                    .await
             }
             StorageLocation::S3(s3) => s3.list_entries(granularity, &mut on_progress).await,
         }
@@ -230,7 +232,11 @@ impl LocalStorage {
                         .path()
                         .strip_prefix(&root)
                         .with_context(|| {
-                            format!("{} is outside root {}", item.path().display(), root.display())
+                            format!(
+                                "{} is outside root {}",
+                                item.path().display(),
+                                root.display()
+                            )
                         })?
                         .to_string_lossy()
                         .replace('\\', "/");
@@ -238,9 +244,9 @@ impl LocalStorage {
                         return Ok(None);
                     }
 
-                    let metadata = tokio::fs::metadata(item.path())
-                        .await
-                        .with_context(|| format!("reading file metadata {}", item.path().display()))?;
+                    let metadata = tokio::fs::metadata(item.path()).await.with_context(|| {
+                        format!("reading file metadata {}", item.path().display())
+                    })?;
                     let size = metadata.len();
                     let kind = classify_entry(&rel_path, size);
                     Ok(Some(DatasetEntry {

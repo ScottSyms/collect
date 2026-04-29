@@ -12,7 +12,9 @@ pub(crate) fn load_completed(path: &Path) -> Result<HashSet<String>> {
     let file = match fs::File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashSet::new()),
-        Err(error) => return Err(error).with_context(|| format!("open manifest {}", path.display())),
+        Err(error) => {
+            return Err(error).with_context(|| format!("open manifest {}", path.display()))
+        }
     };
 
     let reader = BufReader::new(file);
@@ -31,7 +33,8 @@ pub(crate) fn load_completed(path: &Path) -> Result<HashSet<String>> {
 
 pub(crate) fn append_completed(path: &Path, key: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create manifest dir {}", parent.display()))?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create manifest dir {}", parent.display()))?;
     }
 
     let mut file = OpenOptions::new()
