@@ -1,7 +1,7 @@
 use crate::status;
 use std::fmt::Display;
 
-pub const SCAN_REPORT_INTERVAL: usize = 100;
+pub const SCAN_REPORT_INTERVAL: usize = 10;
 pub const LIST_REPORT_INTERVAL: usize = 1000;
 
 pub fn set_mode(mode: status::StatusMode) {

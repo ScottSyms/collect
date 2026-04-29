@@ -157,6 +157,15 @@ pub(crate) fn update_step(stage: &str, current: usize, total: usize, detail: imp
     }
 }
 
+pub(crate) fn set_progress(current: usize, total: usize) {
+    if let Some(state) = SESSION.get() {
+        if let Ok(mut state) = state.lock() {
+            state.current = current;
+            state.total = total;
+        }
+    }
+}
+
 fn run_tui(state: Arc<Mutex<StatusState>>, running: Arc<AtomicBool>) -> Result<()> {
     enable_raw_mode()?;
     let _cleanup = TerminalCleanup;
@@ -244,7 +253,7 @@ fn render(frame: &mut ratatui::Frame, state: &Arc<Mutex<StatusState>>) {
     let body = Paragraph::new(vec![
         Line::from(format!("stage {}", snapshot.stage)),
         Line::from(format!("{}", snapshot.detail)),
-        Line::from(format!("updates every 100 items")),
+        Line::from(format!("updates every 10 items")),
         Line::from(format!("throughput {:.2} items/s", throughput)),
     ])
     .block(

@@ -106,6 +106,7 @@ pub async fn inspect(
 ) -> Result<()> {
     let workspace = tempfile::tempdir()?;
     let total = entries.len();
+    status::set_progress(0, total);
     let mut summary = BTreeMap::<String, PartitionSummary>::new();
     let mut completed = 0usize;
 
@@ -325,6 +326,7 @@ pub async fn validate(
 ) -> Result<()> {
     let workspace = tempfile::tempdir()?;
     let total = entries.len();
+    status::set_progress(0, total);
     let mut completed = 0usize;
     let mut results = Vec::with_capacity(entries.len());
 
@@ -399,6 +401,8 @@ pub async fn compact(
         report("compact", "no compactable partitions found");
         return Ok(());
     }
+
+    status::set_progress(0, jobs.len());
 
     report(
         "compact",
@@ -491,6 +495,7 @@ async fn compact_partition_jobs(
 
     for (index, job) in jobs.into_iter().enumerate() {
         check_cancelled()?;
+        status::set_progress(index + 1, partition_jobs);
         let output_rel = job.output_rel.clone();
         compact_job(
             storage,
@@ -537,6 +542,8 @@ pub async fn vacuum(
         .cloned()
         .map(|entry| (entry.rel_path.clone(), entry))
         .collect();
+
+    status::set_progress(0, entries.len());
 
     report(
         "vacuum",
@@ -760,6 +767,7 @@ async fn compact_job(
     concurrency: usize,
     compression_level: i32,
 ) -> Result<()> {
+    status::set_progress(job_index, job_total);
     let manifest = CompactionManifest::new(
         &job.partition,
         job.output_rel.clone(),
