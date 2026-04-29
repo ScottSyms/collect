@@ -21,7 +21,7 @@ fn default_concurrency() -> usize {
 #[command(
     version,
     about = "Maintain hive-partitioned Parquet collections stored locally or on S3",
-    after_help = "Examples:\n  collect-maint --root data --partition minute inspect\n  collect-maint --root data --partition hour compact\n  collect-maint --root data --partition day compact --apply\n  collect-maint --root data --partition month vacuum\n  collect-maint --root data --partition year vacuum --apply\n\nNotes:\n  partition is required and must match the dataset layout. compact and vacuum are dry-run by default. Re-run with --apply to make changes."
+    after_help = "Examples:\n  collect-maint --root data --partition day inspect\n  collect-maint --root data --partition hour compact\n  collect-maint --root data --partition day compact --apply\n  collect-maint --root data --partition month vacuum\n  collect-maint --root data --partition year vacuum --apply\n\nNotes:\n  partition is required and must match the dataset layout. compact and vacuum are dry-run by default. Re-run with --apply to make changes."
 )]
 struct Cli {
     #[command(flatten)]

@@ -29,7 +29,7 @@ impl Default for TuiConfig {
             tcp_port: String::new(),
             source: String::new(),
             out_dir: "data".to_string(),
-            partition: "minute".to_string(),
+            partition: "day".to_string(),
             max_rows: String::new(),
             max_batch_bytes: String::new(),
             compression_level: String::new(),

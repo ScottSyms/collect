@@ -132,7 +132,7 @@ pub struct CommonCliArgs {
     pub out_dir: PathBuf,
 
     /// Partition granularity for dataset layout
-    #[arg(long, default_value_t = PartitionGranularity::Minute)]
+    #[arg(long, default_value_t = PartitionGranularity::Day)]
     pub partition: PartitionGranularity,
 
     /// Max rows to buffer per Parquet file before flush (default: flush on the selected partition boundary)
@@ -278,7 +278,7 @@ impl CommonCliArgs {
             }
         }
 
-        if self.partition == PartitionGranularity::Minute {
+        if self.partition == PartitionGranularity::Day {
             if let Ok(value) = std::env::var("PARTITION") {
                 if let Ok(parsed) = value.parse::<PartitionGranularity>() {
                     self.partition = parsed;

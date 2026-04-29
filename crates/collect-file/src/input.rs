@@ -114,6 +114,10 @@ impl FileInputSource {
         self.jobs.len()
     }
 
+    pub(crate) fn estimated_size_bytes(&self) -> u64 {
+        self.jobs.iter().map(|job| job.estimated_size).sum()
+    }
+
     pub(crate) fn into_job_sources(self) -> Vec<Self> {
         let FileInputSource { source, ais, jobs, .. } = self;
 

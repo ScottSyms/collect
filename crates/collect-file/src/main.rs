@@ -137,12 +137,14 @@ async fn run_file_ingest(
         manage_health: false,
     };
     let total_files = source.job_count();
+    let total_bytes = source.estimated_size_bytes();
     let sources = source.into_job_sources();
+    let worker_limit = default_worker_limit(total_files, total_bytes).min(sources.len().max(1));
     eprintln!(
         "🧵 Starting parallel ingest with {} worker(s)",
-        sources.len().min(default_worker_limit())
+        worker_limit
     );
-    run_parallel_file_ingest(sources, options, health_file, total_files).await
+    run_parallel_file_ingest(sources, options, health_file, total_files, worker_limit).await
 }
 
 async fn run_parallel_file_ingest(
@@ -150,6 +152,7 @@ async fn run_parallel_file_ingest(
     options: IngestOptions,
     health_file: PathBuf,
     total_files: usize,
+    worker_limit: usize,
 ) -> Result<()> {
     let running = Arc::new(AtomicBool::new(true));
     update_health_status_async(&health_file, true).await?;
@@ -237,7 +240,6 @@ async fn run_parallel_file_ingest(
         eprintln!("🛑 Shutdown signal received. Stopping file workers...");
     });
 
-    let worker_limit = default_worker_limit().min(sources.len().max(1));
     eprintln!("🚚 phase=dispatching file jobs to workers...");
     phase.store(PHASE_DISPATCHING, Ordering::SeqCst);
     let mut tasks = stream::iter(sources.into_iter())
@@ -289,11 +291,25 @@ async fn run_parallel_file_ingest(
     Ok(())
 }
 
-fn default_worker_limit() -> usize {
-    std::thread::available_parallelism()
-        .map(|count| count.get().saturating_mul(2))
-        .unwrap_or(8)
-        .clamp(4, 32)
+fn default_worker_limit(total_files: usize, total_bytes: u64) -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(4);
+    let avg_file_size = if total_files == 0 {
+        0
+    } else {
+        total_bytes / total_files as u64
+    };
+
+    let worker_count = if avg_file_size < 16 * 1024 * 1024 {
+        cores.saturating_mul(4)
+    } else if avg_file_size < 128 * 1024 * 1024 {
+        cores.saturating_mul(3)
+    } else {
+        cores.saturating_mul(2)
+    };
+
+    worker_count.clamp(4, 64)
 }
 
 fn phase_label(phase: usize) -> &'static str {

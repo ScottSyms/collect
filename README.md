@@ -53,19 +53,19 @@ cargo run -p collect-file -- --input data.txt --source mydata --compression-leve
 
 ```bash
 # Read-only inspection
-cargo run -p collect-maint -- --root data --partition minute inspect
+cargo run -p collect-maint -- --root data --partition day inspect
 
 # Dry-run compaction plan
-cargo run -p collect-maint -- --root data --partition minute compact
+cargo run -p collect-maint -- --root data --partition day compact
 
 # Real compaction run
-cargo run -p collect-maint -- --root data --partition minute compact --apply
+cargo run -p collect-maint -- --root data --partition day compact --apply
 
 # Dry-run cleanup plan
-cargo run -p collect-maint -- --root data --partition minute vacuum
+cargo run -p collect-maint -- --root data --partition day vacuum
 
 # Real cleanup run
-cargo run -p collect-maint -- --root data --partition minute vacuum --apply
+cargo run -p collect-maint -- --root data --partition day vacuum --apply
 ```
 
 ## Environment Variables
@@ -180,20 +180,15 @@ data/
 │   └── year=2025/
 │       └── month=01/
 │           └── day=15/
-│               └── hour=14/
-│                   └── minute=30/
-│                       ├── 20250115_143045_001.parquet
-│                       └── 20250115_143145_002.parquet
+│               └── 20250115_000000_001.parquet
 └── source=norway-tcp/
     └── year=2025/
     └── month=01/
         └── day=15/
-            └── hour=14/
-                └── minute=31/
-                        └── 20250115_143155_001.parquet
+            └── 20250115_000000_001.parquet
 ```
 
-Use `--partition minute|hour|day|month|year` to choose how deep the time hierarchy goes.
+Use `--partition day|hour|minute|month|year` to choose how deep the time hierarchy goes. The default is `day`.
 
 ## Health Checks
 
