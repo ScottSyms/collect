@@ -412,35 +412,84 @@ pub async fn compact(
     let workspace = tempfile::tempdir()?;
     let total = jobs.len();
     let mut completed = 0usize;
-    let mut stream = stream::iter(jobs.into_iter().enumerate())
-        .map(|(index, job)| {
+    let partition_groups = group_compaction_jobs_by_partition(jobs);
+    let mut stream = stream::iter(partition_groups.into_iter())
+        .map(|(partition, jobs)| {
             let workspace = workspace.path().to_path_buf();
             async move {
-                let output_rel = job.output_rel.clone();
-                compact_job(
+                compact_partition_jobs(
                     storage,
-                    &job,
+                    partition,
+                    jobs,
                     &workspace,
-                    index + 1,
-                    total,
                     concurrency,
                     compression_level,
                 )
-                .await?;
-                Ok::<_, anyhow::Error>((index, output_rel))
+                .await
             }
         })
         .buffer_unordered(concurrency.max(1));
 
     while let Some(result) = stream.next().await {
-        let (_index, output_rel) = result?;
-        completed += 1;
-        report_step("compact", completed, total, &output_rel);
+        let outputs = result?;
+        for output_rel in outputs {
+            completed += 1;
+            report_step("compact", completed, total, &output_rel);
+        }
     }
 
     report("compact", "complete");
 
     Ok(())
+}
+
+async fn compact_partition_jobs(
+    storage: &StorageLocation,
+    partition: PartitionKey,
+    jobs: Vec<CompactionJob>,
+    workspace: &Path,
+    concurrency: usize,
+    compression_level: i32,
+) -> Result<Vec<String>> {
+    let partition_jobs = jobs.len();
+    let mut outputs = Vec::with_capacity(jobs.len());
+
+    for (index, job) in jobs.into_iter().enumerate() {
+        let output_rel = job.output_rel.clone();
+        compact_job(
+            storage,
+            &job,
+            workspace,
+            index + 1,
+            partition_jobs,
+            concurrency,
+            compression_level,
+        )
+        .await?;
+        outputs.push(output_rel);
+    }
+
+    report(
+        "compact",
+        format!("partition {} complete", partition.relative_dir()),
+    );
+
+    Ok(outputs)
+}
+
+fn group_compaction_jobs_by_partition(
+    jobs: Vec<CompactionJob>,
+) -> Vec<(PartitionKey, Vec<CompactionJob>)> {
+    let mut grouped: BTreeMap<PartitionKey, Vec<CompactionJob>> = BTreeMap::new();
+
+    for job in jobs {
+        grouped
+            .entry(job.partition.clone())
+            .or_default()
+            .push(job);
+    }
+
+    grouped.into_iter().collect()
 }
 
 pub async fn vacuum(
