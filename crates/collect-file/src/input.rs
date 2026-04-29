@@ -139,7 +139,9 @@ impl FileInputSource {
     }
 
     pub(crate) fn into_job_sources(self) -> Vec<Self> {
-        let FileInputSource { source, ais, jobs, .. } = self;
+        let FileInputSource {
+            source, ais, jobs, ..
+        } = self;
 
         jobs.into_iter()
             .map(|job| FileInputSource::from_jobs(source.clone(), ais, vec![job]))
@@ -373,9 +375,7 @@ impl InputJob {
         let InputJob { path, kind, .. } = self;
 
         match kind {
-            InputKind::Plain => {
-                open_plain_file_reader(path, max_line_length)
-            }
+            InputKind::Plain => open_plain_file_reader(path, max_line_length),
             InputKind::Gzip => {
                 let file = tokio::fs::File::open(&path)
                     .await
@@ -426,7 +426,11 @@ fn collect_input_jobs(root: &Path) -> Result<Vec<InputJob>> {
             match expand_input_path(entry.path(), metadata.len()) {
                 Ok(expanded) => jobs.extend(expanded),
                 Err(error) if should_skip_input_error(&error) => {
-                    eprintln!("⚠️  Skipping unreadable file {}: {}", entry.path().display(), error);
+                    eprintln!(
+                        "⚠️  Skipping unreadable file {}: {}",
+                        entry.path().display(),
+                        error
+                    );
                 }
                 Err(error) => return Err(error),
             }
@@ -530,7 +534,12 @@ fn collect_zip_jobs(path: &Path) -> Result<Vec<InputJob>> {
         if is_hidden_entry_name(&entry_name) {
             continue;
         }
-        jobs.push(InputJob::zip_entry(path.to_path_buf(), estimated_size, entry_index, entry_name));
+        jobs.push(InputJob::zip_entry(
+            path.to_path_buf(),
+            estimated_size,
+            entry_index,
+            entry_name,
+        ));
     }
 
     Ok(jobs)
@@ -948,13 +957,13 @@ mod tests {
     use std::collections::HashMap;
     use std::fs::File as StdFile;
     use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
     use tempfile::tempdir;
     use tokio::io::AsyncWriteExt;
     use walkdir::WalkDir;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
 
     #[tokio::test]
     async fn reads_plain_gzip_bzip2_and_zip_entries_in_order() -> Result<()> {
@@ -1039,6 +1048,8 @@ mod tests {
                 s3: None,
                 health_file,
                 manage_health: true,
+                report_progress: true,
+                log_writes: true,
             },
         )
         .await?;
@@ -1269,6 +1280,8 @@ mod tests {
                 s3: None,
                 health_file,
                 manage_health: true,
+                report_progress: true,
+                log_writes: true,
             },
         )
         .await?;

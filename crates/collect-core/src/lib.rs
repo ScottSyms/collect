@@ -17,11 +17,11 @@ use std::error::Error;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::AtomicU64;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use std::sync::atomic::AtomicU64;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncRead;
 use tokio::sync::{mpsc, Semaphore};
@@ -40,6 +40,7 @@ const DEFAULT_S3_REGION: &str = "us-east-1";
 const DEFAULT_HEALTH_STALE_WINDOW_SECONDS: u64 = 60;
 const DEFAULT_UPLOAD_QUEUE_CAPACITY: usize = 128;
 const DEFAULT_UPLOAD_CONCURRENCY: usize = 4;
+const DEFAULT_WRITE_QUEUE_CAPACITY: usize = 64;
 const DEFAULT_UPLOAD_RETRIES: usize = 3;
 const HEALTH_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 static PARQUET_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -220,6 +221,8 @@ pub struct IngestOptions {
     pub s3: Option<S3Options>,
     pub health_file: PathBuf,
     pub manage_health: bool,
+    pub report_progress: bool,
+    pub log_writes: bool,
 }
 
 pub type LineReader = FramedRead<Box<dyn AsyncRead + Unpin + Send>, LinesCodec>;
@@ -509,6 +512,8 @@ where
         s3,
         health_file,
         manage_health,
+        report_progress,
+        log_writes,
     } = options;
 
     if common.health_check {
@@ -565,6 +570,8 @@ where
     let mut files_flushed = 0usize;
 
     let (upload_tx, upload_worker) = spawn_upload_worker(s3_storage.clone());
+    let (write_tx, write_worker) =
+        spawn_write_worker(shutdown.clone(), upload_tx.clone(), log_writes);
 
     if options.manage_health {
         update_health_status_async(&health_file, true).await?;
@@ -590,7 +597,7 @@ where
                     }
                 }
             }
-            _ = progress_heartbeat.tick() => {
+            _ = progress_heartbeat.tick(), if report_progress => {
                 emit_ingest_progress(
                     source,
                     rows_processed,
@@ -619,8 +626,10 @@ where
                                     &common.out_dir,
                                     &current_key,
                                     &mut buf,
-                                    upload_tx.as_ref(),
+                                    write_tx.as_ref(),
                                     common.compression_level,
+                                    &shutdown,
+                                    log_writes,
                                 )
                                 .await?;
                                 rows_in_file = 0;
@@ -635,8 +644,10 @@ where
                                 &common.out_dir,
                                 &current_key,
                                 &mut buf,
-                                upload_tx.as_ref(),
+                                write_tx.as_ref(),
                                 common.compression_level,
+                                &shutdown,
+                                log_writes,
                             )
                             .await?;
                             rows_in_file = 0;
@@ -652,8 +663,10 @@ where
                                 &common.out_dir,
                                 &current_key,
                                 &mut buf,
-                                upload_tx.as_ref(),
+                                write_tx.as_ref(),
                                 common.compression_level,
+                                &shutdown,
+                                log_writes,
                             )
                             .await?;
                             rows_in_file = 0;
@@ -666,8 +679,10 @@ where
                                     &common.out_dir,
                                     &current_key,
                                     &mut buf,
-                                    upload_tx.as_ref(),
+                                    write_tx.as_ref(),
                                     common.compression_level,
+                                    &shutdown,
+                                    log_writes,
                                 )
                                 .await?;
                                 rows_in_file = 0;
@@ -714,23 +729,40 @@ where
             &common.out_dir,
             &current_key,
             &mut buf,
-            upload_tx.as_ref(),
+            write_tx.as_ref(),
             common.compression_level,
+            &shutdown,
+            log_writes,
         )
         .await?;
+    }
+
+    if let Some(write_tx) = write_tx {
+        drop(write_tx);
+        if let Some(write_worker) = write_worker {
+            match write_worker.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => return Err(error),
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
 
     if let Some(upload_tx) = upload_tx {
         drop(upload_tx);
         if let Some(upload_worker) = upload_worker {
-            println!("Waiting for background uploads to complete...");
+            if log_writes {
+                println!("Waiting for background uploads to complete...");
+            }
             let drain_timeout = Duration::from_secs(common.upload_drain_timeout_seconds);
             match tokio::time::timeout(drain_timeout, upload_worker).await {
                 Ok(join_result) => {
                     if let Err(error) = join_result {
                         eprintln!("Upload worker failed: {}", error);
                     } else {
-                        println!("All uploads completed");
+                        if log_writes {
+                            println!("All uploads completed");
+                        }
                     }
                 }
                 Err(_) => {
@@ -1041,8 +1073,8 @@ fn open_writer(
         fs::create_dir_all(parent).with_context(|| format!("mkdir -p {}", parent.display()))?;
     }
     let file = File::create(path).with_context(|| format!("create {}", path.display()))?;
-    let zstd_level = ZstdLevel::try_new(compression_level)
-        .context("invalid Zstd compression level")?;
+    let zstd_level =
+        ZstdLevel::try_new(compression_level).context("invalid Zstd compression level")?;
     let props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(zstd_level))
         .set_column_encoding(ColumnPath::from("ts"), Encoding::DELTA_BINARY_PACKED)
@@ -1153,42 +1185,187 @@ fn spawn_upload_worker(
     (Some(tx), Some(worker))
 }
 
-async fn flush_batch(
-    root: &Path,
-    key: &PartKey,
-    buf: &mut BatchBuf,
-    upload_tx: Option<&mpsc::Sender<(PathBuf, String)>>,
+fn spawn_write_worker(
+    shutdown: Arc<AtomicBool>,
+    upload_tx: Option<mpsc::Sender<(PathBuf, String)>>,
+    log_writes: bool,
+) -> (
+    Option<mpsc::Sender<WriteJob>>,
+    Option<tokio::task::JoinHandle<Result<()>>>,
+) {
+    let (tx, rx) = mpsc::channel::<WriteJob>(DEFAULT_WRITE_QUEUE_CAPACITY);
+    let worker_count = default_write_worker_limit();
+
+    let worker = tokio::spawn(async move {
+        let mut workers = Vec::with_capacity(worker_count);
+        let shared_rx = Arc::new(tokio::sync::Mutex::new(rx));
+
+        for _ in 0..worker_count {
+            let shared_rx = shared_rx.clone();
+            let shutdown = shutdown.clone();
+            let upload_tx = upload_tx.clone();
+            workers.push(tokio::spawn(async move {
+                loop {
+                    if shutdown.load(Ordering::SeqCst) {
+                        break;
+                    }
+
+                    let next_job = {
+                        let mut rx = shared_rx.lock().await;
+                        rx.recv().await
+                    };
+
+                    let Some(job) = next_job else {
+                        break;
+                    };
+
+                    if let Err(error) = write_batch_job(job, upload_tx.as_ref(), log_writes).await {
+                        shutdown.store(true, Ordering::SeqCst);
+                        return Err(error);
+                    }
+                }
+
+                Ok::<_, anyhow::Error>(())
+            }));
+        }
+
+        let mut first_error = None;
+        for worker in workers {
+            match worker.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error.into());
+                    }
+                }
+            }
+        }
+
+        if let Some(error) = first_error {
+            eprintln!("Write worker failed: {}", error);
+            return Err(error);
+        }
+
+        Ok(())
+    });
+
+    (Some(tx), Some(worker))
+}
+
+struct WriteJob {
+    path: PathBuf,
+    s3_key: String,
+    batch: RecordBatch,
     compression_level: i32,
+}
+
+async fn write_batch_job(
+    job: WriteJob,
+    upload_tx: Option<&mpsc::Sender<(PathBuf, String)>>,
+    log_writes: bool,
 ) -> Result<()> {
-    let dir = key.dir_path(root);
-    let filename = parquet_file_name();
-    let path = dir.join(&filename);
-    let batch = buf.to_record_batch()?;
-    let schema = buf.schema.clone();
-    let path_for_write = path.clone();
+    let WriteJob {
+        path,
+        s3_key,
+        batch,
+        compression_level,
+    } = job;
+    let schema = batch.schema();
     let batch_rows = batch.num_rows();
+    let temp_path = path.with_file_name(format!(
+        "{}.tmp",
+        path.file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("part.parquet")
+    ));
+    let final_path = path.clone();
 
     tokio::task::spawn_blocking(move || -> Result<()> {
-        let mut writer = open_writer(&path_for_write, &schema, compression_level)?;
+        let mut writer = open_writer(&temp_path, &schema, compression_level)?;
         writer.write(&batch).context("writing batch to Parquet")?;
         writer.close().context("closing Parquet writer")?;
+        fs::rename(&temp_path, &final_path).with_context(|| {
+            format!(
+                "renaming {} to {}",
+                temp_path.display(),
+                final_path.display()
+            )
+        })?;
         Ok(())
     })
     .await
     .context("joining parquet write task")??;
 
-    println!(
-        "✅ Wrote {} rows to {} (queued for upload)",
-        format_count(batch_rows),
-        path.display()
-    );
+    if log_writes {
+        println!(
+            "✅ Wrote {} rows to {} (queued for upload)",
+            format_count(batch_rows),
+            path.display()
+        );
+    }
 
     if let Some(upload_tx) = upload_tx {
-        let s3_key = key.s3_key(&filename);
         upload_tx
             .send((path, s3_key))
             .await
             .context("Failed to queue upload task")?;
+    }
+
+    Ok(())
+}
+
+fn default_write_worker_limit() -> usize {
+    std::thread::available_parallelism()
+        .map(|count| count.get().saturating_div(2).max(2))
+        .unwrap_or(4)
+        .clamp(2, 8)
+}
+
+async fn flush_batch(
+    root: &Path,
+    key: &PartKey,
+    buf: &mut BatchBuf,
+    write_tx: Option<&mpsc::Sender<WriteJob>>,
+    compression_level: i32,
+    shutdown: &AtomicBool,
+    _log_writes: bool,
+) -> Result<()> {
+    let dir = key.dir_path(root);
+    let filename = parquet_file_name();
+    let path = dir.join(&filename);
+    let batch = buf.to_record_batch()?;
+    let s3_key = key.s3_key(&filename);
+    let Some(write_tx) = write_tx else {
+        return Err(anyhow::anyhow!("missing write queue"));
+    };
+
+    let mut job = Some(WriteJob {
+        path,
+        s3_key,
+        batch,
+        compression_level,
+    });
+
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            return Err(anyhow::anyhow!("write queue interrupted by shutdown"));
+        }
+
+        match write_tx.try_send(job.take().expect("write job missing")) {
+            Ok(()) => break,
+            Err(mpsc::error::TrySendError::Full(returned_job)) => {
+                job = Some(returned_job);
+                tokio::task::yield_now().await;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                return Err(anyhow::anyhow!("write queue closed"));
+            }
+        }
     }
 
     Ok(())

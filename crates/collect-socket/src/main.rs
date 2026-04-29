@@ -189,6 +189,8 @@ async fn main() -> Result<()> {
             s3: args.s3.to_options(),
             health_file,
             manage_health: true,
+            report_progress: true,
+            log_writes: true,
         },
     )
     .await

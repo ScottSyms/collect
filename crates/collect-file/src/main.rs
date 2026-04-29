@@ -6,23 +6,20 @@ use collect_core::{
 };
 use collect_tui::{run_tui, TuiModel};
 use std::collections::VecDeque;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 mod completion_manifest;
 mod input;
+mod status;
 
 mod tui;
-
-const PHASE_SCANNING: usize = 0;
-const PHASE_DISPATCHING: usize = 1;
-const PHASE_INGESTING: usize = 2;
-const PHASE_DRAINING: usize = 3;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -51,11 +48,16 @@ struct Args {
     /// Launch interactive TUI for configuration
     #[arg(long)]
     tui: bool,
+
+    /// Disable the runtime status UI and print aggregate updates every 10 files
+    #[arg(long)]
+    noui: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut args = Args::parse();
+    let noui = args.noui;
 
     if args.tui {
         let initial_config = tui::TuiConfig::load_from_env();
@@ -65,6 +67,7 @@ async fn main() -> Result<()> {
                 let mut full_args = vec!["collect-file".to_string()];
                 full_args.extend(config.to_cli_args());
                 args = Args::parse_from(full_args);
+                args.noui = noui;
             }
             None => {
                 println!("Configuration cancelled.");
@@ -93,8 +96,12 @@ async fn main() -> Result<()> {
         }
     }
 
+    args.noui = noui;
+
     args.common.apply_env();
     args.s3.apply_env();
+
+    let status_mode = status::StatusMode::from_tty(!args.noui && std::io::stdout().is_terminal());
 
     let input = args
         .input
@@ -104,11 +111,19 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| default_source_from_path(&input));
 
     let health_file = health_file_path("collect-file");
-    eprintln!("📍 phase=scanning files=0/0 (0%)");
     eprintln!("🔎 Scanning input files...");
     let source = input::FileInputSource::new_parallel(input, source_name, args.ais).await?;
-    eprintln!("📦 Discovered {} input job(s)", source.job_count());
-    run_file_ingest(source, args.common.to_options(), args.s3.to_options(), health_file).await
+    if status_mode.is_plain() {
+        eprintln!("📦 Discovered {} input job(s)", source.job_count());
+    }
+    run_file_ingest(
+        source,
+        args.common.to_options(),
+        args.s3.to_options(),
+        health_file,
+        status_mode,
+    )
+    .await
 }
 
 async fn run_file_ingest(
@@ -116,6 +131,7 @@ async fn run_file_ingest(
     common: collect_core::CommonOptions,
     s3: Option<collect_core::S3Options>,
     health_file: PathBuf,
+    status_mode: status::StatusMode,
 ) -> Result<()> {
     let manifest_path = completion_manifest::manifest_path(&common.out_dir);
     let completed = match completion_manifest::load_completed(&manifest_path) {
@@ -130,6 +146,8 @@ async fn run_file_ingest(
         s3,
         health_file: health_file.clone(),
         manage_health: false,
+        report_progress: false,
+        log_writes: false,
     };
     let mut sources: Vec<_> = source
         .into_job_sources()
@@ -154,13 +172,28 @@ async fn run_file_ingest(
         .map(input::FileInputSource::estimated_size_bytes)
         .sum();
     let worker_limit = default_worker_limit(total_files, total_bytes).min(sources.len().max(1));
-    eprintln!(
-        "🧵 Starting parallel ingest with {} worker(s)",
-        worker_limit
-    );
     if sources.len() == 1 {
-        eprintln!("▶️  Starting single-worker ingest");
+        if status_mode.is_plain() {
+            eprintln!(
+                "🧵 Starting parallel ingest with {} worker(s)",
+                worker_limit
+            );
+            eprintln!("▶️  Starting single-worker ingest");
+        }
         let mut source = sources.pop().expect("single source");
+        let completed_files = Arc::new(AtomicUsize::new(0));
+        let running = Arc::new(AtomicBool::new(true));
+        let started_at = Instant::now();
+        let status_task = if status_mode.is_tui() {
+            Some(status::spawn_status_tui(
+                total_files,
+                completed_files.clone(),
+                running.clone(),
+                started_at,
+            ))
+        } else {
+            None
+        };
         let result = run_ingest(
             &mut source,
             IngestOptions {
@@ -168,23 +201,43 @@ async fn run_file_ingest(
                 s3: options.s3.clone(),
                 health_file: health_file.clone(),
                 manage_health: true,
+                report_progress: false,
+                log_writes: false,
             },
         )
         .await;
 
         if result.is_ok() {
+            completed_files.store(1, Ordering::SeqCst);
             if let Ok(key) = source.completion_key() {
                 if let Err(error) = completion_manifest::append_completed(&manifest_path, &key) {
                     eprintln!("⚠️  Failed to update completion manifest: {}", error);
                 }
             }
+
+            if status_mode.is_plain() {
+                status::print_plain_update(1, total_files, started_at);
+            }
+        }
+
+        running.store(false, Ordering::SeqCst);
+        if let Some(status_task) = status_task {
+            let _ = status_task.join();
         }
 
         return result;
     }
 
-    run_parallel_file_ingest(sources, options, health_file, total_files, worker_limit, manifest_path)
-        .await
+    run_parallel_file_ingest(
+        sources,
+        options,
+        health_file,
+        total_files,
+        worker_limit,
+        manifest_path,
+        status_mode,
+    )
+    .await
 }
 
 async fn run_parallel_file_ingest(
@@ -194,11 +247,12 @@ async fn run_parallel_file_ingest(
     total_files: usize,
     worker_limit: usize,
     manifest_path: PathBuf,
+    status_mode: status::StatusMode,
 ) -> Result<()> {
     let running = Arc::new(AtomicBool::new(true));
     update_health_status_async(&health_file, true).await?;
-    let phase = Arc::new(AtomicUsize::new(PHASE_DISPATCHING));
     let completed_files = Arc::new(AtomicUsize::new(0));
+    let started_at = Instant::now();
 
     let health_running = running.clone();
     let health_file_for_task = health_file.clone();
@@ -215,43 +269,22 @@ async fn run_parallel_file_ingest(
         }
     });
 
-    let progress_running = running.clone();
-    let progress_phase = phase.clone();
-    let progress_completed = completed_files.clone();
-    let progress_task = tokio::spawn(async move {
-        let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
-        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        heartbeat.tick().await;
-
-        loop {
-            heartbeat.tick().await;
-            let phase_label = phase_label(progress_phase.load(Ordering::SeqCst));
-            let completed = progress_completed.load(Ordering::SeqCst);
-            if progress_running.load(Ordering::SeqCst) {
-                eprintln!(
-                    "📊 phase={} done={}/{}",
-                    phase_label,
-                    completed,
-                    total_files,
-                );
-            } else {
-                eprintln!(
-                    "📊 phase={} done={}/{}",
-                    phase_label,
-                    completed,
-                    total_files,
-                );
-                break;
-            }
-        }
-    });
+    let status_task = if status_mode.is_tui() {
+        Some(status::spawn_status_tui(
+            total_files,
+            completed_files.clone(),
+            running.clone(),
+            started_at,
+        ))
+    } else {
+        None
+    };
 
     let stop = Arc::new(AtomicBool::new(false));
     let queue = Arc::new(Mutex::new(VecDeque::from(sources)));
 
     let stop_for_signal = stop.clone();
     let running_for_signal = running.clone();
-    let phase_for_signal = phase.clone();
     let _signal_task = tokio::spawn(async move {
         #[cfg(unix)]
         {
@@ -278,12 +311,16 @@ async fn run_parallel_file_ingest(
 
         stop_for_signal.store(true, Ordering::SeqCst);
         running_for_signal.store(false, Ordering::SeqCst);
-        phase_for_signal.store(PHASE_DRAINING, Ordering::SeqCst);
+        status::request_cancel();
         eprintln!("🛑 Shutdown signal received. Stopping file workers...");
     });
 
-    eprintln!("🚚 phase=dispatching file jobs to workers...");
-    phase.store(PHASE_DISPATCHING, Ordering::SeqCst);
+    if status_mode.is_plain() {
+        eprintln!(
+            "🧵 Starting parallel ingest with {} worker(s)",
+            worker_limit
+        );
+    }
     let mut first_error = None;
 
     let mut workers = Vec::with_capacity(worker_limit);
@@ -291,12 +328,14 @@ async fn run_parallel_file_ingest(
         let queue = queue.clone();
         let stop = stop.clone();
         let completed_files = completed_files.clone();
-        let phase = phase.clone();
         let manifest_path = manifest_path.clone();
         let worker_options = options.clone();
+        let status_mode = status_mode;
+        let started_at = started_at;
         workers.push(tokio::spawn(async move {
             loop {
-                if stop.load(Ordering::SeqCst) {
+                if stop.load(Ordering::SeqCst) || status::is_cancelled() {
+                    stop.store(true, Ordering::SeqCst);
                     break;
                 }
 
@@ -309,21 +348,29 @@ async fn run_parallel_file_ingest(
                     break;
                 };
 
-                phase.store(PHASE_INGESTING, Ordering::SeqCst);
+                if status::is_cancelled() {
+                    stop.store(true, Ordering::SeqCst);
+                    break;
+                }
+
                 if let Err(error) = run_ingest(&mut source, worker_options.clone()).await {
                     stop.store(true, Ordering::SeqCst);
                     return Err(error);
                 }
 
                 let completed = completed_files.fetch_add(1, Ordering::SeqCst) + 1;
-                if completed >= total_files {
-                    phase.store(PHASE_DRAINING, Ordering::SeqCst);
-                }
 
                 if let Ok(key) = source.completion_key() {
-                    if let Err(error) = completion_manifest::append_completed(&manifest_path, &key) {
+                    if let Err(error) = completion_manifest::append_completed(&manifest_path, &key)
+                    {
                         eprintln!("⚠️  Failed to update completion manifest: {}", error);
                     }
+                }
+
+                if status_mode.is_plain()
+                    && status::should_emit_plain_update(completed, total_files)
+                {
+                    status::print_plain_update(completed, total_files, started_at);
                 }
             }
 
@@ -345,9 +392,15 @@ async fn run_parallel_file_ingest(
     }
 
     running.store(false, Ordering::SeqCst);
-    phase.store(PHASE_DRAINING, Ordering::SeqCst);
     let _ = health_task.await;
-    let _ = progress_task.await;
+    if let Some(status_task) = status_task {
+        let _ = status_task.join();
+    }
+
+    if status::is_cancelled() {
+        return Err(anyhow::anyhow!("ingest cancelled"));
+    }
+
     update_health_status_async(&health_file, false).await?;
 
     if let Some(error) = first_error {
@@ -376,14 +429,4 @@ fn default_worker_limit(total_files: usize, total_bytes: u64) -> usize {
     };
 
     worker_count.clamp(4, 64)
-}
-
-fn phase_label(phase: usize) -> &'static str {
-    match phase {
-        PHASE_SCANNING => "scan",
-        PHASE_DISPATCHING => "dispatch",
-        PHASE_INGESTING => "ingest",
-        PHASE_DRAINING => "drain",
-        _ => "unknown",
-    }
 }
