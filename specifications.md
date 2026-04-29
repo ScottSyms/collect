@@ -123,7 +123,7 @@ If `--ais` is unset, `AIS` can enable it.
 
 ### Runtime Status
 
-- When stdout is a TTY, a full-screen runtime status view is used.
+- When stdout is a TTY, a full-screen runtime status view is used automatically.
 - `--noui` forces plain text mode.
 - Plain mode prints aggregate updates every 10 items.
 - TUI mode shows:
@@ -145,6 +145,7 @@ If `--ais` is unset, `AIS` can enable it.
 - Long lines are bounded by `max-line-length`.
 - Writes are decoupled from parsing so ingestion stays responsive under load.
 - Health status is updated during ingest.
+- Plain files without embedded timestamps use a stable file-level timestamp fallback so they stay within a partition unless row timestamps actually cross a partition boundary.
 
 ## collect-socket
 
@@ -239,7 +240,7 @@ Leaf partitions contain Parquet files under the selected partition granularity l
 
 ### Runtime Status
 
-- When stdout is a TTY, a full-screen runtime status view is used.
+- When stdout is a TTY, a full-screen runtime status view is used automatically.
 - `--noui` forces plain text mode.
 - Plain mode prints aggregate updates every 10 items.
 - TUI mode shows:
@@ -270,6 +271,8 @@ Shared ingest engine and common CLI types.
 - Run the ingest loop.
 - Manage health updates.
 - Manage background writes/uploads.
+- Support cooperative shutdown from signal handlers and runtime monitors.
+- Optionally suppress write/upload chatter for UI-driven runs.
 
 ### Ingest Pipeline
 

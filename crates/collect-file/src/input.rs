@@ -24,6 +24,7 @@ pub(crate) struct FileInputSource {
     ais: bool,
     ais_group_timestamps: HashMap<String, i64>,
     ais_pending_timestamp_ms: Option<i64>,
+    current_job_timestamp_ms: Option<i64>,
     jobs: Vec<InputJob>,
     cursor: usize,
 }
@@ -105,6 +106,7 @@ impl FileInputSource {
             ais,
             ais_group_timestamps: HashMap::new(),
             ais_pending_timestamp_ms: None,
+            current_job_timestamp_ms: None,
             jobs,
             cursor: 0,
         }
@@ -162,6 +164,9 @@ impl FileInputSource {
             }
 
             let display = job.display.clone();
+            self.current_job_timestamp_ms = Some(
+                file_timestamp_ms(&job.path).unwrap_or_else(|_| now_unix_millis()),
+            );
             self.cursor += 1;
 
             match job.open(max_line_length).await {
@@ -172,6 +177,7 @@ impl FileInputSource {
             }
         }
 
+        self.current_job_timestamp_ms = None;
         Ok(line_reader_from_async_read(
             tokio::io::empty(),
             max_line_length,
@@ -200,7 +206,7 @@ impl LineSource for FileInputSource {
 
     fn timestamp_for_payload(&mut self, payload: &str) -> Option<i64> {
         if !self.ais {
-            return None;
+            return self.current_job_timestamp_ms;
         }
 
         let sentence = nmea_sentence(payload);
@@ -550,6 +556,26 @@ fn default_scan_concurrency() -> usize {
         .map(|count| count.get().saturating_mul(2))
         .unwrap_or(8)
         .clamp(4, 32)
+}
+
+fn file_timestamp_ms(path: &Path) -> Result<i64> {
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("reading file metadata {}", path.display()))?;
+    let modified = metadata
+        .modified()
+        .with_context(|| format!("reading modified time {}", path.display()))?;
+    let duration = modified
+        .duration_since(UNIX_EPOCH)
+        .context("file modified time predates unix epoch")?;
+
+    Ok(duration.as_millis() as i64)
+}
+
+fn now_unix_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| std::time::Duration::from_secs(0))
+        .as_millis() as i64
 }
 
 enum InputFormat {
@@ -1134,6 +1160,7 @@ mod tests {
             ais: true,
             ais_group_timestamps: HashMap::new(),
             ais_pending_timestamp_ms: None,
+            current_job_timestamp_ms: None,
             jobs: vec![],
             cursor: 0,
         };
@@ -1156,6 +1183,7 @@ mod tests {
             ais: true,
             ais_group_timestamps: HashMap::new(),
             ais_pending_timestamp_ms: None,
+            current_job_timestamp_ms: None,
             jobs: vec![],
             cursor: 0,
         };
@@ -1177,6 +1205,7 @@ mod tests {
             ais: true,
             ais_group_timestamps: HashMap::new(),
             ais_pending_timestamp_ms: None,
+            current_job_timestamp_ms: None,
             jobs: vec![],
             cursor: 0,
         };
@@ -1200,6 +1229,7 @@ mod tests {
             ais: false,
             ais_group_timestamps: HashMap::new(),
             ais_pending_timestamp_ms: None,
+            current_job_timestamp_ms: None,
             jobs: vec![InputJob::plain(PathBuf::from("/tmp/input.txt"), 0)],
             cursor: 1,
         };
@@ -1210,6 +1240,21 @@ mod tests {
         assert_eq!(progress.current_input, "/tmp/input.txt");
         assert_eq!(progress.current_input_index, 1);
         assert_eq!(progress.input_total, 1);
+    }
+
+    #[test]
+    fn uses_file_timestamp_for_plain_payloads() {
+        let mut source = FileInputSource {
+            source: "source".to_string(),
+            ais: false,
+            ais_group_timestamps: HashMap::new(),
+            ais_pending_timestamp_ms: None,
+            current_job_timestamp_ms: Some(1_700_000_000_000),
+            jobs: vec![],
+            cursor: 0,
+        };
+
+        assert_eq!(source.timestamp_for_payload("plain payload"), Some(1_700_000_000_000));
     }
 
     #[tokio::test]
@@ -1363,6 +1408,7 @@ mod tests {
             ais: true,
             ais_group_timestamps: HashMap::new(),
             ais_pending_timestamp_ms: None,
+            current_job_timestamp_ms: None,
             jobs: vec![],
             cursor: 0,
         };
