@@ -1,6 +1,7 @@
 mod commands;
 mod partition;
 mod progress;
+mod status;
 mod storage;
 
 use anyhow::{bail, Context, Result};
@@ -8,6 +9,7 @@ use clap::{Args, Parser, Subcommand};
 use collect_core::PartitionGranularity;
 use commands::{compact, inspect, vacuum, validate};
 use progress::{count, report};
+use std::io::IsTerminal;
 use storage::{StorageConfig, StorageLocation};
 
 fn default_concurrency() -> usize {
@@ -34,6 +36,10 @@ struct Cli {
     /// Maximum number of concurrent maintenance workers
     #[arg(long, global = true, default_value_t = default_concurrency())]
     concurrency: usize,
+
+    /// Disable the runtime status UI and print aggregate updates every 100 items
+    #[arg(long, global = true)]
+    noui: bool,
 
     /// Zstd compression level for compacted Parquet output
     #[arg(long, global = true, default_value_t = 5)]
@@ -114,6 +120,12 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let storage = cli.storage.into_location().await?;
     let concurrency = cli.concurrency.max(1);
+    let status_mode = if !cli.noui && std::io::stdout().is_terminal() {
+        status::StatusMode::Tui
+    } else {
+        status::StatusMode::Plain
+    };
+
     report(
         "collect-maint",
         format!(
@@ -138,7 +150,14 @@ async fn main() -> Result<()> {
         format!("loaded {} entries", count(entries.len())),
     );
 
-    match cli.command {
+    progress::set_mode(status_mode);
+    let status_session = if status_mode == status::StatusMode::Tui {
+        Some(status::start("collect-maint"))
+    } else {
+        None
+    };
+
+    let result = match cli.command {
         Command::Inspect { verbose } => inspect(&storage, &entries, concurrency, verbose).await,
         Command::Validate => validate(&storage, &entries, concurrency).await,
         Command::Compact {
@@ -158,7 +177,16 @@ async fn main() -> Result<()> {
         Command::Vacuum { apply } => {
             vacuum(&storage, &entries, cli.partition, apply, concurrency).await
         }
+    };
+
+    if status::is_cancelled() {
+        report("collect-maint", "cancelled");
+        drop(status_session);
+        return Ok(());
     }
+
+    drop(status_session);
+    result
 }
 
 impl StorageArgs {

@@ -2,6 +2,7 @@ use crate::partition::{
     compaction_output_name, manifest_path_for_output, CompactionManifest, EntryKind, PartitionKey,
 };
 use crate::progress::{count, decimal, report, report_step, should_report, SCAN_REPORT_INTERVAL};
+use crate::status;
 use crate::storage::{DatasetEntry, StorageLocation};
 use anyhow::{bail, Context, Result};
 use arrow::array::{Array, StringArray, TimestampMillisecondArray};
@@ -20,6 +21,14 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const SMALL_PARQUET_FILE_BYTES: u64 = 256 * 1024 * 1024;
+
+fn check_cancelled() -> Result<()> {
+    if status::is_cancelled() {
+        bail!("operation cancelled");
+    }
+
+    Ok(())
+}
 
 struct FileScan {
     rows: usize,
@@ -121,6 +130,7 @@ pub async fn inspect(
         .buffer_unordered(concurrency.max(1));
 
     while let Some(result) = stream.next().await {
+        check_cancelled()?;
         let (_index, entry, scan) = result?;
         completed += 1;
         report_step("inspect", completed, total, &entry.rel_path);
@@ -215,21 +225,27 @@ fn print_inspection_report(
         }
     }
 
-    println!("Dataset: {}", dataset_label);
-    println!(
-        "Summary: {} partition(s), {} file(s), {} rows, size {}",
-        count(partitions),
-        count(parquet_files + compacted_files + manifests + temp_files + other_files),
-        count(rows),
-        human_bytes(bytes),
+    report("inspect", format!("Dataset: {}", dataset_label));
+    report(
+        "inspect",
+        format!(
+            "Summary: {} partition(s), {} file(s), {} rows, size {}",
+            count(partitions),
+            count(parquet_files + compacted_files + manifests + temp_files + other_files),
+            count(rows),
+            human_bytes(bytes),
+        ),
     );
-    println!(
-        "Files: parquet={} compacted={} manifests={} temp={} other={}",
-        count(parquet_files),
-        count(compacted_files),
-        count(manifests),
-        count(temp_files),
-        count(other_files)
+    report(
+        "inspect",
+        format!(
+            "Files: parquet={} compacted={} manifests={} temp={} other={}",
+            count(parquet_files),
+            count(compacted_files),
+            count(manifests),
+            count(temp_files),
+            count(other_files)
+        ),
     );
 
     let min_ts = min_ts_ms
@@ -240,12 +256,12 @@ fn print_inspection_report(
         .and_then(DateTime::<Utc>::from_timestamp_millis)
         .map(|value| value.to_rfc3339())
         .unwrap_or_else(|| "-".to_string());
-    println!("Time range: {} -> {}", min_ts, max_ts);
+    report("inspect", format!("Time range: {} -> {}", min_ts, max_ts));
 
     if compact_candidates == 0 && vacuum_candidates == 0 && validate_candidates == 0 {
-        println!("No maintenance needed.");
+        report("inspect", "No maintenance needed.");
     } else {
-        println!("Recommendations:");
+        report("inspect", "Recommendations:");
         if compact_candidates > 0 {
             let majority = if compact_majority_small > 0 {
                 format!(
@@ -256,36 +272,48 @@ fn print_inspection_report(
             } else {
                 String::new()
             };
-            println!(
-                "- compact: {} partition(s) have more than one parquet file{}",
-                count(compact_candidates),
-                majority
+            report(
+                "inspect",
+                format!(
+                    "- compact: {} partition(s) have more than one parquet file{}",
+                    count(compact_candidates),
+                    majority
+                ),
             );
         }
         if vacuum_candidates > 0 {
-            println!(
-                "- vacuum: {} partition(s) have temp or manifest files",
-                count(vacuum_candidates)
+            report(
+                "inspect",
+                format!(
+                    "- vacuum: {} partition(s) have temp or manifest files",
+                    count(vacuum_candidates)
+                ),
             );
         }
         if validate_candidates > 0 {
-            println!(
-                "- validate: {} partition(s) have scan issues or unrecognized files",
-                count(validate_candidates)
+            report(
+                "inspect",
+                format!(
+                    "- validate: {} partition(s) have scan issues or unrecognized files",
+                    count(validate_candidates)
+                ),
             );
         }
         if scan_issues > 0 {
-            println!("  scan issues detected: {}", count(scan_issues));
+            report(
+                "inspect",
+                format!("  scan issues detected: {}", count(scan_issues)),
+            );
         }
         if !verbose {
-            println!("Use --verbose for per-partition detail.");
+            report("inspect", "Use --verbose for per-partition detail.");
         }
     }
 
     if verbose {
-        println!("Partitions:");
+        report("inspect", "Partitions:");
         for line in verbose_lines {
-            println!("{}", line);
+            report("inspect", line);
         }
     }
 }
@@ -321,6 +349,7 @@ pub async fn validate(
         .buffer_unordered(concurrency.max(1));
 
     while let Some(result) = stream.next().await {
+        check_cancelled()?;
         let (index, rel_path, issues) = result?;
         completed += 1;
         report_step("validate", completed, total, &rel_path);
@@ -337,12 +366,12 @@ pub async fn validate(
     }
 
     if issues.is_empty() {
-        println!("Validation passed");
+        report("validate", "Validation passed");
         report("validate", "complete");
         Ok(())
     } else {
         for issue in &issues {
-            eprintln!("✗ {}", issue);
+            report("validate", format!("✗ {}", issue));
         }
         report(
             "validate",
@@ -366,7 +395,7 @@ pub async fn compact(
     );
     let jobs = plan_compaction(entries, target_file_size_bytes);
     if jobs.is_empty() {
-        println!("No compactable partitions found");
+        report("compact", "No compactable partitions found");
         report("compact", "no compactable partitions found");
         return Ok(());
     }
@@ -388,6 +417,7 @@ pub async fn compact(
 
     if !apply {
         for (index, job) in jobs.iter().enumerate() {
+            check_cancelled()?;
             report_step(
                 "compact",
                 index + 1,
@@ -398,11 +428,14 @@ pub async fn compact(
                     job.output_rel
                 ),
             );
-            println!(
-                "Would compact {} file(s) in {} -> {}",
-                count(job.inputs.len()),
-                job.partition.relative_dir(),
-                job.output_rel
+            report(
+                "compact",
+                format!(
+                    "Would compact {} file(s) in {} -> {}",
+                    count(job.inputs.len()),
+                    job.partition.relative_dir(),
+                    job.output_rel
+                ),
             );
         }
         report("compact", "dry run complete");
@@ -431,8 +464,10 @@ pub async fn compact(
         .buffer_unordered(concurrency.max(1));
 
     while let Some(result) = stream.next().await {
+        check_cancelled()?;
         let outputs = result?;
         for output_rel in outputs {
+            check_cancelled()?;
             completed += 1;
             report_step("compact", completed, total, &output_rel);
         }
@@ -455,6 +490,7 @@ async fn compact_partition_jobs(
     let mut outputs = Vec::with_capacity(jobs.len());
 
     for (index, job) in jobs.into_iter().enumerate() {
+        check_cancelled()?;
         let output_rel = job.output_rel.clone();
         compact_job(
             storage,
@@ -483,10 +519,7 @@ fn group_compaction_jobs_by_partition(
     let mut grouped: BTreeMap<PartitionKey, Vec<CompactionJob>> = BTreeMap::new();
 
     for job in jobs {
-        grouped
-            .entry(job.partition.clone())
-            .or_default()
-            .push(job);
+        grouped.entry(job.partition.clone()).or_default().push(job);
     }
 
     grouped.into_iter().collect()
@@ -536,6 +569,7 @@ pub async fn vacuum(
         .buffer_unordered(concurrency.max(1));
 
     while let Some(result) = stream.next().await {
+        check_cancelled()?;
         let (index, rel_path, issues) = result?;
         completed += 1;
         report_step("vacuum", completed, total, &rel_path);
@@ -545,12 +579,12 @@ pub async fn vacuum(
     results.sort_by_key(|(index, _, _)| *index);
 
     if apply {
-        println!("Vacuum complete");
+        report("vacuum", "Vacuum complete");
         report("vacuum", "complete");
     } else {
         for (_, _, entry_issues) in results {
             for issue in entry_issues {
-                println!("{}", issue);
+                report("vacuum", issue);
             }
         }
         report("vacuum", "dry run complete");
@@ -812,10 +846,13 @@ async fn compact_job(
     storage.delete_rel_paths(&input_paths, concurrency).await?;
     storage.delete_rel_path(&job.manifest_rel).await?;
 
-    println!(
-        "Compacted {} file(s) into {}",
-        count(job.inputs.len()),
-        job.output_rel
+    report(
+        "compact",
+        format!(
+            "Compacted {} file(s) into {}",
+            count(job.inputs.len()),
+            job.output_rel
+        ),
     );
     report(
         "compact",
@@ -840,6 +877,7 @@ async fn materialize_group(
         .map(|(index, input)| {
             let workspace = workspace.to_path_buf();
             async move {
+                check_cancelled()?;
                 if should_report(index + 1, total, SCAN_REPORT_INTERVAL) {
                     report(
                         "compact",
@@ -896,8 +934,8 @@ fn write_compacted_output(
         bail!("no input files to compact");
     }
 
-    let zstd_level = ZstdLevel::try_new(compression_level)
-        .context("invalid Zstd compression level")?;
+    let zstd_level =
+        ZstdLevel::try_new(compression_level).context("invalid Zstd compression level")?;
     let props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(zstd_level))
         .set_column_encoding(ColumnPath::from("ts"), Encoding::DELTA_BINARY_PACKED)
@@ -916,6 +954,7 @@ fn write_compacted_output(
     let mut writer: Option<ArrowWriter<StdFile>> = None;
 
     for input_path in input_paths {
+        check_cancelled()?;
         let input_file =
             StdFile::open(input_path).with_context(|| format!("open {}", input_path.display()))?;
         let mut reader = ParquetRecordBatchReaderBuilder::try_new(input_file)
@@ -924,6 +963,7 @@ fn write_compacted_output(
             .with_context(|| format!("build parquet reader {}", input_path.display()))?;
 
         while let Some(batch) = reader.next().transpose()? {
+            check_cancelled()?;
             if writer.is_none() {
                 let schema = batch.schema();
                 let file = output_file
