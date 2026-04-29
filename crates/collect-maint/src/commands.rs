@@ -395,14 +395,14 @@ pub async fn compact(
         "compact",
         format!("planning compaction for {} entries", count(entries.len())),
     );
+    let (processed_partitions, total_partitions) = leaf_partition_progress(entries);
+    status::lock_progress(processed_partitions, total_partitions);
     let jobs = plan_compaction(entries, target_file_size_bytes);
     if jobs.is_empty() {
         report("compact", "No compactable partitions found");
         report("compact", "no compactable partitions found");
         return Ok(());
     }
-
-    status::set_progress(0, jobs.len());
 
     report(
         "compact",
@@ -475,6 +475,7 @@ pub async fn compact(
             completed += 1;
             report_step("compact", completed, total, &output_rel);
         }
+        status::advance_progress(1);
     }
 
     report("compact", "complete");
@@ -495,7 +496,6 @@ async fn compact_partition_jobs(
 
     for (index, job) in jobs.into_iter().enumerate() {
         check_cancelled()?;
-        status::set_progress(index + 1, partition_jobs);
         let output_rel = job.output_rel.clone();
         compact_job(
             storage,
@@ -516,6 +516,25 @@ async fn compact_partition_jobs(
     );
 
     Ok(outputs)
+}
+
+fn leaf_partition_progress(entries: &[DatasetEntry]) -> (usize, usize) {
+    let mut by_partition: BTreeMap<PartitionKey, usize> = BTreeMap::new();
+
+    for entry in entries {
+        match entry.kind {
+            EntryKind::Parquet | EntryKind::CompactedParquet => {
+                if let Some(partition) = entry.partition.clone() {
+                    *by_partition.entry(partition).or_default() += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let total = by_partition.len();
+    let processed = by_partition.values().filter(|count| **count == 1).count();
+    (processed, total)
 }
 
 fn group_compaction_jobs_by_partition(
@@ -767,7 +786,6 @@ async fn compact_job(
     concurrency: usize,
     compression_level: i32,
 ) -> Result<()> {
-    status::set_progress(job_index, job_total);
     let manifest = CompactionManifest::new(
         &job.partition,
         job.output_rel.clone(),

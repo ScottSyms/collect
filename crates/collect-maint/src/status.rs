@@ -38,6 +38,7 @@ struct StatusState {
     detail: String,
     current: usize,
     total: usize,
+    locked: bool,
     started_at: Instant,
     finished: bool,
 }
@@ -96,6 +97,7 @@ pub(crate) fn start(title: impl Into<String>) -> StatusSession {
         detail: String::new(),
         current: 0,
         total: 0,
+        locked: false,
         started_at: Instant::now(),
         finished: false,
     }));
@@ -149,8 +151,10 @@ pub(crate) fn update_step(stage: &str, current: usize, total: usize, detail: imp
                 if let Ok(mut state) = state.lock() {
                     state.stage = stage.to_string();
                     state.detail = detail;
-                    state.current = current;
-                    state.total = total;
+                    if !state.locked {
+                        state.current = current;
+                        state.total = total;
+                    }
                 }
             }
         }
@@ -162,6 +166,29 @@ pub(crate) fn set_progress(current: usize, total: usize) {
         if let Ok(mut state) = state.lock() {
             state.current = current;
             state.total = total;
+            state.locked = false;
+        }
+    }
+}
+
+pub(crate) fn lock_progress(current: usize, total: usize) {
+    if let Some(state) = SESSION.get() {
+        if let Ok(mut state) = state.lock() {
+            state.current = current;
+            state.total = total;
+            state.locked = true;
+        }
+    }
+}
+
+pub(crate) fn advance_progress(delta: usize) {
+    if delta == 0 {
+        return;
+    }
+
+    if let Some(state) = SESSION.get() {
+        if let Ok(mut state) = state.lock() {
+            state.current = state.current.saturating_add(delta).min(state.total);
         }
     }
 }
