@@ -12,12 +12,14 @@ use progress::{count, report};
 use std::io::IsTerminal;
 use storage::{StorageConfig, StorageLocation};
 
-fn default_concurrency() -> usize {
+fn auto_concurrency() -> usize {
     std::thread::available_parallelism()
         .map(|count| count.get().saturating_mul(2))
         .unwrap_or(8)
         .clamp(4, 32)
 }
+
+const DEFAULT_COMPACT_TARGET_FILE_SIZE_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -33,11 +35,11 @@ struct Cli {
     #[arg(long, value_enum)]
     partition: PartitionGranularity,
 
-    /// Maximum number of concurrent maintenance workers
-    #[arg(long, global = true, default_value_t = default_concurrency())]
-    concurrency: usize,
+    /// Maximum number of concurrent maintenance workers; auto-selected when omitted
+    #[arg(long, global = true)]
+    concurrency: Option<usize>,
 
-    /// Disable the runtime status UI and print aggregate updates every 100 items
+    /// Disable the runtime status UI and print aggregate updates every 10 items
     #[arg(long, global = true)]
     noui: bool,
 
@@ -99,7 +101,7 @@ enum Command {
     /// Compact small parquet files within a single partition (dry run by default; use --apply to execute)
     Compact {
         /// Target maximum bytes per compacted file
-        #[arg(long, default_value_t = 268_435_456)]
+        #[arg(long, default_value_t = DEFAULT_COMPACT_TARGET_FILE_SIZE_BYTES)]
         target_file_size_bytes: u64,
 
         /// Actually apply changes (dry run by default)
@@ -119,24 +121,36 @@ enum Command {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let storage = cli.storage.into_location().await?;
-    let concurrency = cli.concurrency.max(1);
+    let (concurrency, concurrency_source) = match cli.concurrency {
+        Some(value) => (value.max(1), "configured"),
+        None => (auto_concurrency(), "auto-selected"),
+    };
     let status_mode = if !cli.noui && std::io::stdout().is_terminal() {
         status::StatusMode::Tui
     } else {
         status::StatusMode::Plain
     };
+    progress::set_mode(status_mode);
+    let status_session = if status_mode == status::StatusMode::Tui {
+        Some(status::start("collect-maint"))
+    } else {
+        None
+    };
 
+    status::set_progress(0, 0);
     report(
         "collect-maint",
         format!(
-            "loading dataset entries from {} with {} workers",
+            "loading dataset entries from {} with {} workers ({})",
             storage.dataset_label(),
-            count(concurrency)
+            count(concurrency),
+            concurrency_source
         ),
     );
     let entries = storage
         .list_entries(cli.partition, concurrency, |listed| {
             if listed > 0 {
+                status::set_progress(listed, listed);
                 report(
                     "collect-maint",
                     format!("listed {} entries so far", count(listed)),
@@ -149,13 +163,6 @@ async fn main() -> Result<()> {
         "collect-maint",
         format!("loaded {} entries", count(entries.len())),
     );
-
-    progress::set_mode(status_mode);
-    let status_session = if status_mode == status::StatusMode::Tui {
-        Some(status::start("collect-maint"))
-    } else {
-        None
-    };
 
     let result = match cli.command {
         Command::Inspect { verbose } => inspect(&storage, &entries, concurrency, verbose).await,

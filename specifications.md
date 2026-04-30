@@ -194,7 +194,7 @@ Global flags:
 - `--s3-secret-key <secret>`
 - `--s3-disable-tls`
 - `--partition <granularity>`
-- `--concurrency <n>`
+- `--concurrency <n>`; if omitted, `collect-maint` auto-selects a worker count
 - `--noui`: disable runtime status TUI and print plain updates every 10 items
 - `--compression-level <level>`
 
@@ -228,6 +228,7 @@ Leaf partitions contain Parquet files under the selected partition granularity l
 
 - Dry-run by default.
 - With `--apply`, compacts small Parquet files within leaf partitions.
+- Default compacted output target size is about 512 MiB.
 - Only leaf partitions with more than one Parquet file are candidates.
 - Compaction groups files by partition, plans output files, writes manifests, materializes inputs, writes compacted Parquet, validates the result, publishes output, and deletes old inputs/manifests.
 - Partition writes are isolated so one partition’s compaction does not interfere with another.

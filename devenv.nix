@@ -7,6 +7,7 @@
   # https://devenv.sh/packages/
   packages = [ pkgs.git
                pkgs.duckdb
+               pkgs.rclone
  ];
 
   # https://devenv.sh/languages/

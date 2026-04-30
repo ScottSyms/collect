@@ -15,7 +15,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use parquet::schema::types::ColumnPath;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs::File as StdFile;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -96,6 +96,30 @@ struct CompactionJob {
     inputs: Vec<DatasetEntry>,
     output_rel: String,
     manifest_rel: String,
+}
+
+struct CompactionPlan {
+    jobs: Vec<CompactionJob>,
+    ready_partitions: usize,
+    total_partitions: usize,
+}
+
+struct PartitionPlanState {
+    compactable_files: Vec<DatasetEntry>,
+    data_file_count: usize,
+    all_data_files_within_target: bool,
+    blocked: bool,
+}
+
+impl PartitionPlanState {
+    fn new() -> Self {
+        Self {
+            compactable_files: Vec::new(),
+            data_file_count: 0,
+            all_data_files_within_target: true,
+            blocked: false,
+        }
+    }
 }
 
 pub async fn inspect(
@@ -395,21 +419,34 @@ pub async fn compact(
         "compact",
         format!("planning compaction for {} entries", count(entries.len())),
     );
-    let (processed_partitions, total_partitions) = leaf_partition_progress(entries);
-    status::lock_progress(processed_partitions, total_partitions);
-    let jobs = plan_compaction(entries, target_file_size_bytes);
-    if jobs.is_empty() {
+    let plan = plan_compaction(entries, target_file_size_bytes);
+    status::lock_progress(plan.ready_partitions, plan.total_partitions);
+    if plan.jobs.is_empty() {
+        status::lock_progress(plan.total_partitions, plan.total_partitions);
         report("compact", "No compactable partitions found");
         report("compact", "no compactable partitions found");
         return Ok(());
     }
 
+    let total_jobs = plan.jobs.len();
+    let partition_groups = group_compaction_jobs_by_partition(plan.jobs);
+    let planned_partitions = partition_groups.len();
+    status::lock_progress(plan.ready_partitions, plan.total_partitions);
+
     report(
         "compact",
         format!(
             "planned {} job(s) with {} workers",
-            count(jobs.len()),
+            count(total_jobs),
             count(concurrency.max(1))
+        ),
+    );
+    report(
+        "compact",
+        format!(
+            "{} partition(s) already meet the target layout; {} partition(s) need compaction",
+            count(plan.ready_partitions),
+            count(planned_partitions)
         ),
     );
 
@@ -420,36 +457,39 @@ pub async fn compact(
     }
 
     if !apply {
-        for (index, job) in jobs.iter().enumerate() {
+        let mut completed_jobs = 0usize;
+        for (_partition, jobs) in &partition_groups {
             check_cancelled()?;
-            report_step(
-                "compact",
-                index + 1,
-                jobs.len(),
-                format!(
-                    "would compact {} -> {}",
-                    job.partition.relative_dir(),
-                    job.output_rel
-                ),
-            );
-            report(
-                "compact",
-                format!(
-                    "Would compact {} file(s) in {} -> {}",
-                    count(job.inputs.len()),
-                    job.partition.relative_dir(),
-                    job.output_rel
-                ),
-            );
+            for job in jobs {
+                completed_jobs += 1;
+                report_step(
+                    "compact",
+                    completed_jobs,
+                    total_jobs,
+                    format!(
+                        "would compact {} -> {}",
+                        job.partition.relative_dir(),
+                        job.output_rel
+                    ),
+                );
+                report(
+                    "compact",
+                    format!(
+                        "Would compact {} file(s) in {} -> {}",
+                        count(job.inputs.len()),
+                        job.partition.relative_dir(),
+                        job.output_rel
+                    ),
+                );
+            }
+            status::advance_progress(1);
         }
         report("compact", "dry run complete");
         return Ok(());
     }
 
     let workspace = tempfile::tempdir()?;
-    let total = jobs.len();
     let mut completed = 0usize;
-    let partition_groups = group_compaction_jobs_by_partition(jobs);
     let mut stream = stream::iter(partition_groups.into_iter())
         .map(|(partition, jobs)| {
             let workspace = workspace.path().to_path_buf();
@@ -473,7 +513,7 @@ pub async fn compact(
         for output_rel in outputs {
             check_cancelled()?;
             completed += 1;
-            report_step("compact", completed, total, &output_rel);
+            report_step("compact", completed, total_jobs, &output_rel);
         }
         status::advance_progress(1);
     }
@@ -516,25 +556,6 @@ async fn compact_partition_jobs(
     );
 
     Ok(outputs)
-}
-
-fn leaf_partition_progress(entries: &[DatasetEntry]) -> (usize, usize) {
-    let mut by_partition: BTreeMap<PartitionKey, usize> = BTreeMap::new();
-
-    for entry in entries {
-        match entry.kind {
-            EntryKind::Parquet | EntryKind::CompactedParquet => {
-                if let Some(partition) = entry.partition.clone() {
-                    *by_partition.entry(partition).or_default() += 1;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let total = by_partition.len();
-    let processed = by_partition.values().filter(|count| **count == 1).count();
-    (processed, total)
 }
 
 fn group_compaction_jobs_by_partition(
@@ -619,35 +640,13 @@ pub async fn vacuum(
     Ok(())
 }
 
-fn plan_compaction(entries: &[DatasetEntry], target_file_size_bytes: u64) -> Vec<CompactionJob> {
-    let mut by_partition: BTreeMap<PartitionKey, Vec<DatasetEntry>> = BTreeMap::new();
-    let mut blocked_partitions: BTreeSet<PartitionKey> = BTreeSet::new();
+fn plan_compaction(entries: &[DatasetEntry], target_file_size_bytes: u64) -> CompactionPlan {
+    let mut by_partition: BTreeMap<PartitionKey, PartitionPlanState> = BTreeMap::new();
     let total_entries = entries.len();
     let heartbeat_interval = Duration::from_secs(5);
     let mut last_report = Instant::now();
 
     for (index, entry) in entries.iter().enumerate() {
-        if entry.kind != EntryKind::Parquet {
-            if let Some(partition) = entry.partition.clone() {
-                blocked_partitions.insert(partition);
-            }
-            if index == 0
-                || index + 1 == total_entries
-                || last_report.elapsed() >= heartbeat_interval
-            {
-                report(
-                    "compact",
-                    format!(
-                        "planning compaction: indexed {} / {} entries across {} partition(s)",
-                        count(index + 1),
-                        count(total_entries),
-                        count(by_partition.len())
-                    ),
-                );
-                last_report = Instant::now();
-            }
-            continue;
-        }
         let Some(partition) = entry.partition.clone() else {
             if index == 0
                 || index + 1 == total_entries
@@ -666,10 +665,27 @@ fn plan_compaction(entries: &[DatasetEntry], target_file_size_bytes: u64) -> Vec
             }
             continue;
         };
-        by_partition
+
+        let partition_state = by_partition
             .entry(partition)
-            .or_default()
-            .push(entry.clone());
+            .or_insert_with(PartitionPlanState::new);
+        match entry.kind {
+            EntryKind::Parquet => {
+                partition_state.data_file_count += 1;
+                partition_state.all_data_files_within_target &=
+                    entry.size <= target_file_size_bytes;
+                partition_state.compactable_files.push(entry.clone());
+            }
+            EntryKind::CompactedParquet => {
+                partition_state.data_file_count += 1;
+                partition_state.all_data_files_within_target &=
+                    entry.size <= target_file_size_bytes;
+                partition_state.blocked = true;
+            }
+            EntryKind::Manifest | EntryKind::Temp | EntryKind::Other => {
+                partition_state.blocked = true;
+            }
+        }
 
         if index == 0 || index + 1 == total_entries || last_report.elapsed() >= heartbeat_interval {
             report(
@@ -693,11 +709,14 @@ fn plan_compaction(entries: &[DatasetEntry], target_file_size_bytes: u64) -> Vec
         ),
     );
 
-    let mut jobs = Vec::new();
     let total_partitions = by_partition.len();
+    status::lock_progress(0, total_partitions);
+    let mut jobs = Vec::new();
+    let mut ready_partitions = 0usize;
     let mut partition_report = Instant::now();
 
-    for (partition_index, (partition, mut files)) in by_partition.into_iter().enumerate() {
+    for (partition_index, (partition, state)) in by_partition.into_iter().enumerate() {
+        status::lock_progress(partition_index + 1, total_partitions);
         if partition_index == 0
             || partition_index + 1 == total_partitions
             || partition_report.elapsed() >= heartbeat_interval
@@ -714,10 +733,16 @@ fn plan_compaction(entries: &[DatasetEntry], target_file_size_bytes: u64) -> Vec
             partition_report = Instant::now();
         }
 
-        if blocked_partitions.contains(&partition) || files.len() < 2 {
+        if state.blocked || state.compactable_files.len() < 2 {
+            if !state.blocked && state.data_file_count > 0 && state.all_data_files_within_target {
+                ready_partitions += 1;
+            }
             continue;
         }
 
+        let jobs_before_partition = jobs.len();
+        let all_data_files_within_target = state.all_data_files_within_target;
+        let mut files = state.compactable_files;
         files.sort_by(|left, right| {
             left.size
                 .cmp(&right.size)
@@ -753,9 +778,17 @@ fn plan_compaction(entries: &[DatasetEntry], target_file_size_bytes: u64) -> Vec
         if current.len() > 1 {
             jobs.push(make_job(&partition, group_index, current));
         }
+
+        if jobs.len() == jobs_before_partition && all_data_files_within_target {
+            ready_partitions += 1;
+        }
     }
 
-    jobs
+    CompactionPlan {
+        jobs,
+        ready_partitions,
+        total_partitions,
+    }
 }
 
 fn make_job(
@@ -832,7 +865,17 @@ async fn compact_job(
             job.output_rel
         ),
     );
-    write_compacted_output(&materialized, &temp_output_path, compression_level)?;
+    let materialized_for_write = materialized.clone();
+    let temp_output_for_write = temp_output_path.clone();
+    tokio::task::spawn_blocking(move || {
+        write_compacted_output(
+            &materialized_for_write,
+            &temp_output_for_write,
+            compression_level,
+        )
+    })
+    .await
+    .context("joining compacted output writer")??;
     report(
         "compact",
         format!(
@@ -842,7 +885,13 @@ async fn compact_job(
             job.output_rel
         ),
     );
-    let scan = scan_parquet_file(&temp_output_path, Some(&job.partition))?;
+    let temp_output_for_scan = temp_output_path.clone();
+    let partition_for_scan = job.partition.clone();
+    let scan = tokio::task::spawn_blocking(move || {
+        scan_parquet_file(&temp_output_for_scan, Some(&partition_for_scan))
+    })
+    .await
+    .context("joining compacted output validator")??;
     if !scan.issues.is_empty() {
         bail!(
             "compacted output validation failed for {}: {}",
@@ -979,8 +1028,20 @@ fn write_compacted_output(
     );
     let mut writer: Option<ArrowWriter<StdFile>> = None;
 
-    for input_path in input_paths {
+    let total_inputs = input_paths.len();
+    for (index, input_path) in input_paths.iter().enumerate() {
         check_cancelled()?;
+        if should_report(index + 1, total_inputs, SCAN_REPORT_INTERVAL) {
+            report(
+                "compact",
+                format!(
+                    "rewriting parquet input {} / {}: {}",
+                    count(index + 1),
+                    count(total_inputs),
+                    input_path.display()
+                ),
+            );
+        }
         let input_file =
             StdFile::open(input_path).with_context(|| format!("open {}", input_path.display()))?;
         let mut reader = ParquetRecordBatchReaderBuilder::try_new(input_file)

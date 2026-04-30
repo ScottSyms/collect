@@ -49,7 +49,7 @@ cargo run -p collect-file -- --input data.txt --source mydata --compression-leve
 
 ## Maintenance
 
-`collect-maint` inspects, validates, compacts, and vacuums hive-partitioned datasets. It requires `--partition` so it can parse the on-disk layout. `compact` and `vacuum` are dry-run by default; add `--apply` to make changes. `--compression-level` controls Zstd speed vs file size for ingest and compaction.
+`collect-maint` inspects, validates, compacts, and vacuums hive-partitioned datasets. It requires `--partition` so it can parse the on-disk layout. `compact` and `vacuum` are dry-run by default; add `--apply` to make changes. Worker concurrency is selected automatically unless `--concurrency` is provided. `compact` targets compacted files of about 512 MiB by default; override with `--target-file-size-bytes`. `--compression-level` controls Zstd speed vs file size for ingest and compaction.
 
 ```bash
 # Read-only inspection
@@ -147,7 +147,7 @@ docker run -d \
   collect:latest
 ```
 
-The image defaults to `collect-socket`; use `--entrypoint /usr/local/bin/collect-file` for file ingestion.
+The image defaults to `collect-socket`; use `--entrypoint /usr/local/bin/collect-file` for file ingestion or `--entrypoint /usr/local/bin/collect-maint` for maintenance commands.
 
 ## Configuration Precedence
 
@@ -180,12 +180,12 @@ data/
 │   └── year=2025/
 │       └── month=01/
 │           └── day=15/
-│               └── 20250115_000000_001.parquet
+│               └── part-20250115T000000000-000000.parquet
 └── source=norway-tcp/
     └── year=2025/
-    └── month=01/
-        └── day=15/
-            └── 20250115_000000_001.parquet
+        └── month=01/
+            └── day=15/
+                └── part-20250115T000000000-000001.parquet
 ```
 
 Use `--partition day|hour|minute|month|year` to choose how deep the time hierarchy goes. The default is `day`.

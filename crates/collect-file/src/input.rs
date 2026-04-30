@@ -164,9 +164,8 @@ impl FileInputSource {
             }
 
             let display = job.display.clone();
-            self.current_job_timestamp_ms = Some(
-                file_timestamp_ms(&job.path).unwrap_or_else(|_| now_unix_millis()),
-            );
+            self.current_job_timestamp_ms =
+                Some(file_timestamp_ms(&job.path).unwrap_or_else(|_| now_unix_millis()));
             self.cursor += 1;
 
             match job.open(max_line_length).await {
@@ -286,6 +285,14 @@ impl LineSource for FileInputSource {
 
         self.ais_pending_timestamp_ms = None;
         Some(timestamp_ms)
+    }
+
+    fn normalize_payload(&mut self, payload: String, timestamp_ms: i64) -> String {
+        if !self.ais {
+            return payload;
+        }
+
+        normalize_ais_payload(&payload, timestamp_ms).unwrap_or(payload)
     }
 
     async fn open(&mut self, max_line_length: usize) -> Result<LineReader> {
@@ -817,17 +824,23 @@ fn parse_ais_timestamp_ms(value: &str) -> Option<i64> {
 }
 
 fn parse_ais_group_id(value: &str) -> Option<String> {
-    let candidate = value
+    let parts = value
         .split('-')
         .filter(|part| !part.is_empty())
-        .last()
-        .unwrap_or(value)
-        .trim();
+        .map(str::trim)
+        .collect::<Vec<_>>();
+
+    let candidate = match parts.as_slice() {
+        [_, fragment_count, group_id, ..] if !fragment_count.is_empty() && !group_id.is_empty() => {
+            format!("{fragment_count}:{group_id}")
+        }
+        _ => value.trim().to_string(),
+    };
 
     if candidate.is_empty() {
         None
     } else {
-        Some(candidate.to_string())
+        Some(candidate)
     }
 }
 
@@ -874,6 +887,57 @@ fn remove_timestamp_for_groups(
     if let Some(group_id) = sentence_group_id {
         timestamps.remove(group_id);
     }
+}
+
+fn normalize_ais_payload(payload: &str, timestamp_ms: i64) -> Option<String> {
+    let malformed = malformed_leading_epoch_tag_block(payload)?;
+    let timestamp_seconds = timestamp_ms.div_euclid(1_000);
+    let mut fields = malformed
+        .tag_body
+        .split(',')
+        .filter(|field| !field.is_empty())
+        .filter(|field| !field.starts_with("c:"))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    fields.push(format!("c:{}", timestamp_seconds));
+    let tag_body = fields.join(",");
+    let checksum = nmea_tag_block_checksum(&tag_body);
+
+    Some(format!(
+        "\\{}*{:02X}\\{}",
+        tag_body, checksum, malformed.sentence
+    ))
+}
+
+struct MalformedTagBlock<'a> {
+    tag_body: &'a str,
+    sentence: &'a str,
+}
+
+fn malformed_leading_epoch_tag_block(payload: &str) -> Option<MalformedTagBlock<'_>> {
+    let sentence_start = payload
+        .char_indices()
+        .find(|(_, ch)| *ch == '!' || *ch == '$')
+        .map(|(idx, _)| idx)?;
+    let prefix = &payload[..sentence_start];
+    let sentence = &payload[sentence_start..];
+    let tag_start = prefix.find('\\')?;
+    let leading = prefix[..tag_start].trim();
+    if leading.is_empty() || !leading.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+
+    let tag_block = &prefix[tag_start + 1..];
+    let tag_body = tag_block.split('*').next().unwrap_or(tag_block).trim();
+    if tag_body.is_empty() {
+        return None;
+    }
+
+    Some(MalformedTagBlock { tag_body, sentence })
+}
+
+fn nmea_tag_block_checksum(tag_body: &str) -> u8 {
+    tag_body.bytes().fold(0u8, |checksum, byte| checksum ^ byte)
 }
 
 fn open_zip_entry_reader(
@@ -1199,6 +1263,23 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_malformed_leading_epoch_tag_block() {
+        let payload = r"1564038609\g:2-2-0013*5F\!AIVDM,2,2,3,A,8P?EDQ0,2*20";
+
+        assert_eq!(
+            normalize_ais_payload(payload, 1_564_038_609_000).as_deref(),
+            Some(r"\g:2-2-0013,c:1564038609*28\!AIVDM,2,2,3,A,8P?EDQ0,2*20")
+        );
+    }
+
+    #[test]
+    fn leaves_valid_tag_block_payload_unchanged() {
+        let payload = r"\g:1-2-73874,s:r003669945,c:1241544035*4A\!AIVDM,1,1,,B,15N4cJ`005Jrek0H@9n`DW5608EP,0*13";
+
+        assert_eq!(normalize_ais_payload(payload, 1_241_544_035_000), None);
+    }
+
+    #[test]
     fn reuses_ais_group_timestamp_for_three_fragment_messages() {
         let mut source = FileInputSource {
             source: "source".to_string(),
@@ -1220,6 +1301,33 @@ mod tests {
             Some(1_609_459_200_000)
         );
         assert_eq!(source.timestamp_for_payload(third), Some(1_609_459_200_000));
+    }
+
+    #[test]
+    fn keeps_tag_group_timestamps_separate_when_numbers_are_reused() {
+        let mut source = FileInputSource {
+            source: "source".to_string(),
+            ais: true,
+            ais_group_timestamps: HashMap::new(),
+            ais_pending_timestamp_ms: None,
+            current_job_timestamp_ms: None,
+            jobs: vec![],
+            cursor: 0,
+        };
+
+        let three_part_first = r"\g:1-3-42,c:1609459200*00\!AIVDM,3,1,9,A,first,0*00";
+        let two_part_second = r"\g:2-2-42*00\!AIVDM,2,2,8,A,second,0*00";
+        let three_part_second = r"\g:2-3-42*00\!AIVDM,3,2,9,A,third,0*00";
+
+        assert_eq!(
+            source.timestamp_for_payload(three_part_first),
+            Some(1_609_459_200_000)
+        );
+        assert_eq!(source.timestamp_for_payload(two_part_second), None);
+        assert_eq!(
+            source.timestamp_for_payload(three_part_second),
+            Some(1_609_459_200_000)
+        );
     }
 
     #[test]
@@ -1254,7 +1362,10 @@ mod tests {
             cursor: 0,
         };
 
-        assert_eq!(source.timestamp_for_payload("plain payload"), Some(1_700_000_000_000));
+        assert_eq!(
+            source.timestamp_for_payload("plain payload"),
+            Some(1_700_000_000_000)
+        );
     }
 
     #[tokio::test]

@@ -57,7 +57,7 @@ pub enum PartitionGranularity {
 
 impl Default for PartitionGranularity {
     fn default() -> Self {
-        Self::Minute
+        Self::Day
     }
 }
 
@@ -246,6 +246,10 @@ pub trait LineSource {
 
     fn timestamp_for_payload(&mut self, _payload: &str) -> Option<i64> {
         None
+    }
+
+    fn normalize_payload(&mut self, payload: String, _timestamp_ms: i64) -> String {
+        payload
     }
 
     fn ingest_progress(&self) -> Option<IngestProgress> {
@@ -615,6 +619,7 @@ where
                             Some(timestamp_ms) => timestamp_ms,
                             None => now_unix_duration().as_millis() as i64,
                         };
+                        let payload = source.normalize_payload(payload, row_ts_ms);
                         let row_key = PartKey::from_timestamp(
                             source.source_name(),
                             row_ts_ms,
