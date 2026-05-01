@@ -8,6 +8,7 @@
   packages = [ pkgs.git
                pkgs.duckdb
                pkgs.rclone
+               pkgs.sail
  ];
 
   # https://devenv.sh/languages/

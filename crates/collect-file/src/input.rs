@@ -24,6 +24,7 @@ pub(crate) struct FileInputSource {
     ais: bool,
     ais_group_timestamps: HashMap<String, i64>,
     ais_pending_timestamp_ms: Option<i64>,
+    ais_payload_timestamp_ms: Option<i64>,
     current_job_timestamp_ms: Option<i64>,
     jobs: Vec<InputJob>,
     cursor: usize,
@@ -106,6 +107,7 @@ impl FileInputSource {
             ais,
             ais_group_timestamps: HashMap::new(),
             ais_pending_timestamp_ms: None,
+            ais_payload_timestamp_ms: None,
             current_job_timestamp_ms: None,
             jobs,
             cursor: 0,
@@ -161,6 +163,7 @@ impl FileInputSource {
             if self.cursor > 0 {
                 self.ais_group_timestamps.clear();
                 self.ais_pending_timestamp_ms = None;
+                self.ais_payload_timestamp_ms = None;
             }
 
             let display = job.display.clone();
@@ -204,6 +207,8 @@ impl LineSource for FileInputSource {
     }
 
     fn timestamp_for_payload(&mut self, payload: &str) -> Option<i64> {
+        self.ais_payload_timestamp_ms = None;
+
         if !self.ais {
             return self.current_job_timestamp_ms;
         }
@@ -212,6 +217,7 @@ impl LineSource for FileInputSource {
 
         if let Some(timestamp_ms) = parse_pghp_timestamp_ms(sentence) {
             self.ais_pending_timestamp_ms = Some(timestamp_ms);
+            self.ais_payload_timestamp_ms = Some(timestamp_ms);
             return Some(timestamp_ms);
         }
 
@@ -224,6 +230,7 @@ impl LineSource for FileInputSource {
 
         if let Some(timestamp_ms) = tag_block.timestamp_ms {
             self.ais_pending_timestamp_ms = None;
+            self.ais_payload_timestamp_ms = Some(timestamp_ms);
             if sentence.is_fragmented() {
                 cache_timestamp_for_groups(
                     &mut self.ais_group_timestamps,
@@ -241,6 +248,7 @@ impl LineSource for FileInputSource {
             sentence.group_id.as_deref(),
         ) {
             self.ais_pending_timestamp_ms = None;
+            self.ais_payload_timestamp_ms = Some(timestamp_ms);
             if sentence.is_final_fragment() {
                 remove_timestamp_for_groups(
                     &mut self.ais_group_timestamps,
@@ -273,6 +281,7 @@ impl LineSource for FileInputSource {
                 self.ais_pending_timestamp_ms = None;
             }
 
+            self.ais_payload_timestamp_ms = Some(timestamp_ms);
             return Some(timestamp_ms);
         }
 
@@ -280,15 +289,17 @@ impl LineSource for FileInputSource {
             if sentence.is_final_fragment() {
                 self.ais_pending_timestamp_ms = None;
             }
+            self.ais_payload_timestamp_ms = Some(timestamp_ms);
             return Some(timestamp_ms);
         }
 
         self.ais_pending_timestamp_ms = None;
+        self.ais_payload_timestamp_ms = Some(timestamp_ms);
         Some(timestamp_ms)
     }
 
     fn normalize_payload(&mut self, payload: String, timestamp_ms: i64) -> String {
-        if !self.ais {
+        if !self.ais || self.ais_payload_timestamp_ms != Some(timestamp_ms) {
             return payload;
         }
 
@@ -824,23 +835,17 @@ fn parse_ais_timestamp_ms(value: &str) -> Option<i64> {
 }
 
 fn parse_ais_group_id(value: &str) -> Option<String> {
-    let parts = value
+    let candidate = value
         .split('-')
         .filter(|part| !part.is_empty())
-        .map(str::trim)
-        .collect::<Vec<_>>();
-
-    let candidate = match parts.as_slice() {
-        [_, fragment_count, group_id, ..] if !fragment_count.is_empty() && !group_id.is_empty() => {
-            format!("{fragment_count}:{group_id}")
-        }
-        _ => value.trim().to_string(),
-    };
+        .last()
+        .unwrap_or(value)
+        .trim();
 
     if candidate.is_empty() {
         None
     } else {
-        Some(candidate)
+        Some(candidate.to_string())
     }
 }
 
@@ -890,10 +895,44 @@ fn remove_timestamp_for_groups(
 }
 
 fn normalize_ais_payload(payload: &str, timestamp_ms: i64) -> Option<String> {
-    let malformed = malformed_leading_epoch_tag_block(payload)?;
     let timestamp_seconds = timestamp_ms.div_euclid(1_000);
-    let mut fields = malformed
+
+    if let Some(malformed) = malformed_leading_epoch_tag_block(payload) {
+        return Some(format_tagged_ais_payload(
+            malformed.tag_body,
+            malformed.sentence,
+            timestamp_seconds,
+        ));
+    }
+
+    let tagged = ais_tag_block(payload)?;
+    if tagged
         .tag_body
+        .split(',')
+        .map(|field| field.split('*').next().unwrap_or(field).trim())
+        .any(|field| field.starts_with("c:"))
+    {
+        return None;
+    }
+
+    if !tagged
+        .tag_body
+        .split(',')
+        .map(|field| field.split('*').next().unwrap_or(field).trim())
+        .any(|field| field.starts_with("g:"))
+    {
+        return None;
+    }
+
+    Some(format_tagged_ais_payload(
+        tagged.tag_body,
+        tagged.sentence,
+        timestamp_seconds,
+    ))
+}
+
+fn format_tagged_ais_payload(tag_body: &str, sentence: &str, timestamp_seconds: i64) -> String {
+    let mut fields = tag_body
         .split(',')
         .filter(|field| !field.is_empty())
         .filter(|field| !field.starts_with("c:"))
@@ -903,15 +942,39 @@ fn normalize_ais_payload(payload: &str, timestamp_ms: i64) -> Option<String> {
     let tag_body = fields.join(",");
     let checksum = nmea_tag_block_checksum(&tag_body);
 
-    Some(format!(
-        "\\{}*{:02X}\\{}",
-        tag_body, checksum, malformed.sentence
-    ))
+    format!("\\{}*{:02X}\\{}", tag_body, checksum, sentence)
 }
 
 struct MalformedTagBlock<'a> {
     tag_body: &'a str,
     sentence: &'a str,
+}
+
+struct AisTaggedPayload<'a> {
+    tag_body: &'a str,
+    sentence: &'a str,
+}
+
+fn ais_tag_block(payload: &str) -> Option<AisTaggedPayload<'_>> {
+    let prefix_end = payload
+        .char_indices()
+        .find(|(_, ch)| *ch == '!' || *ch == '$')
+        .map(|(idx, _)| idx)?;
+    let prefix = &payload[..prefix_end];
+    let sentence = &payload[prefix_end..];
+
+    if !prefix.starts_with('\\') {
+        return None;
+    }
+
+    let tag_block_end = prefix[1..].find('\\').map(|idx| idx + 1)?;
+    let tag_block = &prefix[1..tag_block_end];
+    let tag_body = tag_block.split('*').next().unwrap_or(tag_block).trim();
+    if tag_body.is_empty() {
+        return None;
+    }
+
+    Some(AisTaggedPayload { tag_body, sentence })
 }
 
 fn malformed_leading_epoch_tag_block(payload: &str) -> Option<MalformedTagBlock<'_>> {
@@ -1224,6 +1287,7 @@ mod tests {
             ais: true,
             ais_group_timestamps: HashMap::new(),
             ais_pending_timestamp_ms: None,
+            ais_payload_timestamp_ms: None,
             current_job_timestamp_ms: None,
             jobs: vec![],
             cursor: 0,
@@ -1247,6 +1311,7 @@ mod tests {
             ais: true,
             ais_group_timestamps: HashMap::new(),
             ais_pending_timestamp_ms: None,
+            ais_payload_timestamp_ms: None,
             current_job_timestamp_ms: None,
             jobs: vec![],
             cursor: 0,
@@ -1280,12 +1345,44 @@ mod tests {
     }
 
     #[test]
+    fn adds_cached_timestamp_to_later_grouped_sentence_tag_block() {
+        let payload = r"\g:2-2-4447*00\!AIVDM,2,2,0,A,P0,4*72";
+
+        assert_eq!(
+            normalize_ais_payload(payload, 1_604_189_030_000).as_deref(),
+            Some(r"\g:2-2-4447,c:1604189030*2B\!AIVDM,2,2,0,A,P0,4*72")
+        );
+    }
+
+    #[test]
+    fn leaves_uncached_later_grouped_sentence_payload_unchanged() {
+        let mut source = FileInputSource {
+            source: "source".to_string(),
+            ais: true,
+            ais_group_timestamps: HashMap::new(),
+            ais_pending_timestamp_ms: None,
+            ais_payload_timestamp_ms: None,
+            current_job_timestamp_ms: None,
+            jobs: vec![],
+            cursor: 0,
+        };
+        let payload = r"\g:2-2-4447*00\!AIVDM,2,2,0,A,P0,4*72";
+
+        assert_eq!(source.timestamp_for_payload(payload), None);
+        assert_eq!(
+            source.normalize_payload(payload.to_string(), 1_604_189_030_000),
+            payload
+        );
+    }
+
+    #[test]
     fn reuses_ais_group_timestamp_for_three_fragment_messages() {
         let mut source = FileInputSource {
             source: "source".to_string(),
             ais: true,
             ais_group_timestamps: HashMap::new(),
             ais_pending_timestamp_ms: None,
+            ais_payload_timestamp_ms: None,
             current_job_timestamp_ms: None,
             jobs: vec![],
             cursor: 0,
@@ -1304,12 +1401,13 @@ mod tests {
     }
 
     #[test]
-    fn keeps_tag_group_timestamps_separate_when_numbers_are_reused() {
+    fn uses_tag_group_id_as_cache_key() {
         let mut source = FileInputSource {
             source: "source".to_string(),
             ais: true,
             ais_group_timestamps: HashMap::new(),
             ais_pending_timestamp_ms: None,
+            ais_payload_timestamp_ms: None,
             current_job_timestamp_ms: None,
             jobs: vec![],
             cursor: 0,
@@ -1323,7 +1421,10 @@ mod tests {
             source.timestamp_for_payload(three_part_first),
             Some(1_609_459_200_000)
         );
-        assert_eq!(source.timestamp_for_payload(two_part_second), None);
+        assert_eq!(
+            source.timestamp_for_payload(two_part_second),
+            Some(1_609_459_200_000)
+        );
         assert_eq!(
             source.timestamp_for_payload(three_part_second),
             Some(1_609_459_200_000)
@@ -1337,6 +1438,7 @@ mod tests {
             ais: false,
             ais_group_timestamps: HashMap::new(),
             ais_pending_timestamp_ms: None,
+            ais_payload_timestamp_ms: None,
             current_job_timestamp_ms: None,
             jobs: vec![InputJob::plain(PathBuf::from("/tmp/input.txt"), 0)],
             cursor: 1,
@@ -1357,6 +1459,7 @@ mod tests {
             ais: false,
             ais_group_timestamps: HashMap::new(),
             ais_pending_timestamp_ms: None,
+            ais_payload_timestamp_ms: None,
             current_job_timestamp_ms: Some(1_700_000_000_000),
             jobs: vec![],
             cursor: 0,
@@ -1519,6 +1622,7 @@ mod tests {
             ais: true,
             ais_group_timestamps: HashMap::new(),
             ais_pending_timestamp_ms: None,
+            ais_payload_timestamp_ms: None,
             current_job_timestamp_ms: None,
             jobs: vec![],
             cursor: 0,
