@@ -4,11 +4,12 @@
 
 `collect` is a Rust workspace for ingesting newline-delimited text into Hive-partitioned Parquet datasets and for maintaining those datasets afterward.
 
-It has three user-facing binaries:
+It has four user-facing binaries:
 
 - `collect-file`: ingest files and directories
 - `collect-socket`: ingest newline-delimited TCP streams
 - `collect-maint`: inspect, validate, compact, and vacuum datasets
+- `ais-normalize`: re-timestamp, re-partition, and combine multi-part AIS sentences in collected Parquet data
 
 ## Workspace Goals
 
@@ -60,7 +61,7 @@ Default partition granularity is `day`.
 
 ### Purpose
 
-Recursively ingest files from a path into partitioned Parquet.
+Recursively ingest files from a path into partitioned Parquet. Rows are timestamped using the source file's modification time.
 
 ### Supported Inputs
 
@@ -77,23 +78,13 @@ Recursively ingest files from a path into partitioned Parquet.
 - zip entries are processed entry-by-entry in archive order.
 - unreadable files are skipped with a warning instead of aborting the run.
 
-### AIS Timestamping
-
-`--ais` enables AIS-specific timestamp extraction.
-
-When enabled, file ingestion prefers:
-
-- NMEA `c:<epoch>` tag block timestamps
-- `$PGHP` capture timestamps
-- grouped `\g` / fragment timestamp reuse for related AIS sentences
-
 ### CLI
 
 Required / common flags:
 
 - `--input <path>`: file or directory to ingest
 - `--source <label>`: logical source name
-- `--ais`: enable AIS timestamp extraction
+- `--concurrency <n>`: override the auto-selected file worker count
 - `--tui`: launch the configuration TUI
 - `--noui`: disable runtime status TUI and print plain aggregate updates
 
@@ -119,7 +110,6 @@ Precedence order:
 
 If `--input` is omitted, `INPUT_PATH` or `INPUT_FILE` is used.
 If `--source` is omitted, `SOURCE` is used.
-If `--ais` is unset, `AIS` can enable it.
 
 ### Runtime Status
 
@@ -145,7 +135,7 @@ If `--ais` is unset, `AIS` can enable it.
 - Long lines are bounded by `max-line-length`.
 - Writes are decoupled from parsing so ingestion stays responsive under load.
 - Health status is updated during ingest.
-- Plain files without embedded timestamps use a stable file-level timestamp fallback so they stay within a partition unless row timestamps actually cross a partition boundary.
+- All rows use the file modification time as their timestamp. AIS-specific timestamp extraction is handled as a post-processing step by `ais-normalize`.
 
 ## collect-socket
 
@@ -231,7 +221,7 @@ Leaf partitions contain Parquet files under the selected partition granularity l
 - Default compacted output target size is about 512 MiB.
 - Only leaf partitions with more than one Parquet file are candidates.
 - Compaction groups files by partition, plans output files, writes manifests, materializes inputs, writes compacted Parquet, validates the result, publishes output, and deletes old inputs/manifests.
-- Partition writes are isolated so one partition’s compaction does not interfere with another.
+- Partition writes are isolated so one partition's compaction does not interfere with another.
 
 ### vacuum
 
@@ -255,6 +245,68 @@ Leaf partitions contain Parquet files under the selected partition granularity l
 - `processed` means leaf partitions already consolidated to a single Parquet file at startup, plus partitions consolidated during the current run.
 - `remaining` means leaf partitions still needing consolidation.
 - Progress is updated as partition compactions finish, not per job.
+
+## ais-normalize
+
+### Purpose
+
+Post-process a Hive-partitioned Parquet dataset collected from AIS NMEA feeds. Corrects row timestamps from embedded NMEA metadata, moves rows to the correct partition, and combines multi-part AIS sentences into single records.
+
+### When to Use
+
+Run `ais-normalize` after `collect-file` or `collect-socket` has ingested raw AIS data. The ingest binaries stamp rows with the file modification time or wall clock; `ais-normalize` replaces those with the precise capture timestamps embedded in the payloads.
+
+### What It Does
+
+**Re-timestamp:** For each row, extract the correct capture time from:
+
+- NMEA tag block `c:<epoch>` fields
+- `$PGHP` capture timestamp lines (Gatehouse format: `$PGHP,1,YYYY,M,D,H,M,S,ms,...`)
+- Carry-forward: a `$PGHP` or tagged first fragment's timestamp propagates to subsequent unfragmented sentences and fragment parts that lack their own `c:` field
+
+If no NMEA timestamp is found, the original `ts` value is kept unchanged.
+
+**Re-partition:** After re-timestamping, the correct partition key is recomputed. Rows whose timestamp moves them to a different partition are written to the new location.
+
+**Combine multi-part sentences:** Multi-sentence AIS messages (e.g. type 5 static/voyage data using two sentences, type 24 class B using two parts) are reassembled into a single output record:
+
+- The 6-bit ASCII payload fields from all parts are concatenated.
+- Fill bits are taken from the final fragment.
+- The NMEA sentence counter is reset to `1,1` (single sentence).
+- The NMEA checksum is recalculated.
+- Any tag block with a `c:` timestamp is preserved on the combined sentence.
+- The combined record uses the timestamp of the first fragment.
+
+Incomplete groups (fragments missing their partner at end of scan) are emitted as individual raw sentences and counted in stats.
+
+### CLI
+
+- `--input-dir <path>`: source Hive-partitioned Parquet root
+- `--output-dir <path>`: destination root (may equal `--input-dir`)
+- `--partition <granularity>`: must match the dataset layout (default: `day`)
+- `--source <label>`: filter to one source label; all sources if omitted
+- `--apply`: write output; dry-run by default
+- `--batch-size <n>`: rows per Parquet read batch (default: 8192)
+- `--compression-level <n>`: Zstd level for output (default: 5)
+- `--noui`: disable TUI and print plain progress updates
+
+### Defaults and Precedence
+
+Dry-run by default; `--apply` is required to write any output.
+
+### Processing Behavior
+
+- Partitions are processed in chronological order.
+- Each partition's fragment buffer is independent; cross-partition fragment groups are flushed as-is at the end of each partition.
+- `$PGHP` rows are re-timestamped and re-partitioned using their own embedded time; they are preserved in the output.
+- Output files use fresh names (`norm-*.parquet`) and do not overwrite input files, so `--output-dir == --input-dir` is safe. Run `collect-maint compact --apply` afterward to consolidate.
+
+### Runtime Status
+
+- Prints a dry-run summary of affected partitions when `--apply` is not set.
+- Prints a stats summary on completion: input rows, output rows, re-timestamped, re-partitioned, combined messages, incomplete groups, partitions processed.
+- `--noui` prints plain partition progress updates every 10 partitions.
+- Cancellable with `Ctrl-C`.
 
 ## collect-core
 
@@ -327,7 +379,6 @@ File ingestion:
 - `INPUT_PATH`
 - `INPUT_FILE`
 - `SOURCE`
-- `AIS`
 
 Socket ingestion:
 
@@ -370,6 +421,7 @@ The exact depth depends on partition granularity.
 - Cancellation must restore the terminal.
 - Plain mode must remain log-friendly.
 - Maintenance `compact` and `vacuum` must default to dry-run.
+- `ais-normalize` must default to dry-run.
 - Shared defaults should prefer `day` partitioning.
 
 ## Rebuild Guidance
@@ -381,5 +433,6 @@ If recreating this from scratch:
 3. Add `collect-file` ingestion and manifest-based restartability.
 4. Add `collect-socket` reconnecting TCP ingestion.
 5. Add `collect-maint` inspect/validate/compact/vacuum flows.
-6. Add TUI/plain runtime status layers and cancellation.
-7. Add tests for input decoding, manifest restart, partition planning, and maintenance flows.
+6. Add `ais-normalize` post-processing for AIS datasets.
+7. Add TUI/plain runtime status layers and cancellation.
+8. Add tests for input decoding, manifest restart, partition planning, maintenance flows, and AIS normalization.

@@ -1,5 +1,5 @@
 use anyhow::{bail, Result};
-use chrono::Utc;
+use chrono::{Duration, Months, TimeZone, Utc};
 use collect_core::PartitionGranularity;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -30,11 +30,19 @@ impl PartitionKey {
         format_partition_dir(self)
     }
 
-    pub fn matches_timestamp_ms(&self, timestamp_ms: i64) -> bool {
-        let (year, month, day, hour, minute) =
-            self.granularity.components_from_timestamp(timestamp_ms);
-        (self.year, self.month, self.day, self.hour, self.minute)
-            == (year, month, day, hour, minute)
+    pub fn timestamp_bounds_ms(&self) -> Option<(i64, i64)> {
+        let start = Utc
+            .with_ymd_and_hms(self.year, self.month, self.day, self.hour, self.minute, 0)
+            .single()?;
+        let end = match self.granularity {
+            PartitionGranularity::Minute => start.checked_add_signed(Duration::minutes(1))?,
+            PartitionGranularity::Hour => start.checked_add_signed(Duration::hours(1))?,
+            PartitionGranularity::Day => start.checked_add_signed(Duration::days(1))?,
+            PartitionGranularity::Month => start.checked_add_months(Months::new(1))?,
+            PartitionGranularity::Year => start.checked_add_months(Months::new(12))?,
+        };
+
+        Some((start.timestamp_millis(), end.timestamp_millis()))
     }
 }
 

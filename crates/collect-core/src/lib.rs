@@ -219,6 +219,7 @@ pub struct S3Options {
 pub struct IngestOptions {
     pub common: CommonOptions,
     pub s3: Option<S3Options>,
+    pub s3_storage: Option<S3Storage>,
     pub health_file: PathBuf,
     pub manage_health: bool,
     pub report_progress: bool,
@@ -515,6 +516,7 @@ where
     let IngestOptions {
         common,
         s3,
+        s3_storage,
         health_file,
         manage_health,
         report_progress,
@@ -527,9 +529,10 @@ where
         return Ok(());
     }
 
-    let s3_storage = match s3 {
-        Some(s3_options) => Some(s3_options.into_storage().await?),
-        None => None,
+    let s3_storage = match (s3_storage, s3) {
+        (Some(storage), _) => Some(storage),
+        (None, Some(s3_options)) => Some(s3_options.into_storage().await?),
+        (None, None) => None,
     };
 
     let mut reader = source.open(common.max_line_length).await?;
@@ -902,6 +905,15 @@ pub struct S3Storage {
     client: S3Client,
     bucket: String,
     keep_local: bool,
+}
+
+impl std::fmt::Debug for S3Storage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3Storage")
+            .field("bucket", &self.bucket)
+            .field("keep_local", &self.keep_local)
+            .finish_non_exhaustive()
+    }
 }
 
 impl S3Storage {

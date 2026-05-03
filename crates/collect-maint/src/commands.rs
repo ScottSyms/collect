@@ -6,7 +6,9 @@ use crate::status;
 use crate::storage::{DatasetEntry, StorageLocation};
 use anyhow::{bail, Context, Result};
 use arrow::array::{Array, StringArray, TimestampMillisecondArray};
-use arrow::datatypes::{DataType, TimeUnit};
+use arrow::compute::kernels::aggregate;
+use arrow::datatypes::{DataType, TimeUnit, TimestampMillisecondType};
+use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Utc};
 use collect_core::PartitionGranularity;
 use futures_util::stream::{self, StreamExt};
@@ -21,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const SMALL_PARQUET_FILE_BYTES: u64 = 256 * 1024 * 1024;
+const COMPACT_RECORD_BATCH_ROWS: usize = 8192;
 
 fn check_cancelled() -> Result<()> {
     if status::is_cancelled() {
@@ -45,6 +48,11 @@ impl FileScan {
             max_ts_ms: None,
             issues: Vec::new(),
         }
+    }
+
+    fn update_ts_range(&mut self, min_ts_ms: i64, max_ts_ms: i64) {
+        self.min_ts_ms = Some(self.min_ts_ms.map_or(min_ts_ms, |cur| cur.min(min_ts_ms)));
+        self.max_ts_ms = Some(self.max_ts_ms.map_or(max_ts_ms, |cur| cur.max(max_ts_ms)));
     }
 }
 
@@ -867,31 +875,17 @@ async fn compact_job(
     );
     let materialized_for_write = materialized.clone();
     let temp_output_for_write = temp_output_path.clone();
-    tokio::task::spawn_blocking(move || {
+    let partition_for_write = job.partition.clone();
+    let scan = tokio::task::spawn_blocking(move || {
         write_compacted_output(
             &materialized_for_write,
             &temp_output_for_write,
             compression_level,
+            &partition_for_write,
         )
     })
     .await
     .context("joining compacted output writer")??;
-    report(
-        "compact",
-        format!(
-            "{}/{} validating compacted output {}",
-            count(job_index),
-            count(job_total),
-            job.output_rel
-        ),
-    );
-    let temp_output_for_scan = temp_output_path.clone();
-    let partition_for_scan = job.partition.clone();
-    let scan = tokio::task::spawn_blocking(move || {
-        scan_parquet_file(&temp_output_for_scan, Some(&partition_for_scan))
-    })
-    .await
-    .context("joining compacted output validator")??;
     if !scan.issues.is_empty() {
         bail!(
             "compacted output validation failed for {}: {}",
@@ -946,6 +940,14 @@ async fn materialize_group(
     concurrency: usize,
 ) -> Result<Vec<PathBuf>> {
     let total = inputs.len();
+    let local_paths = inputs
+        .iter()
+        .map(|input| storage.final_local_path(&input.rel_path))
+        .collect::<Option<Vec<_>>>();
+    if let Some(local_paths) = local_paths {
+        return Ok(local_paths);
+    }
+
     let mut materialized = Vec::with_capacity(total);
     let mut stream = stream::iter(inputs.iter().cloned())
         .enumerate()
@@ -1004,15 +1006,21 @@ fn write_compacted_output(
     input_paths: &[PathBuf],
     output_path: &Path,
     compression_level: i32,
-) -> Result<()> {
+    expected_partition: &PartitionKey,
+) -> Result<FileScan> {
     if input_paths.is_empty() {
         bail!("no input files to compact");
     }
+
+    let expected_bounds = expected_partition
+        .timestamp_bounds_ms()
+        .with_context(|| format!("invalid partition {}", expected_partition.relative_dir()))?;
 
     let zstd_level =
         ZstdLevel::try_new(compression_level).context("invalid Zstd compression level")?;
     let props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(zstd_level))
+        .set_write_batch_size(COMPACT_RECORD_BATCH_ROWS)
         .set_column_encoding(ColumnPath::from("ts"), Encoding::DELTA_BINARY_PACKED)
         .set_column_encoding(
             ColumnPath::from("payload"),
@@ -1027,6 +1035,7 @@ fn write_compacted_output(
             .with_context(|| format!("create {}", output_path.display()))?,
     );
     let mut writer: Option<ArrowWriter<StdFile>> = None;
+    let mut scan = FileScan::empty();
 
     let total_inputs = input_paths.len();
     for (index, input_path) in input_paths.iter().enumerate() {
@@ -1046,11 +1055,18 @@ fn write_compacted_output(
             StdFile::open(input_path).with_context(|| format!("open {}", input_path.display()))?;
         let mut reader = ParquetRecordBatchReaderBuilder::try_new(input_file)
             .with_context(|| format!("read parquet footer {}", input_path.display()))?
+            .with_batch_size(COMPACT_RECORD_BATCH_ROWS)
             .build()
             .with_context(|| format!("build parquet reader {}", input_path.display()))?;
 
         while let Some(batch) = reader.next().transpose()? {
             check_cancelled()?;
+            scan_record_batch(
+                &batch,
+                &mut scan,
+                Some(expected_partition),
+                Some(expected_bounds),
+            );
             if writer.is_none() {
                 let schema = batch.schema();
                 let file = output_file
@@ -1075,102 +1091,103 @@ fn write_compacted_output(
     };
     writer.close().context("close compacted parquet writer")?;
 
-    Ok(())
+    Ok(scan)
+}
+
+fn scan_record_batch(
+    batch: &RecordBatch,
+    scan: &mut FileScan,
+    expected_partition: Option<&PartitionKey>,
+    expected_bounds: Option<(i64, i64)>,
+) {
+    if batch.num_columns() < 2 {
+        scan.issues.push(format!(
+            "unexpected column count: {}",
+            count(batch.num_columns())
+        ));
+        return;
+    }
+    if batch.num_columns() != 2 {
+        scan.issues.push(format!(
+            "unexpected column count: {}",
+            count(batch.num_columns())
+        ));
+    }
+
+    let schema = batch.schema();
+    if schema.fields().len() >= 2 {
+        let ts_field = schema.field(0);
+        let payload_field = schema.field(1);
+        if ts_field.name() != "ts"
+            || payload_field.name() != "payload"
+            || !matches!(
+                ts_field.data_type(),
+                DataType::Timestamp(TimeUnit::Millisecond, Some(_))
+            )
+            || !matches!(payload_field.data_type(), DataType::Utf8)
+        {
+            scan.issues.push("unexpected schema".to_string());
+        }
+    }
+
+    let Some(ts_column) = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<TimestampMillisecondArray>()
+    else {
+        scan.issues.push("missing ts column".to_string());
+        return;
+    };
+    let Some(_payload_column) = batch.column(1).as_any().downcast_ref::<StringArray>() else {
+        scan.issues.push("missing payload column".to_string());
+        return;
+    };
+
+    scan.rows += batch.num_rows();
+
+    let Some(batch_min_ts) = aggregate::min::<TimestampMillisecondType>(ts_column) else {
+        return;
+    };
+    let Some(batch_max_ts) = aggregate::max::<TimestampMillisecondType>(ts_column) else {
+        return;
+    };
+
+    scan.update_ts_range(batch_min_ts, batch_max_ts);
+
+    if let (Some(partition), Some((start_ms, end_ms))) = (expected_partition, expected_bounds) {
+        if batch_min_ts < start_ms || batch_max_ts >= end_ms {
+            scan.issues.push(format!(
+                "timestamp range {} -> {} does not match partition {}",
+                count(batch_min_ts),
+                count(batch_max_ts),
+                partition.relative_dir()
+            ));
+        }
+    }
 }
 
 fn scan_parquet_file(path: &Path, expected_partition: Option<&PartitionKey>) -> Result<FileScan> {
     let file = StdFile::open(path).with_context(|| format!("open {}", path.display()))?;
+    let expected_bounds = expected_partition.and_then(PartitionKey::timestamp_bounds_ms);
     let mut reader = ParquetRecordBatchReaderBuilder::try_new(file)
         .with_context(|| format!("read parquet footer {}", path.display()))?
+        .with_batch_size(COMPACT_RECORD_BATCH_ROWS)
         .build()
         .with_context(|| format!("build parquet reader {}", path.display()))?;
 
-    let mut rows = 0usize;
-    let mut min_ts_ms: Option<i64> = None;
-    let mut max_ts_ms: Option<i64> = None;
-    let mut issues = Vec::new();
+    let mut scan = FileScan::empty();
     let mut saw_any_batch = false;
 
     while let Some(batch) = reader.next().transpose()? {
         saw_any_batch = true;
-        if batch.num_columns() < 2 {
-            issues.push(format!(
-                "unexpected column count: {}",
-                count(batch.num_columns())
-            ));
-            continue;
-        }
-        if batch.num_columns() != 2 {
-            issues.push(format!(
-                "unexpected column count: {}",
-                count(batch.num_columns())
-            ));
-        }
-
-        let schema = batch.schema();
-        if schema.fields().len() >= 2 {
-            let ts_field = schema.field(0);
-            let payload_field = schema.field(1);
-            if ts_field.name() != "ts"
-                || payload_field.name() != "payload"
-                || !matches!(
-                    ts_field.data_type(),
-                    DataType::Timestamp(TimeUnit::Millisecond, Some(_))
-                )
-                || !matches!(payload_field.data_type(), DataType::Utf8)
-            {
-                issues.push("unexpected schema".to_string());
-            }
-        }
-
-        let Some(ts_column) = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<TimestampMillisecondArray>()
-        else {
-            issues.push("missing ts column".to_string());
-            continue;
-        };
-        let Some(_payload_column) = batch.column(1).as_any().downcast_ref::<StringArray>() else {
-            issues.push("missing payload column".to_string());
-            continue;
-        };
-
-        for row in 0..batch.num_rows() {
-            let ts_ms = ts_column.value(row);
-            rows += 1;
-            min_ts_ms = Some(match min_ts_ms {
-                Some(current) => current.min(ts_ms),
-                None => ts_ms,
-            });
-            max_ts_ms = Some(match max_ts_ms {
-                Some(current) => current.max(ts_ms),
-                None => ts_ms,
-            });
-
-            if let Some(partition) = expected_partition {
-                if !partition.matches_timestamp_ms(ts_ms) {
-                    issues.push(format!(
-                        "timestamp {} does not match partition {}",
-                        count(ts_ms),
-                        partition.relative_dir()
-                    ));
-                    break;
-                }
-            }
-        }
+        scan_record_batch(&batch, &mut scan, expected_partition, expected_bounds);
     }
 
     if !saw_any_batch {
-        issues.push("file contains no rows".to_string());
+        scan.issues.push("file contains no rows".to_string());
     }
 
-    Ok(FileScan {
-        rows,
-        min_ts_ms,
-        max_ts_ms,
-        issues,
-    })
+    Ok(scan)
 }
 
 async fn inspect_entry(

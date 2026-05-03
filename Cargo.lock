@@ -32,6 +32,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "ais-normalize"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "chrono",
+ "clap",
+ "collect-core",
+ "crossterm",
+ "futures-util",
+ "parquet",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "tokio",
+ "walkdir",
+]
+
+[[package]]
 name = "alloc-no-stdlib"
 version = "2.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

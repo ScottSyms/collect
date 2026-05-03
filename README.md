@@ -45,7 +45,7 @@ cargo run -p collect-socket -- --tcp-host 153.44.253.27 --tcp-port 5631 --source
 cargo run -p collect-file -- --input data.txt --source mydata --compression-level 1 --s3-bucket maritime-data
 ```
 
-`collect-file` auto-detects plain text, gzip, bzip2, and zip inputs. Zip archives are read entry-by-entry in archive order. Hidden dotfiles are skipped silently. `--ais` applies to `collect-file` only; it prefers NMEA `c:<epoch>` tag block timestamps and `$PGHP` capture timestamps when present, and reuses the first sentence timestamp for grouped `\g:` fragments.
+`collect-file` auto-detects plain text, gzip, bzip2, and zip inputs. Zip archives are read entry-by-entry in archive order. Hidden dotfiles are skipped silently. `--concurrency` overrides the auto-selected file worker count. `--ais` applies to `collect-file` only; it prefers NMEA `c:<epoch>` tag block timestamps and `$PGHP` capture timestamps when present, and reuses the first sentence timestamp for grouped `\g:` fragments.
 
 ## Maintenance
 

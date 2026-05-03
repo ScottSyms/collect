@@ -187,6 +187,7 @@ async fn main() -> Result<()> {
         IngestOptions {
             common: args.common.to_options(),
             s3: args.s3.to_options(),
+            s3_storage: None,
             health_file,
             manage_health: true,
             report_progress: true,

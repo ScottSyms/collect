@@ -24,7 +24,7 @@ mod tui;
 #[derive(Parser, Debug)]
 #[command(
     version,
-    about = "Recursively ingest plain, gzip, bzip2, and zip files into Hive-partitioned Parquet with Zstd compression, with optional AIS capture timestamps"
+    about = "Recursively ingest plain, gzip, bzip2, and zip files into Hive-partitioned Parquet with Zstd compression"
 )]
 struct Args {
     /// Input file or directory to ingest
@@ -35,9 +35,9 @@ struct Args {
     #[arg(short, long)]
     source: Option<String>,
 
-    /// Use AIS capture timestamps when present, including NMEA c:<epoch> tag blocks, grouped \g fragments, and $PGHP capture lines
+    /// Maximum number of concurrent file ingest workers; auto-selected when omitted
     #[arg(long)]
-    ais: bool,
+    concurrency: Option<usize>,
 
     #[command(flatten)]
     common: CommonCliArgs,
@@ -58,6 +58,7 @@ struct Args {
 async fn main() -> Result<()> {
     let mut args = Args::parse();
     let noui = args.noui;
+    let concurrency = args.concurrency;
 
     if args.tui {
         let initial_config = tui::TuiConfig::load_from_env();
@@ -68,6 +69,7 @@ async fn main() -> Result<()> {
                 full_args.extend(config.to_cli_args());
                 args = Args::parse_from(full_args);
                 args.noui = noui;
+                args.concurrency = concurrency;
             }
             None => {
                 println!("Configuration cancelled.");
@@ -90,12 +92,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    if !args.ais {
-        if let Ok(value) = std::env::var("AIS") {
-            args.ais = matches!(value.to_ascii_lowercase().as_str(), "true" | "1");
-        }
-    }
-
     args.noui = noui;
 
     args.common.apply_env();
@@ -112,7 +108,7 @@ async fn main() -> Result<()> {
 
     let health_file = health_file_path("collect-file");
     eprintln!("🔎 Scanning input files...");
-    let source = input::FileInputSource::new_parallel(input, source_name, args.ais).await?;
+    let source = input::FileInputSource::new_parallel(input, source_name).await?;
     if status_mode.is_plain() {
         eprintln!("📦 Discovered {} input job(s)", source.job_count());
     }
@@ -122,6 +118,7 @@ async fn main() -> Result<()> {
         args.s3.to_options(),
         health_file,
         status_mode,
+        args.concurrency,
     )
     .await
 }
@@ -132,6 +129,7 @@ async fn run_file_ingest(
     s3: Option<collect_core::S3Options>,
     health_file: PathBuf,
     status_mode: status::StatusMode,
+    concurrency: Option<usize>,
 ) -> Result<()> {
     let manifest_path = completion_manifest::manifest_path(&common.out_dir);
     let completed = match completion_manifest::load_completed(&manifest_path) {
@@ -142,15 +140,6 @@ async fn run_file_ingest(
         }
     };
     let stop = Arc::new(AtomicBool::new(false));
-    let options = IngestOptions {
-        common,
-        s3,
-        health_file: health_file.clone(),
-        manage_health: false,
-        report_progress: false,
-        log_writes: false,
-        shutdown: Some(stop.clone()),
-    };
     let mut sources: Vec<_> = source
         .into_job_sources()
         .into_iter()
@@ -173,7 +162,29 @@ async fn run_file_ingest(
         .iter()
         .map(input::FileInputSource::estimated_size_bytes)
         .sum();
-    let worker_limit = default_worker_limit(total_files, total_bytes).min(sources.len().max(1));
+    let worker_limit = concurrency
+        .map(|value| value.max(1))
+        .unwrap_or_else(|| default_worker_limit(total_files, total_bytes))
+        .min(sources.len().max(1));
+    let (s3_options, s3_storage) = if common.health_check {
+        (s3, None)
+    } else {
+        let s3_storage = match s3 {
+            Some(s3_options) => Some(s3_options.into_storage().await?),
+            None => None,
+        };
+        (None, s3_storage)
+    };
+    let options = IngestOptions {
+        common,
+        s3: s3_options,
+        s3_storage,
+        health_file: health_file.clone(),
+        manage_health: false,
+        report_progress: false,
+        log_writes: false,
+        shutdown: Some(stop.clone()),
+    };
     if sources.len() == 1 {
         if status_mode.is_plain() {
             eprintln!(
@@ -202,6 +213,7 @@ async fn run_file_ingest(
             IngestOptions {
                 common: options.common.clone(),
                 s3: options.s3.clone(),
+                s3_storage: options.s3_storage.clone(),
                 health_file: health_file.clone(),
                 manage_health: true,
                 report_progress: false,

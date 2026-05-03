@@ -5,6 +5,7 @@ members = [
     "crates/collect-file",
     "crates/collect-socket",
     "crates/collect-maint",
+    "crates/ais-normalize",
 ]
 resolver = "2"
 
