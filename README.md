@@ -1,13 +1,16 @@
-# capture
+# collect
 
-A high-performance Rust application for ingesting data streams into Hive-partitioned Parquet files with Zstd compression. Supports file and TCP inputs with optional remote storage (S3/MinIO).
+A Rust workspace for ingesting data into Hive-partitioned Parquet files with Zstd compression. It provides `collect-file` for recursive file ingestion, `collect-socket` for TCP line ingestion, and `collect-maint` for inspection, validation, compaction, and vacuuming, with optional remote storage (S3/MinIO).
 
 ## Features
-- **Multiple Input Sources**: File or TCP stream
-- **Hive Partitioning**: Automatic partitioning by source, year, month, day, hour, and minute
+- **Multiple Input Sources**: Plain, compressed, or TCP stream
+- **Compressed Inputs**: Plain text, gzip, bzip2, and zip files
+- **AIS Timestamps**: Optional AIS capture timestamping for file ingestion
+- **Hive Partitioning**: Automatic partitioning by source and selected time granularity
 - **Parquet Format**: Efficient columnar storage with Zstd compression
 - **S3 Integration**: Upload to AWS S3 or S3-compatible storage (MinIO) with optional TLS
 - **Background Uploads**: Non-blocking S3 uploads to prevent data collection pauses
+- **Maintenance CLI**: Inspect, validate, compact, and vacuum hive-partitioned datasets
 - **Docker Support**: Full Docker and docker-compose integration with health checks
 - **Environment Variables**: Complete environment variable support for containerized deployments
 - **Real-time Processing**: Async processing with configurable buffering
@@ -26,34 +29,62 @@ export SOURCE="norway-tcp"
 export S3_BUCKET="maritime-data"
 export S3_REGION="us-west-2"
 
-./capture
+cargo run -p collect-socket --
 ```
 
 ### Using Command Line Arguments
 
 ```bash
 # File input
-./capture --input data.txt --source mydata
+cargo run -p collect-file -- --input data.txt --source mydata
 
 # TCP stream
-./capture --tcp-host 153.44.253.27 --tcp-port 5631 --source norway-tcp
+cargo run -p collect-socket -- --tcp-host 153.44.253.27 --tcp-port 5631 --source norway-tcp
 
 # File input with S3
-./capture --input data.txt --source mydata --s3-bucket maritime-data
+cargo run -p collect-file -- --input data.txt --source mydata --compression-level 1 --s3-bucket maritime-data
+```
+
+`collect-file` auto-detects plain text, gzip, bzip2, and zip inputs. Zip archives are read entry-by-entry in archive order. Hidden dotfiles are skipped silently. `--concurrency` overrides the auto-selected file worker count. `--ais` applies to `collect-file` only; it prefers NMEA `c:<epoch>` tag block timestamps and `$PGHP` capture timestamps when present, and reuses the first sentence timestamp for grouped `\g:` fragments.
+
+## Maintenance
+
+`collect-maint` inspects, validates, compacts, and vacuums hive-partitioned datasets. It requires `--partition` so it can parse the on-disk layout. `compact` and `vacuum` are dry-run by default; add `--apply` to make changes. Worker concurrency is selected automatically unless `--concurrency` is provided. `compact` targets compacted files of about 512 MiB by default; override with `--target-file-size-bytes`. `--compression-level` controls Zstd speed vs file size for ingest and compaction.
+
+```bash
+# Read-only inspection
+cargo run -p collect-maint -- --root data --partition day inspect
+
+# Dry-run compaction plan
+cargo run -p collect-maint -- --root data --partition day compact
+
+# Real compaction run
+cargo run -p collect-maint -- --root data --partition day compact --apply
+
+# Dry-run cleanup plan
+cargo run -p collect-maint -- --root data --partition day vacuum
+
+# Real cleanup run
+cargo run -p collect-maint -- --root data --partition day vacuum --apply
 ```
 
 ## Environment Variables
 
-All command-line parameters can be configured using environment variables:
+Most `collect-file` and `collect-socket` command-line parameters can be configured using environment variables. `collect-maint` remains CLI-only.
 
 | Environment Variable | CLI Argument | Description |
 |---------------------|--------------|-------------|
-| `INPUT_FILE` | `--input` | Input text file path |
+| `INPUT_PATH` / `INPUT_FILE` | `--input` | Input file or directory path |
 | `TCP_HOST` | `--tcp-host` | TCP host address |
 | `TCP_PORT` | `--tcp-port` | TCP port number |
 | `SOURCE` | `--source` | Logical source label |
+| `PARTITION` | `--partition` | Partition granularity for ingest layout |
+| `AIS` | `--ais` | Use NMEA `c:<epoch>` tag blocks or `$PGHP` capture timestamps (collect-file only) |
 | `OUT_DIR` | `--out-dir` | Output directory |
 | `MAX_ROWS` | `--max-rows` | Max rows per file |
+| `MAX_BATCH_BYTES` | `--max-batch-bytes` | Max payload bytes per Parquet file |
+| `COMPRESSION_LEVEL` | `--compression-level` | Zstd compression level for Parquet output |
+| `MAX_LINE_LENGTH` | `--max-line-length` | Max bytes per input line |
 | `UPLOAD_DRAIN_TIMEOUT_SECONDS` | `--upload-drain-timeout-seconds` | Max seconds to wait for upload drain |
 | `HEALTH_CHECK` | `--health-check` | Run health check |
 | `S3_BUCKET` | `--s3-bucket` | S3 bucket name |
@@ -76,7 +107,7 @@ version: '3.8'
 services:
   data-ingest:
     build: .
-    image: capture:latest
+    image: collect:latest
     environment:
       # TCP Stream
       - TCP_HOST=153.44.253.27
@@ -91,7 +122,7 @@ services:
     volumes:
       - ./output:/data
     healthcheck:
-      test: ["CMD", "/usr/local/bin/capture", "--health-check"]
+      test: ["CMD", "/usr/local/bin/collect-socket", "--health-check"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -100,7 +131,7 @@ services:
 ### Building the Docker Image
 
 ```bash
-docker build -t capture .
+docker build -t collect .
 ```
 
 ### Running with Docker
@@ -113,8 +144,10 @@ docker run -d \
   -e TCP_PORT="5631" \
   -e SOURCE="norway-tcp" \
   -v $(pwd)/output:/data \
-  capture:latest
+  collect:latest
 ```
+
+The image defaults to `collect-socket`; use `--entrypoint /usr/local/bin/collect-file` for file ingestion or `--entrypoint /usr/local/bin/collect-maint` for maintenance commands.
 
 ## Configuration Precedence
 
@@ -126,6 +159,17 @@ Configuration values are applied in the following order (highest to lowest prece
 
 This allows you to set base configuration via environment variables and override specific values with command-line arguments when needed.
 
+## TUI
+
+Both binaries include an interactive console setup flow:
+
+```bash
+cargo run -p collect-file -- --tui
+cargo run -p collect-socket -- --tui
+```
+
+The file binary saves to `collect-file-config.json` by default. The socket binary saves to `collect-socket-config.json` by default.
+
 ## Output Structure
 
 Data is organized in Hive-partitioned directories:
@@ -136,18 +180,15 @@ data/
 │   └── year=2025/
 │       └── month=01/
 │           └── day=15/
-│               └── hour=14/
-│                   └── minute=30/
-│                       ├── 20250115_143045_001.parquet
-│                       └── 20250115_143145_002.parquet
+│               └── part-20250115T000000000-000000.parquet
 └── source=norway-tcp/
     └── year=2025/
         └── month=01/
             └── day=15/
-                └── hour=14/
-                    └── minute=31/
-                        └── 20250115_143155_001.parquet
+                └── part-20250115T000000000-000001.parquet
 ```
+
+Use `--partition day|hour|minute|month|year` to choose how deep the time hierarchy goes. The default is `day`.
 
 ## Health Checks
 
@@ -155,13 +196,13 @@ The application includes health check functionality for container orchestration:
 
 ```bash
 # Check health status
-./capture --health-check
+./target/release/collect-socket --health-check
 
 # Or using environment variable
-HEALTH_CHECK=true ./capture
+HEALTH_CHECK=true ./target/release/collect-socket
 ```
 
-Health status is tracked in `/tmp/health_status` with timestamps and status information.
+Health status is tracked in `/tmp/collect-socket.health` for the socket binary and `/tmp/collect-file.health` for the file binary.
 
 ## S3 Integration
 
@@ -201,17 +242,21 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 # Clone and build
 git clone <repository-url>
-cd capture
-cargo build --release
+cd collect
+cargo build --release --workspace
 
 # Run
-./target/release/capture --help
+./target/release/collect-file --help
+./target/release/collect-socket --help
+./target/release/collect-maint --help
 ```
 
 ## Performance Tuning
 
 - **MAX_ROWS**: Control memory usage vs file size (default: flush on minute boundary)
 - **MAX_PAYLOAD_BYTES**: Flush before buffered string data grows too large for Arrow offsets (default: `268435456`)
+- **MAX_ROWS**: Cap rows per file when you want smaller Parquet chunks
+- **MAX_BATCH_BYTES**: Cap buffered payload size per Parquet file (default: 64 MiB)
 - **Compression**: Uses Zstd for optimal compression ratio and speed
 - **Async Processing**: Leverages Tokio for high-performance async I/O
 - **Resource Limits**: Set appropriate memory limits in Docker for large datasets
@@ -229,7 +274,7 @@ cargo build --release
 rustup update
 
 # Clean and rebuild
-cargo clean && cargo build --release
+cargo clean && cargo build --release --workspace
 ```
 
 ### Connection Issues
@@ -237,11 +282,3 @@ cargo clean && cargo build --release
 - **S3**: Validate credentials and bucket permissions
 
 See individual documentation files for detailed troubleshooting guides.
-
-## License
-
-[Add your license information here]
-
-## Contributing
-
-[Add contributing guidelines here]

@@ -1,0 +1,968 @@
+use anyhow::{bail, Context, Result};
+use async_compression::tokio::bufread::{BzDecoder, GzipDecoder};
+use bytes::Bytes;
+use collect_core::{
+    line_reader_from_async_read, IngestProgress, LineReader, LineSource, ReaderTransition,
+};
+use futures_util::stream::{self, StreamExt};
+use std::cmp::Ordering;
+use std::fs::File as StdFile;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
+use tokio::io::BufReader;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::io::StreamReader;
+use walkdir::WalkDir;
+
+#[derive(Debug)]
+pub(crate) struct FileInputSource {
+    source: String,
+    current_job_timestamp_ms: Option<i64>,
+    jobs: Vec<InputJob>,
+    cursor: usize,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum InputKind {
+    Plain,
+    Gzip,
+    Bzip2,
+    ZipEntry {
+        entry_index: usize,
+        entry_name: String,
+    },
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct InputJob {
+    path: PathBuf,
+    display: String,
+    estimated_size: u64,
+    sort_index: usize,
+    kind: InputKind,
+}
+
+impl FileInputSource {
+    #[cfg(test)]
+    pub(crate) fn new(input: PathBuf, source: String) -> Result<Self> {
+        let input_display = input.display().to_string();
+        let mut jobs = if input.is_file() {
+            let metadata = std::fs::metadata(&input)
+                .with_context(|| format!("reading file metadata {}", input.display()))?;
+            expand_input_path(&input, metadata.len())?
+        } else if input.is_dir() {
+            collect_input_jobs(&input)?
+        } else {
+            return Err(anyhow::anyhow!(
+                "input path does not exist or is not readable: {}",
+                input_display
+            ));
+        };
+
+        jobs.sort_unstable_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then(left.sort_index.cmp(&right.sort_index))
+        });
+        Ok(Self::from_jobs(source, jobs))
+    }
+
+    pub(crate) async fn new_parallel(input: PathBuf, source: String) -> Result<Self> {
+        let input_display = input.display().to_string();
+        let mut jobs = if input.is_file() {
+            let metadata = std::fs::metadata(&input)
+                .with_context(|| format!("reading file metadata {}", input.display()))?;
+            expand_input_path(&input, metadata.len())?
+        } else if input.is_dir() {
+            collect_input_jobs_parallel(&input, default_scan_concurrency()).await?
+        } else {
+            return Err(anyhow::anyhow!(
+                "input path does not exist or is not readable: {}",
+                input_display
+            ));
+        };
+
+        jobs.sort_unstable_by(|left, right| {
+            right
+                .estimated_size
+                .cmp(&left.estimated_size)
+                .then(left.path.cmp(&right.path))
+                .then(left.sort_index.cmp(&right.sort_index))
+        });
+
+        Ok(Self::from_jobs(source, jobs))
+    }
+
+    fn from_jobs(source: String, jobs: Vec<InputJob>) -> Self {
+        Self {
+            source,
+            current_job_timestamp_ms: None,
+            jobs,
+            cursor: 0,
+        }
+    }
+
+    pub(crate) fn job_count(&self) -> usize {
+        self.jobs.len()
+    }
+
+    pub(crate) fn estimated_size_bytes(&self) -> u64 {
+        self.jobs.iter().map(|job| job.estimated_size).sum()
+    }
+
+    pub(crate) fn completion_key(&self) -> Result<String> {
+        let job = self
+            .jobs
+            .first()
+            .context("missing input job for completion key")?;
+        let metadata = std::fs::metadata(&job.path)
+            .with_context(|| format!("reading file metadata {}", job.path.display()))?;
+        let modified_ms = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_millis())
+            .unwrap_or(0);
+
+        Ok(format!(
+            "{:?}|{}|{}|{}",
+            job.display, job.estimated_size, modified_ms, job.sort_index
+        ))
+    }
+
+    pub(crate) fn into_job_sources(self) -> Vec<Self> {
+        let FileInputSource { source, jobs, .. } = self;
+
+        jobs.into_iter()
+            .map(|job| FileInputSource::from_jobs(source.clone(), vec![job]))
+            .collect()
+    }
+
+    async fn open_next(&mut self, max_line_length: usize) -> Result<LineReader> {
+        while self.cursor < self.jobs.len() {
+            let job = self
+                .jobs
+                .get(self.cursor)
+                .cloned()
+                .context("no more input files to open")?;
+
+            let display = job.display.clone();
+            self.current_job_timestamp_ms =
+                Some(file_timestamp_ms(&job.path).unwrap_or_else(|_| now_unix_millis()));
+            self.cursor += 1;
+
+            match job.open(max_line_length).await {
+                Ok(reader) => return Ok(reader),
+                Err(error) => {
+                    eprintln!("⚠️  Skipping unreadable file {}: {}", display, error);
+                }
+            }
+        }
+
+        self.current_job_timestamp_ms = None;
+        Ok(line_reader_from_async_read(
+            tokio::io::empty(),
+            max_line_length,
+        ))
+    }
+}
+
+#[collect_core::async_trait]
+impl LineSource for FileInputSource {
+    fn source_name(&self) -> &str {
+        &self.source
+    }
+
+    fn ingest_progress(&self) -> Option<IngestProgress> {
+        if self.cursor == 0 || self.cursor > self.jobs.len() {
+            return None;
+        }
+
+        let job = self.jobs.get(self.cursor - 1)?;
+        Some(IngestProgress {
+            current_input: job.display.clone(),
+            current_input_index: self.cursor,
+            input_total: self.jobs.len(),
+        })
+    }
+
+    fn timestamp_for_payload(&mut self, _payload: &str) -> Option<i64> {
+        self.current_job_timestamp_ms
+    }
+
+    async fn open(&mut self, max_line_length: usize) -> Result<LineReader> {
+        self.open_next(max_line_length).await
+    }
+
+    async fn on_stream_end(
+        &mut self,
+        _shutdown: &std::sync::atomic::AtomicBool,
+        max_line_length: usize,
+    ) -> Result<ReaderTransition> {
+        if self.cursor < self.jobs.len() {
+            Ok(ReaderTransition::Continue(
+                self.open_next(max_line_length).await?,
+            ))
+        } else {
+            Ok(ReaderTransition::Stop)
+        }
+    }
+
+    async fn on_stream_error(
+        &mut self,
+        error: &collect_core::LinesCodecError,
+        _shutdown: &std::sync::atomic::AtomicBool,
+        max_line_length: usize,
+    ) -> Result<ReaderTransition> {
+        if let Some(job) = self.jobs.get(self.cursor.saturating_sub(1)) {
+            eprintln!("⚠️  Skipping failed file {}: {}", job.display, error);
+        } else {
+            eprintln!("⚠️  Skipping failed input: {}", error);
+        }
+
+        Ok(ReaderTransition::Continue(
+            self.open_next(max_line_length).await?,
+        ))
+    }
+}
+
+impl InputJob {
+    fn plain(path: PathBuf, estimated_size: u64) -> Self {
+        let display = path.display().to_string();
+        Self {
+            path,
+            display,
+            estimated_size,
+            sort_index: 0,
+            kind: InputKind::Plain,
+        }
+    }
+
+    fn gzip(path: PathBuf, estimated_size: u64) -> Self {
+        let display = path.display().to_string();
+        Self {
+            path,
+            display,
+            estimated_size,
+            sort_index: 0,
+            kind: InputKind::Gzip,
+        }
+    }
+
+    fn bzip2(path: PathBuf, estimated_size: u64) -> Self {
+        let display = path.display().to_string();
+        Self {
+            path,
+            display,
+            estimated_size,
+            sort_index: 0,
+            kind: InputKind::Bzip2,
+        }
+    }
+
+    fn zip_entry(
+        path: PathBuf,
+        estimated_size: u64,
+        entry_index: usize,
+        entry_name: String,
+    ) -> Self {
+        let display = format!("{}::{}", path.display(), entry_name);
+        Self {
+            path,
+            display,
+            estimated_size,
+            sort_index: entry_index + 1,
+            kind: InputKind::ZipEntry {
+                entry_index,
+                entry_name,
+            },
+        }
+    }
+
+    async fn open(self, max_line_length: usize) -> Result<LineReader> {
+        let InputJob { path, kind, .. } = self;
+
+        match kind {
+            InputKind::Plain => open_plain_file_reader(path, max_line_length).await,
+            InputKind::Gzip => {
+                let file = tokio::fs::File::open(&path)
+                    .await
+                    .with_context(|| format!("open gzip file {}", path.display()))?;
+                let decoder = GzipDecoder::new(BufReader::new(file));
+                Ok(line_reader_from_async_read(decoder, max_line_length))
+            }
+            InputKind::Bzip2 => {
+                let file = tokio::fs::File::open(&path)
+                    .await
+                    .with_context(|| format!("open bzip2 file {}", path.display()))?;
+                let decoder = BzDecoder::new(BufReader::new(file));
+                Ok(line_reader_from_async_read(decoder, max_line_length))
+            }
+            InputKind::ZipEntry {
+                entry_index,
+                entry_name,
+            } => open_zip_entry_reader(path, entry_index, entry_name, max_line_length),
+        }
+    }
+}
+
+impl Ord for InputJob {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.path
+            .cmp(&other.path)
+            .then(self.sort_index.cmp(&other.sort_index))
+    }
+}
+
+impl PartialOrd for InputJob {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[cfg(test)]
+fn collect_input_jobs(root: &Path) -> Result<Vec<InputJob>> {
+    let mut jobs = Vec::new();
+
+    for entry in WalkDir::new(root) {
+        let entry = entry.context("walking input directory")?;
+        if entry.file_type().is_file() {
+            if is_hidden_file(entry.path()) {
+                continue;
+            }
+            let metadata = entry.metadata().context("reading file metadata")?;
+            match expand_input_path(entry.path(), metadata.len()) {
+                Ok(expanded) => jobs.extend(expanded),
+                Err(error) if should_skip_input_error(&error) => {
+                    eprintln!(
+                        "⚠️  Skipping unreadable file {}: {}",
+                        entry.path().display(),
+                        error
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    Ok(jobs)
+}
+
+async fn collect_input_jobs_parallel(root: &Path, concurrency: usize) -> Result<Vec<InputJob>> {
+    let mut paths = Vec::new();
+
+    for entry in WalkDir::new(root) {
+        let entry = entry.context("walking input directory")?;
+        if entry.file_type().is_file() {
+            if is_hidden_file(entry.path()) {
+                continue;
+            }
+            paths.push(entry.path().to_path_buf());
+        }
+    }
+
+    let mut jobs = Vec::new();
+    let mut stream = stream::iter(paths.into_iter())
+        .map(|path| async move {
+            let metadata = tokio::fs::metadata(&path)
+                .await
+                .with_context(|| format!("reading file metadata {}", path.display()))?;
+            expand_input_path(&path, metadata.len())
+        })
+        .buffer_unordered(concurrency.max(1));
+
+    while let Some(result) = stream.next().await {
+        match result {
+            Ok(expanded) => jobs.extend(expanded),
+            Err(error) if should_skip_input_error(&error) => {
+                eprintln!("⚠️  Skipping unreadable file: {}", error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(jobs)
+}
+
+fn expand_input_path(path: &Path, estimated_size: u64) -> Result<Vec<InputJob>> {
+    if is_hidden_file(path) {
+        return Ok(Vec::new());
+    }
+
+    match detect_input_format(path) {
+        Err(error) if should_skip_input_error(&error) => {
+            eprintln!("⚠️  Skipping unreadable file {}: {}", path.display(), error);
+            Ok(Vec::new())
+        }
+        Err(error) => Err(error),
+        Ok(InputFormat::Plain) => {
+            if is_tar_like_path(path) {
+                bail!("tar archives are not supported: {}", path.display());
+            }
+
+            Ok(vec![InputJob::plain(path.to_path_buf(), estimated_size)])
+        }
+        Ok(InputFormat::Gzip) => Ok(vec![InputJob::gzip(path.to_path_buf(), estimated_size)]),
+        Ok(InputFormat::Bzip2) => Ok(vec![InputJob::bzip2(path.to_path_buf(), estimated_size)]),
+        Ok(InputFormat::Zip) => match collect_zip_jobs(path) {
+            Ok(jobs) => Ok(jobs),
+            Err(error) if should_skip_input_error(&error) => {
+                eprintln!("⚠️  Skipping unreadable file {}: {}", path.display(), error);
+                Ok(Vec::new())
+            }
+            Err(error) => Err(error),
+        },
+    }
+}
+
+fn should_skip_input_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<io::Error>() || cause.is::<zip::result::ZipError>())
+}
+
+fn collect_zip_jobs(path: &Path) -> Result<Vec<InputJob>> {
+    let file =
+        StdFile::open(path).with_context(|| format!("open zip archive {}", path.display()))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .with_context(|| format!("read zip archive {}", path.display()))?;
+    let mut jobs = Vec::new();
+    let estimated_size = std::fs::metadata(path)
+        .with_context(|| format!("reading file metadata {}", path.display()))?
+        .len();
+
+    for entry_index in 0..archive.len() {
+        let entry = archive
+            .by_index(entry_index)
+            .with_context(|| format!("read zip entry {} in {}", entry_index, path.display()))?;
+        let entry_name = entry.name().to_string();
+        if entry_name.ends_with('/') {
+            continue;
+        }
+        if is_hidden_entry_name(&entry_name) {
+            continue;
+        }
+        jobs.push(InputJob::zip_entry(
+            path.to_path_buf(),
+            estimated_size,
+            entry_index,
+            entry_name,
+        ));
+    }
+
+    Ok(jobs)
+}
+
+fn default_scan_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(|count| count.get().saturating_mul(2))
+        .unwrap_or(8)
+        .clamp(4, 32)
+}
+
+fn file_timestamp_ms(path: &Path) -> Result<i64> {
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("reading file metadata {}", path.display()))?;
+    let modified = metadata
+        .modified()
+        .with_context(|| format!("reading modified time {}", path.display()))?;
+    let duration = modified
+        .duration_since(UNIX_EPOCH)
+        .context("file modified time predates unix epoch")?;
+
+    Ok(duration.as_millis() as i64)
+}
+
+fn now_unix_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| std::time::Duration::from_secs(0))
+        .as_millis() as i64
+}
+
+enum InputFormat {
+    Plain,
+    Gzip,
+    Bzip2,
+    Zip,
+}
+
+fn detect_input_format(path: &Path) -> Result<InputFormat> {
+    let prefix = file_prefix(path, 6)?;
+    if is_zip_magic(&prefix) {
+        return Ok(InputFormat::Zip);
+    }
+    if is_gzip_magic(&prefix) {
+        return Ok(InputFormat::Gzip);
+    }
+    if is_bzip2_magic(&prefix) {
+        return Ok(InputFormat::Bzip2);
+    }
+
+    match file_extension(path).as_deref() {
+        Some("zip") => Ok(InputFormat::Zip),
+        Some("gz") => Ok(InputFormat::Gzip),
+        Some("bz2") => Ok(InputFormat::Bzip2),
+        _ => Ok(InputFormat::Plain),
+    }
+}
+
+fn file_prefix(path: &Path, len: usize) -> Result<Vec<u8>> {
+    let mut file =
+        StdFile::open(path).with_context(|| format!("open input file {}", path.display()))?;
+    let mut buf = vec![0u8; len];
+    let read = file
+        .read(&mut buf)
+        .with_context(|| format!("read input file {}", path.display()))?;
+    buf.truncate(read);
+    Ok(buf)
+}
+
+fn file_extension(path: &Path) -> Option<String> {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+}
+
+fn is_tar_like_path(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+
+    let name = name.to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        n if n.ends_with(".tar")
+            || n.ends_with(".tar.gz")
+            || n.ends_with(".tgz")
+            || n.ends_with(".tar.bz2")
+            || n.ends_with(".tbz")
+            || n.ends_with(".tbz2")
+            || n.ends_with(".tar.xz")
+            || n.ends_with(".txz")
+            || n.ends_with(".tar.lzma")
+            || n.ends_with(".tar.zst")
+            || n.ends_with(".tzst")
+    )
+}
+
+fn is_zip_magic(prefix: &[u8]) -> bool {
+    prefix.starts_with(b"PK\x03\x04")
+        || prefix.starts_with(b"PK\x05\x06")
+        || prefix.starts_with(b"PK\x07\x08")
+}
+
+fn is_gzip_magic(prefix: &[u8]) -> bool {
+    prefix.starts_with(&[0x1f, 0x8b])
+}
+
+fn is_bzip2_magic(prefix: &[u8]) -> bool {
+    prefix.starts_with(b"BZh")
+}
+
+fn is_hidden_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .map(is_hidden_file_name)
+        .unwrap_or(false)
+}
+
+fn is_hidden_file_name(name: &str) -> bool {
+    matches!(name.as_bytes().first(), Some(b'.')) && name != "." && name != ".."
+}
+
+fn is_hidden_entry_name(entry_name: &str) -> bool {
+    Path::new(entry_name)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(is_hidden_file_name)
+        .unwrap_or(false)
+}
+
+fn open_zip_entry_reader(
+    path: PathBuf,
+    entry_index: usize,
+    entry_name: String,
+    max_line_length: usize,
+) -> Result<LineReader> {
+    let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(8);
+
+    let _ = tokio::task::spawn_blocking(move || {
+        let result: io::Result<()> = (|| {
+            let file = StdFile::open(&path)?;
+            let mut archive = zip::ZipArchive::new(file)
+                .map_err(|error| zip_error_to_io(&path, &entry_name, error))?;
+            let mut entry = archive
+                .by_index(entry_index)
+                .map_err(|error| zip_error_to_io(&path, &entry_name, error))?;
+            if entry.name().ends_with('/') {
+                return Ok(());
+            }
+
+            let mut buffer = vec![0u8; 16 * 1024];
+            loop {
+                let read = entry.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+
+                if tx
+                    .blocking_send(Ok(Bytes::copy_from_slice(&buffer[..read])))
+                    .is_err()
+                {
+                    return Ok(());
+                }
+            }
+
+            Ok(())
+        })();
+
+        if let Err(error) = result {
+            let _ = tx.blocking_send(Err(error));
+        }
+    });
+
+    let stream = ReceiverStream::new(rx);
+    let reader = StreamReader::new(stream);
+    Ok(line_reader_from_async_read(reader, max_line_length))
+}
+
+fn zip_error_to_io(path: &Path, entry_name: &str, error: zip::result::ZipError) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "failed reading zip entry {} in {}: {}",
+            entry_name,
+            path.display(),
+            error
+        ),
+    )
+}
+
+async fn open_plain_file_reader(path: PathBuf, max_line_length: usize) -> Result<LineReader> {
+    let file = tokio::fs::File::open(&path)
+        .await
+        .with_context(|| format!("open input file {}", path.display()))?;
+    let reader = BufReader::with_capacity(256 * 1024, file);
+    Ok(line_reader_from_async_read(reader, max_line_length))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use collect_core::{run_ingest, CommonOptions, IngestOptions};
+    use futures_util::StreamExt;
+    use std::fs::File as StdFile;
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
+    use tempfile::tempdir;
+    use tokio::io::AsyncWriteExt;
+    use walkdir::WalkDir;
+
+    #[tokio::test]
+    async fn reads_plain_gzip_bzip2_and_zip_entries_in_order() -> Result<()> {
+        let dir = tempdir()?;
+        let root = dir.path();
+
+        write_text_file(&root.join("a_plain.txt"), "plain-1\nplain-2\n")?;
+        write_gzip_file(&root.join("b_gzip.gz"), "gzip-1\n")
+            .await
+            .context("write gzip fixture")?;
+        write_bzip2_file(&root.join("c_bzip.bz2"), "bzip-1\n")
+            .await
+            .context("write bzip2 fixture")?;
+        write_zip_file(&root.join("d_archive.zip"))?;
+
+        let mut source = FileInputSource::new(root.to_path_buf(), "source".to_string())?;
+        let lines = collect_all_lines(&mut source, 1024).await?;
+
+        assert_eq!(
+            lines,
+            vec!["plain-1", "plain-2", "gzip-1", "bzip-1", "zip-1", "zip-2"]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn silently_ignores_hidden_input_file() -> Result<()> {
+        let dir = tempdir()?;
+        let hidden = dir.path().join(".hidden.txt");
+        write_text_file(&hidden, "hidden-1\nhidden-2\n")?;
+
+        let mut source = FileInputSource::new(hidden, "source".to_string())?;
+        let lines = collect_all_lines(&mut source, 1024).await?;
+
+        assert!(lines.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn silently_ignores_hidden_files_in_directories() -> Result<()> {
+        let dir = tempdir()?;
+        let root = dir.path();
+
+        write_text_file(&root.join(".hidden.txt"), "hidden-1\n")?;
+        write_text_file(&root.join("visible.txt"), "visible-1\n")?;
+
+        let mut source = FileInputSource::new(root.to_path_buf(), "source".to_string())?;
+        let lines = collect_all_lines(&mut source, 1024).await?;
+
+        assert_eq!(lines, vec!["visible-1"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn flushes_when_batch_bytes_are_small() -> Result<()> {
+        let dir = tempdir()?;
+        let input_path = dir.path().join("big.txt");
+        let out_dir = dir.path().join("out");
+        let health_file = dir.path().join("health");
+
+        let mut contents = String::new();
+        for i in 0..200 {
+            contents.push_str(&format!("line-{i:04} {}\n", "x".repeat(80)));
+        }
+        write_text_file(&input_path, &contents)?;
+
+        let mut source = FileInputSource::new(input_path, "source".to_string())?;
+        run_ingest(
+            &mut source,
+            IngestOptions {
+                common: CommonOptions {
+                    out_dir: out_dir.clone(),
+                    partition: collect_core::PartitionGranularity::Minute,
+                    max_rows: None,
+                    max_batch_bytes: 1024,
+                    compression_level: 5,
+                    upload_drain_timeout_seconds: 1,
+                    max_line_length: 1024,
+                    health_check: false,
+                },
+                s3: None,
+                s3_storage: None,
+                health_file,
+                manage_health: true,
+                report_progress: true,
+                log_writes: true,
+                shutdown: None,
+            },
+        )
+        .await?;
+
+        let parquet_files = WalkDir::new(&out_dir)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.file_type().is_file()
+                    && entry.path().extension().and_then(|ext| ext.to_str()) == Some("parquet")
+            })
+            .count();
+
+        assert!(
+            parquet_files > 1,
+            "expected multiple Parquet files, found {parquet_files}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn accepts_gzip_with_tar_like_name() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("archive.tar.gz");
+        write_gzip_file(&path, "gzip-1\n").await?;
+
+        let mut source = FileInputSource::new(path, "source".to_string())?;
+        let lines = collect_all_lines(&mut source, 1024).await?;
+
+        assert_eq!(lines, vec!["gzip-1"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn accepts_zip_with_tar_like_name() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("archive.tar.gz");
+        write_zip_file(&path)?;
+
+        let mut source = FileInputSource::new(path, "source".to_string())?;
+        let lines = collect_all_lines(&mut source, 1024).await?;
+
+        assert_eq!(lines, vec!["zip-1", "zip-2"]);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn skips_unreadable_files_in_directories() -> Result<()> {
+        let dir = tempdir()?;
+        let root = dir.path();
+
+        write_text_file(&root.join("a_readable.txt"), "good-1\n")?;
+        let unreadable = root.join("b_unreadable.txt");
+        write_text_file(&unreadable, "bad-1\n")?;
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0))?;
+
+        let mut source = FileInputSource::new(root.to_path_buf(), "source".to_string())?;
+        let lines = collect_all_lines(&mut source, 1024).await?;
+
+        assert_eq!(lines, vec!["good-1"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_plain_tar_like_paths() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("archive.tar");
+        write_text_file(&path, "not used\n").expect("write file");
+
+        let error = FileInputSource::new(path, "source".to_string())
+            .expect_err("tar files should be rejected");
+        assert!(error.to_string().contains("tar archives are not supported"));
+    }
+
+    #[test]
+    fn reports_current_input_progress() {
+        let source = FileInputSource {
+            source: "source".to_string(),
+            current_job_timestamp_ms: None,
+            jobs: vec![InputJob::plain(PathBuf::from("/tmp/input.txt"), 0)],
+            cursor: 1,
+        };
+
+        let progress = source
+            .ingest_progress()
+            .expect("expected progress snapshot");
+        assert_eq!(progress.current_input, "/tmp/input.txt");
+        assert_eq!(progress.current_input_index, 1);
+        assert_eq!(progress.input_total, 1);
+    }
+
+    #[test]
+    fn uses_file_timestamp_for_plain_payloads() {
+        let mut source = FileInputSource {
+            source: "source".to_string(),
+            current_job_timestamp_ms: Some(1_700_000_000_000),
+            jobs: vec![],
+            cursor: 0,
+        };
+
+        assert_eq!(
+            source.timestamp_for_payload("plain payload"),
+            Some(1_700_000_000_000)
+        );
+    }
+
+    #[tokio::test]
+    async fn skips_invalid_gzip_inputs_without_failing() -> Result<()> {
+        let dir = tempdir()?;
+        let input_path = dir.path().join("broken.gz");
+        write_text_file(&input_path, "this is not gzip\n")?;
+
+        let mut source = FileInputSource::new(input_path, "broken".to_string())?;
+        let lines = collect_all_lines(&mut source, 1024).await?;
+
+        assert!(lines.is_empty());
+        Ok(())
+    }
+
+    async fn collect_all_lines(
+        source: &mut FileInputSource,
+        max_line_length: usize,
+    ) -> Result<Vec<String>> {
+        let shutdown = AtomicBool::new(false);
+        let mut reader = source.open(max_line_length).await?;
+        let mut lines = Vec::new();
+
+        loop {
+            match reader.next().await {
+                Some(Ok(line)) => lines.push(line),
+                Some(Err(error)) => match source
+                    .on_stream_error(&error, &shutdown, max_line_length)
+                    .await?
+                {
+                    ReaderTransition::Continue(next_reader) => {
+                        reader = next_reader;
+                    }
+                    ReaderTransition::Stop => return Err(error.into()),
+                },
+                None => match source.on_stream_end(&shutdown, max_line_length).await? {
+                    ReaderTransition::Continue(next_reader) => {
+                        reader = next_reader;
+                    }
+                    ReaderTransition::Stop => break,
+                },
+            }
+        }
+
+        Ok(lines)
+    }
+
+    fn write_text_file(path: &Path, contents: &str) -> Result<()> {
+        let mut file = StdFile::create(path)
+            .with_context(|| format!("create plain fixture {}", path.display()))?;
+        file.write_all(contents.as_bytes())
+            .with_context(|| format!("write plain fixture {}", path.display()))?;
+        Ok(())
+    }
+
+    async fn write_gzip_file(path: &Path, contents: &str) -> Result<()> {
+        let file = tokio::fs::File::create(path)
+            .await
+            .with_context(|| format!("create gzip fixture {}", path.display()))?;
+        let mut encoder = async_compression::tokio::write::GzipEncoder::new(file);
+        encoder
+            .write_all(contents.as_bytes())
+            .await
+            .with_context(|| format!("write gzip fixture {}", path.display()))?;
+        encoder
+            .shutdown()
+            .await
+            .with_context(|| format!("finish gzip fixture {}", path.display()))?;
+        Ok(())
+    }
+
+    async fn write_bzip2_file(path: &Path, contents: &str) -> Result<()> {
+        let file = tokio::fs::File::create(path)
+            .await
+            .with_context(|| format!("create bzip2 fixture {}", path.display()))?;
+        let mut encoder = async_compression::tokio::write::BzEncoder::new(file);
+        encoder
+            .write_all(contents.as_bytes())
+            .await
+            .with_context(|| format!("write bzip2 fixture {}", path.display()))?;
+        encoder
+            .shutdown()
+            .await
+            .with_context(|| format!("finish bzip2 fixture {}", path.display()))?;
+        Ok(())
+    }
+
+    fn write_zip_file(path: &Path) -> Result<()> {
+        let file = StdFile::create(path)
+            .with_context(|| format!("create zip fixture {}", path.display()))?;
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+
+        zip.start_file("first.txt", options)
+            .with_context(|| format!("start zip entry in {}", path.display()))?;
+        zip.write_all(b"zip-1\n")
+            .with_context(|| format!("write zip entry in {}", path.display()))?;
+
+        zip.start_file("nested/second.txt", options)
+            .with_context(|| format!("start zip entry in {}", path.display()))?;
+        zip.write_all(b"zip-2\n")
+            .with_context(|| format!("write zip entry in {}", path.display()))?;
+
+        zip.finish()
+            .with_context(|| format!("finish zip fixture {}", path.display()))?;
+        Ok(())
+    }
+}

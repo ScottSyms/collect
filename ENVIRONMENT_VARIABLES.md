@@ -1,14 +1,14 @@
 # Environment Variable Configuration
 
-All command-line parameters can be configured using environment variables, making Docker deployments much easier to manage. This document lists all available environment variables and their usage.
+Most `collect-file` and `collect-socket` command-line parameters can be configured using environment variables, making Docker deployments much easier to manage. `collect-maint` remains CLI-only. This document lists the supported environment variables and their usage.
 
 ## Environment Variable Reference
 
 ### Input Source Configuration (Choose One)
 
 #### File Input
-- `INPUT_FILE`: Path to input text file (one record per line)
-  - Example: `INPUT_FILE=/input/data.txt`
+- `INPUT_PATH` / `INPUT_FILE`: Path to input file or directory
+  - Example: `INPUT_PATH=/input/data.txt`
   - Conflicts with TCP options
 
 #### TCP Input  
@@ -28,13 +28,33 @@ All command-line parameters can be configured using environment variables, makin
   - Example: `SOURCE=ais-sf-bay`
   - Default: input file stem or "tcp" for network input
 
+- `PARTITION`: Partition granularity for the dataset layout
+  - Example: `PARTITION=hour`
+  - Default: `minute`
+
+- `AIS`: Use NMEA `c:<epoch>` tag blocks or `$PGHP` capture timestamps when present; grouped `\g:` fragments reuse the first sentence timestamp for the whole AIS message, otherwise fall back to ingest time. File ingestion only.
+  - Example: `AIS=true`
+  - Default: `false`
+
 - `OUT_DIR`: Output root directory for Parquet files
   - Example: `OUT_DIR=/data`
   - Default: `data`
 
 - `MAX_ROWS`: Maximum rows to buffer per Parquet file before flush
   - Example: `MAX_ROWS=10000`
-  - Default: flush on minute boundary only
+  - Default: flush on the selected partition boundary only
+
+- `MAX_BATCH_BYTES`: Maximum payload bytes to buffer per Parquet file before flush
+  - Example: `MAX_BATCH_BYTES=67108864`
+  - Default: `67108864` (64 MiB)
+
+- `COMPRESSION_LEVEL`: Zstd compression level for Parquet output
+  - Example: `COMPRESSION_LEVEL=1`
+  - Default: `5`
+
+- `MAX_LINE_LENGTH`: Maximum bytes allowed per input line
+  - Example: `MAX_LINE_LENGTH=65536`
+  - Default: `65536`
 
 - `MAX_PAYLOAD_BYTES`: Maximum payload bytes to buffer per Parquet file before flush
   - Example: `MAX_PAYLOAD_BYTES=268435456`
@@ -44,7 +64,7 @@ All command-line parameters can be configured using environment variables, makin
   - Example: `HEALTH_CHECK=true`
   - Default: `false`
 
-- `KEEP_LOCAL`: Keep local files after S3 upload
+- `KEEP_LOCAL`: Keep local files after successful S3 upload
   - Example: `KEEP_LOCAL=true`
   - Default: `false` (delete after successful upload)
 
@@ -82,7 +102,7 @@ version: '3.8'
 
 services:
   data-ingest:
-    image: hive-parquet-ingest:latest
+    image: collect:latest
     environment:
       - TCP_HOST=153.44.253.27
       - TCP_PORT=5631
@@ -103,7 +123,7 @@ version: '3.8'
 
 services:
   data-ingest:
-    image: hive-parquet-ingest:latest
+    image: collect:latest
     environment:
       - TCP_HOST=153.44.253.27
       - TCP_PORT=5631
@@ -121,9 +141,9 @@ version: '3.8'
 
 services:
   data-ingest:
-    image: hive-parquet-ingest:latest
+    image: collect:latest
     environment:
-      - INPUT_FILE=/input/data.txt
+      - INPUT_PATH=/input/data.txt
       - SOURCE=batch-data
       - S3_BUCKET=data-lake
       - S3_ENDPOINT=http://minio:9000
@@ -151,7 +171,7 @@ This allows for flexible configuration where you can:
 The application gracefully handles missing environment variables:
 
 - **Optional parameters** (like `S3_BUCKET`): Missing environment variables are treated as unset/empty
-- **Parameters with defaults** (like `S3_REGION`, `OUT_DIR`): Use their default values when environment variable is missing
+- **Parameters with defaults** (like `S3_REGION`, `OUT_DIR`, `PARTITION`): Use their default values when environment variable is missing
 - **Boolean parameters** (like `HEALTH_CHECK`, `KEEP_LOCAL`): Default to `false` when environment variable is missing
 ## Docker Health Checks
 
@@ -159,21 +179,26 @@ The application supports Docker health checks via the `HEALTH_CHECK` environment
 
 ```dockerfile
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=10s \
-  CMD ["/usr/local/bin/hive_parquet_ingest", "--health-check"]
+  CMD ["/usr/local/bin/collect-socket", "--health-check"]
 ```
 
 Or using environment variables:
 
 ```yaml
-healthcheck:
-  test: ["CMD", "/usr/local/bin/hive_parquet_ingest"]
-  environment:
-    - HEALTH_CHECK=true
-  interval: 30s
-  timeout: 10s
-  retries: 3
-  start_period: 10s
+services:
+  data-ingest:
+    image: collect:latest
+    environment:
+      - HEALTH_CHECK=true
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/collect-socket"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
 ```
+
+The healthcheck command inherits the service environment, so `HEALTH_CHECK=true` is visible there. Swap `collect-socket` for `collect-file` if the container runs file ingestion.
 
 ## Best Practices
 

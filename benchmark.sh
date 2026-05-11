@@ -1,4 +1,5 @@
 #!/bin/bash
+# Legacy helper for the pre-workspace single-binary layout.
 # Performance benchmark suite for hive_parquet_ingest
 
 echo "Performance Benchmark Suite"

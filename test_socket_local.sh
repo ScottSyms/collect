@@ -6,7 +6,7 @@ DATA_DIR="${SCRIPT_DIR}/data"
 DURATION_SECONDS=60
 
 echo "Building release binary..."
-cargo build --release
+cargo build --release -p collect-socket
 
 if [[ -z "$DATA_DIR" || "$DATA_DIR" == "/" ]]; then
   echo "Refusing to clean invalid data directory: '$DATA_DIR'"
@@ -18,7 +18,7 @@ rm -rf "$DATA_DIR"
 mkdir -p "$DATA_DIR"
 
 echo "Starting capture for ${DURATION_SECONDS}s..."
-cargo run --release -- \
+cargo run --release -p collect-socket -- \
   --tcp-host 153.44.253.27 \
   --tcp-port 5631 \
   --source test-socket-local \

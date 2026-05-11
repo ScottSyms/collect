@@ -1,4 +1,5 @@
 #!/bin/bash
+# Legacy helper for the pre-workspace single-binary layout.
 # Memory growth tracker with CSV output
 
 if [ -z "$1" ]; then

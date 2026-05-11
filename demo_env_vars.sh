@@ -1,4 +1,5 @@
 #!/bin/bash
+# Legacy helper for the pre-workspace single-binary layout.
 # Example script demonstrating graceful environment variable handling
 
 echo "Demonstrating graceful environment variable handling"
