@@ -253,6 +253,8 @@ cargo build --release --workspace
 
 ## Performance Tuning
 
+- **MAX_ROWS**: Control memory usage vs file size (default: flush on minute boundary)
+- **MAX_PAYLOAD_BYTES**: Flush before buffered string data grows too large for Arrow offsets (default: `268435456`)
 - **MAX_ROWS**: Cap rows per file when you want smaller Parquet chunks
 - **MAX_BATCH_BYTES**: Cap buffered payload size per Parquet file (default: 64 MiB)
 - **Compression**: Uses Zstd for optimal compression ratio and speed

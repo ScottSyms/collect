@@ -64,6 +64,10 @@ struct Args {
     #[arg(long)]
     max_rows: Option<usize>,
 
+    /// Max payload bytes to buffer per Parquet file before flush
+    #[arg(long, default_value_t = DEFAULT_MAX_PAYLOAD_BYTES)]
+    max_payload_bytes: usize,
+
     /// Seconds to wait for background uploads on shutdown
     #[arg(long, default_value_t = 60)]
     upload_drain_timeout_seconds: u64,
@@ -267,10 +271,13 @@ struct BatchBuf {
     schema: std::sync::Arc<Schema>,
     row_capacity: usize,
     byte_capacity: usize,
+    max_payload_bytes: usize,
+    payload_bytes: usize,
 }
 
 const HEALTH_FILE: &str = "/tmp/app_health";
 const HEALTH_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
+const DEFAULT_MAX_PAYLOAD_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_UPLOAD_QUEUE_CAPACITY: usize = 128;
 const DEFAULT_UPLOAD_CONCURRENCY: usize = 4;
 const DEFAULT_UPLOAD_RETRIES: usize = 3;
@@ -326,9 +333,9 @@ impl InputMode {
 }
 
 impl BatchBuf {
-    fn new(max_rows: Option<usize>) -> Self {
+    fn new(max_rows: Option<usize>, max_payload_bytes: usize) -> Self {
         let row_capacity = max_rows.unwrap_or(4096);
-        let byte_capacity = row_capacity.saturating_mul(128);
+        let byte_capacity = row_capacity.saturating_mul(128).min(max_payload_bytes);
         let fields = vec![
             Field::new(
                 "ts",
@@ -343,12 +350,15 @@ impl BatchBuf {
             schema: std::sync::Arc::new(Schema::new(fields)),
             row_capacity,
             byte_capacity,
+            max_payload_bytes,
+            payload_bytes: 0,
         }
     }
 
     fn push(&mut self, ts_ms: i64, payload: &str) {
         self.ts.append_value(ts_ms);
         self.payload.append_value(payload);
+        self.payload_bytes = self.payload_bytes.saturating_add(payload.len());
     }
 
     fn len(&self) -> usize {
@@ -357,6 +367,15 @@ impl BatchBuf {
 
     fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    fn should_flush_before_push(&self, next_payload_len: usize) -> bool {
+        !self.is_empty()
+            && self.payload_bytes.saturating_add(next_payload_len) > self.max_payload_bytes
+    }
+
+    fn payload_bytes(&self) -> usize {
+        self.payload_bytes
     }
 
     fn to_record_batch(&mut self) -> Result<RecordBatch> {
@@ -368,6 +387,7 @@ impl BatchBuf {
 
         self.ts = TimestampMillisecondBuilder::with_capacity(self.row_capacity);
         self.payload = StringBuilder::with_capacity(self.row_capacity, self.byte_capacity);
+        self.payload_bytes = 0;
 
         let ts = std::sync::Arc::new(ts_array) as std::sync::Arc<dyn arrow::array::Array>;
         let payload = std::sync::Arc::new(payload_array) as std::sync::Arc<dyn arrow::array::Array>;
@@ -666,6 +686,14 @@ async fn main() -> Result<()> {
         }
     }
 
+    if args.max_payload_bytes == DEFAULT_MAX_PAYLOAD_BYTES {
+        if let Ok(max_payload_bytes_env) = std::env::var("MAX_PAYLOAD_BYTES") {
+            if let Ok(parsed) = max_payload_bytes_env.parse::<usize>() {
+                args.max_payload_bytes = parsed;
+            }
+        }
+    }
+
     if args.upload_drain_timeout_seconds == 60 {
         if let Ok(timeout_env) = std::env::var("UPLOAD_DRAIN_TIMEOUT_SECONDS") {
             if let Ok(parsed) = timeout_env.parse::<u64>() {
@@ -766,6 +794,7 @@ async fn main() -> Result<()> {
     } else {
         println!("   Max Rows Per File: unlimited (flush on minute boundary)");
     }
+    println!("   Max Payload Per File: {} bytes", args.max_payload_bytes);
     println!("   Max Line Length: {} bytes", args.max_line_length);
     println!(
         "   Upload Drain Timeout: {}s",
@@ -853,7 +882,7 @@ async fn main() -> Result<()> {
     let now = now_unix_duration();
     let mut current_minute_id = now.as_secs() / 60;
     let mut current_key = PartKey::from_minute(&source, current_minute_id);
-    let mut buf = BatchBuf::new(args.max_rows);
+    let mut buf = BatchBuf::new(args.max_rows, args.max_payload_bytes);
     let mut rows_in_file = 0usize;
 
     let (upload_tx, upload_worker) = spawn_upload_worker(s3_storage.clone());
@@ -891,8 +920,19 @@ async fn main() -> Result<()> {
                             current_key = PartKey::from_minute(&source, current_minute_id);
                         }
 
+                        if buf.should_flush_before_push(payload.len()) {
+                            flush_batch(&args.out_dir, &current_key, &mut buf, upload_tx.as_ref()).await?;
+                            rows_in_file = 0;
+                        }
+
                         buf.push(now_ms, &payload);
                         rows_in_file += 1;
+
+                        if buf.payload_bytes() >= args.max_payload_bytes {
+                            flush_batch(&args.out_dir, &current_key, &mut buf, upload_tx.as_ref()).await?;
+                            rows_in_file = 0;
+                            continue;
+                        }
 
                         if let Some(max_rows) = args.max_rows {
                             if rows_in_file >= max_rows {

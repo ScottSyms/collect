@@ -56,6 +56,10 @@ Most `collect-file` and `collect-socket` command-line parameters can be configur
   - Example: `MAX_LINE_LENGTH=65536`
   - Default: `65536`
 
+- `MAX_PAYLOAD_BYTES`: Maximum payload bytes to buffer per Parquet file before flush
+  - Example: `MAX_PAYLOAD_BYTES=268435456`
+  - Default: `268435456`
+
 - `HEALTH_CHECK`: Run health check and exit (for Docker HEALTHCHECK)
   - Example: `HEALTH_CHECK=true`
   - Default: `false`
