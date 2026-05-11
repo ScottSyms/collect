@@ -1105,11 +1105,14 @@ dependencies = [
  "collect-core",
  "collect-tui",
  "futures-util",
+ "parquet",
  "rdkafka",
  "serde",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tokio-util",
+ "walkdir",
 ]
 
 [[package]]
