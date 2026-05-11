@@ -1,0 +1,19 @@
+[package]
+name = "collect-kafka"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+tokio.workspace = true
+futures-util.workspace = true
+tokio-util.workspace = true
+
+collect-core = { path = "../collect-core" }
+collect-tui = { path = "../collect-tui" }
+
+rdkafka = { version = "0.36", features = ["tokio"] }
+bytes = "1"
+tokio-stream = { version = "0.1", features = ["sync"] }
