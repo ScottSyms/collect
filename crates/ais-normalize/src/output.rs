@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
-use arrow::array::{StringBuilder, TimestampMillisecondBuilder};
+use arrow::array::{StringBuilder, TimestampMillisecondArray, TimestampMillisecondBuilder};
+use arrow::compute::{sort_to_indices, take, SortOptions};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use chrono::Utc;
@@ -14,6 +15,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+const FLUSH_BATCH_SIZE: usize = 65_536;
 
 fn parquet_file_name() -> String {
     let now = Utc::now();
@@ -43,6 +46,27 @@ fn build_schema() -> Arc<Schema> {
     ]))
 }
 
+fn sort_record_batch_by_ts(batch: &RecordBatch) -> Result<RecordBatch> {
+    let ts_column = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<TimestampMillisecondArray>()
+        .ok_or_else(|| anyhow::anyhow!("missing ts column for sorting"))?;
+
+    let sort_options = SortOptions {
+        descending: false,
+        nulls_first: false,
+    };
+    let indices = sort_to_indices(ts_column, Some(sort_options), None)
+        .context("sort indices")?;
+
+    let sorted_columns: Vec<_> = (0..batch.num_columns())
+        .map(|i| take(batch.column(i), &indices, None).context("reorder column"))
+        .collect::<Result<Vec<_>>>()?;
+
+    RecordBatch::try_new(batch.schema(), sorted_columns).context("build sorted batch")
+}
+
 fn open_writer(path: &Path, schema: &Arc<Schema>, compression_level: i32) -> Result<ArrowWriter<File>> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("mkdir -p {}", parent.display()))?;
@@ -66,7 +90,8 @@ struct PartitionWriter {
     schema: Arc<Schema>,
     ts: TimestampMillisecondBuilder,
     payload: StringBuilder,
-    rows: u64,
+    total_rows: u64,
+    batch_rows: usize,
 }
 
 impl PartitionWriter {
@@ -90,18 +115,24 @@ impl PartitionWriter {
             schema: schema.clone(),
             ts: TimestampMillisecondBuilder::with_capacity(4096),
             payload: StringBuilder::with_capacity(4096, 4096 * 64),
-            rows: 0,
+            total_rows: 0,
+            batch_rows: 0,
         })
     }
 
-    fn push(&mut self, ts_ms: i64, payload: &str) {
+    fn push(&mut self, ts_ms: i64, payload: &str) -> Result<()> {
         self.ts.append_value(ts_ms);
         self.payload.append_value(payload);
-        self.rows += 1;
+        self.total_rows += 1;
+        self.batch_rows += 1;
+        if self.batch_rows >= FLUSH_BATCH_SIZE {
+            self.flush_batch()?;
+        }
+        Ok(())
     }
 
     fn flush_batch(&mut self) -> Result<()> {
-        if self.rows == 0 {
+        if self.batch_rows == 0 {
             return Ok(());
         }
         let ts_array = self.ts.finish().with_timezone_opt(Some(Arc::from("UTC")));
@@ -115,19 +146,20 @@ impl PartitionWriter {
         )
         .context("building RecordBatch")?;
         self.writer.write(&batch).context("writing Parquet batch")?;
+        self.batch_rows = 0;
         Ok(())
     }
 
     fn close(mut self) -> Result<u64> {
         self.flush_batch()?;
         self.writer.close().context("closing Parquet writer")?;
-        if self.rows > 0 {
+        if self.total_rows > 0 {
             fs::rename(&self.temp_path, &self.final_path)
                 .with_context(|| format!("rename {} -> {}", self.temp_path.display(), self.final_path.display()))?;
         } else {
             let _ = fs::remove_file(&self.temp_path);
         }
-        Ok(self.rows)
+        Ok(self.total_rows)
     }
 }
 
@@ -177,7 +209,7 @@ impl OutputWriterPool {
             .expect("failed to create partition writer")
         });
 
-        writer.push(ts_ms, payload);
+        writer.push(ts_ms, payload)?;
         self.total_rows_written += 1;
         Ok(())
     }

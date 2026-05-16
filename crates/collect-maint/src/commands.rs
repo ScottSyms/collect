@@ -6,7 +6,7 @@ use crate::status;
 use crate::storage::{DatasetEntry, StorageLocation};
 use anyhow::{bail, Context, Result};
 use arrow::array::{Array, StringArray, TimestampMillisecondArray};
-use arrow::compute::kernels::aggregate;
+use arrow::compute::{concat_batches, kernels::aggregate, sort_to_indices, take, SortOptions};
 use arrow::datatypes::{DataType, TimeUnit, TimestampMillisecondType};
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Utc};
@@ -1016,25 +1016,7 @@ fn write_compacted_output(
         .timestamp_bounds_ms()
         .with_context(|| format!("invalid partition {}", expected_partition.relative_dir()))?;
 
-    let zstd_level =
-        ZstdLevel::try_new(compression_level).context("invalid Zstd compression level")?;
-    let props = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(zstd_level))
-        .set_write_batch_size(COMPACT_RECORD_BATCH_ROWS)
-        .set_column_encoding(ColumnPath::from("ts"), Encoding::DELTA_BINARY_PACKED)
-        .set_column_encoding(
-            ColumnPath::from("payload"),
-            Encoding::DELTA_LENGTH_BYTE_ARRAY,
-        )
-        .set_column_dictionary_enabled(ColumnPath::from("ts"), false)
-        .set_column_dictionary_enabled(ColumnPath::from("payload"), false)
-        .build();
-
-    let mut output_file = Some(
-        StdFile::create(output_path)
-            .with_context(|| format!("create {}", output_path.display()))?,
-    );
-    let mut writer: Option<ArrowWriter<StdFile>> = None;
+    let mut all_batches: Vec<RecordBatch> = Vec::new();
     let mut scan = FileScan::empty();
 
     let total_inputs = input_paths.len();
@@ -1044,7 +1026,7 @@ fn write_compacted_output(
             report(
                 "compact",
                 format!(
-                    "rewriting parquet input {} / {}: {}",
+                    "reading parquet input {} / {}: {}",
                     count(index + 1),
                     count(total_inputs),
                     input_path.display()
@@ -1067,28 +1049,69 @@ fn write_compacted_output(
                 Some(expected_partition),
                 Some(expected_bounds),
             );
-            if writer.is_none() {
-                let schema = batch.schema();
-                let file = output_file
-                    .take()
-                    .ok_or_else(|| anyhow::anyhow!("missing compacted output file handle"))?;
-                writer = Some(
-                    ArrowWriter::try_new(file, schema, Some(props.clone()))
-                        .context("create compacted parquet writer")?,
-                );
-            }
-
-            if let Some(writer) = writer.as_mut() {
-                writer.write(&batch).context("write compacted batch")?;
-            }
+            all_batches.push(batch);
         }
     }
 
-    let Some(writer) = writer else {
-        drop(output_file);
-        let _ = std::fs::remove_file(output_path);
+    if all_batches.is_empty() {
         bail!("no batches read while compacting {}", output_path.display());
+    }
+
+    let schema = all_batches[0].schema();
+    let combined = concat_batches(&schema, &all_batches)
+        .context("concatenate record batches")?;
+
+    let ts_column = combined
+        .column(0)
+        .as_any()
+        .downcast_ref::<TimestampMillisecondArray>()
+        .ok_or_else(|| anyhow::anyhow!("missing ts column for sorting"))?;
+
+    let sort_options = SortOptions {
+        descending: false,
+        nulls_first: false,
     };
+    let indices =
+        sort_to_indices(ts_column, Some(sort_options), None).context("sort indices")?;
+
+    let sorted_columns: Vec<_> = (0..combined.num_columns())
+        .map(|i| {
+            take(combined.column(i), &indices, None)
+                .with_context(|| format!("reorder column {}", i))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let sorted_batch =
+        RecordBatch::try_new(schema.clone(), sorted_columns).context("build sorted batch")?;
+
+    let zstd_level =
+        ZstdLevel::try_new(compression_level).context("invalid Zstd compression level")?;
+    let props = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(zstd_level))
+        .set_write_batch_size(COMPACT_RECORD_BATCH_ROWS)
+        .set_column_encoding(ColumnPath::from("ts"), Encoding::DELTA_BINARY_PACKED)
+        .set_column_encoding(
+            ColumnPath::from("payload"),
+            Encoding::DELTA_LENGTH_BYTE_ARRAY,
+        )
+        .set_column_dictionary_enabled(ColumnPath::from("ts"), false)
+        .set_column_dictionary_enabled(ColumnPath::from("payload"), false)
+        .build();
+
+    let output_file = StdFile::create(output_path)
+        .with_context(|| format!("create {}", output_path.display()))?;
+    let mut writer = ArrowWriter::try_new(output_file, schema, Some(props))
+        .context("create compacted parquet writer")?;
+
+    let total_rows = sorted_batch.num_rows();
+    let mut offset = 0;
+    while offset < total_rows {
+        let end = (offset + COMPACT_RECORD_BATCH_ROWS).min(total_rows);
+        let chunk = sorted_batch.slice(offset, end - offset);
+        writer.write(&chunk).context("write compacted batch")?;
+        offset = end;
+    }
+
     writer.close().context("close compacted parquet writer")?;
 
     Ok(scan)

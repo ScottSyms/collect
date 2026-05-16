@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
-use arrow::array::{ArrayBuilder, StringBuilder, TimestampMillisecondBuilder};
+use arrow::array::{ArrayBuilder, StringBuilder, TimestampMillisecondArray, TimestampMillisecondBuilder};
+use arrow::compute::{sort_to_indices, take, SortOptions};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use aws_config::Region;
@@ -1083,6 +1084,27 @@ impl BatchBuf {
     }
 }
 
+fn sort_record_batch_by_ts(batch: &RecordBatch) -> Result<RecordBatch> {
+    let ts_column = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<TimestampMillisecondArray>()
+        .ok_or_else(|| anyhow::anyhow!("missing ts column for sorting"))?;
+
+    let sort_options = SortOptions {
+        descending: false,
+        nulls_first: false,
+    };
+    let indices = sort_to_indices(ts_column, Some(sort_options), None)
+        .context("sort indices")?;
+
+    let sorted_columns: Vec<_> = (0..batch.num_columns())
+        .map(|i| take(batch.column(i), &indices, None).context("reorder column"))
+        .collect::<Result<Vec<_>>>()?;
+
+    RecordBatch::try_new(batch.schema(), sorted_columns).context("build sorted batch")
+}
+
 fn open_writer(
     path: &Path,
     schema: &Arc<Schema>,
@@ -1358,6 +1380,7 @@ async fn flush_batch(
     let filename = parquet_file_name();
     let path = dir.join(&filename);
     let batch = buf.to_record_batch()?;
+    let batch = sort_record_batch_by_ts(&batch)?;
     let s3_key = key.s3_key(&filename);
     let Some(write_tx) = write_tx else {
         return Err(anyhow::anyhow!("missing write queue"));
