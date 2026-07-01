@@ -30,6 +30,7 @@ RUN useradd -m -u 1000 appuser
 COPY --from=builder /usr/src/app/target/release/collect-file /usr/local/bin/collect-file
 COPY --from=builder /usr/src/app/target/release/collect-socket /usr/local/bin/collect-socket
 COPY --from=builder /usr/src/app/target/release/collect-maint /usr/local/bin/collect-maint
+COPY --from=builder /usr/src/app/target/release/collect-aisstream /usr/local/bin/collect-aisstream
 
 # Create data directory
 RUN mkdir -p /data && chown appuser:appuser /data
