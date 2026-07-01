@@ -13,3 +13,6 @@ devenv.local.yaml
 
 # pre-commit
 .pre-commit-config.yaml
+
+# Nomad prod config (contains credentials)
+/nomad/nomad-collect-prod
