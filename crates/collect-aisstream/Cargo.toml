@@ -1,0 +1,16 @@
+[package]
+name = "collect-aisstream"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+
+collect-core = { path = "../collect-core" }
+collect-tui = { path = "../collect-tui" }
