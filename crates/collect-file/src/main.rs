@@ -175,6 +175,17 @@ async fn run_file_ingest(
         };
         (None, s3_storage)
     };
+    let mut common = common;
+    let parallel = sources.len() > 1;
+    if parallel {
+        // Each parallel source runs its own ingest pipeline: scale the batch
+        // buffer down by worker count (floor 4 MiB) and use one write worker
+        // per source, so total memory and task counts stay near the
+        // single-source configuration instead of multiplying by workers.
+        common.max_batch_bytes = (common.max_batch_bytes / worker_limit)
+            .max(4 * 1024 * 1024)
+            .min(common.max_batch_bytes);
+    }
     let options = IngestOptions {
         common,
         s3: s3_options,
@@ -184,13 +195,25 @@ async fn run_file_ingest(
         report_progress: false,
         log_writes: false,
         shutdown: Some(stop.clone()),
+        write_workers: if parallel { Some(1) } else { None },
+        // The parallel path sweeps once below; per-worker sweeps would race
+        // over the same out_dir.
+        sweep_orphans: false,
     };
+    if parallel {
+        if let Some(storage) = options.s3_storage.clone().filter(|s| !s.keeps_local()) {
+            let out_dir = options.common.out_dir.clone();
+            tokio::spawn(async move {
+                match collect_core::sweep_orphaned_uploads(out_dir, storage).await {
+                    Ok(0) => {}
+                    Ok(count) => eprintln!("♻️  Uploaded {} orphaned parquet file(s) from a previous run", count),
+                    Err(error) => eprintln!("⚠️  Orphan upload sweep failed: {}", error),
+                }
+            });
+        }
+    }
     if sources.len() == 1 {
         if status_mode.is_plain() {
-            eprintln!(
-                "🧵 Starting parallel ingest with {} worker(s)",
-                worker_limit
-            );
             eprintln!("▶️  Starting single-worker ingest");
         }
         let mut source = sources.pop().expect("single source");
@@ -219,6 +242,8 @@ async fn run_file_ingest(
                 report_progress: false,
                 log_writes: false,
                 shutdown: Some(stop.clone()),
+                write_workers: None,
+                sweep_orphans: true,
             },
         )
         .await;
@@ -265,7 +290,7 @@ async fn run_parallel_file_ingest(
     worker_limit: usize,
     manifest_path: PathBuf,
     status_mode: status::StatusMode,
-    _stop: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
 ) -> Result<()> {
     let running = Arc::new(AtomicBool::new(true));
     update_health_status_async(&health_file, true).await?;
@@ -287,7 +312,6 @@ async fn run_parallel_file_ingest(
         }
     });
 
-    let stop = Arc::new(AtomicBool::new(false));
     let status_task = if status_mode.is_tui() {
         Some(status::spawn_status_tui(
             total_files,
@@ -345,12 +369,10 @@ async fn run_parallel_file_ingest(
     let mut workers = Vec::with_capacity(worker_limit);
     for _ in 0..worker_limit {
         let queue = queue.clone();
-        let stop = _stop.clone();
+        let stop = stop.clone();
         let completed_files = completed_files.clone();
         let manifest_path = manifest_path.clone();
         let worker_options = options.clone();
-        let status_mode = status_mode;
-        let started_at = started_at;
         workers.push(tokio::spawn(async move {
             loop {
                 if stop.load(Ordering::SeqCst) || status::is_cancelled() {
@@ -439,13 +461,16 @@ fn default_worker_limit(total_files: usize, total_bytes: u64) -> usize {
         total_bytes / total_files as u64
     };
 
+    // Ingest is compression-bound (zstd on write, gzip/bzip2 on read), so
+    // oversubscribing cores mostly thrashes. Small files get modest
+    // oversubscription to hide per-file open/close latency.
     let worker_count = if avg_file_size < 16 * 1024 * 1024 {
-        cores.saturating_mul(4)
-    } else if avg_file_size < 128 * 1024 * 1024 {
-        cores.saturating_mul(3)
-    } else {
         cores.saturating_mul(2)
+    } else if avg_file_size < 128 * 1024 * 1024 {
+        cores.saturating_mul(3) / 2
+    } else {
+        cores
     };
 
-    worker_count.clamp(4, 64)
+    worker_count.clamp(2, 32)
 }

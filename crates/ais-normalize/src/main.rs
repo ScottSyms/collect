@@ -3,9 +3,12 @@ use arrow::array::{StringArray, TimestampMillisecondArray};
 use clap::Parser;
 use collect_core::PartitionGranularity;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::File as StdFile;
 use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 mod dataset;
 mod normalize;
@@ -53,6 +56,10 @@ struct Args {
     /// Zstd compression level for output files
     #[arg(long, default_value_t = 5)]
     compression_level: i32,
+
+    /// Number of partitions to process concurrently; auto-selected when omitted
+    #[arg(long)]
+    concurrency: Option<usize>,
 
     /// Disable the runtime status TUI and print plain progress updates
     #[arg(long)]
@@ -125,53 +132,127 @@ async fn main() -> Result<()> {
         }
     );
 
-    let mut pool = OutputWriterPool::new(
-        args.output_dir.clone(),
-        args.compression_level,
-        dry_run,
-    );
+    let concurrency = args
+        .concurrency
+        .unwrap_or_else(default_concurrency)
+        .clamp(1, total_partitions.max(1));
+    if status_mode.is_plain() && concurrency > 1 {
+        eprintln!("Processing partitions with {} worker(s).", concurrency);
+    }
+
+    // Partitions are independent (processor state and writer pools are
+    // per-partition), so distribute them over a small worker pool.
+    type PartitionQueue = Mutex<VecDeque<(PartitionKey, Vec<DatasetFile>)>>;
+    let queue: Arc<PartitionQueue> = Arc::new(Mutex::new(partitions.into()));
+    let processed = Arc::new(AtomicUsize::new(0));
+
+    let mut workers = Vec::with_capacity(concurrency);
+    for _ in 0..concurrency {
+        let queue = queue.clone();
+        let processed = processed.clone();
+        let output_dir = args.output_dir.clone();
+        let granularity = args.partition;
+        let batch_size = args.batch_size;
+        let compression_level = args.compression_level;
+
+        workers.push(tokio::spawn(async move {
+            let mut stats = NormalizeStats::default();
+            let mut partition_rows: BTreeMap<String, u64> = BTreeMap::new();
+
+            loop {
+                if status::is_cancelled() {
+                    break;
+                }
+
+                let next = queue.lock().expect("partition queue lock").pop_front();
+                let Some((partition_key, partition_files)) = next else {
+                    break;
+                };
+
+                let output_dir = output_dir.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    process_partition(
+                        partition_key,
+                        partition_files,
+                        output_dir,
+                        granularity,
+                        batch_size,
+                        compression_level,
+                        dry_run,
+                    )
+                })
+                .await
+                .context("partition worker panicked")?;
+
+                match result {
+                    Ok((partition_stats, rows)) => {
+                        stats.merge(&partition_stats);
+                        for (rel_dir, rows_written) in rows {
+                            *partition_rows.entry(rel_dir).or_default() += rows_written;
+                        }
+                    }
+                    Err(error) => {
+                        // Stop the other workers before surfacing the error.
+                        status::request_cancel();
+                        return Err(error);
+                    }
+                }
+
+                let done = processed.fetch_add(1, Ordering::SeqCst) + 1;
+                if status_mode.is_plain() && status::should_emit_plain_update(done, 10) {
+                    status::print_plain_update(done, total_partitions);
+                }
+            }
+
+            Ok::<_, anyhow::Error>((stats, partition_rows))
+        }));
+    }
 
     let mut total_stats = NormalizeStats::default();
-
-    for (idx, (partition_key, partition_files)) in partitions.into_iter().enumerate() {
-        if status::is_cancelled() {
-            eprintln!("Cancelled after {} partition(s).", idx);
-            break;
-        }
-
-        let source = partition_key.source.clone();
-        let mut processor = PartitionProcessor::new(source, args.partition);
-
-        for file in &partition_files {
-            process_parquet_file(
-                &file.path,
-                &partition_key,
-                &mut processor,
-                &mut pool,
-                args.batch_size,
-            )
-            .with_context(|| format!("processing {}", file.path.display()))?;
-        }
-
-        // Flush any incomplete fragment groups at the end of this partition.
-        let leftovers = processor.flush_incomplete(&partition_key);
-        for row in leftovers {
-            pool.write_row(&row.partition_rel_dir, row.ts_ms, &row.payload)?;
-        }
-
-        processor.stats.partitions_processed += 1;
-        total_stats.merge(&processor.stats);
-
-        let processed = idx + 1;
-        if status_mode.is_plain() && status::should_emit_plain_update(processed, 10) {
-            status::print_plain_update(processed, total_partitions);
+    let mut partition_rows: BTreeMap<String, u64> = BTreeMap::new();
+    let mut first_error = None;
+    for worker in workers {
+        match worker.await {
+            Ok(Ok((stats, rows))) => {
+                total_stats.merge(&stats);
+                for (rel_dir, rows_written) in rows {
+                    *partition_rows.entry(rel_dir).or_default() += rows_written;
+                }
+            }
+            Ok(Err(error)) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error.into());
+                }
+            }
         }
     }
 
-    let partitions_written = pool.flush_all().context("flushing output writers")?;
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+
+    if status::is_cancelled() {
+        eprintln!(
+            "Cancelled after {} partition(s).",
+            processed.load(Ordering::SeqCst)
+        );
+    }
+
+    let partitions_written = partition_rows.len();
     total_stats.print_summary();
 
     if dry_run {
+        if !partition_rows.is_empty() {
+            eprintln!("Dry run — would write to {} partition(s):", partitions_written);
+            for (rel_dir, rows) in &partition_rows {
+                eprintln!("  {} ({} rows)", rel_dir, rows);
+            }
+        }
         eprintln!(
             "Dry run complete. Pass --apply to write {} output partition(s).",
             partitions_written
@@ -183,9 +264,56 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn default_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(4)
+        .clamp(1, 8)
+}
+
+/// Process one source partition end to end with its own processor and writer
+/// pool, so partitions can run concurrently and writer memory stays bounded
+/// by the output partitions a single input partition touches.
+fn process_partition(
+    partition_key: PartitionKey,
+    files: Vec<DatasetFile>,
+    output_dir: PathBuf,
+    granularity: PartitionGranularity,
+    batch_size: usize,
+    compression_level: i32,
+    dry_run: bool,
+) -> Result<(NormalizeStats, Vec<(String, u64)>)> {
+    let source_rel_dir: Arc<str> = Arc::from(partition_key.relative_dir());
+    let mut processor = PartitionProcessor::new(partition_key.source.clone(), granularity);
+    let mut pool = OutputWriterPool::new(output_dir, compression_level, dry_run);
+
+    for file in &files {
+        process_parquet_file(
+            &file.path,
+            &source_rel_dir,
+            &mut processor,
+            &mut pool,
+            batch_size,
+        )
+        .with_context(|| format!("processing {}", file.path.display()))?;
+    }
+
+    // Flush any incomplete fragment groups at the end of this partition.
+    let mut leftovers = Vec::new();
+    processor.flush_incomplete(&source_rel_dir, &mut leftovers);
+    for row in leftovers {
+        pool.write_row(&row.partition_rel_dir, row.ts_ms, &row.payload)?;
+    }
+
+    let mut stats = processor.stats;
+    stats.partitions_processed += 1;
+    let rows = pool.flush_all().context("flushing output writers")?;
+    Ok((stats, rows))
+}
+
 fn process_parquet_file(
     path: &std::path::Path,
-    partition_key: &PartitionKey,
+    source_rel_dir: &Arc<str>,
     processor: &mut PartitionProcessor,
     pool: &mut OutputWriterPool,
     batch_size: usize,
@@ -209,6 +337,7 @@ fn process_parquet_file(
             .downcast_ref::<StringArray>()
             .context("expected string column at index 1")?;
 
+        let mut rows = Vec::with_capacity(4);
         for i in 0..batch.num_rows() {
             if status::is_cancelled() {
                 return Ok(());
@@ -216,8 +345,8 @@ fn process_parquet_file(
             let ts_ms = ts_col.value(i);
             let payload = payload_col.value(i);
 
-            let rows = processor.process_row(partition_key, ts_ms, payload);
-            for row in rows {
+            processor.process_row(source_rel_dir, ts_ms, payload, &mut rows);
+            for row in rows.drain(..) {
                 pool.write_row(&row.partition_rel_dir, row.ts_ms, &row.payload)?;
             }
         }

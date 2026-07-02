@@ -1,13 +1,14 @@
 use anyhow::{Context, Result};
-use arrow::array::{StringBuilder, TimestampMillisecondArray, TimestampMillisecondBuilder};
-use arrow::compute::{sort_to_indices, take, SortOptions};
+use arrow::array::{StringBuilder, TimestampMillisecondBuilder};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use chrono::Utc;
+use collect_core::sort_record_batch_by_ts;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use parquet::schema::types::ColumnPath;
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
@@ -46,27 +47,6 @@ fn build_schema() -> Arc<Schema> {
     ]))
 }
 
-fn sort_record_batch_by_ts(batch: &RecordBatch) -> Result<RecordBatch> {
-    let ts_column = batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<TimestampMillisecondArray>()
-        .ok_or_else(|| anyhow::anyhow!("missing ts column for sorting"))?;
-
-    let sort_options = SortOptions {
-        descending: false,
-        nulls_first: false,
-    };
-    let indices = sort_to_indices(ts_column, Some(sort_options), None)
-        .context("sort indices")?;
-
-    let sorted_columns: Vec<_> = (0..batch.num_columns())
-        .map(|i| take(batch.column(i), &indices, None).context("reorder column"))
-        .collect::<Result<Vec<_>>>()?;
-
-    RecordBatch::try_new(batch.schema(), sorted_columns).context("build sorted batch")
-}
-
 fn open_writer(path: &Path, schema: &Arc<Schema>, compression_level: i32) -> Result<ArrowWriter<File>> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("mkdir -p {}", parent.display()))?;
@@ -75,6 +55,10 @@ fn open_writer(path: &Path, schema: &Arc<Schema>, compression_level: i32) -> Res
     let zstd_level = ZstdLevel::try_new(compression_level).context("invalid Zstd level")?;
     let props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(zstd_level))
+        // One row group per flushed (sorted) batch: keeps every row group
+        // sorted by ts so collect-maint compaction can stream-merge these
+        // files, and bounds writer memory to one batch per open partition.
+        .set_max_row_group_size(FLUSH_BATCH_SIZE)
         .set_column_encoding(ColumnPath::from("ts"), Encoding::DELTA_BINARY_PACKED)
         .set_column_encoding(ColumnPath::from("payload"), Encoding::DELTA_LENGTH_BYTE_ARRAY)
         .set_column_dictionary_enabled(ColumnPath::from("ts"), false)
@@ -145,6 +129,9 @@ impl PartitionWriter {
             ],
         )
         .context("building RecordBatch")?;
+        // Retimestamping reorders rows; sort each batch so every row group
+        // (one per batch, see open_writer) is sorted by ts.
+        let batch = sort_record_batch_by_ts(&batch)?;
         self.writer.write(&batch).context("writing Parquet batch")?;
         self.batch_rows = 0;
         Ok(())
@@ -199,15 +186,15 @@ impl OutputWriterPool {
             return Ok(());
         }
 
-        let writer = self.writers.entry(partition_rel_dir.to_string()).or_insert_with(|| {
-            PartitionWriter::new(
+        let writer = match self.writers.entry(partition_rel_dir.to_string()) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(PartitionWriter::new(
                 &self.output_root,
                 partition_rel_dir,
                 &self.schema,
                 self.compression_level,
-            )
-            .expect("failed to create partition writer")
-        });
+            )?),
+        };
 
         writer.push(ts_ms, payload)?;
         self.total_rows_written += 1;
@@ -215,25 +202,20 @@ impl OutputWriterPool {
     }
 
     /// Close all writers and rename temp files to final paths.
-    /// Returns the number of partitions written.
-    pub fn flush_all(self) -> Result<usize> {
+    /// Returns `(partition_rel_dir, rows)` per partition written (or that
+    /// would be written in dry-run mode); callers aggregate and report.
+    pub fn flush_all(self) -> Result<Vec<(String, u64)>> {
         if self.dry_run {
-            let count = self.dry_run_counts.len();
-            if count > 0 {
-                eprintln!("Dry run — would write to {} partition(s):", count);
-                let mut dirs: Vec<_> = self.dry_run_counts.iter().collect();
-                dirs.sort_by_key(|(k, _)| k.as_str());
-                for (dir, rows) in dirs {
-                    eprintln!("  {} ({} rows)", dir, rows);
-                }
-            }
-            return Ok(count);
+            return Ok(self.dry_run_counts.into_iter().collect());
         }
 
-        let count = self.writers.len();
-        for (_, writer) in self.writers {
-            writer.close()?;
+        let mut partitions = Vec::with_capacity(self.writers.len());
+        for (rel_dir, writer) in self.writers {
+            let rows = writer.close()?;
+            if rows > 0 {
+                partitions.push((rel_dir, rows));
+            }
         }
-        Ok(count)
+        Ok(partitions)
     }
 }

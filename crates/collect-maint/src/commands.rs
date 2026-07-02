@@ -5,21 +5,28 @@ use crate::progress::{count, decimal, report, report_step, should_report, SCAN_R
 use crate::status;
 use crate::storage::{DatasetEntry, StorageLocation};
 use anyhow::{bail, Context, Result};
-use arrow::array::{Array, StringArray, TimestampMillisecondArray};
-use arrow::compute::{concat_batches, kernels::aggregate, sort_to_indices, take, SortOptions};
-use arrow::datatypes::{DataType, TimeUnit, TimestampMillisecondType};
+use arrow::array::{
+    Array, StringArray, StringBuilder, TimestampMillisecondArray, TimestampMillisecondBuilder,
+};
+use arrow::compute::{concat_batches, kernels::aggregate};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit, TimestampMillisecondType};
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Utc};
-use collect_core::PartitionGranularity;
+use collect_core::{sort_record_batch_by_ts, PartitionGranularity};
 use futures_util::stream::{self, StreamExt};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::arrow::ArrowWriter;
+use parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReader,
+    ParquetRecordBatchReaderBuilder,
+};
+use parquet::arrow::{ArrowWriter, ProjectionMask};
 use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use parquet::schema::types::ColumnPath;
-use std::collections::BTreeMap;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap};
 use std::fs::File as StdFile;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const SMALL_PARQUET_FILE_BYTES: u64 = 256 * 1024 * 1024;
@@ -1002,6 +1009,263 @@ async fn materialize_entry(
     }
 }
 
+/// One sorted, incrementally read run of rows (a single parquet row group).
+///
+/// Streaming runs hold one decoded batch at a time; buffered runs hold a
+/// fully sorted in-memory copy of an unsorted row group (legacy data only).
+struct MergeRun {
+    reader: Option<ParquetRecordBatchReader>,
+    ts: TimestampMillisecondArray,
+    payload: StringArray,
+    pos: usize,
+}
+
+impl MergeRun {
+    fn streaming(
+        path: &Path,
+        metadata: &ArrowReaderMetadata,
+        row_group: usize,
+    ) -> Result<Option<Self>> {
+        let reader = open_row_group_reader(path, metadata, row_group, None)?;
+        let mut run = Self {
+            reader: Some(reader),
+            ts: TimestampMillisecondArray::from(Vec::<i64>::new()),
+            payload: StringArray::from(Vec::<&str>::new()),
+            pos: 0,
+        };
+        Ok(if run.load_next_batch()? {
+            Some(run)
+        } else {
+            None
+        })
+    }
+
+    fn buffered(
+        path: &Path,
+        metadata: &ArrowReaderMetadata,
+        row_group: usize,
+    ) -> Result<Option<Self>> {
+        let mut reader = open_row_group_reader(path, metadata, row_group, None)?;
+        let mut batches = Vec::new();
+        while let Some(batch) = reader.next().transpose()? {
+            if batch.num_rows() > 0 {
+                batches.push(batch);
+            }
+        }
+        if batches.is_empty() {
+            return Ok(None);
+        }
+        let schema = batches[0].schema();
+        let combined = concat_batches(&schema, &batches).context("concatenate record batches")?;
+        let sorted = sort_record_batch_by_ts(&combined)?;
+        let (ts, payload) = split_columns(&sorted)?;
+        Ok(Some(Self {
+            reader: None,
+            ts,
+            payload,
+            pos: 0,
+        }))
+    }
+
+    fn current_ts(&self) -> i64 {
+        self.ts.value(self.pos)
+    }
+
+    fn current_payload(&self) -> &str {
+        self.payload.value(self.pos)
+    }
+
+    fn load_next_batch(&mut self) -> Result<bool> {
+        while let Some(reader) = self.reader.as_mut() {
+            match reader.next().transpose().context("reading parquet batch")? {
+                Some(batch) if batch.num_rows() > 0 => {
+                    let (ts, payload) = split_columns(&batch)?;
+                    self.ts = ts;
+                    self.payload = payload;
+                    self.pos = 0;
+                    return Ok(true);
+                }
+                Some(_) => continue,
+                None => self.reader = None,
+            }
+        }
+        Ok(false)
+    }
+
+    fn advance(&mut self) -> Result<bool> {
+        self.pos += 1;
+        if self.pos < self.ts.len() {
+            return Ok(true);
+        }
+        self.load_next_batch()
+    }
+}
+
+fn open_row_group_reader(
+    path: &Path,
+    metadata: &ArrowReaderMetadata,
+    row_group: usize,
+    projection: Option<ProjectionMask>,
+) -> Result<ParquetRecordBatchReader> {
+    let file = StdFile::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut builder = ParquetRecordBatchReaderBuilder::new_with_metadata(file, metadata.clone())
+        .with_row_groups(vec![row_group])
+        .with_batch_size(COMPACT_RECORD_BATCH_ROWS);
+    if let Some(projection) = projection {
+        builder = builder.with_projection(projection);
+    }
+    builder
+        .build()
+        .with_context(|| format!("build parquet reader {}", path.display()))
+}
+
+/// Streams only the ts column, so checking costs far less than a full decode.
+fn row_group_is_sorted_by_ts(
+    path: &Path,
+    metadata: &ArrowReaderMetadata,
+    row_group: usize,
+) -> Result<bool> {
+    let ts_only = ProjectionMask::leaves(metadata.metadata().file_metadata().schema_descr(), [0]);
+    let reader = open_row_group_reader(path, metadata, row_group, Some(ts_only))?;
+    let mut last = i64::MIN;
+    for batch in reader {
+        let batch = batch.context("reading ts column")?;
+        let ts = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .ok_or_else(|| anyhow::anyhow!("missing ts column in {}", path.display()))?;
+        for index in 0..ts.len() {
+            let value = ts.value(index);
+            if value < last {
+                return Ok(false);
+            }
+            last = value;
+        }
+    }
+    Ok(true)
+}
+
+fn split_columns(batch: &RecordBatch) -> Result<(TimestampMillisecondArray, StringArray)> {
+    if batch.num_columns() < 2 {
+        bail!("unexpected column count: {}", batch.num_columns());
+    }
+    let ts = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<TimestampMillisecondArray>()
+        .ok_or_else(|| anyhow::anyhow!("missing ts column"))?
+        .clone();
+    let payload = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| anyhow::anyhow!("missing payload column"))?
+        .clone();
+    Ok((ts, payload))
+}
+
+/// Buffers merged rows and writes them out in fixed-size validated chunks.
+struct CompactedOutputWriter {
+    writer: ArrowWriter<StdFile>,
+    schema: Arc<Schema>,
+    ts: TimestampMillisecondBuilder,
+    payload: StringBuilder,
+    chunk_rows: usize,
+    scan: FileScan,
+    partition: PartitionKey,
+    bounds: (i64, i64),
+}
+
+impl CompactedOutputWriter {
+    fn new(
+        output_path: &Path,
+        compression_level: i32,
+        partition: PartitionKey,
+        bounds: (i64, i64),
+    ) -> Result<Self> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("payload", DataType::Utf8, false),
+        ]));
+        let zstd_level =
+            ZstdLevel::try_new(compression_level).context("invalid Zstd compression level")?;
+        let props = WriterProperties::builder()
+            .set_compression(Compression::ZSTD(zstd_level))
+            .set_write_batch_size(COMPACT_RECORD_BATCH_ROWS)
+            .set_column_encoding(ColumnPath::from("ts"), Encoding::DELTA_BINARY_PACKED)
+            .set_column_encoding(
+                ColumnPath::from("payload"),
+                Encoding::DELTA_LENGTH_BYTE_ARRAY,
+            )
+            .set_column_dictionary_enabled(ColumnPath::from("ts"), false)
+            .set_column_dictionary_enabled(ColumnPath::from("payload"), false)
+            .build();
+        let output_file = StdFile::create(output_path)
+            .with_context(|| format!("create {}", output_path.display()))?;
+        let writer = ArrowWriter::try_new(output_file, schema.clone(), Some(props))
+            .context("create compacted parquet writer")?;
+        Ok(Self {
+            writer,
+            schema,
+            ts: TimestampMillisecondBuilder::with_capacity(COMPACT_RECORD_BATCH_ROWS),
+            payload: StringBuilder::with_capacity(
+                COMPACT_RECORD_BATCH_ROWS,
+                COMPACT_RECORD_BATCH_ROWS * 64,
+            ),
+            chunk_rows: 0,
+            scan: FileScan::empty(),
+            partition,
+            bounds,
+        })
+    }
+
+    fn push(&mut self, ts_ms: i64, payload: &str) -> Result<()> {
+        self.ts.append_value(ts_ms);
+        self.payload.append_value(payload);
+        self.chunk_rows += 1;
+        if self.chunk_rows >= COMPACT_RECORD_BATCH_ROWS {
+            self.flush_chunk()?;
+        }
+        Ok(())
+    }
+
+    fn flush_chunk(&mut self) -> Result<()> {
+        if self.chunk_rows == 0 {
+            return Ok(());
+        }
+        let ts_array = self.ts.finish().with_timezone_opt(Some(Arc::from("UTC")));
+        let payload_array = self.payload.finish();
+        let batch = RecordBatch::try_new(
+            self.schema.clone(),
+            vec![
+                Arc::new(ts_array) as Arc<dyn Array>,
+                Arc::new(payload_array) as Arc<dyn Array>,
+            ],
+        )
+        .context("building compacted RecordBatch")?;
+        scan_record_batch(
+            &batch,
+            &mut self.scan,
+            Some(&self.partition),
+            Some(self.bounds),
+        );
+        self.writer.write(&batch).context("write compacted batch")?;
+        self.chunk_rows = 0;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<FileScan> {
+        self.flush_chunk()?;
+        self.writer.close().context("close compacted parquet writer")?;
+        Ok(self.scan)
+    }
+}
+
 fn write_compacted_output(
     input_paths: &[PathBuf],
     output_path: &Path,
@@ -1016,9 +1280,13 @@ fn write_compacted_output(
         .timestamp_bounds_ms()
         .with_context(|| format!("invalid partition {}", expected_partition.relative_dir()))?;
 
-    let mut all_batches: Vec<RecordBatch> = Vec::new();
-    let mut scan = FileScan::empty();
-
+    // Open one sorted run per input row group. The collectors write row
+    // groups already sorted by ts, so runs normally stream batch by batch;
+    // unsorted row groups (legacy data) are loaded and sorted in memory
+    // individually. Peak memory is one read batch per streaming run plus any
+    // unsorted row groups — not the whole partition.
+    let mut runs: Vec<MergeRun> = Vec::new();
+    let mut arrow_schema: Option<SchemaRef> = None;
     let total_inputs = input_paths.len();
     for (index, input_path) in input_paths.iter().enumerate() {
         check_cancelled()?;
@@ -1026,95 +1294,83 @@ fn write_compacted_output(
             report(
                 "compact",
                 format!(
-                    "reading parquet input {} / {}: {}",
+                    "opening parquet input {} / {}: {}",
                     count(index + 1),
                     count(total_inputs),
                     input_path.display()
                 ),
             );
         }
-        let input_file =
-            StdFile::open(input_path).with_context(|| format!("open {}", input_path.display()))?;
-        let mut reader = ParquetRecordBatchReaderBuilder::try_new(input_file)
-            .with_context(|| format!("read parquet footer {}", input_path.display()))?
-            .with_batch_size(COMPACT_RECORD_BATCH_ROWS)
-            .build()
-            .with_context(|| format!("build parquet reader {}", input_path.display()))?;
 
-        while let Some(batch) = reader.next().transpose()? {
+        let file =
+            StdFile::open(input_path).with_context(|| format!("open {}", input_path.display()))?;
+        let metadata = ArrowReaderMetadata::load(&file, ArrowReaderOptions::new())
+            .with_context(|| format!("read parquet footer {}", input_path.display()))?;
+
+        match &arrow_schema {
+            Some(schema) if schema.as_ref() != metadata.schema().as_ref() => {
+                bail!("schema mismatch in {}", input_path.display());
+            }
+            Some(_) => {}
+            None => arrow_schema = Some(metadata.schema().clone()),
+        }
+
+        for row_group in 0..metadata.metadata().num_row_groups() {
             check_cancelled()?;
-            scan_record_batch(
-                &batch,
-                &mut scan,
-                Some(expected_partition),
-                Some(expected_bounds),
-            );
-            all_batches.push(batch);
+            if metadata.metadata().row_group(row_group).num_rows() == 0 {
+                continue;
+            }
+            let run = if row_group_is_sorted_by_ts(input_path, &metadata, row_group)? {
+                MergeRun::streaming(input_path, &metadata, row_group)?
+            } else {
+                report(
+                    "compact",
+                    format!(
+                        "row group {} in {} is not sorted by ts; sorting it in memory",
+                        count(row_group),
+                        input_path.display()
+                    ),
+                );
+                MergeRun::buffered(input_path, &metadata, row_group)?
+            };
+            runs.extend(run);
         }
     }
 
-    if all_batches.is_empty() {
+    if runs.is_empty() {
         bail!("no batches read while compacting {}", output_path.display());
     }
 
-    let schema = all_batches[0].schema();
-    let combined = concat_batches(&schema, &all_batches)
-        .context("concatenate record batches")?;
+    let mut output = CompactedOutputWriter::new(
+        output_path,
+        compression_level,
+        expected_partition.clone(),
+        expected_bounds,
+    )?;
 
-    let ts_column = combined
-        .column(0)
-        .as_any()
-        .downcast_ref::<TimestampMillisecondArray>()
-        .ok_or_else(|| anyhow::anyhow!("missing ts column for sorting"))?;
+    // K-way merge: pop the run with the smallest current ts, emit its row,
+    // advance it, and re-insert while it has rows left.
+    let mut heap: BinaryHeap<Reverse<(i64, usize)>> = runs
+        .iter()
+        .enumerate()
+        .map(|(index, run)| Reverse((run.current_ts(), index)))
+        .collect();
 
-    let sort_options = SortOptions {
-        descending: false,
-        nulls_first: false,
-    };
-    let indices =
-        sort_to_indices(ts_column, Some(sort_options), None).context("sort indices")?;
+    let mut rows_since_cancel_check = 0usize;
+    while let Some(Reverse((ts_ms, index))) = heap.pop() {
+        output.push(ts_ms, runs[index].current_payload())?;
+        if runs[index].advance()? {
+            heap.push(Reverse((runs[index].current_ts(), index)));
+        }
 
-    let sorted_columns: Vec<_> = (0..combined.num_columns())
-        .map(|i| {
-            take(combined.column(i), &indices, None)
-                .with_context(|| format!("reorder column {}", i))
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    let sorted_batch =
-        RecordBatch::try_new(schema.clone(), sorted_columns).context("build sorted batch")?;
-
-    let zstd_level =
-        ZstdLevel::try_new(compression_level).context("invalid Zstd compression level")?;
-    let props = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(zstd_level))
-        .set_write_batch_size(COMPACT_RECORD_BATCH_ROWS)
-        .set_column_encoding(ColumnPath::from("ts"), Encoding::DELTA_BINARY_PACKED)
-        .set_column_encoding(
-            ColumnPath::from("payload"),
-            Encoding::DELTA_LENGTH_BYTE_ARRAY,
-        )
-        .set_column_dictionary_enabled(ColumnPath::from("ts"), false)
-        .set_column_dictionary_enabled(ColumnPath::from("payload"), false)
-        .build();
-
-    let output_file = StdFile::create(output_path)
-        .with_context(|| format!("create {}", output_path.display()))?;
-    let mut writer = ArrowWriter::try_new(output_file, schema, Some(props))
-        .context("create compacted parquet writer")?;
-
-    let total_rows = sorted_batch.num_rows();
-    let mut offset = 0;
-    while offset < total_rows {
-        let end = (offset + COMPACT_RECORD_BATCH_ROWS).min(total_rows);
-        let chunk = sorted_batch.slice(offset, end - offset);
-        writer.write(&chunk).context("write compacted batch")?;
-        offset = end;
+        rows_since_cancel_check += 1;
+        if rows_since_cancel_check >= COMPACT_RECORD_BATCH_ROWS {
+            rows_since_cancel_check = 0;
+            check_cancelled()?;
+        }
     }
 
-    writer.close().context("close compacted parquet writer")?;
-
-    Ok(scan)
+    output.finish()
 }
 
 fn scan_record_batch(
@@ -1302,7 +1558,6 @@ async fn vacuum_entry(
                 let output_path = materialize_entry(storage, output_entry, workspace.path())
                     .await?
                     .ok_or_else(|| anyhow::anyhow!("unable to materialize compacted output"))?;
-                let partition = partition;
                 let scan = tokio::task::spawn_blocking(move || {
                     scan_parquet_file(&output_path, Some(&partition))
                 })
@@ -1444,4 +1699,139 @@ fn can_compact(bucket: &PartitionSummary) -> bool {
         && bucket.manifests == 0
         && bucket.temp_files == 0
         && bucket.other_files == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn compaction_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("payload", DataType::Utf8, false),
+        ]))
+    }
+
+    fn write_input(path: &Path, rows: &[(i64, &str)]) -> Result<()> {
+        let schema = compaction_schema();
+        let ts = TimestampMillisecondArray::from(rows.iter().map(|(t, _)| *t).collect::<Vec<_>>())
+            .with_timezone_opt(Some(Arc::from("UTC")));
+        let payload = StringArray::from(rows.iter().map(|(_, p)| *p).collect::<Vec<_>>());
+        let file = StdFile::create(path)?;
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), None)?;
+        writer.write(&RecordBatch::try_new(
+            schema,
+            vec![Arc::new(ts) as Arc<dyn Array>, Arc::new(payload) as Arc<dyn Array>],
+        )?)?;
+        writer.close()?;
+        Ok(())
+    }
+
+    fn read_rows(path: &Path) -> Result<Vec<(i64, String)>> {
+        let file = StdFile::open(path)?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+        let mut rows = Vec::new();
+        for batch in reader {
+            let batch = batch?;
+            let ts = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .expect("ts column");
+            let payload = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("payload column");
+            for i in 0..batch.num_rows() {
+                rows.push((ts.value(i), payload.value(i).to_string()));
+            }
+        }
+        Ok(rows)
+    }
+
+    fn day_partition() -> PartitionKey {
+        PartitionKey::parse(
+            "source=test/year=2024/month=01/day=15/x.parquet",
+            PartitionGranularity::Day,
+        )
+        .expect("valid partition path")
+    }
+
+    #[test]
+    fn merges_sorted_and_unsorted_inputs_into_sorted_output() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let partition = day_partition();
+        let (start_ms, _) = partition.timestamp_bounds_ms().expect("bounds");
+
+        let a = dir.path().join("a.parquet");
+        let b = dir.path().join("b.parquet");
+        let c = dir.path().join("c.parquet");
+        // Two sorted inputs and one unsorted input (exercises the buffered
+        // fallback for legacy row groups).
+        write_input(
+            &a,
+            &[
+                (start_ms + 1, "a1"),
+                (start_ms + 4, "a2"),
+                (start_ms + 9, "a3"),
+            ],
+        )?;
+        write_input(
+            &b,
+            &[
+                (start_ms + 2, "b1"),
+                (start_ms + 3, "b2"),
+                (start_ms + 8, "b3"),
+            ],
+        )?;
+        write_input(
+            &c,
+            &[
+                (start_ms + 7, "c1"),
+                (start_ms + 5, "c2"),
+                (start_ms + 6, "c3"),
+            ],
+        )?;
+
+        let output = dir.path().join("out.parquet");
+        let scan = write_compacted_output(&[a, b, c], &output, 3, &partition)?;
+
+        assert!(scan.issues.is_empty(), "unexpected issues: {:?}", scan.issues);
+        assert_eq!(scan.rows, 9);
+
+        let rows = read_rows(&output)?;
+        let ts: Vec<i64> = rows.iter().map(|(t, _)| *t).collect();
+        let expected: Vec<i64> = (1..=9).map(|i| start_ms + i).collect();
+        assert_eq!(ts, expected, "output must be globally sorted by ts");
+
+        let payloads: Vec<&str> = rows.iter().map(|(_, p)| p.as_str()).collect();
+        assert_eq!(
+            payloads,
+            vec!["a1", "b1", "b2", "a2", "c2", "c3", "c1", "b3", "a3"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn flags_rows_outside_partition_bounds() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let partition = day_partition();
+        let (start_ms, end_ms) = partition.timestamp_bounds_ms().expect("bounds");
+
+        let input = dir.path().join("input.parquet");
+        write_input(&input, &[(start_ms, "ok"), (end_ms, "out of range")])?;
+
+        let output = dir.path().join("out.parquet");
+        let scan = write_compacted_output(&[input], &output, 3, &partition)?;
+        assert!(
+            !scan.issues.is_empty(),
+            "row at partition end boundary must be flagged"
+        );
+        Ok(())
+    }
 }

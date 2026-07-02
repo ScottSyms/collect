@@ -6,9 +6,10 @@ use collect_core::{
 };
 use collect_tui::{run_tui, TuiModel};
 use futures_util::StreamExt;
-use rdkafka::consumer::{Consumer, StreamConsumer};
+use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::message::Message;
-use rdkafka::ClientConfig;
+use rdkafka::{ClientConfig, Offset, TopicPartitionList};
+use std::collections::HashMap;
 use std::io;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -18,7 +19,10 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::StreamReader;
 
+mod offsets;
 mod tui;
+
+use offsets::{OffsetTracker, PendingLines};
 
 const DEFAULT_KAFKA_AUTO_OFFSET_RESET: &str = "latest";
 const KAFKA_FORWARDER_CHANNEL_CAPACITY: usize = 1024;
@@ -67,6 +71,9 @@ struct KafkaInputSource {
     auto_offset_reset: String,
     source: String,
     shutdown: Arc<AtomicBool>,
+    /// Consumer of the most recently opened stream; used to commit offsets.
+    consumer: Option<Arc<StreamConsumer>>,
+    tracker: OffsetTracker,
 }
 
 impl KafkaInputSource {
@@ -85,6 +92,8 @@ impl KafkaInputSource {
             auto_offset_reset,
             source,
             shutdown,
+            consumer: None,
+            tracker: OffsetTracker::new(PendingLines::default()),
         }
     }
 
@@ -92,12 +101,38 @@ impl KafkaInputSource {
         Ok(ClientConfig::new()
             .set("bootstrap.servers", &self.brokers)
             .set("group.id", &self.group_id)
-            .set("enable.auto.commit", "true")
+            // Offsets are committed manually once the batch containing them
+            // has been written to disk (see offsets.rs); auto-commit would
+            // advance offsets for data that only exists in memory.
+            .set("enable.auto.commit", "false")
             .set("auto.offset.reset", &self.auto_offset_reset)
             .set("enable.partition.eof", "false")
             .set("session.timeout.ms", "6000")
             .set("heartbeat.interval.ms", "2000")
             .create()?)
+    }
+
+    fn commit_offsets(&self, offsets: &HashMap<i32, i64>) {
+        let Some(consumer) = &self.consumer else {
+            return;
+        };
+
+        let mut tpl = TopicPartitionList::new();
+        for (&partition, &offset) in offsets {
+            // Kafka commits the *next* offset to consume.
+            if let Err(error) =
+                tpl.add_partition_offset(&self.topic, partition, Offset::Offset(offset + 1))
+            {
+                eprintln!("⚠️  Failed to build Kafka offset commit list: {error}");
+                return;
+            }
+        }
+
+        // Sync keeps the commit ordered ahead of process exit; commits happen
+        // at batch-flush frequency, so the blocking round trip is negligible.
+        if let Err(error) = consumer.commit(&tpl, CommitMode::Sync) {
+            eprintln!("⚠️  Failed to commit Kafka offsets: {error}");
+        }
     }
 }
 
@@ -108,8 +143,10 @@ impl LineSource for KafkaInputSource {
     }
 
     fn timestamp_for_payload(&mut self, _payload: &str) -> Option<i64> {
+        // Called exactly once per consumed line: drive offset accounting here.
         // Generic: use ingestion/arrival time.
         // collect-core will fall back to "now" when this returns None.
+        self.tracker.on_line();
         None
     }
 
@@ -117,9 +154,24 @@ impl LineSource for KafkaInputSource {
         payload
     }
 
+    fn on_batch_sealed(&mut self, seq: u64) {
+        self.tracker.seal(seq);
+    }
+
+    fn on_batch_durable(&mut self, seq: u64) {
+        if let Some(offsets) = self.tracker.durable(seq) {
+            self.commit_offsets(&offsets);
+        }
+    }
+
     async fn open(&mut self, max_line_length: usize) -> Result<LineReader> {
         let consumer = self.make_consumer()?;
         consumer.subscribe(&[&self.topic])?;
+        let consumer = Arc::new(consumer);
+        self.consumer = Some(consumer.clone());
+
+        let pending = PendingLines::default();
+        self.tracker.reset_stream(pending.clone());
 
         let shutdown = self.shutdown.clone();
         let (tx, rx) = mpsc::channel::<io::Result<bytes::Bytes>>(
@@ -133,6 +185,29 @@ impl LineSource for KafkaInputSource {
                 match stream.next().await {
                     Some(Ok(msg)) => {
                         if let Some(payload) = msg.payload() {
+                            // Drop messages the line codec would reject, so
+                            // every forwarded message maps to a known number
+                            // of consumed lines and offset accounting stays
+                            // exact.
+                            let longest_segment = payload
+                                .split(|&byte| byte == b'\n')
+                                .map(<[u8]>::len)
+                                .max()
+                                .unwrap_or(0);
+                            if longest_segment >= max_line_length {
+                                eprintln!(
+                                    "⚠️  Dropping oversized Kafka message ({} bytes) at partition {} offset {}",
+                                    payload.len(),
+                                    msg.partition(),
+                                    msg.offset()
+                                );
+                                continue;
+                            }
+
+                            let line_count =
+                                payload.iter().filter(|&&byte| byte == b'\n').count() as u32 + 1;
+                            pending.push(msg.partition(), msg.offset(), line_count);
+
                             let mut v = payload.to_vec();
                             v.push(b'\n');
                             if tx.send(Ok(bytes::Bytes::from(v))).await.is_err() {
@@ -264,6 +339,8 @@ async fn main() -> Result<()> {
             report_progress: true,
             log_writes: true,
             shutdown: Some(shutdown.clone()),
+            write_workers: None,
+            sweep_orphans: true,
         },
     )
     .await

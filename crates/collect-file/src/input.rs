@@ -429,7 +429,7 @@ fn collect_zip_jobs(path: &Path) -> Result<Vec<InputJob>> {
     let mut archive = zip::ZipArchive::new(file)
         .with_context(|| format!("read zip archive {}", path.display()))?;
     let mut jobs = Vec::new();
-    let estimated_size = std::fs::metadata(path)
+    let archive_size = std::fs::metadata(path)
         .with_context(|| format!("reading file metadata {}", path.display()))?
         .len();
 
@@ -444,9 +444,18 @@ fn collect_zip_jobs(path: &Path) -> Result<Vec<InputJob>> {
         if is_hidden_entry_name(&entry_name) {
             continue;
         }
+        // Size each job by its entry's uncompressed size rather than the
+        // whole archive, so totals and worker scheduling are not inflated by
+        // multi-entry archives. Streamed entries may report 0; fall back to
+        // the archive size.
+        let entry_size = if entry.size() > 0 {
+            entry.size()
+        } else {
+            archive_size
+        };
         jobs.push(InputJob::zip_entry(
             path.to_path_buf(),
-            estimated_size,
+            entry_size,
             entry_index,
             entry_name,
         ));
@@ -743,6 +752,7 @@ mod tests {
                     upload_drain_timeout_seconds: 1,
                     max_line_length: 1024,
                     health_check: false,
+                    metrics_addr: None,
                 },
                 s3: None,
                 s3_storage: None,
@@ -751,6 +761,8 @@ mod tests {
                 report_progress: true,
                 log_writes: true,
                 shutdown: None,
+                write_workers: None,
+                sweep_orphans: false,
             },
         )
         .await?;

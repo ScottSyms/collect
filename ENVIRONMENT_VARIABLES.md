@@ -30,7 +30,7 @@ Most `collect-file` and `collect-socket` command-line parameters can be configur
 
 - `PARTITION`: Partition granularity for the dataset layout
   - Example: `PARTITION=hour`
-  - Default: `minute`
+  - Default: `day`
 
 - `AIS`: Use NMEA `c:<epoch>` tag blocks or `$PGHP` capture timestamps when present; grouped `\g:` fragments reuse the first sentence timestamp for the whole AIS message, otherwise fall back to ingest time. File ingestion only.
   - Example: `AIS=true`
@@ -56,13 +56,14 @@ Most `collect-file` and `collect-socket` command-line parameters can be configur
   - Example: `MAX_LINE_LENGTH=65536`
   - Default: `65536`
 
-- `MAX_PAYLOAD_BYTES`: Maximum payload bytes to buffer per Parquet file before flush
-  - Example: `MAX_PAYLOAD_BYTES=268435456`
-  - Default: `268435456`
-
 - `HEALTH_CHECK`: Run health check and exit (for Docker HEALTHCHECK)
   - Example: `HEALTH_CHECK=true`
   - Default: `false`
+
+- `METRICS_ADDR`: Serve Prometheus metrics (`/metrics`) and an HTTP health check (`/healthz`) on this address
+  - Example: `METRICS_ADDR=0.0.0.0:9184`
+  - Default: disabled
+  - `/healthz` returns `200` while the ingest loop heartbeat is fresh and `503` once it goes stale (60s window)
 
 - `KEEP_LOCAL`: Keep local files after successful S3 upload
   - Example: `KEEP_LOCAL=true`
@@ -71,6 +72,7 @@ Most `collect-file` and `collect-socket` command-line parameters can be configur
 - `UPLOAD_DRAIN_TIMEOUT_SECONDS`: Max seconds to wait for background uploads on shutdown
   - Example: `UPLOAD_DRAIN_TIMEOUT_SECONDS=60`
   - Default: `60`
+  - On SIGTERM the collectors flush the in-memory batch, finish queued Parquet writes, and drain uploads for up to this long. Make sure your orchestrator's stop grace period (Docker `stop_grace_period`, Nomad `kill_timeout`) exceeds this value.
 
 ### S3 Configuration
 

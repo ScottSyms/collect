@@ -1081,6 +1081,7 @@ dependencies = [
  "clap",
  "futures-util",
  "parquet",
+ "tempfile",
  "tokio",
  "tokio-util",
 ]
