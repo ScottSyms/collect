@@ -16,6 +16,9 @@ job "collect-socket" {
         command = "/usr/local/bin/collect-socket"
       }
 
+      # Deregister from Consul before SIGTERM so scrapes stop routing here.
+      shutdown_delay = "10s"
+
       # Must exceed UPLOAD_DRAIN_TIMEOUT_SECONDS (default 60s) so a stopped
       # alloc can flush its final batch and drain pending S3 uploads before
       # Nomad escalates SIGTERM to SIGKILL.
