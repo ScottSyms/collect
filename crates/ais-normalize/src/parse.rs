@@ -144,7 +144,7 @@ pub fn parse_ais_group_id(value: &str) -> Option<String> {
     let candidate = value
         .split('-')
         .filter(|part| !part.is_empty())
-        .last()
+        .next_back()
         .unwrap_or(value)
         .trim();
 

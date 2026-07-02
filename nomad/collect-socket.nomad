@@ -5,12 +5,21 @@ job "collect-socket" {
   group "norway" {
     count = 1
 
+    network {
+      port "metrics" {}
+    }
+
     task "collect-socket" {
       driver = "exec"
 
       config {
         command = "/usr/local/bin/collect-socket"
       }
+
+      # Must exceed UPLOAD_DRAIN_TIMEOUT_SECONDS (default 60s) so a stopped
+      # alloc can flush its final batch and drain pending S3 uploads before
+      # Nomad escalates SIGTERM to SIGKILL.
+      kill_timeout = "90s"
 
       env {
         RUST_LOG       = var.rust_log
@@ -26,6 +35,8 @@ job "collect-socket" {
         S3_ACCESS_KEY  = var.s3_access_key
         S3_SECRET_KEY  = var.s3_secret_key
         S3_DISABLE_TLS = var.s3_disable_tls
+        # Prometheus metrics and /healthz on the Nomad-assigned port.
+        METRICS_ADDR   = "0.0.0.0:${NOMAD_PORT_metrics}"
       }
 
       resources {
@@ -35,10 +46,13 @@ job "collect-socket" {
 
       service {
         name = "collect-socket"
+        port = "metrics"
+
+        tags = ["prometheus"]
+
         check {
-          type     = "script"
-          command  = "/usr/local/bin/collect-socket"
-          args     = ["--health-check"]
+          type     = "http"
+          path     = "/healthz"
           interval = "30s"
           timeout  = "10s"
 

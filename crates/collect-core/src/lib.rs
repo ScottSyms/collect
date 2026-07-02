@@ -25,11 +25,14 @@ use std::sync::{
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncRead;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::codec::{FramedRead, LinesCodec};
 
+mod metrics;
+
 pub use async_trait::async_trait;
+pub use metrics::IngestMetrics;
 pub use tokio_util::codec::LinesCodecError;
 
 const DEFAULT_OUT_DIR: &str = "data";
@@ -102,6 +105,33 @@ impl PartitionGranularity {
             Self::Year => (dt.year(), 1, 1, 0, 0),
         }
     }
+
+    /// Millisecond bounds `[start, end)` of the partition period containing
+    /// `timestamp_ms`. Negative timestamps clamp to the epoch, matching
+    /// `components_from_timestamp`.
+    pub fn period_bounds_ms(self, timestamp_ms: i64) -> (i64, i64) {
+        let (year, month, day, hour, minute) = self.components_from_timestamp(timestamp_ms);
+        let start = Utc
+            .with_ymd_and_hms(year, month, day, hour, minute, 0)
+            .single()
+            .unwrap_or_else(|| {
+                Utc.timestamp_opt(0, 0)
+                    .single()
+                    .expect("unix epoch should be valid")
+            });
+        let end = match self {
+            Self::Minute => start + chrono::Duration::minutes(1),
+            Self::Hour => start + chrono::Duration::hours(1),
+            Self::Day => start + chrono::Duration::days(1),
+            Self::Month => start
+                .checked_add_months(chrono::Months::new(1))
+                .unwrap_or(start + chrono::Duration::days(31)),
+            Self::Year => start
+                .checked_add_months(chrono::Months::new(12))
+                .unwrap_or(start + chrono::Duration::days(366)),
+        };
+        (start.timestamp_millis(), end.timestamp_millis())
+    }
 }
 
 impl std::fmt::Display for PartitionGranularity {
@@ -160,6 +190,10 @@ pub struct CommonCliArgs {
     /// Run health check and exit
     #[arg(long)]
     pub health_check: bool,
+
+    /// Serve Prometheus metrics and /healthz on this address, e.g. 0.0.0.0:9184
+    #[arg(long)]
+    pub metrics_addr: Option<String>,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -203,6 +237,7 @@ pub struct CommonOptions {
     pub upload_drain_timeout_seconds: u64,
     pub max_line_length: usize,
     pub health_check: bool,
+    pub metrics_addr: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -226,6 +261,16 @@ pub struct IngestOptions {
     pub report_progress: bool,
     pub log_writes: bool,
     pub shutdown: Option<Arc<AtomicBool>>,
+    /// Number of parquet write workers; defaults to a per-process heuristic.
+    /// Callers running many ingests concurrently (e.g. collect-file's
+    /// parallel mode) should set this to 1 to avoid multiplying task counts.
+    pub write_workers: Option<usize>,
+    /// Scan `out_dir` at startup for parquet files a previous run wrote but
+    /// never uploaded, and upload them in the background. Only applies when
+    /// S3 is configured without keep_local. Callers running many ingests
+    /// over one out_dir (collect-file's parallel mode) should sweep once
+    /// themselves and set this to false.
+    pub sweep_orphans: bool,
 }
 
 pub type LineReader = FramedRead<Box<dyn AsyncRead + Unpin + Send>, LinesCodec>;
@@ -253,6 +298,21 @@ pub trait LineSource {
     fn normalize_payload(&mut self, payload: String, _timestamp_ms: i64) -> String {
         payload
     }
+
+    /// Called after a batch has been sealed and queued for writing. Every line
+    /// previously delivered to this source belongs to some batch with a
+    /// sequence number `<= seq` (sequence numbers start at 1). Note that the
+    /// line currently being processed may or may not be part of the sealed
+    /// batch, so sources tracking consumption progress should be conservative
+    /// about the most recent line.
+    fn on_batch_sealed(&mut self, _seq: u64) {}
+
+    /// Called once the batch with this sequence number has been durably
+    /// written to local disk (written and renamed into place). Notifications
+    /// may arrive out of order when multiple write workers are active.
+    /// Sources that track upstream progress (e.g. Kafka offsets) should only
+    /// advance through contiguous durable sequence numbers.
+    fn on_batch_durable(&mut self, _seq: u64) {}
 
     fn ingest_progress(&self) -> Option<IngestProgress> {
         None
@@ -335,6 +395,14 @@ impl CommonCliArgs {
                 self.health_check = value;
             }
         }
+
+        if self.metrics_addr.is_none() {
+            if let Ok(value) = std::env::var("METRICS_ADDR") {
+                if !value.trim().is_empty() {
+                    self.metrics_addr = Some(value);
+                }
+            }
+        }
     }
 
     pub fn to_options(&self) -> CommonOptions {
@@ -347,6 +415,7 @@ impl CommonCliArgs {
             upload_drain_timeout_seconds: self.upload_drain_timeout_seconds,
             max_line_length: self.max_line_length,
             health_check: self.health_check,
+            metrics_addr: self.metrics_addr.clone(),
         }
     }
 }
@@ -500,6 +569,239 @@ mod tests {
         let year = PartKey::from_timestamp("source", ts_one, PartitionGranularity::Year);
         assert_eq!(year.relative_dir(), "source=source/year=2024");
     }
+
+    #[test]
+    fn period_bounds_cover_their_timestamp() {
+        let ts = Utc
+            .with_ymd_and_hms(2024, 2, 29, 23, 59, 58)
+            .single()
+            .expect("valid timestamp")
+            .timestamp_millis();
+
+        for granularity in [
+            PartitionGranularity::Minute,
+            PartitionGranularity::Hour,
+            PartitionGranularity::Day,
+            PartitionGranularity::Month,
+            PartitionGranularity::Year,
+        ] {
+            let (start, end) = granularity.period_bounds_ms(ts);
+            assert!(start <= ts && ts < end, "{granularity}: {start}..{end} vs {ts}");
+            // A timestamp just past the end must map to a different partition.
+            let next = PartKey::from_timestamp("s", end, granularity);
+            let current = PartKey::from_timestamp("s", ts, granularity);
+            assert_ne!(next, current, "{granularity}");
+        }
+
+        let (day_start, day_end) = PartitionGranularity::Day.period_bounds_ms(ts);
+        assert_eq!(day_end - day_start, 24 * 3600 * 1000);
+    }
+
+    fn count_parquet_rows(dir: &std::path::Path) -> anyhow::Result<i64> {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+
+        let mut total = 0;
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(current) = stack.pop() {
+            for entry in std::fs::read_dir(&current)? {
+                let path = entry?.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("parquet") {
+                    let reader = SerializedFileReader::new(std::fs::File::open(&path)?)?;
+                    total += reader.metadata().file_metadata().num_rows();
+                }
+            }
+        }
+        Ok(total)
+    }
+
+    #[tokio::test]
+    async fn shutdown_flushes_buffered_rows() -> anyhow::Result<()> {
+        use super::{
+            async_trait, line_reader_from_async_read, run_ingest, CommonOptions, IngestOptions,
+            LineReader, LineSource,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        // Emits three lines but raises the shutdown flag while the second is
+        // being processed, mimicking a SIGTERM landing mid-stream with rows
+        // still buffered in memory.
+        struct ShutdownMidStream {
+            shutdown: Arc<AtomicBool>,
+            seen: usize,
+        }
+
+        #[async_trait]
+        impl LineSource for ShutdownMidStream {
+            fn source_name(&self) -> &str {
+                "shutdown-test"
+            }
+
+            fn normalize_payload(&mut self, payload: String, _timestamp_ms: i64) -> String {
+                self.seen += 1;
+                if self.seen == 2 {
+                    self.shutdown.store(true, Ordering::SeqCst);
+                }
+                payload
+            }
+
+            async fn open(&mut self, max_line_length: usize) -> anyhow::Result<LineReader> {
+                Ok(line_reader_from_async_read(
+                    std::io::Cursor::new(b"line-1\nline-2\nline-3\n".to_vec()),
+                    max_line_length,
+                ))
+            }
+        }
+
+        let dir = tempfile::tempdir()?;
+        let out_dir = dir.path().join("out");
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut source = ShutdownMidStream {
+            shutdown: shutdown.clone(),
+            seen: 0,
+        };
+
+        run_ingest(
+            &mut source,
+            IngestOptions {
+                common: CommonOptions {
+                    out_dir: out_dir.clone(),
+                    partition: PartitionGranularity::Year,
+                    max_rows: None,
+                    max_batch_bytes: 64 * 1024 * 1024,
+                    compression_level: 3,
+                    upload_drain_timeout_seconds: 1,
+                    max_line_length: 1024,
+                    health_check: false,
+                    metrics_addr: None,
+                },
+                s3: None,
+                s3_storage: None,
+                health_file: dir.path().join("health"),
+                manage_health: false,
+                report_progress: false,
+                log_writes: false,
+                shutdown: Some(shutdown),
+                write_workers: None,
+                sweep_orphans: false,
+            },
+        )
+        .await?;
+
+        assert_eq!(
+            count_parquet_rows(&out_dir)?,
+            2,
+            "rows buffered when shutdown was requested must be flushed to disk"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn finds_only_hive_layout_parquet_orphans() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let out_dir = dir.path().join("out");
+        let partition_dir = out_dir.join("source=ais/year=2024/month=01/day=15");
+        std::fs::create_dir_all(&partition_dir)?;
+
+        std::fs::write(partition_dir.join("part-1.parquet"), b"data")?;
+        std::fs::write(partition_dir.join("part-2.parquet.tmp"), b"incomplete")?;
+        std::fs::write(out_dir.join("stray.parquet"), b"outside layout")?;
+        std::fs::write(out_dir.join(".collect-file-completed"), b"manifest")?;
+
+        let orphans = super::find_orphaned_uploads(&out_dir)?;
+        assert_eq!(orphans.len(), 1, "only the finished hive-layout file");
+        assert_eq!(
+            orphans[0].1,
+            "source=ais/year=2024/month=01/day=15/part-1.parquet"
+        );
+        assert_eq!(orphans[0].0, partition_dir.join("part-1.parquet"));
+
+        // Missing out_dir is a clean no-op (first run on an empty node).
+        let none = super::find_orphaned_uploads(&dir.path().join("missing"))?;
+        assert!(none.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn every_sealed_batch_is_reported_durable() -> anyhow::Result<()> {
+        use super::{
+            async_trait, line_reader_from_async_read, run_ingest, CommonOptions, IngestOptions,
+            LineReader, LineSource,
+        };
+
+        struct RecordingSource {
+            sealed: Vec<u64>,
+            durable: Vec<u64>,
+        }
+
+        #[async_trait]
+        impl LineSource for RecordingSource {
+            fn source_name(&self) -> &str {
+                "seal-test"
+            }
+
+            fn on_batch_sealed(&mut self, seq: u64) {
+                self.sealed.push(seq);
+            }
+
+            fn on_batch_durable(&mut self, seq: u64) {
+                self.durable.push(seq);
+            }
+
+            async fn open(&mut self, max_line_length: usize) -> anyhow::Result<LineReader> {
+                let data: String = (0..6).map(|i| format!("line-{i}\n")).collect();
+                Ok(line_reader_from_async_read(
+                    std::io::Cursor::new(data.into_bytes()),
+                    max_line_length,
+                ))
+            }
+        }
+
+        let dir = tempfile::tempdir()?;
+        let mut source = RecordingSource {
+            sealed: Vec::new(),
+            durable: Vec::new(),
+        };
+
+        run_ingest(
+            &mut source,
+            IngestOptions {
+                common: CommonOptions {
+                    out_dir: dir.path().join("out"),
+                    partition: PartitionGranularity::Year,
+                    max_rows: Some(2), // 6 lines -> 3 sealed batches
+                    max_batch_bytes: 64 * 1024 * 1024,
+                    compression_level: 3,
+                    upload_drain_timeout_seconds: 1,
+                    max_line_length: 1024,
+                    health_check: false,
+                    metrics_addr: None,
+                },
+                s3: None,
+                s3_storage: None,
+                health_file: dir.path().join("health"),
+                manage_health: false,
+                report_progress: false,
+                log_writes: false,
+                shutdown: None,
+                write_workers: None,
+                sweep_orphans: false,
+            },
+        )
+        .await?;
+
+        assert_eq!(source.sealed, vec![1, 2, 3], "seals arrive in order");
+        let mut durable = source.durable.clone();
+        durable.sort_unstable();
+        assert_eq!(
+            durable,
+            vec![1, 2, 3],
+            "every sealed batch must be reported durable before run_ingest returns"
+        );
+        Ok(())
+    }
 }
 
 pub fn line_reader_from_async_read<R>(reader: R, max_line_length: usize) -> LineReader
@@ -523,6 +825,8 @@ where
         report_progress,
         log_writes,
         shutdown: external_shutdown,
+        write_workers,
+        sweep_orphans,
     } = options;
 
     if common.health_check {
@@ -535,6 +839,58 @@ where
         (None, Some(s3_options)) => Some(s3_options.into_storage().await?),
         (None, None) => None,
     };
+
+    let metrics = Arc::new(IngestMetrics::default());
+    metrics.touch_heartbeat();
+    let metrics_server = match &common.metrics_addr {
+        Some(addr) => {
+            match metrics::spawn_metrics_server(
+                addr,
+                source.source_name().to_string(),
+                metrics.clone(),
+            )
+            .await
+            {
+                Ok((handle, local_addr)) => {
+                    eprintln!("📡 Metrics endpoint listening on http://{local_addr}/metrics");
+                    Some(handle)
+                }
+                Err(error) => {
+                    // Never fail ingest because a metrics port is taken (e.g.
+                    // several collect-file workers sharing one address).
+                    eprintln!("⚠️  Metrics endpoint disabled: {error}");
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+
+    // Snapshot orphaned files from previous runs *before* this run writes
+    // anything new, then upload them in the background alongside live data.
+    if sweep_orphans {
+        if let Some(storage) = s3_storage.clone().filter(|storage| !storage.keeps_local()) {
+            let out_dir = common.out_dir.clone();
+            match tokio::task::spawn_blocking(move || find_orphaned_uploads(&out_dir)).await {
+                Ok(Ok(orphans)) if !orphans.is_empty() => {
+                    eprintln!(
+                        "♻️  Found {} orphaned parquet file(s) from a previous run; uploading in background",
+                        format_count(orphans.len())
+                    );
+                    metrics
+                        .orphan_files_swept
+                        .fetch_add(orphans.len() as u64, Ordering::Relaxed);
+                    let sweep_metrics = metrics.clone();
+                    tokio::spawn(async move {
+                        upload_orphaned_files(storage, orphans, sweep_metrics).await;
+                    });
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => eprintln!("⚠️  Orphan upload scan failed: {error}"),
+                Err(error) => eprintln!("⚠️  Orphan upload scan failed: {error}"),
+            }
+        }
+    }
 
     let mut reader = source.open(common.max_line_length).await?;
 
@@ -568,22 +924,35 @@ where
         eprintln!("Shutdown signal received. Flushing buffers and draining uploads...");
     });
 
-    let now = now_unix_duration();
-    let mut current_key = PartKey::from_timestamp(
-        source.source_name(),
-        now.as_millis() as i64,
-        common.partition,
-    );
+    let now_ms = now_unix_duration().as_millis() as i64;
+    let mut current_key = PartKey::from_timestamp(source.source_name(), now_ms, common.partition);
+    // Cache the current partition's time window so the per-row check is two
+    // integer comparisons instead of a PartKey allocation plus calendar math.
+    let (mut key_start_ms, mut key_end_ms) = common.partition.period_bounds_ms(now_ms);
     let mut buf = BatchBuf::new(common.max_rows, common.max_batch_bytes);
     let mut rows_in_file = 0usize;
     let mut rows_processed = 0usize;
     let mut files_flushed = 0usize;
+    let mut batches_sealed = 0u64;
 
-    let (upload_tx, upload_worker) = spawn_upload_worker(s3_storage.clone());
-    let (write_tx, write_worker) =
-        spawn_write_worker(shutdown.clone(), upload_tx.clone(), log_writes);
+    let (upload_tx, upload_worker) = spawn_upload_worker(s3_storage.clone(), metrics.clone());
+    let (durable_tx, mut durable_rx) = mpsc::unbounded_channel::<u64>();
+    // Bound queued batches by payload bytes, not job count, so memory stays
+    // predictable regardless of batch size.
+    let write_budget_bytes = common
+        .max_batch_bytes
+        .saturating_mul(4)
+        .max(8 * 1024 * 1024);
+    let (write_queue, write_worker) = spawn_write_worker(
+        shutdown.clone(),
+        upload_tx.clone(),
+        durable_tx,
+        log_writes,
+        write_workers,
+        write_budget_bytes,
+    );
 
-    if options.manage_health {
+    if manage_health {
         update_health_status_async(&health_file, true).await?;
     }
 
@@ -601,6 +970,7 @@ where
 
         tokio::select! {
             _ = heartbeat.tick() => {
+                metrics.touch_heartbeat();
                 if manage_health {
                     if let Err(error) = update_health_status_async(&health_file, true).await {
                         eprintln!("Failed to update health status: {}", error);
@@ -616,6 +986,12 @@ where
                     files_flushed,
                 );
             }
+            maybe_seq = durable_rx.recv() => {
+                if let Some(seq) = maybe_seq {
+                    metrics.batches_durable.fetch_add(1, Ordering::Relaxed);
+                    source.on_batch_durable(seq);
+                }
+            }
             maybe_line = reader.next() => {
                 match maybe_line {
                     Some(Ok(payload)) => {
@@ -624,29 +1000,34 @@ where
                             None => now_unix_duration().as_millis() as i64,
                         };
                         let payload = source.normalize_payload(payload, row_ts_ms);
-                        let row_key = PartKey::from_timestamp(
-                            source.source_name(),
-                            row_ts_ms,
-                            common.partition,
-                        );
                         let payload_len = payload.len();
 
-                        if row_key != current_key {
+                        let row_ts_clamped = row_ts_ms.max(0);
+                        if row_ts_clamped < key_start_ms || row_ts_clamped >= key_end_ms {
                             if !buf.is_empty() {
                                 flush_batch(
                                     &common.out_dir,
                                     &current_key,
                                     &mut buf,
-                                    write_tx.as_ref(),
+                                    write_queue.as_ref(),
                                     common.compression_level,
-                                    &shutdown,
-                                    log_writes,
+                                    batches_sealed + 1,
                                 )
                                 .await?;
+                                batches_sealed += 1;
+                                source.on_batch_sealed(batches_sealed);
+                                metrics.batches_sealed.store(batches_sealed, Ordering::Relaxed);
                                 rows_in_file = 0;
                                 files_flushed += 1;
                             }
-                            current_key = row_key;
+                            current_key = PartKey::from_timestamp(
+                                source.source_name(),
+                                row_ts_ms,
+                                common.partition,
+                            );
+                            let bounds = common.partition.period_bounds_ms(row_ts_ms);
+                            key_start_ms = bounds.0;
+                            key_end_ms = bounds.1;
                         }
 
                         // Keep each batch well below Arrow's string offset limit.
@@ -655,12 +1036,14 @@ where
                                 &common.out_dir,
                                 &current_key,
                                 &mut buf,
-                                write_tx.as_ref(),
+                                write_queue.as_ref(),
                                 common.compression_level,
-                                &shutdown,
-                                log_writes,
+                                batches_sealed + 1,
                             )
                             .await?;
+                            batches_sealed += 1;
+                            source.on_batch_sealed(batches_sealed);
+                            metrics.batches_sealed.store(batches_sealed, Ordering::Relaxed);
                             rows_in_file = 0;
                             files_flushed += 1;
                         }
@@ -668,18 +1051,25 @@ where
                         buf.push(row_ts_ms, &payload);
                         rows_in_file += 1;
                         rows_processed += 1;
+                        metrics.rows_processed.fetch_add(1, Ordering::Relaxed);
+                        metrics
+                            .buffered_bytes
+                            .store(buf.payload_bytes() as u64, Ordering::Relaxed);
+                        metrics.touch_last_row();
 
                         if buf.payload_bytes() >= common.max_batch_bytes {
                             flush_batch(
                                 &common.out_dir,
                                 &current_key,
                                 &mut buf,
-                                write_tx.as_ref(),
+                                write_queue.as_ref(),
                                 common.compression_level,
-                                &shutdown,
-                                log_writes,
+                                batches_sealed + 1,
                             )
                             .await?;
+                            batches_sealed += 1;
+                            source.on_batch_sealed(batches_sealed);
+                            metrics.batches_sealed.store(batches_sealed, Ordering::Relaxed);
                             rows_in_file = 0;
                             files_flushed += 1;
                         }
@@ -690,12 +1080,14 @@ where
                                     &common.out_dir,
                                     &current_key,
                                     &mut buf,
-                                    write_tx.as_ref(),
+                                    write_queue.as_ref(),
                                     common.compression_level,
-                                    &shutdown,
-                                    log_writes,
+                                    batches_sealed + 1,
                                 )
                                 .await?;
+                                batches_sealed += 1;
+                                source.on_batch_sealed(batches_sealed);
+                                metrics.batches_sealed.store(batches_sealed, Ordering::Relaxed);
                                 rows_in_file = 0;
                                 files_flushed += 1;
                             }
@@ -740,16 +1132,18 @@ where
             &common.out_dir,
             &current_key,
             &mut buf,
-            write_tx.as_ref(),
+            write_queue.as_ref(),
             common.compression_level,
-            &shutdown,
-            log_writes,
+            batches_sealed + 1,
         )
         .await?;
+        batches_sealed += 1;
+        source.on_batch_sealed(batches_sealed);
+        metrics.batches_sealed.store(batches_sealed, Ordering::Relaxed);
     }
 
-    if let Some(write_tx) = write_tx {
-        drop(write_tx);
+    if let Some(write_queue) = write_queue {
+        drop(write_queue);
         if let Some(write_worker) = write_worker {
             match write_worker.await {
                 Ok(Ok(())) => {}
@@ -757,6 +1151,14 @@ where
                 Err(error) => return Err(error.into()),
             }
         }
+    }
+
+    // All write workers have exited, so every durability notification is
+    // buffered in the channel; deliver them so sources can record final
+    // progress (e.g. commit Kafka offsets) before we return.
+    while let Ok(seq) = durable_rx.try_recv() {
+        metrics.batches_durable.fetch_add(1, Ordering::Relaxed);
+        source.on_batch_durable(seq);
     }
 
     if let Some(upload_tx) = upload_tx {
@@ -786,7 +1188,11 @@ where
         }
     }
 
-    if options.manage_health {
+    if let Some(metrics_server) = metrics_server {
+        metrics_server.abort();
+    }
+
+    if manage_health {
         update_health_status_async(&health_file, false).await?;
     }
     Ok(())
@@ -960,6 +1366,11 @@ impl S3Storage {
         })
     }
 
+    /// True when uploaded files are kept on local disk after upload.
+    pub fn keeps_local(&self) -> bool {
+        self.keep_local
+    }
+
     pub async fn upload_file(&self, local_path: &Path, s3_key: &str) -> Result<()> {
         let file_metadata = tokio::fs::metadata(local_path)
             .await
@@ -1084,12 +1495,21 @@ impl BatchBuf {
     }
 }
 
-fn sort_record_batch_by_ts(batch: &RecordBatch) -> Result<RecordBatch> {
+/// Sort a `(ts, payload)` record batch by ascending timestamp.
+///
+/// Returns a cheap clone when the batch is already sorted — the common case
+/// for streaming sources, avoiding the O(n log n) sort and the full copy that
+/// reordering implies.
+pub fn sort_record_batch_by_ts(batch: &RecordBatch) -> Result<RecordBatch> {
     let ts_column = batch
         .column(0)
         .as_any()
         .downcast_ref::<TimestampMillisecondArray>()
         .ok_or_else(|| anyhow::anyhow!("missing ts column for sorting"))?;
+
+    if ts_column.values().windows(2).all(|pair| pair[0] <= pair[1]) {
+        return Ok(batch.clone());
+    }
 
     let sort_options = SortOptions {
         descending: false,
@@ -1146,15 +1566,32 @@ fn parquet_file_name() -> String {
     )
 }
 
-async fn upload_with_retry(storage: S3Storage, path: PathBuf, s3_key: String) {
+async fn upload_with_retry(
+    storage: S3Storage,
+    path: PathBuf,
+    s3_key: String,
+    metrics: Arc<IngestMetrics>,
+) {
+    // Scale the attempt timeout with file size (60s base + ~2s per MiB,
+    // capped at 15 min) so large files on slow links are not doomed to hit
+    // the same fixed timeout on every retry.
+    let file_size = tokio::fs::metadata(&path)
+        .await
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let attempt_timeout = Duration::from_secs((60 + 2 * (file_size / (1024 * 1024))).min(900));
+
     for attempt in 1..=DEFAULT_UPLOAD_RETRIES {
         let upload_result =
-            tokio::time::timeout(Duration::from_secs(60), storage.upload_file(&path, &s3_key))
-                .await;
+            tokio::time::timeout(attempt_timeout, storage.upload_file(&path, &s3_key)).await;
 
         match upload_result {
-            Ok(Ok(())) => return,
+            Ok(Ok(())) => {
+                metrics.uploads_succeeded.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
             Ok(Err(error)) if attempt < DEFAULT_UPLOAD_RETRIES => {
+                metrics.upload_retries.fetch_add(1, Ordering::Relaxed);
                 let backoff = Duration::from_secs(1_u64 << (attempt - 1));
                 eprintln!(
                     "Upload attempt {attempt}/{DEFAULT_UPLOAD_RETRIES} failed for {}: {}. Retrying in {}s...",
@@ -1165,6 +1602,7 @@ async fn upload_with_retry(storage: S3Storage, path: PathBuf, s3_key: String) {
                 tokio::time::sleep(backoff).await;
             }
             Err(_) if attempt < DEFAULT_UPLOAD_RETRIES => {
+                metrics.upload_retries.fetch_add(1, Ordering::Relaxed);
                 let backoff = Duration::from_secs(1_u64 << (attempt - 1));
                 eprintln!(
                     "Upload attempt {attempt}/{DEFAULT_UPLOAD_RETRIES} timed out for {}. Retrying in {}s...",
@@ -1174,11 +1612,13 @@ async fn upload_with_retry(storage: S3Storage, path: PathBuf, s3_key: String) {
                 tokio::time::sleep(backoff).await;
             }
             Ok(Err(error)) => {
+                metrics.uploads_failed.fetch_add(1, Ordering::Relaxed);
                 eprintln!("⚠️  Background upload failed after retries: {}", error);
                 eprintln!("   📁 File preserved on disk for retry: {}", path.display());
                 return;
             }
             Err(_) => {
+                metrics.uploads_failed.fetch_add(1, Ordering::Relaxed);
                 eprintln!(
                     "⚠️  Background upload timed out after retries. File preserved on disk: {}",
                     path.display()
@@ -1189,8 +1629,107 @@ async fn upload_with_retry(storage: S3Storage, path: PathBuf, s3_key: String) {
     }
 }
 
+/// Find parquet files under `out_dir` that a previous run wrote but never
+/// uploaded (the uploader deletes local files on success, so with keep_local
+/// off, anything still present belongs to a run that died before upload).
+/// Returns `(local_path, s3_key)` pairs; only files inside the hive layout
+/// (`source=.../...`) are considered, and in-progress `.tmp` files are not.
+fn find_orphaned_uploads(out_dir: &Path) -> Result<Vec<(PathBuf, String)>> {
+    let mut orphans = Vec::new();
+    if !out_dir.is_dir() {
+        return Ok(orphans);
+    }
+
+    let mut stack = vec![out_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                eprintln!("⚠️  Skipping unreadable directory {}: {}", dir.display(), error);
+                continue;
+            }
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|ext| ext.to_str()) != Some("parquet") {
+                continue;
+            }
+            let Ok(rel) = path.strip_prefix(out_dir) else {
+                continue;
+            };
+            let s3_key = rel
+                .components()
+                .map(|component| component.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            if !s3_key.starts_with("source=") {
+                continue;
+            }
+            orphans.push((path, s3_key));
+        }
+    }
+
+    orphans.sort();
+    Ok(orphans)
+}
+
+/// Upload previously found orphan files with bounded concurrency, reusing the
+/// per-file retry/timeout policy of live uploads (successful uploads delete
+/// the local file; failures leave it for the next sweep).
+async fn upload_orphaned_files(
+    storage: S3Storage,
+    files: Vec<(PathBuf, String)>,
+    metrics: Arc<IngestMetrics>,
+) {
+    let semaphore = Arc::new(Semaphore::new(DEFAULT_UPLOAD_CONCURRENCY));
+    let mut uploads = JoinSet::new();
+
+    for (path, s3_key) in files {
+        let permit = match semaphore.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => break,
+        };
+        let storage = storage.clone();
+        let metrics = metrics.clone();
+        uploads.spawn(async move {
+            let _permit = permit;
+            upload_with_retry(storage, path, s3_key, metrics).await;
+        });
+    }
+
+    while let Some(result) = uploads.join_next().await {
+        if let Err(error) = result {
+            eprintln!("Orphan upload task failed: {error}");
+        }
+    }
+}
+
+/// Scan `out_dir` for parquet files left behind by a previous run and upload
+/// them, waiting for completion. Returns the number of files uploaded (or
+/// attempted). No-op when `storage` keeps local files after upload, since
+/// already-uploaded files can't be told apart from orphans.
+pub async fn sweep_orphaned_uploads(out_dir: PathBuf, storage: S3Storage) -> Result<usize> {
+    if storage.keeps_local() {
+        return Ok(0);
+    }
+
+    let files = tokio::task::spawn_blocking(move || find_orphaned_uploads(&out_dir))
+        .await
+        .context("orphan upload scan task")??;
+    let count = files.len();
+    if count > 0 {
+        upload_orphaned_files(storage, files, Arc::new(IngestMetrics::default())).await;
+    }
+    Ok(count)
+}
+
 fn spawn_upload_worker(
     s3_storage: Option<S3Storage>,
+    metrics: Arc<IngestMetrics>,
 ) -> (
     Option<mpsc::Sender<(PathBuf, String)>>,
     Option<tokio::task::JoinHandle<()>>,
@@ -1210,9 +1749,10 @@ fn spawn_upload_worker(
                 Err(_) => break,
             };
             let storage = s3_storage_worker.clone();
+            let metrics = metrics.clone();
             uploads.spawn(async move {
                 let _permit = permit;
-                upload_with_retry(storage, path, s3_key).await;
+                upload_with_retry(storage, path, s3_key, metrics).await;
             });
         }
 
@@ -1226,16 +1766,29 @@ fn spawn_upload_worker(
     (Some(tx), Some(worker))
 }
 
+/// Producer half of the write pipeline: a job channel plus a semaphore that
+/// bounds the payload bytes allowed in flight (queued or being written).
+struct WriteQueueHandle {
+    tx: mpsc::Sender<WriteJob>,
+    byte_budget: Arc<Semaphore>,
+    budget_bytes: usize,
+}
+
 fn spawn_write_worker(
     shutdown: Arc<AtomicBool>,
     upload_tx: Option<mpsc::Sender<(PathBuf, String)>>,
+    durable_tx: mpsc::UnboundedSender<u64>,
     log_writes: bool,
+    worker_limit: Option<usize>,
+    budget_bytes: usize,
 ) -> (
-    Option<mpsc::Sender<WriteJob>>,
+    Option<WriteQueueHandle>,
     Option<tokio::task::JoinHandle<Result<()>>>,
 ) {
     let (tx, rx) = mpsc::channel::<WriteJob>(DEFAULT_WRITE_QUEUE_CAPACITY);
-    let worker_count = default_write_worker_limit();
+    let worker_count = worker_limit
+        .unwrap_or_else(default_write_worker_limit)
+        .max(1);
 
     let worker = tokio::spawn(async move {
         let mut workers = Vec::with_capacity(worker_count);
@@ -1245,12 +1798,14 @@ fn spawn_write_worker(
             let shared_rx = shared_rx.clone();
             let shutdown = shutdown.clone();
             let upload_tx = upload_tx.clone();
+            let durable_tx = durable_tx.clone();
             workers.push(tokio::spawn(async move {
+                // Drain until the channel closes: a shutdown signal stops the
+                // reader, but queued batches must still reach disk. A write
+                // error sets `shutdown` (stopping the reader) and exits this
+                // worker; once every worker has failed the channel closes and
+                // producers see the error.
                 loop {
-                    if shutdown.load(Ordering::SeqCst) {
-                        break;
-                    }
-
                     let next_job = {
                         let mut rx = shared_rx.lock().await;
                         rx.recv().await
@@ -1260,7 +1815,9 @@ fn spawn_write_worker(
                         break;
                     };
 
-                    if let Err(error) = write_batch_job(job, upload_tx.as_ref(), log_writes).await {
+                    if let Err(error) =
+                        write_batch_job(job, upload_tx.as_ref(), &durable_tx, log_writes).await
+                    {
                         shutdown.store(true, Ordering::SeqCst);
                         return Err(error);
                     }
@@ -1295,26 +1852,39 @@ fn spawn_write_worker(
         Ok(())
     });
 
-    (Some(tx), Some(worker))
+    (
+        Some(WriteQueueHandle {
+            tx,
+            byte_budget: Arc::new(Semaphore::new(budget_bytes.min(Semaphore::MAX_PERMITS))),
+            budget_bytes,
+        }),
+        Some(worker),
+    )
 }
 
 struct WriteJob {
+    seq: u64,
     path: PathBuf,
     s3_key: String,
     batch: RecordBatch,
     compression_level: i32,
+    /// Held while the batch occupies memory; released once written to disk.
+    byte_permit: OwnedSemaphorePermit,
 }
 
 async fn write_batch_job(
     job: WriteJob,
     upload_tx: Option<&mpsc::Sender<(PathBuf, String)>>,
+    durable_tx: &mpsc::UnboundedSender<u64>,
     log_writes: bool,
 ) -> Result<()> {
     let WriteJob {
+        seq,
         path,
         s3_key,
         batch,
         compression_level,
+        byte_permit,
     } = job;
     let schema = batch.schema();
     let batch_rows = batch.num_rows();
@@ -1341,6 +1911,14 @@ async fn write_batch_job(
     })
     .await
     .context("joining parquet write task")??;
+
+    // The batch memory is released once it is on disk; free its byte budget
+    // so the producer can seal the next batch.
+    drop(byte_permit);
+
+    // The batch is on local disk under its final name: report durability so
+    // sources can advance their upstream progress markers (e.g. Kafka offsets).
+    let _ = durable_tx.send(seq);
 
     if log_writes {
         println!(
@@ -1371,44 +1949,49 @@ async fn flush_batch(
     root: &Path,
     key: &PartKey,
     buf: &mut BatchBuf,
-    write_tx: Option<&mpsc::Sender<WriteJob>>,
+    queue: Option<&WriteQueueHandle>,
     compression_level: i32,
-    shutdown: &AtomicBool,
-    _log_writes: bool,
+    seq: u64,
 ) -> Result<()> {
     let dir = key.dir_path(root);
     let filename = parquet_file_name();
     let path = dir.join(&filename);
+    let payload_bytes = buf.payload_bytes().max(1);
     let batch = buf.to_record_batch()?;
     let batch = sort_record_batch_by_ts(&batch)?;
     let s3_key = key.s3_key(&filename);
-    let Some(write_tx) = write_tx else {
+    let Some(queue) = queue else {
         return Err(anyhow::anyhow!("missing write queue"));
     };
 
-    let mut job = Some(WriteJob {
-        path,
-        s3_key,
-        batch,
-        compression_level,
-    });
+    // Byte-budget backpressure: memory in the write pipeline is bounded by
+    // the semaphore budget rather than the queue's job count. Oversized
+    // batches clamp to the full budget so they can still proceed alone.
+    let permits = payload_bytes
+        .min(queue.budget_bytes)
+        .min(u32::MAX as usize) as u32;
+    let byte_permit = queue
+        .byte_budget
+        .clone()
+        .acquire_many_owned(permits)
+        .await
+        .map_err(|_| anyhow::anyhow!("write byte budget closed"))?;
 
-    loop {
-        if shutdown.load(Ordering::SeqCst) {
-            return Err(anyhow::anyhow!("write queue interrupted by shutdown"));
-        }
-
-        match write_tx.try_send(job.take().expect("write job missing")) {
-            Ok(()) => break,
-            Err(mpsc::error::TrySendError::Full(returned_job)) => {
-                job = Some(returned_job);
-                tokio::task::yield_now().await;
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                return Err(anyhow::anyhow!("write queue closed"));
-            }
-        }
-    }
+    // Waits for queue capacity even during shutdown: the write workers keep
+    // draining until the channel closes, so this send stays bounded. The
+    // channel only closes early when every write worker has failed.
+    queue
+        .tx
+        .send(WriteJob {
+            seq,
+            path,
+            s3_key,
+            batch,
+            compression_level,
+            byte_permit,
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("write queue closed (write workers failed)"))?;
 
     Ok(())
 }

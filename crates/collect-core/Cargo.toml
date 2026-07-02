@@ -16,3 +16,6 @@ futures-util.workspace = true
 parquet.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

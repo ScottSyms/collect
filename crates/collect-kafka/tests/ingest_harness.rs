@@ -138,6 +138,7 @@ async fn kafka_ingest_harness_writes_expected_parquet() -> Result<()> {
         upload_drain_timeout_seconds: 1,
         max_line_length: 1024,
         health_check: false,
+        metrics_addr: None,
     };
 
     let opts = IngestOptions {
@@ -149,6 +150,8 @@ async fn kafka_ingest_harness_writes_expected_parquet() -> Result<()> {
         report_progress: false,
         log_writes: false,
         shutdown: Some(shutdown),
+        write_workers: None,
+        sweep_orphans: false,
     };
 
     run_ingest(&mut mock, opts).await?;

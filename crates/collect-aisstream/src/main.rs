@@ -361,6 +361,8 @@ async fn main() -> Result<()> {
             report_progress: true,
             log_writes: true,
             shutdown: None,
+            write_workers: None,
+            sweep_orphans: true,
         },
     )
     .await

@@ -1,20 +1,31 @@
 # collect
 
-A Rust workspace for ingesting data into Hive-partitioned Parquet files with Zstd compression. It provides `collect-file` for recursive file ingestion, `collect-socket` for TCP line ingestion, and `collect-maint` for inspection, validation, compaction, and vacuuming, with optional remote storage (S3/MinIO).
+A Rust workspace for ingesting positional data into Hive-partitioned Parquet files with Zstd compression — the bronze layer of a medallion pipeline for maritime (AIS) data. It provides:
+
+- **`collect-file`** — recursive file ingestion (plain, gzip, bzip2, zip)
+- **`collect-socket`** — TCP line-stream ingestion
+- **`collect-kafka`** — Kafka topic ingestion with at-least-once offset commits
+- **`collect-aisstream`** — aisstream.io WebSocket ingestion
+- **`ais-normalize`** — post-processing: re-timestamp, re-partition, and combine multi-part AIS sentences
+- **`collect-maint`** — inspect, validate, compact, and vacuum datasets (local or S3)
+
+All collectors support optional remote storage (S3/MinIO).
 
 ## Features
-- **Multiple Input Sources**: Plain, compressed, or TCP stream
+- **Multiple Input Sources**: Files, TCP streams, Kafka topics, and aisstream.io WebSocket
 - **Compressed Inputs**: Plain text, gzip, bzip2, and zip files
-- **AIS Timestamps**: Optional AIS capture timestamping for file ingestion
+- **AIS Normalization**: Fragment reassembly, tag-block/`$PGHP` re-timestamping, parallel partition processing
 - **Hive Partitioning**: Automatic partitioning by source and selected time granularity
-- **Parquet Format**: Efficient columnar storage with Zstd compression
+- **Parquet Format**: Efficient columnar storage with Zstd compression, sorted by timestamp
 - **S3 Integration**: Upload to AWS S3 or S3-compatible storage (MinIO) with optional TLS
 - **Background Uploads**: Non-blocking S3 uploads to prevent data collection pauses
-- **Maintenance CLI**: Inspect, validate, compact, and vacuum hive-partitioned datasets
+- **At-Least-Once Delivery**: Graceful-shutdown flush, startup sweep of orphaned files, and Kafka offsets committed only after data is durable on disk
+- **Observability**: Optional Prometheus `/metrics` and HTTP `/healthz` endpoint per collector
+- **Maintenance CLI**: Inspect, validate, compact (streaming k-way merge), and vacuum hive-partitioned datasets
 - **Docker Support**: Full Docker and docker-compose integration with health checks
 - **Environment Variables**: Complete environment variable support for containerized deployments
-- **Real-time Processing**: Async processing with configurable buffering
-- **Health Monitoring**: Built-in health checks for container orchestration
+- **Bounded Memory**: Byte-budgeted write pipeline; predictable footprint under backpressure
+- **Health Monitoring**: File-based health checks plus an HTTP endpoint for orchestration
 - **Pure Rust TLS**: Uses rustls for secure connections without OpenSSL dependencies
 
 ## Quick Start
@@ -41,8 +52,17 @@ cargo run -p collect-file -- --input data.txt --source mydata
 # TCP stream
 cargo run -p collect-socket -- --tcp-host 153.44.253.27 --tcp-port 5631 --source norway-tcp
 
+# Kafka topic
+cargo run -p collect-kafka -- --kafka-brokers broker:9092 --topic ais-raw --group-id collect
+
+# aisstream.io WebSocket (worldwide bounding box)
+cargo run -p collect-aisstream -- --api-key $AISSTREAM_API_KEY --bounding-boxes '[[[-90,-180],[90,180]]]'
+
 # File input with S3
 cargo run -p collect-file -- --input data.txt --source mydata --compression-level 1 --s3-bucket maritime-data
+
+# Normalize collected AIS data (combine fragments, re-timestamp/re-partition)
+cargo run -p ais-normalize -- --input-dir data --output-dir normalized --partition day --apply
 ```
 
 `collect-file` auto-detects plain text, gzip, bzip2, and zip inputs. Zip archives are read entry-by-entry in archive order. Hidden dotfiles are skipped silently. `--concurrency` overrides the auto-selected file worker count. `--ais` applies to `collect-file` only; it prefers NMEA `c:<epoch>` tag block timestamps and `$PGHP` capture timestamps when present, and reuses the first sentence timestamp for grouped `\g:` fragments.
@@ -204,6 +224,39 @@ HEALTH_CHECK=true ./target/release/collect-socket
 
 Health status is tracked in `/tmp/collect-socket.health` for the socket binary and `/tmp/collect-file.health` for the file binary.
 
+When `--metrics-addr` is set (see below), an HTTP `GET /healthz` endpoint is also available — it returns `200` while the ingest loop's heartbeat is fresh and `503` once it goes stale (60-second window), so it detects hung loops rather than just live processes. Prefer it for Nomad/Kubernetes HTTP checks.
+
+## Observability
+
+Every collector can serve Prometheus metrics with `--metrics-addr` (or `METRICS_ADDR`):
+
+```bash
+cargo run -p collect-socket -- --tcp-host host --tcp-port 5631 --metrics-addr 0.0.0.0:9184
+curl localhost:9184/metrics
+curl localhost:9184/healthz
+```
+
+Exposed metrics (all labeled with `source="..."`):
+
+| Metric | Type | Meaning |
+|--------|------|---------|
+| `collect_rows_processed_total` | counter | Rows ingested since process start |
+| `collect_batches_sealed_total` | counter | Batches queued for Parquet writing |
+| `collect_batches_durable_total` | counter | Batches durably written to local disk |
+| `collect_buffered_bytes` | gauge | Payload bytes in the open batch |
+| `collect_uploads_succeeded_total` | counter | Completed S3 uploads |
+| `collect_uploads_failed_total` | counter | Uploads abandoned after retries |
+| `collect_upload_retries_total` | counter | Upload attempts retried |
+| `collect_orphan_files_swept_total` | counter | Orphaned files queued at startup |
+| `collect_last_row_unix_ms` | gauge | Timestamp of most recent row |
+| `collect_last_heartbeat_unix_ms` | gauge | Ingest loop heartbeat |
+
+## Delivery Guarantees
+
+- **Graceful shutdown**: on SIGTERM/SIGINT the collectors stop reading, flush the in-memory batch, finish every queued Parquet write, and drain pending S3 uploads for up to `UPLOAD_DRAIN_TIMEOUT_SECONDS` (default 60s). Give your orchestrator a stop grace period longer than that (`kill_timeout` in Nomad, `stop_grace_period` in Docker Compose).
+- **Orphan sweep**: at startup each collector scans its output directory for Parquet files a previous run wrote but never uploaded (crash, SIGKILL, expired drain window) and uploads them in the background. Skipped when `KEEP_LOCAL=true`, since uploaded files can't be distinguished from orphans.
+- **Kafka offsets**: `collect-kafka` disables auto-commit and commits offsets only after the batch containing a message is durably written to local disk, giving at-least-once delivery — a crash replays at most a few messages instead of losing them.
+
 ## S3 Integration
 
 Supports AWS S3 and S3-compatible storage (MinIO) with background uploads to prevent data collection pauses:
@@ -253,11 +306,11 @@ cargo build --release --workspace
 
 ## Performance Tuning
 
-- **MAX_ROWS**: Control memory usage vs file size (default: flush on minute boundary)
-- **MAX_PAYLOAD_BYTES**: Flush before buffered string data grows too large for Arrow offsets (default: `268435456`)
-- **MAX_ROWS**: Cap rows per file when you want smaller Parquet chunks
-- **MAX_BATCH_BYTES**: Cap buffered payload size per Parquet file (default: 64 MiB)
-- **Compression**: Uses Zstd for optimal compression ratio and speed
+- **MAX_ROWS**: Cap rows per file when you want smaller Parquet chunks (default: flush on the partition boundary)
+- **MAX_BATCH_BYTES**: Cap buffered payload size per Parquet file (default: 64 MiB). The write pipeline holds at most ~4× this in flight, so worst-case ingest memory is roughly `5 × MAX_BATCH_BYTES` plus a small base.
+- **Compression**: Zstd level 5 by default; level 3 is ~40% faster for a few percent more size — a good trade for CPU-constrained live collectors
+- **collect-file `--concurrency`**: overrides the auto-selected worker count (defaults to ~1–2× cores; per-worker buffers scale down automatically)
+- **ais-normalize `--concurrency`**: partitions are processed in parallel (defaults to up to 8 workers)
 - **Async Processing**: Leverages Tokio for high-performance async I/O
 - **Resource Limits**: Set appropriate memory limits in Docker for large datasets
 

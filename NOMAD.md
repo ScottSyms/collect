@@ -70,15 +70,28 @@ EOH
 }
 ```
 
+## Metrics & Health Endpoint
+
+The job assigns a dynamic `metrics` port and sets `METRICS_ADDR` so the collector serves:
+
+- `GET /metrics` — Prometheus metrics (rows ingested, batches written, upload successes/failures/retries, orphan files swept, heartbeat)
+- `GET /healthz` — `200` while the ingest loop heartbeat is fresh, `503` once it goes stale (60s window)
+
+The service is registered with a `prometheus` tag, so a Prometheus server using Consul service discovery can scrape it with a `consul_sd_configs` job matching that tag.
+
+## Graceful Shutdown
+
+The job sets `kill_timeout = "90s"`, which must stay **above** `UPLOAD_DRAIN_TIMEOUT_SECONDS` (default 60s). On stop, the collector flushes its in-memory batch, finishes queued Parquet writes, and drains pending S3 uploads before exiting; a shorter kill_timeout would SIGKILL it mid-drain. Files that still miss the window are picked up by the startup orphan sweep on the next allocation and uploaded then.
+
 ## Health Checks & Restart Behaviour
 
-Nomad runs the built-in health check every 30 seconds:
+Nomad polls the HTTP health check every 30 seconds:
 
 ```
-collect-socket --health-check
+GET http://<alloc>:<metrics-port>/healthz
 ```
 
-The check script touches `/tmp/collect-socket.health` on each successful cycle.
+This detects hung ingest loops, not just dead processes — the endpoint goes `503` when the loop stops heartbeating. (The file-based `collect-socket --health-check` script check remains available for setups without a network namespace.)
 
 There are **two independent restart mechanisms**:
 
