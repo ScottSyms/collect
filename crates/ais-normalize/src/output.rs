@@ -137,7 +137,7 @@ impl PartitionWriter {
         Ok(())
     }
 
-    fn close(mut self) -> Result<u64> {
+    fn close(mut self) -> Result<(u64, PathBuf)> {
         self.flush_batch()?;
         self.writer.close().context("closing Parquet writer")?;
         if self.total_rows > 0 {
@@ -146,7 +146,7 @@ impl PartitionWriter {
         } else {
             let _ = fs::remove_file(&self.temp_path);
         }
-        Ok(self.total_rows)
+        Ok((self.total_rows, self.final_path))
     }
 }
 
@@ -202,18 +202,24 @@ impl OutputWriterPool {
     }
 
     /// Close all writers and rename temp files to final paths.
-    /// Returns `(partition_rel_dir, rows)` per partition written (or that
-    /// would be written in dry-run mode); callers aggregate and report.
-    pub fn flush_all(self) -> Result<Vec<(String, u64)>> {
+    /// Returns `(partition_rel_dir, rows, local_path)` per partition written
+    /// (or that would be written in dry-run mode, with an empty path);
+    /// callers aggregate for reporting and, for S3 output, upload
+    /// `local_path` under a key derived from it.
+    pub fn flush_all(self) -> Result<Vec<(String, u64, PathBuf)>> {
         if self.dry_run {
-            return Ok(self.dry_run_counts.into_iter().collect());
+            return Ok(self
+                .dry_run_counts
+                .into_iter()
+                .map(|(rel_dir, rows)| (rel_dir, rows, PathBuf::new()))
+                .collect());
         }
 
         let mut partitions = Vec::with_capacity(self.writers.len());
         for (rel_dir, writer) in self.writers {
-            let rows = writer.close()?;
+            let (rows, path) = writer.close()?;
             if rows > 0 {
-                partitions.push((rel_dir, rows));
+                partitions.push((rel_dir, rows, path));
             }
         }
         Ok(partitions)

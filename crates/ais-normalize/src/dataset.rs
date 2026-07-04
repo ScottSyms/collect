@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
-use collect_core::PartitionGranularity;
+use collect_core::{PartitionGranularity, S3Storage};
+use futures_util::stream::{self, StreamExt};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -180,9 +181,150 @@ pub async fn list_parquet_files(
     .context("dataset scan task panicked")?
 }
 
+/// One matched `.parquet` object in an S3 input bucket, before it's downloaded.
+pub struct S3Entry {
+    pub key: String,
+    pub rel_path: String,
+    pub partition: PartitionKey,
+}
+
+fn rel_from_key(prefix: &str, key: &str) -> String {
+    let prefix = prefix.trim_matches('/');
+    if prefix.is_empty() {
+        key.to_string()
+    } else {
+        key.strip_prefix(&format!("{}/", prefix))
+            .unwrap_or(key)
+            .to_string()
+    }
+}
+
+/// List `.parquet` objects under `prefix` in an S3 bucket, mirroring the
+/// filtering `list_parquet_files` applies locally: skips `tmp-`-prefixed
+/// files, requires the key (relative to `prefix`) to match the Hive layout
+/// for `granularity`, and optionally restricts to one `source`.
+pub async fn list_s3_parquet_entries(
+    storage: &S3Storage,
+    prefix: &str,
+    granularity: PartitionGranularity,
+    source_filter: Option<&str>,
+) -> Result<Vec<S3Entry>> {
+    let keys = storage
+        .list_keys_with_prefix(prefix)
+        .await
+        .context("listing S3 input bucket")?;
+
+    let mut entries: Vec<S3Entry> = Vec::new();
+    for (key, _size) in keys {
+        if !key.ends_with(".parquet") {
+            continue;
+        }
+        let file_name = key.rsplit('/').next().unwrap_or(&key);
+        if file_name.starts_with("tmp-") {
+            continue;
+        }
+
+        let rel_path = rel_from_key(prefix, &key);
+        let Some(partition) = PartitionKey::parse(&rel_path, granularity) else {
+            continue;
+        };
+
+        if let Some(filter) = source_filter {
+            if partition.source != filter {
+                continue;
+            }
+        }
+
+        entries.push(S3Entry {
+            key,
+            rel_path,
+            partition,
+        });
+    }
+
+    entries.sort_by(|a, b| {
+        a.partition
+            .sort_key()
+            .cmp(&b.partition.sort_key())
+            .then(a.rel_path.cmp(&b.rel_path))
+    });
+
+    Ok(entries)
+}
+
+/// Download every matched S3 entry into `scratch_root`, preserving its
+/// relative Hive path, so the rest of the pipeline can treat it exactly like
+/// a local dataset. Runs up to `concurrency` downloads at once.
+pub async fn download_s3_entries(
+    storage: &S3Storage,
+    entries: Vec<S3Entry>,
+    scratch_root: &Path,
+    concurrency: usize,
+) -> Result<Vec<DatasetFile>> {
+    let scratch_root = scratch_root.to_path_buf();
+    let mut files: Vec<DatasetFile> = stream::iter(entries)
+        .map(|entry| {
+            let storage = storage.clone();
+            let local_path = scratch_root.join(&entry.rel_path);
+            async move {
+                storage
+                    .download_to_path(&entry.key, &local_path)
+                    .await
+                    .with_context(|| format!("downloading s3://{}", entry.key))?;
+                Ok::<_, anyhow::Error>(DatasetFile {
+                    partition: entry.partition,
+                    path: local_path,
+                })
+            }
+        })
+        .buffer_unordered(concurrency.max(1))
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+
+    files.sort_by(|a, b| {
+        a.partition
+            .sort_key()
+            .cmp(&b.partition.sort_key())
+            .then(a.path.cmp(&b.path))
+    });
+
+    Ok(files)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rel_from_key_strips_prefix() {
+        assert_eq!(
+            rel_from_key(
+                "datasets/ais",
+                "datasets/ais/source=x/year=2024/day.parquet"
+            ),
+            "source=x/year=2024/day.parquet"
+        );
+    }
+
+    #[test]
+    fn rel_from_key_no_prefix() {
+        assert_eq!(
+            rel_from_key("", "source=x/year=2024/day.parquet"),
+            "source=x/year=2024/day.parquet"
+        );
+    }
+
+    #[test]
+    fn rel_from_key_ignores_non_matching_prefix() {
+        // A key that doesn't actually start with the prefix falls back to itself
+        // rather than panicking; callers still filter by PartitionKey::parse.
+        assert_eq!(
+            rel_from_key("other", "source=x/day.parquet"),
+            "source=x/day.parquet"
+        );
+    }
 
     #[test]
     fn parses_day_partition() {

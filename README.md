@@ -6,7 +6,7 @@ A Rust workspace for ingesting positional data into Hive-partitioned Parquet fil
 - **`collect-socket`** — TCP line-stream ingestion
 - **`collect-kafka`** — Kafka topic ingestion with at-least-once offset commits
 - **`collect-aisstream`** — aisstream.io WebSocket ingestion
-- **`ais-normalize`** — post-processing: re-timestamp, re-partition, and combine multi-part AIS sentences
+- **`ais-normalize`** — post-processing: re-timestamp, re-partition, and combine multi-part AIS sentences (input and output can each be local or S3)
 - **`collect-maint`** — inspect, validate, compact, and vacuum datasets (local or S3)
 
 All collectors support optional remote storage (S3/MinIO).
@@ -14,7 +14,7 @@ All collectors support optional remote storage (S3/MinIO).
 ## Features
 - **Multiple Input Sources**: Files, TCP streams, Kafka topics, and aisstream.io WebSocket
 - **Compressed Inputs**: Plain text, gzip, bzip2, and zip files
-- **AIS Normalization**: Fragment reassembly, tag-block/`$PGHP` re-timestamping, parallel partition processing
+- **AIS Normalization**: Fragment reassembly, tag-block/`$PGHP` re-timestamping, parallel partition processing, S3-to-S3 supported
 - **Hive Partitioning**: Automatic partitioning by source and selected time granularity
 - **Parquet Format**: Efficient columnar storage with Zstd compression, sorted by timestamp
 - **S3 Integration**: Upload to AWS S3 or S3-compatible storage (MinIO) with optional TLS
@@ -63,6 +63,9 @@ cargo run -p collect-file -- --input data.txt --source mydata --compression-leve
 
 # Normalize collected AIS data (combine fragments, re-timestamp/re-partition)
 cargo run -p ais-normalize -- --input-dir data --output-dir normalized --partition day --apply
+
+# Normalize straight from one S3 bucket to another (same endpoint/region/credentials)
+cargo run -p ais-normalize -- --input-s3-bucket raw-ais --output-s3-bucket normalized-ais --s3-endpoint http://minio:9000 --partition day --apply
 ```
 
 See [AIS_NORMALIZE.md](AIS_NORMALIZE.md) for how fragment reassembly and re-timestamping work, the full CLI reference, and deployment as a scheduled batch job.

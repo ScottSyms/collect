@@ -45,15 +45,50 @@ Rows that aren't AIS `VDM`/`VDO` sentences (heartbeats, other NMEA talkers, etc.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--input-dir` | *(required)* | Source Hive-partitioned Parquet root |
-| `--output-dir` | *(required)* | Destination root (see [output directory](#output-directory-non-destructive) note) |
+| `--input-dir` | *(one of `--input-dir`/`--input-s3-bucket` required)* | Source Hive-partitioned Parquet root on local disk |
+| `--output-dir` | *(one of `--output-dir`/`--output-s3-bucket` required)* | Destination root on local disk (see [output directory](#output-directory-non-destructive) note) |
+| `--input-s3-bucket` | *(none)* | Read the input dataset from this S3 bucket instead of `--input-dir` |
+| `--input-s3-prefix` | *(empty)* | Key prefix within the input bucket; acts as the dataset root, env `INPUT_S3_PREFIX` |
+| `--output-s3-bucket` | *(none)* | Write normalized output to this S3 bucket instead of `--output-dir` |
+| `--output-s3-prefix` | *(empty)* | Key prefix within the output bucket; acts as the dataset root, env `OUTPUT_S3_PREFIX` |
+| `--s3-endpoint` | AWS default | S3 endpoint URL, shared by both buckets (for MinIO/other S3-compatible storage), env `S3_ENDPOINT` |
+| `--s3-region` | `us-east-1` | S3 region, shared by both buckets, env `S3_REGION` |
+| `--s3-access-key` | *(none)* | S3 access key, shared by both buckets, env `S3_ACCESS_KEY` or `AWS_ACCESS_KEY_ID` |
+| `--s3-secret-key` | *(none)* | S3 secret key, shared by both buckets, env `S3_SECRET_KEY` or `AWS_SECRET_ACCESS_KEY` |
+| `--s3-disable-tls` | off | Use plain HTTP instead of HTTPS for the S3 endpoint, env `S3_DISABLE_TLS` |
 | `--partition` | `day` | Partition granularity; must match the input dataset's on-disk layout |
 | `--source` | *(all sources)* | Restrict to one `source=` label |
 | `--apply` | off (dry run) | Actually write output; omit to preview only |
 | `--batch-size` | `8192` | Rows per Parquet read batch |
 | `--compression-level` | `5` | Zstd level for output files |
-| `--concurrency` | cores, clamped `[1, 8]` | Partitions processed concurrently |
+| `--concurrency` | cores, clamped `[1, 8]` | Partitions processed concurrently; also bounds S3 download concurrency for `--input-s3-bucket` |
 | `--noui` | off | Disable the TTY status display; print plain progress lines instead (auto-enabled when stdout isn't a terminal) |
+
+`--input-dir`/`--input-s3-bucket` are mutually exclusive (exactly one required), and likewise for `--output-dir`/`--output-s3-bucket`. `--input-s3-bucket` and `--output-s3-bucket` always share one endpoint/region/credentials — only the bucket name (and optional prefix) differs between them, matching how the same S3-compatible store (e.g. one MinIO deployment) typically hosts both the raw and normalized datasets side by side as separate buckets.
+
+## S3 input and output
+
+Either side (or both) can be backed by S3 instead of local disk:
+
+```bash
+# Both input and output on the same MinIO endpoint, different buckets
+cargo run -p ais-normalize -- \
+  --input-s3-bucket raw-ais --output-s3-bucket normalized-ais \
+  --s3-endpoint http://minio:9000 --s3-region us-east-1 \
+  --s3-access-key minioadmin --s3-secret-key minioadmin --s3-disable-tls \
+  --partition day --apply
+
+# Local input, S3 output
+cargo run -p ais-normalize -- \
+  --input-dir data --output-s3-bucket normalized-ais --output-s3-prefix ais \
+  --s3-endpoint http://minio:9000 --s3-access-key minioadmin --s3-secret-key minioadmin --s3-disable-tls \
+  --partition day --apply
+```
+
+When either side is S3, the corresponding files are staged through a local scratch directory (under the OS temp dir) rather than read/written directly:
+
+- **S3 input**: every matched object is listed, then downloaded to the scratch directory up front (concurrency bounded by `--concurrency`) before partition processing starts. Peak local disk usage is roughly the total size of the matched input objects.
+- **S3 output**: each partition writes its normalized Parquet file to the scratch directory exactly as it would to a local `--output-dir`, then uploads it to `output_s3_prefix/<rel_dir>/<file>` and deletes the local copy — with up to 3 attempts (exponential backoff) per file. **If an upload ultimately fails, the scratch directory is deliberately not cleaned up** — its path is printed so you can inspect or manually upload the file — rather than silently discarding already-normalized output. On a fully successful run the scratch directory is removed automatically.
 
 ## Usage
 
@@ -90,10 +125,10 @@ A high `incomplete groups` count usually means fragments of the same message are
 
 ## Output directory (non-destructive)
 
-`ais-normalize` never modifies or deletes the input dataset — it only reads it and writes new files. This means:
+`ais-normalize` never modifies or deletes the input dataset — it only reads it and writes new files. This applies equally to `--output-dir` and `--output-s3-bucket`:
 
-- **`--output-dir` may equal `--input-dir`,** but if it does, the original raw files remain in place alongside the new normalized files in the same partitions. Re-running the tool will also re-scan and re-normalize any previously-written normalized output sitting under that same root (harmless, since already-normalized rows have nothing left to reassemble or re-timestamp, but wasteful).
-- **Recommended pattern:** write to a separate `--output-dir`, verify the result (row counts, spot-check with `collect-maint inspect`), then swap the downstream read path (or move/delete the raw directory) once satisfied. Keep the raw bronze data until you're confident in the normalized output — it's the only copy of the original ingest-time data.
+- **The output target may equal the input target** (same directory, or same bucket/prefix), but if it does, the original raw files remain in place alongside the new normalized files in the same partitions. Re-running the tool will also re-scan and re-normalize any previously-written normalized output sitting under that same root (harmless, since already-normalized rows have nothing left to reassemble or re-timestamp, but wasteful).
+- **Recommended pattern:** write to a separate output directory or bucket, verify the result (row counts, spot-check with `collect-maint inspect`), then swap the downstream read path (or move/delete the raw data) once satisfied. Keep the raw bronze data until you're confident in the normalized output — it's the only copy of the original ingest-time data.
 
 ## Deployment
 
@@ -137,6 +172,25 @@ job "ais-normalize" {
 
 `prohibit_overlap` matters: two concurrent runs over the same dataset would race on partition assignment and file naming. Size `memory` for `--concurrency × (number of output partitions a single input partition's rows fan out into) × ~ a few MiB per open writer buffer` — a few hundred MiB is enough for typical AIS retimestamping fan-out; raise it if a single run touches many output partitions per input partition.
 
+With `--input-s3-bucket`/`--output-s3-bucket`, no host volume is needed at all — swap the `args` block for:
+
+```hcl
+args = [
+  "--input-s3-bucket", "raw-ais",
+  "--output-s3-bucket", "normalized-ais",
+  "--s3-endpoint", "http://minio.service.consul:9000",
+  "--partition", "day",
+  "--concurrency", "4",
+  "--apply",
+]
+env {
+  S3_ACCESS_KEY = "..."
+  S3_SECRET_KEY = "..."
+}
+```
+
+Size local disk for the S3 scratch space too (under the task's `$TMPDIR`): input needs room for the total size of matched input objects, output needs room for one run's worth of normalized files until each uploads.
+
 ### Cron / systemd timer alternative
 
 ```bash
@@ -151,3 +205,4 @@ job "ais-normalize" {
 - **"No Parquet files found"** or fewer files processed than expected — the most common cause is `--partition` not matching the granularity the data was actually ingested with. `PartitionKey` parsing expects an exact number of `key=value` path segments for the given granularity (e.g. `day` expects `source=X/year=Y/month=M/day=D/`); files whose path doesn't match that depth are silently skipped rather than raising an error. Check the ingest job's `--partition`/`PARTITION` setting.
 - **High `incomplete groups`** — see the [summary output](#summary-output) note above.
 - **Output directory filling up with both raw and normalized files** — see [Output directory](#output-directory-non-destructive).
+- **Run failed partway through an S3 upload** — the run exits non-zero and prints the scratch directory path; the already-normalized Parquet file(s) are left there rather than deleted, since they're not yet durable anywhere else. Either upload manually with the printed path and key layout, or just re-run once the underlying S3 issue (network, credentials, bucket) is fixed — the same input regenerates equivalent output, and you can delete the stale scratch directory afterward.
