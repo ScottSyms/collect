@@ -264,8 +264,20 @@ async fn upload_with_retries(storage: &S3Storage, local_path: &Path, key: &str) 
     Err(last_error.expect("loop runs at least once and always records an error on failure"))
 }
 
+/// Best-effort raise of the soft open-file limit toward the hard limit. The
+/// merge and concurrent S3 downloads can hold many descriptors at once, and
+/// some environments default the soft limit low (macOS 256, some containers
+/// 1024). Never fails the run.
+fn raise_open_file_limit() {
+    if let Err(error) = rlimit::increase_nofile_limit(u64::MAX) {
+        eprintln!("Warning: could not raise the open-file limit: {error}");
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    raise_open_file_limit();
+
     let mut args = Args::parse();
     args.apply_env();
     let dry_run = !args.apply;

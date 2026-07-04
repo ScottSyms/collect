@@ -19,6 +19,7 @@ tokio.workspace = true
 walkdir.workspace = true
 crossterm.workspace = true
 ratatui.workspace = true
+rlimit.workspace = true
 tempfile = "3"
 
 [dependencies.collect-core]

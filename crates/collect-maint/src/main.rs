@@ -119,6 +119,13 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Compaction merges many parquet files at once (one reader per row group);
+    // raise the soft open-file limit toward the hard limit so a partition with
+    // many small files does not exhaust descriptors. Best-effort.
+    if let Err(error) = rlimit::increase_nofile_limit(u64::MAX) {
+        eprintln!("Warning: could not raise the open-file limit: {error}");
+    }
+
     let cli = Cli::parse();
     let storage = cli.storage.into_location().await?;
     let (concurrency, concurrency_source) = match cli.concurrency {

@@ -280,9 +280,112 @@ impl MergedWriter {
     }
 }
 
+/// Upper bound on parquet readers (≈ open file descriptors) held at once by a
+/// single merge. A partition with more row groups than this is merged in rounds
+/// through intermediate files so descriptor use never scales with file count.
+const MERGE_MAX_OPEN_READERS: usize = 128;
+
+/// Count non-empty row groups in a parquet file. Opens and closes one handle.
+fn nonempty_row_group_count(path: &Path) -> Result<usize> {
+    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let metadata = ArrowReaderMetadata::load(&file, ArrowReaderOptions::new())
+        .with_context(|| format!("read parquet footer {}", path.display()))?;
+    let mut count = 0;
+    for row_group in 0..metadata.metadata().num_row_groups() {
+        if metadata.metadata().row_group(row_group).num_rows() > 0 {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// Pack `inputs` into batches whose combined row-group count (≈ concurrent open
+/// readers) stays under `MERGE_MAX_OPEN_READERS`. Every batch except the last
+/// holds at least two files, so a multi-round merge always makes progress even
+/// when individual files already exceed the budget.
+fn plan_merge_batches(inputs: &[PathBuf]) -> Result<Vec<Vec<PathBuf>>> {
+    let mut batches: Vec<Vec<PathBuf>> = Vec::new();
+    let mut current: Vec<PathBuf> = Vec::new();
+    let mut current_rgs = 0usize;
+    for input in inputs {
+        let rgs = nonempty_row_group_count(input)?.max(1);
+        if current.len() >= 2 && current_rgs + rgs > MERGE_MAX_OPEN_READERS {
+            batches.push(std::mem::take(&mut current));
+            current_rgs = 0;
+        }
+        current.push(input.clone());
+        current_rgs += rgs;
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    Ok(batches)
+}
+
 /// K-way merge `inputs` into `output_path`, dropping exact `(ts, payload)`
-/// duplicates. Blocking; call from `spawn_blocking`.
+/// duplicates. Bounds concurrently-open readers to `MERGE_MAX_OPEN_READERS` by
+/// merging in rounds through intermediate files when a partition holds more
+/// files than fit at once — so it never runs out of file descriptors regardless
+/// of file count. Blocking; call from `spawn_blocking`.
 fn merge_dedup_files(
+    inputs: &[PathBuf],
+    output_path: &Path,
+    compression_level: i32,
+) -> Result<DedupStats> {
+    let batches = plan_merge_batches(inputs)?;
+    // Common case: everything fits in one pass — write straight to the output.
+    if batches.len() <= 1 {
+        return merge_run_batch(inputs, output_path, compression_level);
+    }
+
+    let scratch = tempfile::Builder::new()
+        .prefix("ais-normalize-merge-")
+        .tempdir()
+        .context("creating merge scratch directory")?;
+
+    // Round 0 consumes the original inputs; its combined rows_in is the true
+    // input-row count (later rounds re-merge already-deduped intermediates).
+    let mut total_input_rows = 0u64;
+    let mut round_files: Vec<PathBuf> = Vec::new();
+    for (index, batch) in batches.iter().enumerate() {
+        let out = scratch.path().join(format!("r0-{index:06}.parquet"));
+        let stats = merge_run_batch(batch, &out, compression_level)?;
+        total_input_rows += stats.rows_in;
+        round_files.push(out);
+    }
+
+    let mut round = 1u32;
+    loop {
+        let batches = plan_merge_batches(&round_files)?;
+        if batches.len() <= 1 {
+            let final_stats = merge_run_batch(&round_files, output_path, compression_level)?;
+            return Ok(DedupStats {
+                partitions_merged: 0,
+                rows_in: total_input_rows,
+                rows_out: final_stats.rows_out,
+                duplicates_removed: total_input_rows.saturating_sub(final_stats.rows_out),
+            });
+        }
+
+        let mut next_files = Vec::with_capacity(batches.len());
+        for (index, batch) in batches.iter().enumerate() {
+            let out = scratch.path().join(format!("r{round}-{index:06}.parquet"));
+            merge_run_batch(batch, &out, compression_level)?;
+            next_files.push(out);
+        }
+        // The previous round's intermediates are fully consumed; reclaim them.
+        for file in &round_files {
+            let _ = fs::remove_file(file);
+        }
+        round_files = next_files;
+        round += 1;
+    }
+}
+
+/// Single-pass k-way merge of `inputs` (one sorted run per row group) into
+/// `output_path`, dropping exact `(ts, payload)` duplicates. Holds one reader
+/// per row group open for the duration, so callers bound the batch size.
+fn merge_run_batch(
     inputs: &[PathBuf],
     output_path: &Path,
     compression_level: i32,
@@ -578,6 +681,49 @@ mod tests {
         // sorted by ts, all distinct
         assert_eq!(rows[0].0, 100);
         assert_eq!(rows[2], (200, "Z".to_string()));
+    }
+
+    #[test]
+    fn merges_far_more_files_than_the_open_reader_budget() {
+        // More files than MERGE_MAX_OPEN_READERS forces the multi-round path;
+        // it must succeed (no descriptor exhaustion) and dedup globally.
+        let dir = tempfile::tempdir().expect("tmp");
+        let n = MERGE_MAX_OPEN_READERS * 3 + 7;
+        let mut inputs = Vec::new();
+        for i in 0..n {
+            let path = dir.path().join(format!("in-{i:05}.parquet"));
+            // Every file is identical, so the whole pile collapses to 2 rows.
+            write_parquet(&path, &[(100, "X"), (200, "Y")]);
+            inputs.push(path);
+        }
+        let out = dir.path().join("out.parquet");
+        let stats = merge_dedup_files(&inputs, &out, 1).expect("multi-round merge");
+        assert_eq!(stats.rows_in, (n * 2) as u64);
+        assert_eq!(stats.rows_out, 2);
+        assert_eq!(stats.duplicates_removed, (n * 2 - 2) as u64);
+        let rows = read_all(&out);
+        assert_eq!(rows, vec![(100, "X".to_string()), (200, "Y".to_string())]);
+    }
+
+    #[test]
+    fn multi_round_preserves_distinct_rows() {
+        // Each file contributes a distinct ts; the multi-round merge must keep
+        // them all and stay ts-sorted.
+        let dir = tempfile::tempdir().expect("tmp");
+        let n = MERGE_MAX_OPEN_READERS * 2 + 1;
+        let mut inputs = Vec::new();
+        for i in 0..n {
+            let path = dir.path().join(format!("in-{i:05}.parquet"));
+            write_parquet(&path, &[(i as i64, "p")]);
+            inputs.push(path);
+        }
+        let out = dir.path().join("out.parquet");
+        let stats = merge_dedup_files(&inputs, &out, 1).expect("multi-round merge");
+        assert_eq!(stats.rows_out, n as u64);
+        assert_eq!(stats.duplicates_removed, 0);
+        let rows = read_all(&out);
+        assert_eq!(rows.len(), n);
+        assert!(rows.windows(2).all(|w| w[0].0 <= w[1].0), "ts-sorted");
     }
 
     #[test]
