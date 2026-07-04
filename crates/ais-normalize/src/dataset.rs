@@ -107,7 +107,116 @@ impl PartitionKey {
 }
 
 fn parse_kv<'a>(segment: &'a str, key: &str) -> Option<&'a str> {
-    segment.strip_prefix(&format!("{}=", key))
+    segment.strip_prefix(key).and_then(|s| s.strip_prefix('='))
+}
+
+/// Optional partition-boundary selection: process only partitions whose
+/// components match every specified value. Components are hierarchical —
+/// specifying `month` without `year` would match that month in every year,
+/// which is almost never intended, so `validate` rejects gaps.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PartitionFilter {
+    pub year: Option<i32>,
+    pub month: Option<u32>,
+    pub day: Option<u32>,
+    pub hour: Option<u32>,
+    pub minute: Option<u32>,
+}
+
+impl PartitionFilter {
+    pub fn is_empty(&self) -> bool {
+        self.year.is_none()
+            && self.month.is_none()
+            && self.day.is_none()
+            && self.hour.is_none()
+            && self.minute.is_none()
+    }
+
+    /// Reject gaps in the hierarchy and components finer than the dataset layout.
+    pub fn validate(&self, granularity: PartitionGranularity) -> Result<()> {
+        let chain = [
+            ("--year", self.year.is_some(), 1usize),
+            ("--month", self.month.is_some(), 2),
+            ("--day", self.day.is_some(), 3),
+            ("--hour", self.hour.is_some(), 4),
+            ("--minute", self.minute.is_some(), 5),
+        ];
+        let depth = granularity.depth();
+        let mut deepest_set = 0usize;
+        for (name, set, level) in chain {
+            if set {
+                if level > depth {
+                    anyhow::bail!(
+                        "{name} is finer than the dataset layout (--partition {granularity})"
+                    );
+                }
+                if level != deepest_set + 1 {
+                    anyhow::bail!(
+                        "{name} requires every coarser component to be set too (year, then month, then day, ...)"
+                    );
+                }
+                deepest_set = level;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn matches(&self, key: &PartitionKey) -> bool {
+        self.year.is_none_or(|y| key.year == y)
+            && self.month.is_none_or(|m| key.month == m)
+            && self.day.is_none_or(|d| key.day == d)
+            && self.hour.is_none_or(|h| key.hour == h)
+            && self.minute.is_none_or(|m| key.minute == m)
+    }
+
+    /// The Hive path fragment covered by this filter (e.g.
+    /// `year=2026/month=07`), used to push the selection down into the S3
+    /// LIST prefix and to prune the local directory walk. `validate`
+    /// guarantees the components form a contiguous chain from `year`.
+    fn hive_path_chain(&self) -> String {
+        let mut chain = String::new();
+        if let Some(year) = self.year {
+            chain.push_str(&format!("year={:04}", year));
+            if let Some(month) = self.month {
+                chain.push_str(&format!("/month={:02}", month));
+                if let Some(day) = self.day {
+                    chain.push_str(&format!("/day={:02}", day));
+                    if let Some(hour) = self.hour {
+                        chain.push_str(&format!("/hour={:02}", hour));
+                        if let Some(minute) = self.minute {
+                            chain.push_str(&format!("/minute={:02}", minute));
+                        }
+                    }
+                }
+            }
+        }
+        chain
+    }
+
+    /// Whether a directory named `segment` (e.g. `year=2024`) can contain
+    /// matching partitions. Unknown segment shapes are conservatively kept.
+    fn dir_segment_may_match(&self, segment: &str) -> bool {
+        if let Some(value) = parse_kv(segment, "year") {
+            return match (value.parse::<i32>(), self.year) {
+                (Ok(parsed), Some(wanted)) => parsed == wanted,
+                _ => true,
+            };
+        }
+        for (key, wanted) in [
+            ("month", self.month),
+            ("day", self.day),
+            ("hour", self.hour),
+            ("minute", self.minute),
+        ] {
+            if let Some(value) = parse_kv(segment, key) {
+                return match (value.parse::<u32>(), wanted) {
+                    (Ok(parsed), Some(want)) => parsed == want,
+                    _ => true,
+                };
+            }
+        }
+        true
+    }
 }
 
 pub struct DatasetFile {
@@ -116,10 +225,15 @@ pub struct DatasetFile {
 }
 
 /// List all `.parquet` files under `root`, sorted chronologically by partition then path.
+///
+/// The walk prunes whole directory subtrees that cannot match `filter` or
+/// `source_filter`, so selecting one day out of a multi-year archive does not
+/// stat every file in it.
 pub async fn list_parquet_files(
     root: &Path,
     granularity: PartitionGranularity,
     source_filter: Option<&str>,
+    filter: PartitionFilter,
 ) -> Result<Vec<DatasetFile>> {
     let root = root.to_path_buf();
     let source_filter = source_filter.map(str::to_string);
@@ -127,7 +241,27 @@ pub async fn list_parquet_files(
     tokio::task::spawn_blocking(move || {
         let mut files: Vec<DatasetFile> = Vec::new();
 
-        for entry in WalkDir::new(&root).follow_links(false) {
+        let source_prune = source_filter.clone();
+        let walker = WalkDir::new(&root)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(move |entry| {
+                if !entry.file_type().is_dir() {
+                    return true;
+                }
+                let Some(name) = entry.file_name().to_str() else {
+                    return true;
+                };
+                if let Some(source) = parse_kv(name, "source") {
+                    if let Some(ref wanted) = source_prune {
+                        return source == wanted;
+                    }
+                    return true;
+                }
+                filter.dir_segment_may_match(name)
+            });
+
+        for entry in walker {
             let entry = entry.context("walking dataset directory")?;
             if !entry.file_type().is_file() {
                 continue;
@@ -156,10 +290,13 @@ pub async fn list_parquet_files(
                 continue;
             };
 
-            if let Some(ref filter) = source_filter {
-                if &partition.source != filter {
+            if let Some(ref wanted) = source_filter {
+                if &partition.source != wanted {
                     continue;
                 }
+            }
+            if !filter.matches(&partition) {
+                continue;
             }
 
             files.push(DatasetFile {
@@ -202,15 +339,38 @@ fn rel_from_key(prefix: &str, key: &str) -> String {
 /// List `.parquet` objects under `prefix` in an S3 bucket, mirroring the
 /// filtering `list_parquet_files` applies locally: skips `tmp-`-prefixed
 /// files, requires the key (relative to `prefix`) to match the Hive layout
-/// for `granularity`, and optionally restricts to one `source`.
+/// for `granularity`, and optionally restricts to one `source` and to
+/// partitions matching `filter`.
+///
+/// When both a source and a partition filter are given, the selection is
+/// pushed down into the S3 LIST prefix so a one-day slice of a multi-year
+/// bucket lists only that day's keys instead of the whole bucket.
 pub async fn list_s3_parquet_entries(
     storage: &S3Storage,
     prefix: &str,
     granularity: PartitionGranularity,
     source_filter: Option<&str>,
+    filter: PartitionFilter,
 ) -> Result<Vec<S3Entry>> {
+    // LIST prefix pushdown needs the source segment, since it comes before
+    // the time components in the key layout.
+    let list_prefix = match source_filter {
+        Some(source) if !filter.is_empty() => {
+            let base = prefix.trim_matches('/');
+            let chain = filter.hive_path_chain();
+            let mut pushed = String::new();
+            if !base.is_empty() {
+                pushed.push_str(base);
+                pushed.push('/');
+            }
+            pushed.push_str(&format!("source={}/{}", source, chain));
+            pushed
+        }
+        _ => prefix.to_string(),
+    };
+
     let keys = storage
-        .list_keys_with_prefix(prefix)
+        .list_keys_with_prefix(&list_prefix)
         .await
         .context("listing S3 input bucket")?;
 
@@ -229,10 +389,13 @@ pub async fn list_s3_parquet_entries(
             continue;
         };
 
-        if let Some(filter) = source_filter {
-            if partition.source != filter {
+        if let Some(wanted) = source_filter {
+            if partition.source != wanted {
                 continue;
             }
+        }
+        if !filter.matches(&partition) {
+            continue;
         }
 
         entries.push(S3Entry {
@@ -296,6 +459,84 @@ pub async fn download_s3_entries(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn day_key(source: &str, year: i32, month: u32, day: u32) -> PartitionKey {
+        PartitionKey {
+            source: source.to_string(),
+            granularity: PartitionGranularity::Day,
+            year,
+            month,
+            day,
+            hour: 0,
+            minute: 0,
+        }
+    }
+
+    #[test]
+    fn filter_matches_hierarchically() {
+        let filter = PartitionFilter {
+            year: Some(2026),
+            month: Some(7),
+            ..Default::default()
+        };
+        assert!(filter.matches(&day_key("a", 2026, 7, 1)));
+        assert!(filter.matches(&day_key("a", 2026, 7, 31)));
+        assert!(!filter.matches(&day_key("a", 2026, 6, 1)));
+        assert!(!filter.matches(&day_key("a", 2025, 7, 1)));
+        assert!(PartitionFilter::default().matches(&day_key("a", 1999, 1, 1)));
+    }
+
+    #[test]
+    fn filter_validate_rejects_gaps_and_too_fine() {
+        let gap = PartitionFilter {
+            month: Some(7),
+            ..Default::default()
+        };
+        assert!(gap.validate(PartitionGranularity::Day).is_err());
+
+        let too_fine = PartitionFilter {
+            year: Some(2026),
+            month: Some(7),
+            day: Some(4),
+            hour: Some(12),
+            ..Default::default()
+        };
+        assert!(too_fine.validate(PartitionGranularity::Day).is_err());
+        assert!(too_fine.validate(PartitionGranularity::Hour).is_ok());
+
+        let ok = PartitionFilter {
+            year: Some(2026),
+            month: Some(7),
+            ..Default::default()
+        };
+        assert!(ok.validate(PartitionGranularity::Day).is_ok());
+    }
+
+    #[test]
+    fn filter_hive_path_chain_stops_at_first_unset() {
+        let filter = PartitionFilter {
+            year: Some(2026),
+            month: Some(7),
+            ..Default::default()
+        };
+        assert_eq!(filter.hive_path_chain(), "year=2026/month=07");
+    }
+
+    #[test]
+    fn filter_prunes_directory_segments() {
+        let filter = PartitionFilter {
+            year: Some(2026),
+            month: Some(7),
+            ..Default::default()
+        };
+        assert!(filter.dir_segment_may_match("year=2026"));
+        assert!(!filter.dir_segment_may_match("year=2025"));
+        assert!(filter.dir_segment_may_match("month=07"));
+        assert!(!filter.dir_segment_may_match("month=06"));
+        // components the filter leaves open, and non-hive names, are kept
+        assert!(filter.dir_segment_may_match("day=15"));
+        assert!(filter.dir_segment_may_match("random-dir"));
+    }
 
     #[test]
     fn rel_from_key_strips_prefix() {

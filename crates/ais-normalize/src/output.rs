@@ -8,7 +8,6 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use parquet::schema::types::ColumnPath;
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
@@ -18,6 +17,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 const FLUSH_BATCH_SIZE: usize = 65_536;
+
+/// Hard cap on simultaneously open partition writers per pool. Rows with
+/// badly scattered timestamps could otherwise fan one input partition out
+/// across an unbounded number of output partitions, each holding builders
+/// and an open Parquet writer. When the cap is hit every open writer is
+/// closed (a "generation"); a partition seen again later simply starts a
+/// new file, which the Hive layout already permits.
+const MAX_OPEN_WRITERS: usize = 64;
 
 fn parquet_file_name() -> String {
     let now = Utc::now();
@@ -97,8 +104,12 @@ impl PartitionWriter {
             final_path,
             writer,
             schema: schema.clone(),
-            ts: TimestampMillisecondBuilder::with_capacity(4096),
-            payload: StringBuilder::with_capacity(4096, 4096 * 64),
+            // Modest initial capacities: retimestamping can fan one input
+            // partition out across many output partitions, and each open
+            // writer holds its own builders. They grow geometrically as
+            // needed, so undersizing costs a few reallocs, not throughput.
+            ts: TimestampMillisecondBuilder::with_capacity(1024),
+            payload: StringBuilder::with_capacity(1024, 64 * 1024),
             total_rows: 0,
             batch_rows: 0,
         })
@@ -160,6 +171,8 @@ pub struct OutputWriterPool {
     dry_run: bool,
     /// Active writers keyed by partition `relative_dir`.
     writers: HashMap<String, PartitionWriter>,
+    /// Files already closed by a generation rollover (see `MAX_OPEN_WRITERS`).
+    finished: Vec<(String, u64, PathBuf)>,
     /// Dry-run row counts keyed by partition `relative_dir`.
     dry_run_counts: HashMap<String, u64>,
     pub total_rows_written: u64,
@@ -173,40 +186,68 @@ impl OutputWriterPool {
             schema: build_schema(),
             dry_run,
             writers: HashMap::new(),
+            finished: Vec::new(),
             dry_run_counts: HashMap::new(),
             total_rows_written: 0,
         }
     }
 
     /// Write a single row to the appropriate output partition.
+    ///
+    /// Consecutive rows overwhelmingly share a partition, so the map hit path
+    /// must not allocate; the key `String` is only built the first time a
+    /// partition is seen.
     pub fn write_row(&mut self, partition_rel_dir: &str, ts_ms: i64, payload: &str) -> Result<()> {
+        self.total_rows_written += 1;
+
         if self.dry_run {
-            *self.dry_run_counts.entry(partition_rel_dir.to_string()).or_default() += 1;
-            self.total_rows_written += 1;
+            if let Some(count) = self.dry_run_counts.get_mut(partition_rel_dir) {
+                *count += 1;
+            } else {
+                self.dry_run_counts.insert(partition_rel_dir.to_string(), 1);
+            }
             return Ok(());
         }
 
-        let writer = match self.writers.entry(partition_rel_dir.to_string()) {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => entry.insert(PartitionWriter::new(
-                &self.output_root,
-                partition_rel_dir,
-                &self.schema,
-                self.compression_level,
-            )?),
-        };
+        if let Some(writer) = self.writers.get_mut(partition_rel_dir) {
+            return writer.push(ts_ms, payload);
+        }
 
-        writer.push(ts_ms, payload)?;
-        self.total_rows_written += 1;
+        if self.writers.len() >= MAX_OPEN_WRITERS {
+            self.close_open_writers()?;
+        }
+
+        let writer = PartitionWriter::new(
+            &self.output_root,
+            partition_rel_dir,
+            &self.schema,
+            self.compression_level,
+        )?;
+        self.writers.insert(partition_rel_dir.to_string(), writer);
+        self.writers
+            .get_mut(partition_rel_dir)
+            .expect("writer just inserted")
+            .push(ts_ms, payload)
+    }
+
+    /// Close every open writer, moving completed files into `finished`.
+    fn close_open_writers(&mut self) -> Result<()> {
+        for (rel_dir, writer) in self.writers.drain() {
+            let (rows, path) = writer.close()?;
+            if rows > 0 {
+                self.finished.push((rel_dir, rows, path));
+            }
+        }
         Ok(())
     }
 
     /// Close all writers and rename temp files to final paths.
-    /// Returns `(partition_rel_dir, rows, local_path)` per partition written
-    /// (or that would be written in dry-run mode, with an empty path);
-    /// callers aggregate for reporting and, for S3 output, upload
-    /// `local_path` under a key derived from it.
-    pub fn flush_all(self) -> Result<Vec<(String, u64, PathBuf)>> {
+    /// Returns `(partition_rel_dir, rows, local_path)` per file written
+    /// (or that would be written in dry-run mode, with an empty path); a
+    /// partition can appear more than once if a generation rollover closed
+    /// it mid-run. Callers aggregate for reporting and, for S3 output,
+    /// upload each `local_path` under a key derived from it.
+    pub fn flush_all(mut self) -> Result<Vec<(String, u64, PathBuf)>> {
         if self.dry_run {
             return Ok(self
                 .dry_run_counts
@@ -215,13 +256,53 @@ impl OutputWriterPool {
                 .collect());
         }
 
-        let mut partitions = Vec::with_capacity(self.writers.len());
-        for (rel_dir, writer) in self.writers {
-            let (rows, path) = writer.close()?;
-            if rows > 0 {
-                partitions.push((rel_dir, rows, path));
-            }
+        self.close_open_writers()?;
+        Ok(self.finished)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn writer_cap_rolls_over_generations_without_losing_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut pool = OutputWriterPool::new(dir.path().to_path_buf(), 1, false);
+
+        // Touch more partitions than the cap allows, then revisit the first
+        // one so it gets a second file in a new generation.
+        let total = MAX_OPEN_WRITERS + 1;
+        for index in 0..total {
+            let rel_dir = format!("source=test/year={:04}", 1000 + index);
+            pool.write_row(&rel_dir, index as i64, "payload")
+                .expect("write");
         }
-        Ok(partitions)
+        pool.write_row("source=test/year=1000", 9999, "payload")
+            .expect("write");
+
+        let outputs = pool.flush_all().expect("flush");
+        let total_rows: u64 = outputs.iter().map(|(_, rows, _)| rows).sum();
+        assert_eq!(total_rows, (total + 1) as u64);
+
+        // The revisited partition produced two files (one per generation).
+        let first_partition_files = outputs
+            .iter()
+            .filter(|(rel_dir, _, _)| rel_dir == "source=test/year=1000")
+            .count();
+        assert_eq!(first_partition_files, 2);
+
+        for (_, _, path) in &outputs {
+            assert!(path.exists(), "output file missing: {}", path.display());
+            assert!(
+                !path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("tmp-"),
+                "temp file left behind: {}",
+                path.display()
+            );
+        }
     }
 }

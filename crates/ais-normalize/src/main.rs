@@ -81,6 +81,26 @@ struct Args {
     #[arg(long)]
     source: Option<String>,
 
+    /// Process only this year's partitions (narrow further with --month, --day, ...)
+    #[arg(long)]
+    year: Option<i32>,
+
+    /// Process only this month's partitions; requires --year
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=12))]
+    month: Option<u32>,
+
+    /// Process only this day's partitions; requires --month
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=31))]
+    day: Option<u32>,
+
+    /// Process only this hour's partitions; requires --day and an hour-or-finer layout
+    #[arg(long, value_parser = clap::value_parser!(u32).range(0..=23))]
+    hour: Option<u32>,
+
+    /// Process only this minute's partitions; requires --hour and a minute layout
+    #[arg(long, value_parser = clap::value_parser!(u32).range(0..=59))]
+    minute: Option<u32>,
+
     /// Apply changes; dry-run by default
     #[arg(long)]
     apply: bool,
@@ -219,6 +239,15 @@ async fn main() -> Result<()> {
         _ => {}
     }
 
+    let partition_filter = dataset::PartitionFilter {
+        year: args.year,
+        month: args.month,
+        day: args.day,
+        hour: args.hour,
+        minute: args.minute,
+    };
+    partition_filter.validate(args.partition)?;
+
     if dry_run {
         eprintln!("ais-normalize: dry run (pass --apply to write output)");
     }
@@ -315,63 +344,89 @@ async fn main() -> Result<()> {
         _ => unreachable!("validated exactly one output target above"),
     };
 
-    let files = if let Some(storage) = &input_storage {
+    // A unit of work: either files already on local disk, or S3 objects the
+    // worker downloads just before processing (and deletes right after), so
+    // scratch disk usage stays bounded by `concurrency` partitions instead of
+    // the whole dataset.
+    enum PartitionWork {
+        Local(Vec<DatasetFile>),
+        Remote(Vec<dataset::S3Entry>),
+    }
+
+    let partitions: Vec<(PartitionKey, PartitionWork)> = if let Some(storage) = &input_storage {
         eprintln!("Listing input S3 bucket...");
+        if !partition_filter.is_empty() && args.source.is_none() {
+            eprintln!(
+                "Note: without --source the partition filter is applied after listing; \
+                 add --source to push it into the S3 LIST prefix."
+            );
+        }
         let entries = dataset::list_s3_parquet_entries(
             storage,
             &args.input_s3_prefix,
             args.partition,
             args.source.as_deref(),
+            partition_filter,
         )
         .await
         .context("listing input S3 bucket")?;
 
         if entries.is_empty() {
             eprintln!(
-                "No Parquet objects found under s3://{}/{}.",
+                "No matching Parquet objects found under s3://{}/{}.",
                 args.input_s3_bucket.as_deref().unwrap_or_default(),
                 args.input_s3_prefix
             );
             return Ok(());
         }
+        eprintln!("Found {} matching object(s).", entries.len());
 
-        eprintln!(
-            "Found {} object(s); downloading to local scratch space...",
-            entries.len()
-        );
-        let download_concurrency = args.concurrency.unwrap_or_else(default_concurrency).max(1);
-        let scratch_root = input_scratch
-            .as_ref()
-            .expect("input scratch dir created when input is S3")
-            .path();
-        dataset::download_s3_entries(storage, entries, scratch_root, download_concurrency)
-            .await
-            .context("downloading input dataset from S3")?
+        let mut partitions: Vec<(PartitionKey, Vec<dataset::S3Entry>)> = Vec::new();
+        for entry in entries {
+            match partitions.last_mut() {
+                Some((key, list)) if *key == entry.partition => list.push(entry),
+                _ => partitions.push((entry.partition.clone(), vec![entry])),
+            }
+        }
+        partitions
+            .into_iter()
+            .map(|(key, list)| (key, PartitionWork::Remote(list)))
+            .collect()
     } else {
         eprintln!("Scanning input dataset...");
         let input_dir = args
             .input_dir
             .as_deref()
             .expect("validated --input-dir present for local input");
-        let files = dataset::list_parquet_files(input_dir, args.partition, args.source.as_deref())
-            .await
-            .context("scanning input dataset")?;
+        let files = dataset::list_parquet_files(
+            input_dir,
+            args.partition,
+            args.source.as_deref(),
+            partition_filter,
+        )
+        .await
+        .context("scanning input dataset")?;
 
         if files.is_empty() {
-            eprintln!("No Parquet files found in {}.", input_dir.display());
+            eprintln!(
+                "No matching Parquet files found in {}.",
+                input_dir.display()
+            );
             return Ok(());
         }
-        files
-    };
 
-    // Group files by partition.
-    let mut partitions: Vec<(PartitionKey, Vec<DatasetFile>)> = Vec::new();
-    for file in files {
-        match partitions.last_mut() {
-            Some((key, list)) if *key == file.partition => list.push(file),
-            _ => partitions.push((file.partition.clone(), vec![file])),
+        let mut partitions: Vec<(PartitionKey, Vec<DatasetFile>)> = Vec::new();
+        for file in files {
+            match partitions.last_mut() {
+                Some((key, list)) if *key == file.partition => list.push(file),
+                _ => partitions.push((file.partition.clone(), vec![file])),
+            }
         }
-    }
+        partitions
+            .into_iter()
+            .map(|(key, list)| (key, PartitionWork::Local(list)))
+            .collect()
+    };
 
     let total_partitions = partitions.len();
     eprintln!(
@@ -394,9 +449,16 @@ async fn main() -> Result<()> {
 
     // Partitions are independent (processor state and writer pools are
     // per-partition), so distribute them over a small worker pool.
-    type PartitionQueue = Mutex<VecDeque<(PartitionKey, Vec<DatasetFile>)>>;
+    type PartitionQueue = Mutex<VecDeque<(PartitionKey, PartitionWork)>>;
     let queue: Arc<PartitionQueue> = Arc::new(Mutex::new(partitions.into()));
     let processed = Arc::new(AtomicUsize::new(0));
+    let input_scratch_root: Option<PathBuf> = input_scratch
+        .as_ref()
+        .map(|scratch| scratch.path().to_path_buf());
+
+    // Per-worker parallelism for downloading one partition's objects; the
+    // worker count provides the cross-partition parallelism.
+    const PARTITION_DOWNLOAD_CONCURRENCY: usize = 4;
 
     let mut workers = Vec::with_capacity(concurrency);
     for _ in 0..concurrency {
@@ -405,6 +467,8 @@ async fn main() -> Result<()> {
         let output_root = output_root.clone();
         let output_storage = output_storage.clone();
         let output_s3_prefix = args.output_s3_prefix.clone();
+        let input_storage = input_storage.clone();
+        let input_scratch_root = input_scratch_root.clone();
         let granularity = args.partition;
         let batch_size = args.batch_size;
         let compression_level = args.compression_level;
@@ -419,8 +483,42 @@ async fn main() -> Result<()> {
                 }
 
                 let next = queue.lock().expect("partition queue lock").pop_front();
-                let Some((partition_key, partition_files)) = next else {
+                let Some((partition_key, work)) = next else {
                     break;
+                };
+
+                // Remote partitions are fetched here, just before processing,
+                // and their scratch copies removed right after — the whole
+                // dataset is never on local disk at once.
+                let downloaded_rel_dir = match &work {
+                    PartitionWork::Remote(_) => Some(partition_key.relative_dir()),
+                    PartitionWork::Local(_) => None,
+                };
+                let partition_files = match work {
+                    PartitionWork::Local(files) => files,
+                    PartitionWork::Remote(entries) => {
+                        let storage = input_storage
+                            .as_ref()
+                            .expect("remote work implies input storage");
+                        let scratch_root = input_scratch_root
+                            .as_ref()
+                            .expect("remote work implies input scratch dir");
+                        match dataset::download_s3_entries(
+                            storage,
+                            entries,
+                            scratch_root,
+                            PARTITION_DOWNLOAD_CONCURRENCY,
+                        )
+                        .await
+                        .context("downloading input partition from S3")
+                        {
+                            Ok(files) => files,
+                            Err(error) => {
+                                status::request_cancel();
+                                return Err(error);
+                            }
+                        }
+                    }
                 };
 
                 let output_root_for_task = output_root.clone();
@@ -437,6 +535,12 @@ async fn main() -> Result<()> {
                 })
                 .await
                 .context("partition worker panicked")?;
+
+                if let (Some(rel_dir), Some(scratch_root)) =
+                    (&downloaded_rel_dir, &input_scratch_root)
+                {
+                    let _ = tokio::fs::remove_dir_all(scratch_root.join(rel_dir)).await;
+                }
 
                 match result {
                     Ok((partition_stats, rows)) => {
