@@ -67,6 +67,7 @@ Rows that aren't AIS `VDM`/`VDO` sentences (heartbeats, other NMEA talkers, etc.
 | `--batch-size` | `8192` | Rows per Parquet read batch |
 | `--compression-level` | `5` | Zstd level for output files |
 | `--concurrency` | cores, clamped `[1, 8]` | Partitions processed concurrently |
+| `--dedup` | `true` | Merge touched output partitions and drop exact `(ts, payload)` duplicates so re-runs are idempotent; `--dedup false` (env `DEDUP=false`) appends instead. See [idempotent re-runs](#idempotent-re-runs-deduplication) |
 | `--noui` | off | Disable the TTY status display; print plain progress lines instead (auto-enabled when stdout isn't a terminal) |
 
 `--input-dir`/`--input-s3-bucket` are mutually exclusive (exactly one required), and likewise for `--output-dir`/`--output-s3-bucket`. `--input-s3-bucket` and `--output-s3-bucket` always share one endpoint/region/credentials — only the bucket name (and optional prefix) differs between them, matching how the same S3-compatible store (e.g. one MinIO deployment) typically hosts both the raw and normalized datasets side by side as separate buckets.
@@ -149,6 +150,19 @@ At the end of a run, a plain-text summary is printed to stderr:
 | `incomplete groups` | Fragment groups that never completed (evicted by the buffer cap or left over at end-of-partition) and were emitted as raw, uncombined fragments |
 
 A high `incomplete groups` count usually means fragments of the same message are landing in different source partitions or being dropped upstream — check the feed and the ingest `--partition` granularity relative to message arrival spacing.
+
+## Idempotent re-runs (deduplication)
+
+By default (`--dedup true`), after the run finishes ais-normalize merges every output partition it wrote to and removes exact `(ts, payload)` duplicates. Because normalize is deterministic — the true timestamp comes from the `\c:` tag block or `$PGHP`, and the combined payload is fixed — re-running over the same (or overlapping) input regenerates byte-identical rows, which the merge collapses. **Running the tool any number of times converges each partition to the same deduped set**, so you can safely re-run a day after fixing an upstream feed, or re-process overlapping ranges, without accumulating duplicates.
+
+- **Duplicate = exact `(ts, payload)`.** Two rows are duplicates only if both the timestamp *and* the full payload match. Rows that differ in any way are all kept — including the `\s:<station>` receiver tag, so the same AIS message received by two base stations is preserved, not collapsed.
+- **Why this instead of "overwrite".** Normalize re-partitions rows (a row read from `day=01` can land in `day=02`), so a "clear the partition and rewrite" approach could delete a neighbor partition's real data when you run with `--day`/`--month` filters. Dedup-merge keeps the union of rows and removes only redundant ones, so spillover and overlapping selections merge safely.
+- **Scope.** Only partitions this run actually wrote to are merged; untouched partitions are never read or rewritten. A partition with a single fresh file and no prior data is left as-is (first runs stay cheap); the merge kicks in once a partition has 2+ files (a prior run's output, or a generation rollover).
+- **Cost.** When a partition is merged it is fully read and rewritten (≈ a compaction pass over that partition; on S3, its prior objects are downloaded, a single merged object is uploaded, and the old objects deleted). This is the price of idempotency — pass `--dedup false` (or `DEDUP=false`) to skip it and append instead (the pre-dedup behavior, where re-runs accumulate files).
+- **Only under `--apply`.** Dry runs never merge; they note that dedup will run on apply.
+- **`output == input` caveat.** With dedup on and the output target equal to the input target, raw and normalized rows share a partition but have different payloads, so they will **not** dedup against each other and the partition ends up holding both — a warning is printed. Use a separate output dir/bucket.
+
+The end-of-run summary reports `partitions merged`, `rows in`, `rows out`, and `duplicates removed`.
 
 ## Output directory (non-destructive)
 

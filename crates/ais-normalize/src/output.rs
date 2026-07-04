@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-const FLUSH_BATCH_SIZE: usize = 65_536;
+pub(crate) const FLUSH_BATCH_SIZE: usize = 65_536;
 
 /// Hard cap on simultaneously open partition writers per pool. Rows with
 /// badly scattered timestamps could otherwise fan one input partition out
@@ -26,7 +26,7 @@ const FLUSH_BATCH_SIZE: usize = 65_536;
 /// new file, which the Hive layout already permits.
 const MAX_OPEN_WRITERS: usize = 64;
 
-fn parquet_file_name() -> String {
+pub(crate) fn parquet_file_name() -> String {
     let now = Utc::now();
     use chrono::{Datelike, Timelike};
     let counter = FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -43,7 +43,7 @@ fn parquet_file_name() -> String {
     )
 }
 
-fn build_schema() -> Arc<Schema> {
+pub(crate) fn build_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new(
             "ts",
@@ -54,7 +54,11 @@ fn build_schema() -> Arc<Schema> {
     ]))
 }
 
-fn open_writer(path: &Path, schema: &Arc<Schema>, compression_level: i32) -> Result<ArrowWriter<File>> {
+pub(crate) fn open_writer(
+    path: &Path,
+    schema: &Arc<Schema>,
+    compression_level: i32,
+) -> Result<ArrowWriter<File>> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("mkdir -p {}", parent.display()))?;
     }

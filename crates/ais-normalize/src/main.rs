@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 mod dataset;
+mod dedup;
 mod normalize;
 mod output;
 mod parse;
@@ -117,6 +118,11 @@ struct Args {
     #[arg(long)]
     concurrency: Option<usize>,
 
+    /// Merge each touched output partition and drop exact (ts, payload)
+    /// duplicates, so re-runs are idempotent. Set false to append instead.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    dedup: bool,
+
     /// Disable the runtime status TUI and print plain progress updates
     #[arg(long)]
     noui: bool,
@@ -175,6 +181,15 @@ impl Args {
                 self.s3_disable_tls = value.eq_ignore_ascii_case("true") || value == "1";
             }
         }
+        // dedup defaults to true; only an explicit env value flips it off. A
+        // command-line --dedup always wins because it is parsed before this.
+        if self.dedup {
+            if let Ok(value) = std::env::var("DEDUP") {
+                if value.eq_ignore_ascii_case("false") || value == "0" {
+                    self.dedup = false;
+                }
+            }
+        }
     }
 }
 
@@ -192,6 +207,24 @@ fn s3_key_for_output(scratch_root: &Path, local_path: &Path, prefix: &str) -> St
     } else {
         format!("{}/{}", prefix, rel)
     }
+}
+
+/// True when the run reads and writes the same place — same local directory,
+/// or same S3 bucket and prefix. Best-effort: local paths are compared after
+/// canonicalization when both resolve, else by raw value.
+fn output_equals_input(args: &Args) -> bool {
+    if let (Some(input), Some(output)) = (&args.input_dir, &args.output_dir) {
+        let canon = std::fs::canonicalize(input)
+            .ok()
+            .zip(std::fs::canonicalize(output).ok())
+            .map(|(a, b)| a == b);
+        return canon.unwrap_or_else(|| input == output);
+    }
+    if let (Some(in_bucket), Some(out_bucket)) = (&args.input_s3_bucket, &args.output_s3_bucket) {
+        return in_bucket == out_bucket
+            && args.input_s3_prefix.trim_matches('/') == args.output_s3_prefix.trim_matches('/');
+    }
+    false
 }
 
 const UPLOAD_MAX_ATTEMPTS: u32 = 3;
@@ -248,8 +281,22 @@ async fn main() -> Result<()> {
     };
     partition_filter.validate(args.partition)?;
 
+    // Dedup only makes sense when we are actually writing output.
+    let dedup_enabled = args.dedup && !dry_run;
+
+    if dedup_enabled && output_equals_input(&args) {
+        eprintln!(
+            "Warning: output target equals input target. With dedup on, the raw input and \
+             normalized rows have different payloads, so they will NOT dedup against each other \
+             and the partition will end up holding both. Use a separate output dir/bucket."
+        );
+    }
+
     if dry_run {
         eprintln!("ais-normalize: dry run (pass --apply to write output)");
+        if args.dedup {
+            eprintln!("Dedup is enabled; it will merge touched partitions on --apply.");
+        }
     }
 
     // Set up Ctrl-C handler.
@@ -475,6 +522,10 @@ async fn main() -> Result<()> {
 
         workers.push(tokio::spawn(async move {
             let mut stats = NormalizeStats::default();
+            // When dedup runs, S3 upload is deferred to the dedup pass so it
+            // uploads a single merged object per partition instead of the raw
+            // per-run files.
+            let upload_inline = !dedup_enabled;
             let mut partition_rows: BTreeMap<String, u64> = BTreeMap::new();
 
             loop {
@@ -549,7 +600,7 @@ async fn main() -> Result<()> {
                             *partition_rows.entry(rel_dir).or_default() += rows_written;
 
                             if let Some(storage) = &output_storage {
-                                if !dry_run && rows_written > 0 {
+                                if !dry_run && rows_written > 0 && upload_inline {
                                     let key = s3_key_for_output(
                                         &output_root,
                                         &local_path,
@@ -621,6 +672,42 @@ async fn main() -> Result<()> {
         return Err(error);
     }
 
+    // Merge each touched output partition and drop exact (ts, payload)
+    // duplicates, so this run collapses cleanly with any prior runs' output.
+    let mut dedup_stats = dedup::DedupStats::default();
+    if dedup_enabled && !partition_rows.is_empty() {
+        if status_mode.is_plain() {
+            eprintln!(
+                "Deduplicating {} output partition(s)...",
+                partition_rows.len()
+            );
+        }
+        for rel_dir in partition_rows.keys() {
+            let stats = if let Some(storage) = &output_storage {
+                let new_files_dir = output_root.join(rel_dir);
+                let work_dir = output_root.join(".dedup").join(rel_dir);
+                dedup::dedup_s3_partition(
+                    storage,
+                    &args.output_s3_prefix,
+                    rel_dir,
+                    &new_files_dir,
+                    &work_dir,
+                    args.compression_level,
+                )
+                .await
+                .with_context(|| format!("deduplicating S3 partition {rel_dir}"))?
+            } else {
+                let dir = output_root.join(rel_dir);
+                let level = args.compression_level;
+                tokio::task::spawn_blocking(move || dedup::dedup_local_partition(&dir, level))
+                    .await
+                    .context("dedup task panicked")?
+                    .with_context(|| format!("deduplicating partition {rel_dir}"))?
+            };
+            dedup_stats.merge(&stats);
+        }
+    }
+
     // Every upload succeeded (or there was nothing to upload): the scratch
     // copies are redundant now, so reclaim the disk space.
     if let Some(scratch_path) = &output_scratch_path {
@@ -636,6 +723,7 @@ async fn main() -> Result<()> {
 
     let partitions_written = partition_rows.len();
     total_stats.print_summary();
+    dedup_stats.print_summary();
 
     if dry_run {
         if !partition_rows.is_empty() {

@@ -1498,6 +1498,19 @@ impl S3Storage {
         file.flush().await?;
         Ok(())
     }
+
+    /// Delete a single object by key. Deleting a key that does not exist is
+    /// treated as success by S3, so this is safe to call idempotently.
+    pub async fn delete_key(&self, key: &str) -> Result<()> {
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .with_context(|| format!("deleting s3://{}/{}", self.bucket, key))?;
+        Ok(())
+    }
 }
 
 struct BatchBuf {
