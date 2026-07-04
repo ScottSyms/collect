@@ -1,12 +1,6 @@
 use chrono::{TimeZone, Utc};
 
 #[derive(Debug, Default)]
-pub struct AisTagBlock {
-    pub timestamp_ms: Option<i64>,
-    pub group_id: Option<String>,
-}
-
-#[derive(Debug, Default)]
 pub struct AisSentenceMetadata {
     pub is_ais: bool,
     pub group_id: Option<String>,
@@ -24,42 +18,37 @@ impl AisSentenceMetadata {
     }
 }
 
-/// Returns the portion of the payload starting at the first `!` or `$`.
-pub fn nmea_sentence(payload: &str) -> &str {
+/// Split a payload at the first `!` or `$` into `(tag-block prefix, sentence)`.
+/// Both are empty-safe: no sentence start means the whole payload is prefix.
+pub fn split_tag_block(payload: &str) -> (&str, &str) {
     let sentence_start = payload
-        .char_indices()
-        .find(|(_, ch)| *ch == '!' || *ch == '$')
-        .map(|(idx, _)| idx)
+        .bytes()
+        .position(|b| b == b'!' || b == b'$')
         .unwrap_or(payload.len());
-
-    &payload[sentence_start..]
+    payload.split_at(sentence_start)
 }
 
-pub fn parse_ais_tag_block(payload: &str) -> AisTagBlock {
-    let sentence_start = payload
-        .char_indices()
-        .find(|(_, ch)| *ch == '!' || *ch == '$')
-        .map(|(idx, _)| idx)
-        .unwrap_or(payload.len());
-    let prefix = &payload[..sentence_start];
-    let mut tag_block = AisTagBlock::default();
+/// Returns the portion of the payload starting at the first `!` or `$`.
+pub fn nmea_sentence(payload: &str) -> &str {
+    split_tag_block(payload).1
+}
 
+/// Extract the `c:<epoch>` timestamp from a tag-block prefix (the part of the
+/// payload before the first `!`/`$`, as returned by [`split_tag_block`]).
+/// The `g:` grouping field is intentionally ignored: fragment grouping uses
+/// the sentence's own fields, which are present on every feed.
+pub fn parse_tag_block_timestamp_ms(prefix: &str) -> Option<i64> {
     for raw_field in prefix.split(',') {
         let field = raw_field.trim_matches('\\');
         let field = field.split('*').next().unwrap_or(field).trim();
 
         if let Some(value) = field.strip_prefix("c:") {
-            if tag_block.timestamp_ms.is_none() {
-                tag_block.timestamp_ms = parse_ais_timestamp_ms(value);
-            }
-        } else if let Some(value) = field.strip_prefix("g:") {
-            if tag_block.group_id.is_none() {
-                tag_block.group_id = parse_ais_group_id(value);
+            if let Some(timestamp_ms) = parse_ais_timestamp_ms(value) {
+                return Some(timestamp_ms);
             }
         }
     }
-
-    tag_block
+    None
 }
 
 pub fn parse_ais_sentence_metadata(sentence: &str) -> AisSentenceMetadata {
@@ -98,6 +87,11 @@ pub fn parse_ais_sentence_metadata(sentence: &str) -> AisSentenceMetadata {
 }
 
 pub fn parse_pghp_timestamp_ms(sentence: &str) -> Option<i64> {
+    // Fast bail before any splitting: almost every sentence is not $PGHP.
+    if !sentence.starts_with("$PGHP") {
+        return None;
+    }
+
     let mut fields = sentence.split(',').map(normalize_sentence_field);
     let sentence_type = fields.next()?;
 
@@ -127,32 +121,23 @@ pub fn parse_pghp_timestamp_ms(sentence: &str) -> Option<i64> {
 }
 
 pub fn parse_ais_timestamp_ms(value: &str) -> Option<i64> {
-    let digits = value
-        .chars()
-        .take_while(|ch| ch.is_ascii_digit())
-        .collect::<String>();
+    let mut seconds: u64 = 0;
+    let mut digit_count = 0usize;
+    for byte in value.bytes() {
+        if !byte.is_ascii_digit() {
+            break;
+        }
+        seconds = seconds
+            .checked_mul(10)?
+            .checked_add(u64::from(byte - b'0'))?;
+        digit_count += 1;
+    }
 
-    if digits.is_empty() {
+    if digit_count == 0 {
         return None;
     }
 
-    let seconds = digits.parse::<u64>().ok()?;
     Some(seconds.saturating_mul(1_000) as i64)
-}
-
-pub fn parse_ais_group_id(value: &str) -> Option<String> {
-    let candidate = value
-        .split('-')
-        .filter(|part| !part.is_empty())
-        .next_back()
-        .unwrap_or(value)
-        .trim();
-
-    if candidate.is_empty() {
-        None
-    } else {
-        Some(candidate.to_string())
-    }
 }
 
 pub fn nmea_tag_block_checksum(tag_body: &str) -> u8 {
@@ -255,16 +240,33 @@ mod tests {
     #[test]
     fn parses_tag_block_timestamp() {
         let payload = r"\c:1241544035*1D\!AIVDM,1,1,,B,15N4cJ,0*00";
-        let tb = parse_ais_tag_block(payload);
-        assert_eq!(tb.timestamp_ms, Some(1_241_544_035_000));
+        let (prefix, sentence) = split_tag_block(payload);
+        assert!(sentence.starts_with("!AIVDM"));
+        assert_eq!(
+            parse_tag_block_timestamp_ms(prefix),
+            Some(1_241_544_035_000)
+        );
     }
 
     #[test]
-    fn parses_tag_block_group_id() {
+    fn parses_tag_block_timestamp_after_group_field() {
         let payload = r"\g:1-2-6287,c:1609459200*56\!AIVDM,2,1,0,A,P0,4*72";
-        let tb = parse_ais_tag_block(payload);
-        assert_eq!(tb.group_id.as_deref(), Some("6287"));
-        assert_eq!(tb.timestamp_ms, Some(1_609_459_200_000));
+        let (prefix, _) = split_tag_block(payload);
+        assert_eq!(
+            parse_tag_block_timestamp_ms(prefix),
+            Some(1_609_459_200_000)
+        );
+    }
+
+    #[test]
+    fn timestamp_parse_rejects_overflow_and_empty() {
+        assert_eq!(parse_ais_timestamp_ms(""), None);
+        assert_eq!(parse_ais_timestamp_ms("abc"), None);
+        assert_eq!(parse_ais_timestamp_ms("99999999999999999999999"), None);
+        assert_eq!(
+            parse_ais_timestamp_ms("1700000000*XX"),
+            Some(1_700_000_000_000)
+        );
     }
 
     #[test]

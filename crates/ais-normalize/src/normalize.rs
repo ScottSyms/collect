@@ -1,7 +1,7 @@
 use crate::dataset::PartitionKey;
 use crate::parse::{
-    combine_ais_fragments, nmea_sentence, parse_ais_sentence_metadata, parse_ais_tag_block,
-    parse_pghp_timestamp_ms,
+    combine_ais_fragments, parse_ais_sentence_metadata, parse_pghp_timestamp_ms,
+    parse_tag_block_timestamp_ms, split_tag_block,
 };
 use crate::stats::NormalizeStats;
 use collect_core::PartitionGranularity;
@@ -109,7 +109,7 @@ impl PartitionProcessor {
     ) {
         self.stats.input_rows += 1;
 
-        let sentence = nmea_sentence(payload);
+        let (tag_prefix, sentence) = split_tag_block(payload);
 
         // Handle $PGHP lines: extract their own timestamp, carry forward for next rows.
         if let Some(pghp_ts) = parse_pghp_timestamp_ms(sentence) {
@@ -118,7 +118,11 @@ impl PartitionProcessor {
             return;
         }
 
-        let tag_block = parse_ais_tag_block(payload);
+        let tag_block_ts = if tag_prefix.is_empty() {
+            None
+        } else {
+            parse_tag_block_timestamp_ms(tag_prefix)
+        };
         let sentence_meta = parse_ais_sentence_metadata(sentence);
 
         if !sentence_meta.is_ais {
@@ -134,7 +138,7 @@ impl PartitionProcessor {
         }
 
         // Resolve the effective timestamp for this AIS sentence.
-        let (new_ts_ms, was_retimestamped) = if let Some(t) = tag_block.timestamp_ms {
+        let (new_ts_ms, was_retimestamped) = if let Some(t) = tag_block_ts {
             // Explicit tag-block timestamp takes precedence.
             if sentence_meta.is_fragmented() {
                 self.pending_timestamp_ms = Some(t);
@@ -165,7 +169,7 @@ impl PartitionProcessor {
         }
 
         // Multi-part sentence: buffer until all fragments arrive.
-        let Some(group_key) = &sentence_meta.group_id else {
+        let Some(group_key) = sentence_meta.group_id else {
             // Fragmented but no group key (missing sequence_id): emit as-is.
             self.emit(
                 source_rel_dir,
@@ -180,73 +184,79 @@ impl PartitionProcessor {
         let fragment_count = sentence_meta.fragment_count.unwrap_or(1);
         let fragment_number = sentence_meta.fragment_number.unwrap_or(1);
 
-        if !self.fragment_groups.contains_key(group_key.as_str())
-            && self.fragment_groups.len() >= MAX_FRAGMENT_GROUPS
-        {
-            self.evict_oldest_group(source_rel_dir, out);
-        }
+        if let Some(group) = self.fragment_groups.get_mut(group_key.as_str()) {
+            // Store just the bare sentence (strip tag block) for combining.
+            if fragment_number >= 1
+                && fragment_number <= group.expected_count
+                && group.slots[fragment_number].is_none()
+            {
+                group.slots[fragment_number] = Some(sentence.to_string());
+                group.received_count += 1;
+            }
 
-        let group = self
-            .fragment_groups
-            .entry(group_key.clone())
-            .or_insert_with(|| {
-                // The rebuilt tag block for a combined sentence carries only
-                // the c: timestamp; g: grouping describes the original
-                // fragmentation, which no longer applies once combined.
-                let tag_block = tag_block.timestamp_ms.map(|t| format!("c:{}", t / 1_000));
-                FragmentGroup {
-                    slots: vec![None; fragment_count + 1],
-                    expected_count: fragment_count,
-                    received_count: 0,
-                    first_ts_ms: new_ts_ms,
-                    tag_block,
-                }
-            });
+            if group.received_count < group.expected_count {
+                return;
+            }
 
-        // Store just the bare sentence (strip tag block) for combining.
-        if fragment_number >= 1
-            && fragment_number <= group.expected_count
-            && group.slots[fragment_number].is_none()
-        {
-            group.slots[fragment_number] = Some(sentence.to_string());
-            group.received_count += 1;
-        }
+            // All fragments received: combine and emit.
+            let group = self
+                .fragment_groups
+                .remove(group_key.as_str())
+                .expect("fragment group just updated");
+            let sentences: Vec<String> = group.slots.into_iter().flatten().collect();
 
-        if group.received_count < group.expected_count {
-            return;
-        }
-
-        // All fragments received: combine and emit.
-        let group = self
-            .fragment_groups
-            .remove(group_key.as_str())
-            .expect("fragment group just updated");
-        let sentences: Vec<String> = group.slots.into_iter().flatten().collect();
-
-        let combined_ts = group.first_ts_ms;
-        if let Some(combined_payload) =
-            combine_ais_fragments(&sentences, group.tag_block.as_deref())
-        {
-            self.stats.combined_messages += 1;
-            self.emit(
-                source_rel_dir,
-                combined_ts,
-                combined_ts != ts_ms,
-                Cow::Owned(combined_payload),
-                out,
-            );
-        } else {
-            // Combine failed: emit each fragment individually.
-            for (index, sentence_str) in sentences.into_iter().enumerate() {
-                let part_ts = if index == 0 { combined_ts } else { ts_ms };
+            let combined_ts = group.first_ts_ms;
+            if let Some(combined_payload) =
+                combine_ais_fragments(&sentences, group.tag_block.as_deref())
+            {
+                self.stats.combined_messages += 1;
                 self.emit(
                     source_rel_dir,
-                    part_ts,
-                    false,
-                    Cow::Owned(sentence_str),
+                    combined_ts,
+                    combined_ts != ts_ms,
+                    Cow::Owned(combined_payload),
                     out,
                 );
+            } else {
+                // Combine failed: emit each fragment individually.
+                for (index, sentence_str) in sentences.into_iter().enumerate() {
+                    let part_ts = if index == 0 { combined_ts } else { ts_ms };
+                    self.emit(
+                        source_rel_dir,
+                        part_ts,
+                        false,
+                        Cow::Owned(sentence_str),
+                        out,
+                    );
+                }
             }
+        } else {
+            // First fragment of a new group; `is_fragmented` guarantees
+            // expected_count >= 2, so a fresh group can never complete here.
+            if self.fragment_groups.len() >= MAX_FRAGMENT_GROUPS {
+                self.evict_oldest_group(source_rel_dir, out);
+            }
+
+            let mut slots = vec![None; fragment_count + 1];
+            let mut received_count = 0;
+            if fragment_number >= 1 && fragment_number <= fragment_count {
+                slots[fragment_number] = Some(sentence.to_string());
+                received_count = 1;
+            }
+            // The rebuilt tag block for a combined sentence carries only
+            // the c: timestamp; g: grouping describes the original
+            // fragmentation, which no longer applies once combined.
+            let tag_block = tag_block_ts.map(|t| format!("c:{}", t / 1_000));
+            self.fragment_groups.insert(
+                group_key,
+                FragmentGroup {
+                    slots,
+                    expected_count: fragment_count,
+                    received_count,
+                    first_ts_ms: new_ts_ms,
+                    tag_block,
+                },
+            );
         }
     }
 

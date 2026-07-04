@@ -24,7 +24,7 @@ use std::sync::{
     Arc,
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::AsyncRead;
+use tokio::io::{AsyncRead, AsyncWriteExt};
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::codec::{FramedRead, LinesCodec};
@@ -1424,6 +1424,91 @@ impl S3Storage {
             println!("🗑️  Removed local file: {}", local_path.display());
         }
 
+        Ok(())
+    }
+
+    /// List `(key, size)` pairs for every object under `prefix`, following
+    /// pagination. Pass `""` to list the whole bucket.
+    pub async fn list_keys_with_prefix(&self, prefix: &str) -> Result<Vec<(String, u64)>> {
+        let mut keys = Vec::new();
+        let mut continuation_token = None;
+
+        loop {
+            let mut request = self.client.list_objects_v2().bucket(&self.bucket);
+            if !prefix.is_empty() {
+                request = request.prefix(prefix);
+            }
+            if let Some(token) = continuation_token.take() {
+                request = request.continuation_token(token);
+            }
+
+            let response = request
+                .send()
+                .await
+                .with_context(|| format!("listing s3://{}/{}", self.bucket, prefix))?;
+            for object in response.contents() {
+                let Some(key) = object.key() else {
+                    continue;
+                };
+                let size = object.size().unwrap_or(0).max(0) as u64;
+                keys.push((key.to_string(), size));
+            }
+
+            if response.is_truncated().unwrap_or(false) {
+                continuation_token = response
+                    .next_continuation_token()
+                    .map(|value| value.to_string());
+            } else {
+                break;
+            }
+        }
+
+        Ok(keys)
+    }
+
+    /// Download an object to `local_path`, creating parent directories as needed.
+    pub async fn download_to_path(&self, key: &str, local_path: &Path) -> Result<()> {
+        let response = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .with_context(|| format!("downloading s3://{}/{}", self.bucket, key))?;
+
+        if let Some(parent) = local_path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("mkdir -p {}", parent.display()))?;
+        }
+
+        let mut file = tokio::fs::File::create(local_path)
+            .await
+            .with_context(|| format!("create {}", local_path.display()))?;
+        let mut reader = response.body.into_async_read();
+        tokio::io::copy(&mut reader, &mut file).await.with_context(|| {
+            format!(
+                "copy s3://{}/{} to {}",
+                self.bucket,
+                key,
+                local_path.display()
+            )
+        })?;
+        file.flush().await?;
+        Ok(())
+    }
+
+    /// Delete a single object by key. Deleting a key that does not exist is
+    /// treated as success by S3, so this is safe to call idempotently.
+    pub async fn delete_key(&self, key: &str) -> Result<()> {
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .with_context(|| format!("deleting s3://{}/{}", self.bucket, key))?;
         Ok(())
     }
 }

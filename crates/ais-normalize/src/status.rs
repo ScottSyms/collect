@@ -32,7 +32,7 @@ pub fn is_cancelled() -> bool {
 
 /// Print a plain progress update every N partitions.
 pub fn should_emit_plain_update(processed: usize, every: usize) -> bool {
-    every > 0 && processed % every == 0
+    every > 0 && processed.is_multiple_of(every)
 }
 
 pub fn print_plain_update(processed: usize, total: usize) {
