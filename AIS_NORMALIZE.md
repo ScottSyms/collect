@@ -25,9 +25,9 @@ Rows that aren't AIS `VDM`/`VDO` sentences (heartbeats, other NMEA talkers, etc.
 
 ## How it works
 
-**Dataset scan.** The input directory is walked once; each Parquet file's path is parsed against the `--partition` granularity to recover its `(source, year, month, day, [hour], [minute])` key. `tmp-`-prefixed files (in-progress writer temp files) are skipped. Files that don't match the expected path depth are silently skipped — see [Troubleshooting](#troubleshooting).
+**Dataset scan.** Each input (one or more directories or buckets — see [merging multiple sources](#merging-multiple-sources)) is walked once; each Parquet file's path is parsed against the `--partition` granularity to recover its `(source, year, month, day, [hour], [minute])` key. `tmp-`-prefixed files (in-progress writer temp files) are skipped. Files that don't match the expected path depth are silently skipped — see [Troubleshooting](#troubleshooting).
 
-**Partition grouping.** Files are grouped by their *input* partition key and sorted chronologically. Each group is handed to a worker as one independent unit of work.
+**Partition grouping.** Files from all inputs are pooled, sorted by *input* partition key, and grouped by that key (so the same partition contributed by two inputs becomes one work item). Each group is handed to a worker as one independent unit of work.
 
 **Concurrency.** A pool of `--concurrency` workers (default: available cores, capped at 8) pulls partitions off a shared queue. Each partition gets its own `PartitionProcessor` (fragment buffer + carry-forward timestamp state) and its own `OutputWriterPool` (one Arrow/Parquet writer per *output* partition the input rows get redistributed into). State never crosses partition boundaries, so partitions can run fully in parallel and memory scales with `concurrency × open output writers per partition` — not with total dataset size. Parallelism is per input partition; a dataset stored at finer granularity (hour/minute) exposes more parallelism than one giant day partition.
 
@@ -45,9 +45,9 @@ Rows that aren't AIS `VDM`/`VDO` sentences (heartbeats, other NMEA talkers, etc.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--input-dir` | *(one of `--input-dir`/`--input-s3-bucket` required)* | Source Hive-partitioned Parquet root on local disk |
+| `--input-dir` | *(one of `--input-dir`/`--input-s3-bucket` required)* | Source Hive-partitioned Parquet root on local disk. **Repeatable** — pass it several times to merge multiple sources in one run (see [merging multiple sources](#merging-multiple-sources)) |
 | `--output-dir` | *(one of `--output-dir`/`--output-s3-bucket` required)* | Destination root on local disk (see [output directory](#output-directory-non-destructive) note) |
-| `--input-s3-bucket` | *(none)* | Read the input dataset from this S3 bucket instead of `--input-dir` |
+| `--input-s3-bucket` | *(none)* | Read the input dataset from this S3 bucket instead of `--input-dir`. **Repeatable**; comma-separated `INPUT_S3_BUCKET` env also works |
 | `--input-s3-prefix` | *(empty)* | Key prefix within the input bucket; acts as the dataset root, env `INPUT_S3_PREFIX` |
 | `--output-s3-bucket` | *(none)* | Write normalized output to this S3 bucket instead of `--output-dir` |
 | `--output-s3-prefix` | *(empty)* | Key prefix within the output bucket; acts as the dataset root, env `OUTPUT_S3_PREFIX` |
@@ -150,6 +150,32 @@ At the end of a run, a plain-text summary is printed to stderr:
 | `incomplete groups` | Fragment groups that never completed (evicted by the buffer cap or left over at end-of-partition) and were emitted as raw, uncombined fragments |
 
 A high `incomplete groups` count usually means fragments of the same message are landing in different source partitions or being dropped upstream — check the feed and the ingest `--partition` granularity relative to message arrival spacing.
+
+## Merging multiple sources
+
+`--input-dir` and `--input-s3-bucket` are both repeatable, so several source datasets can be normalized into one output in a single run (instead of invoking the tool once per feed):
+
+```bash
+# Two S3 buckets (one feed each) → one normalized bucket
+cargo run -p ais-normalize -- \
+  --input-s3-bucket norway --input-s3-bucket aisstream \
+  --output-s3-bucket normalized-ais \
+  --s3-endpoint http://minio:9000 --s3-access-key … --s3-secret-key … --s3-disable-tls \
+  --partition day --apply
+
+# Comma-separated env form
+INPUT_S3_BUCKET=norway,aisstream OUTPUT_S3_BUCKET=normalized-ais … cargo run -p ais-normalize -- --partition day --apply
+
+# Two local dirs
+cargo run -p ais-normalize -- --input-dir /data/norway --input-dir /data/aisstream --output-dir /data/normalized --partition day --apply
+```
+
+Rules and behavior:
+
+- **Each source keeps its own `source=` label.** The output is one dataset holding all the input sources as separate `source=` partition trees (e.g. `source=norway/…` and `source=aisstream/…`); labels are inherited from each input's path, never merged or rewritten. Provenance is preserved.
+- **All inputs must be the same kind.** Either several `--input-dir` **or** several `--input-s3-bucket`, not a mix. Every input bucket shares one endpoint/region/credentials and one `--input-s3-prefix` (keep it empty for bucket-root datasets).
+- **Overlap is handled.** If the same `source=` appears in more than one input (e.g. two snapshots of one feed), those rows land in the same output partition and are deduplicated — the tool detects this case and forces the [dedup merge](#idempotent-re-runs-deduplication) even on a single output file, so one run yields a clean, duplicate-free result. When all sources are distinct (the common case), no such forcing happens and the merge stays cheap.
+- **`--source` and the partition-slice filters** apply to every input.
 
 ## Idempotent re-runs (deduplication)
 

@@ -3,7 +3,7 @@ use arrow::array::{StringArray, TimestampMillisecondArray};
 use clap::Parser;
 use collect_core::{PartitionGranularity, S3Storage};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::File as StdFile;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -30,17 +30,19 @@ use status::StatusMode;
     about = "Re-timestamp, re-partition, and combine multi-part AIS sentences in a Hive-partitioned Parquet dataset"
 )]
 struct Args {
-    /// Source Hive-partitioned Parquet root directory (mutually exclusive with --input-s3-bucket)
+    /// Source Hive-partitioned Parquet root directory. Repeatable to merge
+    /// several sources in one run (mutually exclusive with --input-s3-bucket)
     #[arg(long)]
-    input_dir: Option<PathBuf>,
+    input_dir: Vec<PathBuf>,
 
     /// Output Hive-partitioned Parquet root directory, may equal input-dir (mutually exclusive with --output-s3-bucket)
     #[arg(long)]
     output_dir: Option<PathBuf>,
 
-    /// S3 bucket to read the input dataset from, instead of --input-dir
+    /// S3 bucket to read the input dataset from, instead of --input-dir.
+    /// Repeatable to merge several buckets (all on the shared endpoint)
     #[arg(long)]
-    input_s3_bucket: Option<String>,
+    input_s3_bucket: Vec<String>,
 
     /// Key prefix within the input S3 bucket; acts as the dataset root
     #[arg(long, default_value = "")]
@@ -132,11 +134,15 @@ impl Args {
     /// Only the new S3 fields read from the environment — `--input-dir` /
     /// `--output-dir` remain CLI-only, unchanged from before S3 support.
     fn apply_env(&mut self) {
-        if self.input_dir.is_none() && self.input_s3_bucket.is_none() {
+        if self.input_dir.is_empty() && self.input_s3_bucket.is_empty() {
             if let Ok(value) = std::env::var("INPUT_S3_BUCKET") {
-                if !value.trim().is_empty() {
-                    self.input_s3_bucket = Some(value);
-                }
+                // Comma-separated so several buckets can be given via one env var.
+                self.input_s3_bucket = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|b| !b.is_empty())
+                    .map(str::to_string)
+                    .collect();
             }
         }
         if self.input_s3_prefix.is_empty() {
@@ -209,20 +215,24 @@ fn s3_key_for_output(scratch_root: &Path, local_path: &Path, prefix: &str) -> St
     }
 }
 
-/// True when the run reads and writes the same place — same local directory,
-/// or same S3 bucket and prefix. Best-effort: local paths are compared after
+/// True when the run reads and writes the same place — any input directory
+/// equal to the output directory, or any input bucket equal to the output
+/// bucket at the same prefix. Best-effort: local paths are compared after
 /// canonicalization when both resolve, else by raw value.
 fn output_equals_input(args: &Args) -> bool {
-    if let (Some(input), Some(output)) = (&args.input_dir, &args.output_dir) {
-        let canon = std::fs::canonicalize(input)
-            .ok()
-            .zip(std::fs::canonicalize(output).ok())
-            .map(|(a, b)| a == b);
-        return canon.unwrap_or_else(|| input == output);
+    if let Some(output) = &args.output_dir {
+        let output_canon = std::fs::canonicalize(output).ok();
+        return args.input_dir.iter().any(|input| {
+            match (std::fs::canonicalize(input).ok(), &output_canon) {
+                (Some(a), Some(b)) => a == *b,
+                _ => input == output,
+            }
+        });
     }
-    if let (Some(in_bucket), Some(out_bucket)) = (&args.input_s3_bucket, &args.output_s3_bucket) {
-        return in_bucket == out_bucket
-            && args.input_s3_prefix.trim_matches('/') == args.output_s3_prefix.trim_matches('/');
+    if let Some(out_bucket) = &args.output_s3_bucket {
+        let same_prefix =
+            args.input_s3_prefix.trim_matches('/') == args.output_s3_prefix.trim_matches('/');
+        return same_prefix && args.input_s3_bucket.iter().any(|b| b == out_bucket);
     }
     false
 }
@@ -261,9 +271,9 @@ async fn main() -> Result<()> {
     let dry_run = !args.apply;
     let status_mode = StatusMode::from_tty(!args.noui && std::io::stdout().is_terminal());
 
-    match (&args.input_dir, &args.input_s3_bucket) {
-        (Some(_), Some(_)) => bail!("use either --input-dir or --input-s3-bucket, not both"),
-        (None, None) => bail!("one of --input-dir or --input-s3-bucket is required"),
+    match (args.input_dir.is_empty(), args.input_s3_bucket.is_empty()) {
+        (false, false) => bail!("use either --input-dir or --input-s3-bucket, not both"),
+        (true, true) => bail!("one of --input-dir or --input-s3-bucket is required"),
         _ => {}
     }
     match (&args.output_dir, &args.output_s3_bucket) {
@@ -321,10 +331,12 @@ async fn main() -> Result<()> {
         eprintln!("\nShutdown requested.");
     });
 
-    // Both buckets always live on the same S3 endpoint/region/credentials;
-    // only the bucket name (and optional prefix) differs between them.
-    let input_storage = match &args.input_s3_bucket {
-        Some(bucket) => Some(
+    // Every input bucket lives on the same S3 endpoint/region/credentials; only
+    // the bucket name differs. Build one storage handle per input bucket; their
+    // order is the `storage_index` carried by each listed object.
+    let mut input_storages: Vec<S3Storage> = Vec::with_capacity(args.input_s3_bucket.len());
+    for bucket in &args.input_s3_bucket {
+        input_storages.push(
             S3Storage::new(
                 bucket.clone(),
                 args.s3_region.clone(),
@@ -335,10 +347,11 @@ async fn main() -> Result<()> {
                 args.s3_disable_tls,
             )
             .await
-            .context("connecting to input S3 bucket")?,
-        ),
-        None => None,
-    };
+            .with_context(|| format!("connecting to input S3 bucket {bucket}"))?,
+        );
+    }
+    let input_storages = Arc::new(input_storages);
+    let input_is_s3 = !input_storages.is_empty();
     let output_storage = match &args.output_s3_bucket {
         Some(bucket) => Some(
             S3Storage::new(
@@ -359,8 +372,7 @@ async fn main() -> Result<()> {
     // The input scratch dir only ever holds copies of data still safely
     // stored in the source bucket, so it's fine to auto-delete on drop
     // regardless of how the run ends.
-    let input_scratch = input_storage
-        .is_some()
+    let input_scratch = input_is_s3
         .then(|| {
             tempfile::Builder::new()
                 .prefix("ais-normalize-input-")
@@ -400,80 +412,111 @@ async fn main() -> Result<()> {
         Remote(Vec<dataset::S3Entry>),
     }
 
-    let partitions: Vec<(PartitionKey, PartitionWork)> = if let Some(storage) = &input_storage {
-        eprintln!("Listing input S3 bucket...");
+    // Which input indices contributed each source label. If any source is fed
+    // by more than one input, that source's rows can be merged into a single
+    // output file that already holds cross-input duplicates, so dedup must run
+    // even on single-file partitions (see `force_dedup` below).
+    let mut source_inputs: HashMap<String, HashSet<usize>> = HashMap::new();
+
+    let partitions: Vec<(PartitionKey, PartitionWork)> = if input_is_s3 {
+        eprintln!("Listing {} input S3 bucket(s)...", input_storages.len());
         if !partition_filter.is_empty() && args.source.is_none() {
             eprintln!(
                 "Note: without --source the partition filter is applied after listing; \
                  add --source to push it into the S3 LIST prefix."
             );
         }
-        let entries = dataset::list_s3_parquet_entries(
-            storage,
-            &args.input_s3_prefix,
-            args.partition,
-            args.source.as_deref(),
-            partition_filter,
-        )
-        .await
-        .context("listing input S3 bucket")?;
+
+        // List each bucket, tag its objects with the bucket's index, and pool
+        // them. The per-bucket lists are each sorted, so re-sort the pool by
+        // partition key before grouping so identical keys from different buckets
+        // land in one group.
+        let mut entries: Vec<dataset::S3Entry> = Vec::new();
+        for (index, storage) in input_storages.iter().enumerate() {
+            let mut bucket_entries = dataset::list_s3_parquet_entries(
+                storage,
+                &args.input_s3_prefix,
+                args.partition,
+                args.source.as_deref(),
+                partition_filter,
+            )
+            .await
+            .with_context(|| format!("listing input S3 bucket {}", args.input_s3_bucket[index]))?;
+            for entry in &mut bucket_entries {
+                entry.storage_index = index;
+                source_inputs
+                    .entry(entry.partition.source.clone())
+                    .or_default()
+                    .insert(index);
+            }
+            entries.extend(bucket_entries);
+        }
 
         if entries.is_empty() {
             eprintln!(
-                "No matching Parquet objects found under s3://{}/{}.",
-                args.input_s3_bucket.as_deref().unwrap_or_default(),
+                "No matching Parquet objects found across {} bucket(s) under prefix {:?}.",
+                input_storages.len(),
                 args.input_s3_prefix
             );
             return Ok(());
         }
         eprintln!("Found {} matching object(s).", entries.len());
 
-        let mut partitions: Vec<(PartitionKey, Vec<dataset::S3Entry>)> = Vec::new();
-        for entry in entries {
-            match partitions.last_mut() {
-                Some((key, list)) if *key == entry.partition => list.push(entry),
-                _ => partitions.push((entry.partition.clone(), vec![entry])),
-            }
-        }
-        partitions
+        entries.sort_by(|a, b| {
+            a.partition
+                .sort_key()
+                .cmp(&b.partition.sort_key())
+                .then(a.rel_path.cmp(&b.rel_path))
+        });
+        dataset::group_by_partition(entries, |entry| entry.partition.clone())
             .into_iter()
             .map(|(key, list)| (key, PartitionWork::Remote(list)))
             .collect()
     } else {
-        eprintln!("Scanning input dataset...");
-        let input_dir = args
-            .input_dir
-            .as_deref()
-            .expect("validated --input-dir present for local input");
-        let files = dataset::list_parquet_files(
-            input_dir,
-            args.partition,
-            args.source.as_deref(),
-            partition_filter,
-        )
-        .await
-        .context("scanning input dataset")?;
+        eprintln!("Scanning {} input dir(s)...", args.input_dir.len());
+        let mut files: Vec<DatasetFile> = Vec::new();
+        for (index, dir) in args.input_dir.iter().enumerate() {
+            let dir_files = dataset::list_parquet_files(
+                dir,
+                args.partition,
+                args.source.as_deref(),
+                partition_filter,
+            )
+            .await
+            .with_context(|| format!("scanning input dataset {}", dir.display()))?;
+            for file in &dir_files {
+                source_inputs
+                    .entry(file.partition.source.clone())
+                    .or_default()
+                    .insert(index);
+            }
+            files.extend(dir_files);
+        }
 
         if files.is_empty() {
-            eprintln!(
-                "No matching Parquet files found in {}.",
-                input_dir.display()
-            );
+            eprintln!("No matching Parquet files found in the input dir(s).");
             return Ok(());
         }
 
-        let mut partitions: Vec<(PartitionKey, Vec<DatasetFile>)> = Vec::new();
-        for file in files {
-            match partitions.last_mut() {
-                Some((key, list)) if *key == file.partition => list.push(file),
-                _ => partitions.push((file.partition.clone(), vec![file])),
-            }
-        }
-        partitions
+        files.sort_by(|a, b| {
+            a.partition
+                .sort_key()
+                .cmp(&b.partition.sort_key())
+                .then(a.path.cmp(&b.path))
+        });
+        dataset::group_by_partition(files, |file| file.partition.clone())
             .into_iter()
             .map(|(key, list)| (key, PartitionWork::Local(list)))
             .collect()
     };
+
+    // When a source is contributed by more than one input, its rows may be
+    // merged into a single output file that already contains cross-input
+    // duplicates, so the dedup pass must run even on single-file partitions.
+    let force_dedup = source_inputs.values().any(|inputs| inputs.len() > 1);
+    if dedup_enabled && force_dedup && status_mode.is_plain() {
+        eprintln!("A source is fed by multiple inputs; dedup will merge all touched partitions.");
+    }
 
     let total_partitions = partitions.len();
     eprintln!(
@@ -514,7 +557,7 @@ async fn main() -> Result<()> {
         let output_root = output_root.clone();
         let output_storage = output_storage.clone();
         let output_s3_prefix = args.output_s3_prefix.clone();
-        let input_storage = input_storage.clone();
+        let input_storages = input_storages.clone();
         let input_scratch_root = input_scratch_root.clone();
         let granularity = args.partition;
         let batch_size = args.batch_size;
@@ -548,14 +591,11 @@ async fn main() -> Result<()> {
                 let partition_files = match work {
                     PartitionWork::Local(files) => files,
                     PartitionWork::Remote(entries) => {
-                        let storage = input_storage
-                            .as_ref()
-                            .expect("remote work implies input storage");
                         let scratch_root = input_scratch_root
                             .as_ref()
                             .expect("remote work implies input scratch dir");
                         match dataset::download_s3_entries(
-                            storage,
+                            &input_storages,
                             entries,
                             scratch_root,
                             PARTITION_DOWNLOAD_CONCURRENCY,
@@ -693,16 +733,19 @@ async fn main() -> Result<()> {
                     &new_files_dir,
                     &work_dir,
                     args.compression_level,
+                    force_dedup,
                 )
                 .await
                 .with_context(|| format!("deduplicating S3 partition {rel_dir}"))?
             } else {
                 let dir = output_root.join(rel_dir);
                 let level = args.compression_level;
-                tokio::task::spawn_blocking(move || dedup::dedup_local_partition(&dir, level))
-                    .await
-                    .context("dedup task panicked")?
-                    .with_context(|| format!("deduplicating partition {rel_dir}"))?
+                tokio::task::spawn_blocking(move || {
+                    dedup::dedup_local_partition(&dir, level, force_dedup)
+                })
+                .await
+                .context("dedup task panicked")?
+                .with_context(|| format!("deduplicating partition {rel_dir}"))?
             };
             dedup_stats.merge(&stats);
         }

@@ -319,10 +319,16 @@ pub async fn list_parquet_files(
 }
 
 /// One matched `.parquet` object in an S3 input bucket, before it's downloaded.
+///
+/// `storage_index` records which input bucket the object came from — when a run
+/// reads several buckets, entries for the same partition key can come from
+/// different buckets, and each must be downloaded through its own storage
+/// handle. Listing sets it to `0`; the caller overrides it per bucket.
 pub struct S3Entry {
     pub key: String,
     pub rel_path: String,
     pub partition: PartitionKey,
+    pub storage_index: usize,
 }
 
 fn rel_from_key(prefix: &str, key: &str) -> String {
@@ -402,6 +408,7 @@ pub async fn list_s3_parquet_entries(
             key,
             rel_path,
             partition,
+            storage_index: 0,
         });
     }
 
@@ -415,11 +422,17 @@ pub async fn list_s3_parquet_entries(
     Ok(entries)
 }
 
-/// Download every matched S3 entry into `scratch_root`, preserving its
-/// relative Hive path, so the rest of the pipeline can treat it exactly like
-/// a local dataset. Runs up to `concurrency` downloads at once.
+/// Download every matched S3 entry into `scratch_root`, preserving its relative
+/// Hive path, so the rest of the pipeline can treat it exactly like a local
+/// dataset. Each entry is fetched through `storages[entry.storage_index]`, so a
+/// single partition may draw files from several input buckets. Runs up to
+/// `concurrency` downloads at once.
+///
+/// The scratch filename is prefixed with the storage index so files that share
+/// a name across buckets cannot overwrite each other; they still live under the
+/// partition's `rel_dir`, keeping the caller's per-partition cleanup correct.
 pub async fn download_s3_entries(
-    storage: &S3Storage,
+    storages: &[S3Storage],
     entries: Vec<S3Entry>,
     scratch_root: &Path,
     concurrency: usize,
@@ -427,8 +440,11 @@ pub async fn download_s3_entries(
     let scratch_root = scratch_root.to_path_buf();
     let mut files: Vec<DatasetFile> = stream::iter(entries)
         .map(|entry| {
-            let storage = storage.clone();
-            let local_path = scratch_root.join(&entry.rel_path);
+            let storage = storages
+                .get(entry.storage_index)
+                .expect("entry storage_index within storages")
+                .clone();
+            let local_path = namespaced_scratch_path(&scratch_root, &entry);
             async move {
                 storage
                     .download_to_path(&entry.key, &local_path)
@@ -456,6 +472,41 @@ pub async fn download_s3_entries(
     Ok(files)
 }
 
+/// Group a partition-key-sorted list into contiguous runs sharing a key.
+///
+/// The input MUST already be sorted by partition key — callers that concatenate
+/// several individually-sorted lists (e.g. one per input bucket) re-sort first,
+/// otherwise a key split across the input would produce multiple groups.
+pub fn group_by_partition<T>(
+    items: Vec<T>,
+    key_of: impl Fn(&T) -> PartitionKey,
+) -> Vec<(PartitionKey, Vec<T>)> {
+    let mut groups: Vec<(PartitionKey, Vec<T>)> = Vec::new();
+    for item in items {
+        let key = key_of(&item);
+        match groups.last_mut() {
+            Some((existing, list)) if *existing == key => list.push(item),
+            _ => groups.push((key, vec![item])),
+        }
+    }
+    groups
+}
+
+/// `scratch_root/<rel_dir>/in<idx>-<filename>` for an entry, so same-named
+/// objects from different buckets never collide on disk.
+fn namespaced_scratch_path(scratch_root: &Path, entry: &S3Entry) -> PathBuf {
+    let rel = Path::new(&entry.rel_path);
+    let file_name = rel
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| format!("part-{}.parquet", entry.storage_index));
+    let namespaced = format!("in{}-{}", entry.storage_index, file_name);
+    match rel.parent() {
+        Some(parent) => scratch_root.join(parent).join(namespaced),
+        None => scratch_root.join(namespaced),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -470,6 +521,49 @@ mod tests {
             hour: 0,
             minute: 0,
         }
+    }
+
+    #[test]
+    fn groups_distinct_sources_separately() {
+        // Two sources, already sorted by key: two groups.
+        let keys = vec![
+            day_key("alpha", 2026, 7, 1),
+            day_key("alpha", 2026, 7, 1),
+            day_key("beta", 2026, 7, 1),
+        ];
+        let groups = group_by_partition(keys, |k| k.clone());
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].0.source, "alpha");
+        assert_eq!(groups[0].1.len(), 2);
+        assert_eq!(groups[1].0.source, "beta");
+        assert_eq!(groups[1].1.len(), 1);
+    }
+
+    #[test]
+    fn groups_same_source_from_two_inputs_into_one() {
+        // The same partition key contributed by two inputs collapses to one
+        // group (once the concatenated list is sorted, they are adjacent).
+        let keys = vec![day_key("norway", 2026, 7, 2), day_key("norway", 2026, 7, 2)];
+        let groups = group_by_partition(keys, |k| k.clone());
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].1.len(), 2);
+    }
+
+    #[test]
+    fn namespaced_scratch_path_is_per_storage() {
+        let entry = |idx| S3Entry {
+            key: "k".into(),
+            rel_path: "source=x/year=2026/month=07/day=01/part-0.parquet".into(),
+            partition: day_key("x", 2026, 7, 1),
+            storage_index: idx,
+        };
+        let root = Path::new("/scratch");
+        let a = namespaced_scratch_path(root, &entry(0));
+        let b = namespaced_scratch_path(root, &entry(1));
+        assert_ne!(a, b, "same-named objects from two buckets must not collide");
+        assert!(a.to_string_lossy().ends_with("in0-part-0.parquet"));
+        assert!(b.to_string_lossy().ends_with("in1-part-0.parquet"));
+        assert_eq!(a.parent(), b.parent(), "both live under the same rel_dir");
     }
 
     #[test]

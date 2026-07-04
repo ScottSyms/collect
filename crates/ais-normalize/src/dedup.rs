@@ -367,13 +367,21 @@ fn parquet_files_in_dir(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-/// Merge-dedup a local partition directory in place. Only rewrites when the
-/// partition has 2+ files (i.e. a prior run's output or a generation rollover
-/// could have introduced cross-file duplicates); a lone fresh file is left
-/// untouched to keep first runs cheap. Blocking; call from `spawn_blocking`.
-pub fn dedup_local_partition(dir: &Path, compression_level: i32) -> Result<DedupStats> {
+/// Merge-dedup a local partition directory in place. By default only rewrites
+/// when the partition has 2+ files (a prior run's output or a generation
+/// rollover could have introduced cross-file duplicates); a lone fresh file is
+/// left untouched to keep first runs cheap. When `force` is set — used when a
+/// single source is fed by multiple inputs, so one output file can already
+/// contain cross-input duplicates — a single file is merged too. Blocking;
+/// call from `spawn_blocking`.
+pub fn dedup_local_partition(
+    dir: &Path,
+    compression_level: i32,
+    force: bool,
+) -> Result<DedupStats> {
     let inputs = parquet_files_in_dir(dir)?;
-    if inputs.len() < 2 {
+    let threshold = if force { 1 } else { 2 };
+    if inputs.len() < threshold {
         return Ok(DedupStats::default());
     }
 
@@ -417,6 +425,7 @@ pub async fn dedup_s3_partition(
     new_files_dir: &Path,
     work_dir: &Path,
     compression_level: i32,
+    force: bool,
 ) -> Result<DedupStats> {
     let new_files = parquet_files_in_dir(new_files_dir)?;
     let partition_prefix = format!("{}/", s3_join(output_prefix, rel_dir));
@@ -432,7 +441,9 @@ pub async fn dedup_s3_partition(
         .collect();
 
     // Fast path: exactly one new file and no prior data — just upload it.
-    if new_files.len() == 1 && prior_keys.is_empty() {
+    // Skipped when `force`, so a single output file that may hold cross-input
+    // duplicates still gets merged.
+    if !force && new_files.len() == 1 && prior_keys.is_empty() {
         let key = s3_join(
             output_prefix,
             &format!("{}/{}", rel_dir, file_name_of(&new_files[0])?),
@@ -589,9 +600,24 @@ mod tests {
         let dir = tempfile::tempdir().expect("tmp");
         let only = dir.path().join("norm-1.parquet");
         write_parquet(&only, &[(100, "X"), (200, "Y")]);
-        let stats = dedup_local_partition(dir.path(), 1).expect("dedup");
+        let stats = dedup_local_partition(dir.path(), 1, false).expect("dedup");
         assert_eq!(stats.partitions_merged, 0);
         assert!(only.exists(), "single file should be left in place");
+    }
+
+    #[test]
+    fn local_partition_force_dedups_single_file() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let only = dir.path().join("norm-1.parquet");
+        // One file that already holds an internal duplicate (e.g. two inputs of
+        // the same source merged into one output file).
+        write_parquet(&only, &[(100, "X"), (100, "X"), (200, "Y")]);
+        let stats = dedup_local_partition(dir.path(), 1, true).expect("dedup");
+        assert_eq!(stats.partitions_merged, 1);
+        assert_eq!(stats.duplicates_removed, 1);
+        let files = parquet_files_in_dir(dir.path()).expect("list");
+        assert_eq!(files.len(), 1);
+        assert_eq!(read_all(&files[0]).len(), 2);
     }
 
     #[test]
@@ -605,7 +631,7 @@ mod tests {
             &dir.path().join("norm-2.parquet"),
             &[(100, "X"), (300, "Z")],
         );
-        let stats = dedup_local_partition(dir.path(), 1).expect("dedup");
+        let stats = dedup_local_partition(dir.path(), 1, false).expect("dedup");
         assert_eq!(stats.partitions_merged, 1);
         assert_eq!(stats.duplicates_removed, 1);
         let files = parquet_files_in_dir(dir.path()).expect("list");
