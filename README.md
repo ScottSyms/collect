@@ -65,6 +65,8 @@ cargo run -p collect-file -- --input data.txt --source mydata --compression-leve
 cargo run -p ais-normalize -- --input-dir data --output-dir normalized --partition day --apply
 ```
 
+See [AIS_NORMALIZE.md](AIS_NORMALIZE.md) for how fragment reassembly and re-timestamping work, the full CLI reference, and deployment as a scheduled batch job.
+
 `collect-file` auto-detects plain text, gzip, bzip2, and zip inputs. Zip archives are read entry-by-entry in archive order. Hidden dotfiles are skipped silently. `--concurrency` overrides the auto-selected file worker count. `--ais` applies to `collect-file` only; it prefers NMEA `c:<epoch>` tag block timestamps and `$PGHP` capture timestamps when present, and reuses the first sentence timestamp for grouped `\g:` fragments.
 
 ## Maintenance
