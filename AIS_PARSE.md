@@ -17,14 +17,17 @@ bucket, exactly like ais-normalize.
 
 ## What it produces
 
-Two sibling hive-partitioned datasets under the output root. The output is
-**not partitioned by source** — every source that falls in a time partition
-is decoded into it together, so downstream queries see one unified dataset —
-but each row keeps its origin in a `source` column:
+Sibling hive-partitioned datasets under the output root — `positions/` and
+`statics/` (below), plus `meteo/` and `binary/` from [Type 8](#type-8-binary-broadcast).
+The output is **not partitioned by source** — every source that falls in a
+time partition is decoded into it together, so downstream queries see one
+unified dataset — but each row keeps its origin in a `source` column:
 
 ```
 <output>/positions/year=YYYY/month=MM/day=DD/pos-....parquet
 <output>/statics/year=YYYY/month=MM/day=DD/stat-....parquet
+<output>/meteo/year=YYYY/month=MM/day=DD/met-....parquet
+<output>/binary/year=YYYY/month=MM/day=DD/bin-....parquet
 ```
 
 `source` is read from the input's `source` column when present (ais-normalize
@@ -65,11 +68,50 @@ stays correct and race-free.
 | `eta` | timestamp (ms, UTC), nullable | |
 | `mothership_mmsi` | uint32, nullable | |
 
+**`meteo`** and **`binary`** — decoded from Type 8 Binary Broadcast messages;
+see [Type 8](#type-8-binary-broadcast) below.
+
 Sentences that decode to any other message class (base-station reports, aids
 to navigation, safety messages, GNSS sentences, ...) are counted in the run
 summary (`other decoded`) but not materialized. Unparseable payloads
 (`$PGHP` wrappers, corrupt sentences) are counted as `unparsed` — the bronze
 data still holds them, nothing is lost.
+
+## Type 8 Binary Broadcast
+
+AIS Type 8 carries a generic header — MMSI plus an application identifier
+(DAC = Designated Area Code, FID = Functional ID) — followed by an
+application-specific binary payload. `nmea-parser` doesn't decode Type 8, so
+ais-parse decodes the 6-bit payload itself. Two output datasets result:
+
+- **`meteo/`** — the standardized **meteorological & hydrological** subtypes,
+  DAC=1 FID=31 (IMO289, current) and FID=11 (IMO236, deprecated), decoded into
+  ~40 typed columns: `mmsi`, `dac`, `fid`, position (`latitude`/`longitude`),
+  `day`/`hour`/`minute`, wind (`wind_speed_kn`, `wind_gust_kn`, `wind_dir_deg`,
+  `wind_gust_dir_deg`), `air_temp_c`, `humidity_pct`, `dew_point_c`,
+  `pressure_hpa`, `pressure_tendency`, `visibility_nm`/`visibility_greater`,
+  `water_level_m`/`water_level_trend`, three current layers
+  (`surface_current_speed_kn`/`_dir_deg`, `current2_*`, `current3_*` with
+  depths), waves (`wave_height_m`, `wave_period_s`, `wave_dir_deg`), swell
+  (`swell_*`), `sea_state`, `water_temp_c`, `precipitation_type`,
+  `salinity_pct`, and `ice`. Every measurement is **nullable** — AIS transmits
+  a per-field "not available" sentinel that decodes to `null` — and each is
+  scaled to a natural unit (°C, hPa, knots, metres, degrees true, %). Bit
+  offsets, scales, and sentinels follow gpsd's reference decoder
+  (`driver_ais.c` / `gps.h`).
+
+- **`binary/`** — every *other* Type 8 (area notices, extended voyage data,
+  regional DACs, ...): the generic header (`mmsi`, `dac`, `fid`) plus the
+  application payload retained as `payload_hex` (+ `payload_bits`), so nothing
+  is lost and unrecognized subtypes can be decoded downstream later.
+
+Both datasets carry the same `ts` and `source` columns as the others and are
+partitioned by time only.
+
+Multi-fragment Type 8 messages (up to 5 sentences) are decoded once
+**ais-normalize has combined them** into a single sentence — the normal
+pipeline order. ais-parse only decodes Type 8 from a combined/single sentence;
+a raw un-combined fragment is left alone.
 
 ## Idempotent re-runs (partition replace)
 
@@ -143,6 +185,8 @@ for the shared semantics of each group:
 | `input rows` | bronze rows read |
 | `position rows` | decoded into `positions/` |
 | `static rows` | decoded into `statics/` |
+| `meteo rows` | Type 8 met/hydro decoded into `meteo/` |
+| `binary rows` | other Type 8 retained in `binary/` (header + hex) |
 | `other decoded` | valid messages of classes not materialized |
 | `incomplete fragments` | multi-part fragments whose partner never arrived |
 | `unparsed` | sentences the parser rejected |

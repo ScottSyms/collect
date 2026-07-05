@@ -6,11 +6,12 @@
 //! under a `tmp-` name and renamed into place on close, matching the
 //! convention the rest of the workspace uses for in-flight Parquet output.
 
-use crate::decode::{PositionRow, StaticRow};
+use crate::decode::{BinaryRow, MeteoRow, PositionRow, StaticRow};
 use anyhow::{Context, Result};
 use arrow::array::{
-    ArrayBuilder, ArrayRef, BooleanBuilder, Float64Builder, StringBuilder,
-    TimestampMillisecondBuilder, UInt16Builder, UInt32Builder,
+    ArrayBuilder, ArrayRef, BooleanArray, BooleanBuilder, Float64Array, Float64Builder,
+    StringArray, StringBuilder, TimestampMillisecondArray, TimestampMillisecondBuilder,
+    UInt16Array, UInt16Builder, UInt32Array, UInt32Builder, UInt8Array,
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
@@ -86,6 +87,79 @@ fn statics_schema() -> Arc<Schema> {
         Field::new("destination", DataType::Utf8, true),
         ts_field("eta", true),
         Field::new("mothership_mmsi", DataType::UInt32, true),
+    ]))
+}
+
+fn f64n(name: &str) -> Field {
+    Field::new(name, DataType::Float64, true)
+}
+fn u16n(name: &str) -> Field {
+    Field::new(name, DataType::UInt16, true)
+}
+fn u8n(name: &str) -> Field {
+    Field::new(name, DataType::UInt8, true)
+}
+fn booln(name: &str) -> Field {
+    Field::new(name, DataType::Boolean, true)
+}
+
+fn meteo_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        ts_field("ts", false),
+        Field::new("source", DataType::Utf8, false),
+        Field::new("mmsi", DataType::UInt32, false),
+        Field::new("dac", DataType::UInt16, false),
+        Field::new("fid", DataType::UInt8, false),
+        f64n("latitude"),
+        f64n("longitude"),
+        booln("position_accuracy"),
+        u8n("day"),
+        u8n("hour"),
+        u8n("minute"),
+        u16n("wind_speed_kn"),
+        u16n("wind_gust_kn"),
+        u16n("wind_dir_deg"),
+        u16n("wind_gust_dir_deg"),
+        f64n("air_temp_c"),
+        u8n("humidity_pct"),
+        f64n("dew_point_c"),
+        u16n("pressure_hpa"),
+        u8n("pressure_tendency"),
+        f64n("visibility_nm"),
+        booln("visibility_greater"),
+        f64n("water_level_m"),
+        u8n("water_level_trend"),
+        f64n("surface_current_speed_kn"),
+        u16n("surface_current_dir_deg"),
+        f64n("current2_speed_kn"),
+        u16n("current2_dir_deg"),
+        f64n("current2_depth_m"),
+        f64n("current3_speed_kn"),
+        u16n("current3_dir_deg"),
+        f64n("current3_depth_m"),
+        f64n("wave_height_m"),
+        u16n("wave_period_s"),
+        u16n("wave_dir_deg"),
+        f64n("swell_height_m"),
+        u16n("swell_period_s"),
+        u16n("swell_dir_deg"),
+        u8n("sea_state"),
+        f64n("water_temp_c"),
+        u8n("precipitation_type"),
+        f64n("salinity_pct"),
+        u8n("ice"),
+    ]))
+}
+
+fn binary_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        ts_field("ts", false),
+        Field::new("source", DataType::Utf8, false),
+        Field::new("mmsi", DataType::UInt32, false),
+        Field::new("dac", DataType::UInt16, false),
+        Field::new("fid", DataType::UInt8, false),
+        Field::new("payload_hex", DataType::Utf8, false),
+        Field::new("payload_bits", DataType::UInt32, false),
     ]))
 }
 
@@ -345,6 +419,180 @@ impl StaticsWriter {
         self.flush()?;
         self.sink.finish()
     }
+}
+
+/// Type 8 met/hydro writer. Met/hydro messages are low-rate, so rows are
+/// buffered and columns built at flush time (simpler than 40 incremental
+/// builders); flushing every `FLUSH_BATCH_ROWS` bounds memory regardless.
+pub struct MeteoWriter {
+    sink: FileSink,
+    rows: Vec<MeteoRow>,
+}
+
+impl MeteoWriter {
+    pub fn new(dir: PathBuf, compression_level: i32) -> Self {
+        MeteoWriter {
+            sink: FileSink::new(dir, "met", meteo_schema(), compression_level),
+            rows: Vec::new(),
+        }
+    }
+
+    pub fn write(&mut self, row: MeteoRow) -> Result<()> {
+        self.rows.push(row);
+        if self.rows.len() >= FLUSH_BATCH_ROWS {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        if self.rows.is_empty() {
+            return Ok(());
+        }
+        let r = &self.rows;
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(
+                TimestampMillisecondArray::from(r.iter().map(|x| x.ts_ms).collect::<Vec<_>>())
+                    .with_timezone("UTC"),
+            ),
+            Arc::new(StringArray::from(
+                r.iter().map(|x| x.source.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt32Array::from(
+                r.iter().map(|x| x.mmsi).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt16Array::from(
+                r.iter().map(|x| x.dac).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt8Array::from(
+                r.iter().map(|x| x.fid).collect::<Vec<_>>(),
+            )),
+            f64_col(r, |x| x.latitude),
+            f64_col(r, |x| x.longitude),
+            Arc::new(BooleanArray::from(
+                r.iter().map(|x| x.position_accuracy).collect::<Vec<_>>(),
+            )),
+            u8_col(r, |x| x.day),
+            u8_col(r, |x| x.hour),
+            u8_col(r, |x| x.minute),
+            u16_col(r, |x| x.wind_speed_kn),
+            u16_col(r, |x| x.wind_gust_kn),
+            u16_col(r, |x| x.wind_dir_deg),
+            u16_col(r, |x| x.wind_gust_dir_deg),
+            f64_col(r, |x| x.air_temp_c),
+            u8_col(r, |x| x.humidity_pct),
+            f64_col(r, |x| x.dew_point_c),
+            u16_col(r, |x| x.pressure_hpa),
+            u8_col(r, |x| x.pressure_tendency),
+            f64_col(r, |x| x.visibility_nm),
+            Arc::new(BooleanArray::from(
+                r.iter().map(|x| x.visibility_greater).collect::<Vec<_>>(),
+            )),
+            f64_col(r, |x| x.water_level_m),
+            u8_col(r, |x| x.water_level_trend),
+            f64_col(r, |x| x.surface_current_speed_kn),
+            u16_col(r, |x| x.surface_current_dir_deg),
+            f64_col(r, |x| x.current2_speed_kn),
+            u16_col(r, |x| x.current2_dir_deg),
+            f64_col(r, |x| x.current2_depth_m),
+            f64_col(r, |x| x.current3_speed_kn),
+            u16_col(r, |x| x.current3_dir_deg),
+            f64_col(r, |x| x.current3_depth_m),
+            f64_col(r, |x| x.wave_height_m),
+            u16_col(r, |x| x.wave_period_s),
+            u16_col(r, |x| x.wave_dir_deg),
+            f64_col(r, |x| x.swell_height_m),
+            u16_col(r, |x| x.swell_period_s),
+            u16_col(r, |x| x.swell_dir_deg),
+            u8_col(r, |x| x.sea_state),
+            f64_col(r, |x| x.water_temp_c),
+            u8_col(r, |x| x.precipitation_type),
+            f64_col(r, |x| x.salinity_pct),
+            u8_col(r, |x| x.ice),
+        ];
+        let batch = RecordBatch::try_new(self.sink.schema.clone(), columns)
+            .context("assembling meteo batch")?;
+        self.rows.clear();
+        self.sink.write_batch(batch)
+    }
+
+    pub fn finish(mut self) -> Result<Option<(PathBuf, u64)>> {
+        self.flush()?;
+        self.sink.finish()
+    }
+}
+
+/// Type 8 generic writer: header + application payload retained as hex.
+pub struct BinaryWriter {
+    sink: FileSink,
+    rows: Vec<BinaryRow>,
+}
+
+impl BinaryWriter {
+    pub fn new(dir: PathBuf, compression_level: i32) -> Self {
+        BinaryWriter {
+            sink: FileSink::new(dir, "bin", binary_schema(), compression_level),
+            rows: Vec::new(),
+        }
+    }
+
+    pub fn write(&mut self, row: BinaryRow) -> Result<()> {
+        self.rows.push(row);
+        if self.rows.len() >= FLUSH_BATCH_ROWS {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        if self.rows.is_empty() {
+            return Ok(());
+        }
+        let r = &self.rows;
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(
+                TimestampMillisecondArray::from(r.iter().map(|x| x.ts_ms).collect::<Vec<_>>())
+                    .with_timezone("UTC"),
+            ),
+            Arc::new(StringArray::from(
+                r.iter().map(|x| x.source.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt32Array::from(
+                r.iter().map(|x| x.mmsi).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt16Array::from(
+                r.iter().map(|x| x.dac).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt8Array::from(
+                r.iter().map(|x| x.fid).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                r.iter().map(|x| x.payload_hex.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt32Array::from(
+                r.iter().map(|x| x.payload_bits).collect::<Vec<_>>(),
+            )),
+        ];
+        let batch = RecordBatch::try_new(self.sink.schema.clone(), columns)
+            .context("assembling binary batch")?;
+        self.rows.clear();
+        self.sink.write_batch(batch)
+    }
+
+    pub fn finish(mut self) -> Result<Option<(PathBuf, u64)>> {
+        self.flush()?;
+        self.sink.finish()
+    }
+}
+
+fn f64_col(rows: &[MeteoRow], get: impl Fn(&MeteoRow) -> Option<f64>) -> ArrayRef {
+    Arc::new(Float64Array::from(rows.iter().map(get).collect::<Vec<_>>()))
+}
+fn u16_col(rows: &[MeteoRow], get: impl Fn(&MeteoRow) -> Option<u16>) -> ArrayRef {
+    Arc::new(UInt16Array::from(rows.iter().map(get).collect::<Vec<_>>()))
+}
+fn u8_col(rows: &[MeteoRow], get: impl Fn(&MeteoRow) -> Option<u8>) -> ArrayRef {
+    Arc::new(UInt8Array::from(rows.iter().map(get).collect::<Vec<_>>()))
 }
 
 /// List the `.parquet` files already present in a local partition directory —

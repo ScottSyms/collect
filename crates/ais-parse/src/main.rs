@@ -13,17 +13,22 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+mod ais_bits;
 mod decode;
 mod output;
 mod stats;
 
 use decode::{decode_payload, Decoded};
-use output::{existing_parquet_files, PositionsWriter, StaticsWriter};
+use output::{existing_parquet_files, BinaryWriter, MeteoWriter, PositionsWriter, StaticsWriter};
 use stats::ParseStats;
 
-/// Decoded output lands in two sibling hive datasets under the output root.
+/// Decoded output lands in sibling hive datasets under the output root.
 const POSITIONS_TREE: &str = "positions";
 const STATICS_TREE: &str = "statics";
+const METEO_TREE: &str = "meteo";
+const BINARY_TREE: &str = "binary";
+/// Every output dataset tree — used by the partition-replace logic.
+const OUTPUT_TREES: [&str; 4] = [POSITIONS_TREE, STATICS_TREE, METEO_TREE, BINARY_TREE];
 
 static CANCELLED: AtomicBool = AtomicBool::new(false);
 
@@ -675,7 +680,7 @@ async fn main() -> Result<()> {
                 // run's file, per tree (positions/statics).
                 if let Some(storage) = &output_storage {
                     if !dry_run {
-                        for tree in [POSITIONS_TREE, STATICS_TREE] {
+                        for tree in OUTPUT_TREES {
                             let tree_rel = format!("{tree}/{rel_dir}");
                             let partition_prefix =
                                 format!("{}/", s3_join(&output_s3_prefix, &tree_rel));
@@ -811,6 +816,24 @@ fn default_concurrency() -> usize {
 /// partitioned by source.
 type PartitionOutputs = Vec<(String, PathBuf, u64)>;
 
+/// Record a finished output file (if the writer produced one) under
+/// `<tree>/<rel_dir>/<name>`.
+fn push_output(
+    outputs: &mut PartitionOutputs,
+    tree: &str,
+    rel_dir: &str,
+    done: Option<(PathBuf, u64)>,
+) {
+    if let Some((path, rows)) = done {
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        outputs.push((format!("{tree}/{rel_dir}/{name}"), path, rows));
+    }
+}
+
 /// Decode one output partition end to end into one positions file and one
 /// statics file, then — for local output — replace the prior run's files in
 /// the two output partitions.
@@ -831,14 +854,15 @@ fn process_partition(
     replace_local: bool,
 ) -> Result<(ParseStats, PartitionOutputs)> {
     let rel_dir = partition_key.relative_dir_time_only();
-    let positions_dir = output_root.join(POSITIONS_TREE).join(&rel_dir);
-    let statics_dir = output_root.join(STATICS_TREE).join(&rel_dir);
+    let dir_for = |tree: &str| output_root.join(tree).join(&rel_dir);
 
     // Collected before writing so the new (uniquely-named) files are never in
     // the deletion set.
     let prior_files: Vec<PathBuf> = if !dry_run && replace_local {
-        let mut prior = existing_parquet_files(&positions_dir)?;
-        prior.extend(existing_parquet_files(&statics_dir)?);
+        let mut prior = Vec::new();
+        for tree in OUTPUT_TREES {
+            prior.extend(existing_parquet_files(&dir_for(tree))?);
+        }
         prior
     } else {
         Vec::new()
@@ -847,8 +871,12 @@ fn process_partition(
     let mut parser = NmeaParser::new();
     let mut current_source: Option<&str> = None;
     let mut stats = ParseStats::default();
-    let mut positions = (!dry_run).then(|| PositionsWriter::new(positions_dir, compression_level));
-    let mut statics = (!dry_run).then(|| StaticsWriter::new(statics_dir, compression_level));
+    let mut positions =
+        (!dry_run).then(|| PositionsWriter::new(dir_for(POSITIONS_TREE), compression_level));
+    let mut statics =
+        (!dry_run).then(|| StaticsWriter::new(dir_for(STATICS_TREE), compression_level));
+    let mut meteo = (!dry_run).then(|| MeteoWriter::new(dir_for(METEO_TREE), compression_level));
+    let mut binary = (!dry_run).then(|| BinaryWriter::new(dir_for(BINARY_TREE), compression_level));
 
     for file in &files {
         // Reset fragment state at each source boundary.
@@ -861,8 +889,12 @@ fn process_partition(
             &file.partition.source,
             &mut parser,
             &mut stats,
-            positions.as_mut(),
-            statics.as_mut(),
+            Writers {
+                positions: positions.as_mut(),
+                statics: statics.as_mut(),
+                meteo: meteo.as_mut(),
+                binary: binary.as_mut(),
+            },
             batch_size,
         )
         .with_context(|| format!("processing {}", file.path.display()))?;
@@ -870,25 +902,37 @@ fn process_partition(
     stats.partitions_processed += 1;
 
     let mut outputs: PartitionOutputs = Vec::new();
-    if let Some(writer) = positions {
-        if let Some((path, rows)) = writer.finish().context("closing positions writer")? {
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
-            outputs.push((
-                format!("{POSITIONS_TREE}/{rel_dir}/{name}"),
-                path.clone(),
-                rows,
-            ));
-        }
+    if let Some(w) = positions {
+        push_output(
+            &mut outputs,
+            POSITIONS_TREE,
+            &rel_dir,
+            w.finish().context("closing positions writer")?,
+        );
     }
-    if let Some(writer) = statics {
-        if let Some((path, rows)) = writer.finish().context("closing statics writer")? {
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
-            outputs.push((
-                format!("{STATICS_TREE}/{rel_dir}/{name}"),
-                path.clone(),
-                rows,
-            ));
-        }
+    if let Some(w) = statics {
+        push_output(
+            &mut outputs,
+            STATICS_TREE,
+            &rel_dir,
+            w.finish().context("closing statics writer")?,
+        );
+    }
+    if let Some(w) = meteo {
+        push_output(
+            &mut outputs,
+            METEO_TREE,
+            &rel_dir,
+            w.finish().context("closing meteo writer")?,
+        );
+    }
+    if let Some(w) = binary {
+        push_output(
+            &mut outputs,
+            BINARY_TREE,
+            &rel_dir,
+            w.finish().context("closing binary writer")?,
+        );
     }
 
     // New files are durable: the prior run's output for this partition is now
@@ -901,13 +945,21 @@ fn process_partition(
     Ok((stats, outputs))
 }
 
+/// The set of per-partition writers, threaded into the row loop. Each is
+/// `None` in dry-run mode.
+struct Writers<'a> {
+    positions: Option<&'a mut PositionsWriter>,
+    statics: Option<&'a mut StaticsWriter>,
+    meteo: Option<&'a mut MeteoWriter>,
+    binary: Option<&'a mut BinaryWriter>,
+}
+
 fn process_parquet_file(
     path: &Path,
     path_source: &str,
     parser: &mut NmeaParser,
     stats: &mut ParseStats,
-    mut positions: Option<&mut PositionsWriter>,
-    mut statics: Option<&mut StaticsWriter>,
+    mut writers: Writers<'_>,
     batch_size: usize,
 ) -> Result<()> {
     let file = StdFile::open(path).with_context(|| format!("open {}", path.display()))?;
@@ -962,14 +1014,26 @@ fn process_parquet_file(
             match decode_payload(parser, ts_col.value(i), source, payload_col.value(i)) {
                 Decoded::Position(row) => {
                     stats.positions_out += 1;
-                    if let Some(writer) = positions.as_deref_mut() {
+                    if let Some(writer) = writers.positions.as_deref_mut() {
                         writer.write(&row)?;
                     }
                 }
                 Decoded::Static(row) => {
                     stats.statics_out += 1;
-                    if let Some(writer) = statics.as_deref_mut() {
+                    if let Some(writer) = writers.statics.as_deref_mut() {
                         writer.write(&row)?;
+                    }
+                }
+                Decoded::Meteo(row) => {
+                    stats.meteo_out += 1;
+                    if let Some(writer) = writers.meteo.as_deref_mut() {
+                        writer.write(*row)?;
+                    }
+                }
+                Decoded::Binary(row) => {
+                    stats.binary_out += 1;
+                    if let Some(writer) = writers.binary.as_deref_mut() {
+                        writer.write(*row)?;
                     }
                 }
                 Decoded::Other => stats.other_decoded += 1,

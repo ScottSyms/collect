@@ -5,6 +5,10 @@ pub struct ParseStats {
     pub rows_in: u64,
     pub positions_out: u64,
     pub statics_out: u64,
+    /// Type 8 DAC=1 FID=31/11 meteorological/hydrological rows.
+    pub meteo_out: u64,
+    /// Type 8 rows retained as generic header + hex (other DAC/FID).
+    pub binary_out: u64,
     /// Sentences that decoded fine but aren't materialized (base station
     /// reports, aids to navigation, safety messages, GNSS sentences, ...).
     pub other_decoded: u64,
@@ -22,6 +26,8 @@ impl ParseStats {
         self.rows_in += other.rows_in;
         self.positions_out += other.positions_out;
         self.statics_out += other.statics_out;
+        self.meteo_out += other.meteo_out;
+        self.binary_out += other.binary_out;
         self.other_decoded += other.other_decoded;
         self.incomplete += other.incomplete;
         self.failed += other.failed;
@@ -33,6 +39,8 @@ impl ParseStats {
         eprintln!("  input rows           : {}", self.rows_in);
         eprintln!("  position rows        : {}", self.positions_out);
         eprintln!("  static rows          : {}", self.statics_out);
+        eprintln!("  meteo rows           : {}", self.meteo_out);
+        eprintln!("  binary rows          : {}", self.binary_out);
         eprintln!("  other decoded        : {}", self.other_decoded);
         eprintln!("  incomplete fragments : {}", self.incomplete);
         eprintln!("  unparsed             : {}", self.failed);
