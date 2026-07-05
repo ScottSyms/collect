@@ -1,4 +1,4 @@
-use crate::dataset::PartitionKey;
+use collect_core::dataset::PartitionKey;
 use crate::parse::{
     combine_ais_fragments, parse_ais_sentence_metadata, parse_pghp_timestamp_ms,
     parse_tag_block_timestamp_ms, split_tag_block,

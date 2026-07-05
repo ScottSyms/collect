@@ -2,42 +2,48 @@ use anyhow::{bail, Context, Result};
 use arrow::array::{StringArray, TimestampMillisecondArray};
 use chrono::TimeZone;
 use clap::Parser;
+use collect_core::dataset::{self, DatasetFile, PartitionKey};
+use collect_core::state;
 use collect_core::{PartitionGranularity, S3Storage};
+use nmea_parser::NmeaParser;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::fs::File as StdFile;
-use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-mod dedup;
-mod normalize;
+mod decode;
 mod output;
-mod parse;
 mod stats;
-mod status;
 
-use collect_core::{dataset, state};
+use decode::{decode_payload, Decoded};
+use output::{existing_parquet_files, PositionsWriter, StaticsWriter};
+use stats::ParseStats;
 
-use dataset::{DatasetFile, PartitionKey};
-use normalize::PartitionProcessor;
-use output::OutputWriterPool;
-use stats::NormalizeStats;
-use status::StatusMode;
+/// Decoded output lands in two sibling hive datasets under the output root.
+const POSITIONS_TREE: &str = "positions";
+const STATICS_TREE: &str = "statics";
+
+static CANCELLED: AtomicBool = AtomicBool::new(false);
+
+fn is_cancelled() -> bool {
+    CANCELLED.load(Ordering::Relaxed)
+}
 
 #[derive(Parser, Debug)]
 #[command(
     version,
-    about = "Re-timestamp, re-partition, and combine multi-part AIS sentences in a Hive-partitioned Parquet dataset"
+    about = "Decode normalized AIS sentences into typed Parquet (positions and vessel statics)"
 )]
 struct Args {
-    /// Source Hive-partitioned Parquet root directory. Repeatable to merge
-    /// several sources in one run (mutually exclusive with --input-s3-bucket)
+    /// Normalized Hive-partitioned Parquet root directory. Repeatable to
+    /// merge several sources in one run (mutually exclusive with --input-s3-bucket)
     #[arg(long)]
     input_dir: Vec<PathBuf>,
 
-    /// Output Hive-partitioned Parquet root directory, may equal input-dir (mutually exclusive with --output-s3-bucket)
+    /// Output root; decoded data is written under <root>/positions and
+    /// <root>/statics (mutually exclusive with --output-s3-bucket)
     #[arg(long)]
     output_dir: Option<PathBuf>,
 
@@ -50,7 +56,7 @@ struct Args {
     #[arg(long, default_value = "")]
     input_s3_prefix: String,
 
-    /// S3 bucket to write normalized output to, instead of --output-dir
+    /// S3 bucket to write decoded output to, instead of --output-dir
     #[arg(long)]
     output_s3_bucket: Option<String>,
 
@@ -78,7 +84,8 @@ struct Args {
     #[arg(long)]
     s3_disable_tls: bool,
 
-    /// Partition granularity; must match the dataset layout
+    /// Partition granularity; must match the input dataset layout (the
+    /// output trees mirror it)
     #[arg(long, default_value_t = PartitionGranularity::Day)]
     partition: PartitionGranularity,
 
@@ -107,16 +114,13 @@ struct Args {
     minute: Option<u32>,
 
     /// Process only partitions holding data from the last N hours (rolling
-    /// window from now, UTC). Ideal for an hourly cron re-run; mutually
-    /// exclusive with the fixed --year/--month/--day/--hour/--minute filters.
+    /// window from now, UTC); mutually exclusive with the fixed filters.
     /// With --incremental, acts only as the first run's starting bound
     #[arg(long, value_name = "HOURS")]
     since: Option<u64>,
 
     /// Track a watermark at the output target and process only partitions
-    /// holding files that arrived since the last successful run. Self-heals
-    /// after downtime and catches late-arriving files (selection is by file
-    /// modification time, not partition period)
+    /// holding files that arrived since the last successful run
     #[arg(long)]
     incremental: bool,
 
@@ -135,24 +139,12 @@ struct Args {
     /// Number of partitions to process concurrently; auto-selected when omitted
     #[arg(long)]
     concurrency: Option<usize>,
-
-    /// Merge each touched output partition and drop exact (ts, payload)
-    /// duplicates, so re-runs are idempotent. Set false to append instead.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    dedup: bool,
-
-    /// Disable the runtime status TUI and print plain progress updates
-    #[arg(long)]
-    noui: bool,
 }
 
 impl Args {
-    /// Only the new S3 fields read from the environment — `--input-dir` /
-    /// `--output-dir` remain CLI-only, unchanged from before S3 support.
     fn apply_env(&mut self) {
         if self.input_dir.is_empty() && self.input_s3_bucket.is_empty() {
             if let Ok(value) = std::env::var("INPUT_S3_BUCKET") {
-                // Comma-separated so several buckets can be given via one env var.
                 self.input_s3_bucket = value
                     .split(',')
                     .map(str::trim)
@@ -164,18 +156,6 @@ impl Args {
         if self.input_s3_prefix.is_empty() {
             if let Ok(value) = std::env::var("INPUT_S3_PREFIX") {
                 self.input_s3_prefix = value;
-            }
-        }
-        if self.since.is_none() {
-            if let Ok(value) = std::env::var("SINCE_HOURS") {
-                if let Ok(hours) = value.trim().parse::<u64>() {
-                    self.since = Some(hours);
-                }
-            }
-        }
-        if !self.incremental {
-            if let Ok(value) = std::env::var("INCREMENTAL") {
-                self.incremental = value.eq_ignore_ascii_case("true") || value == "1";
             }
         }
         if self.output_dir.is_none() && self.output_s3_bucket.is_none() {
@@ -215,61 +195,35 @@ impl Args {
                 self.s3_disable_tls = value.eq_ignore_ascii_case("true") || value == "1";
             }
         }
-        // dedup defaults to true; only an explicit env value flips it off. A
-        // command-line --dedup always wins because it is parsed before this.
-        if self.dedup {
-            if let Ok(value) = std::env::var("DEDUP") {
-                if value.eq_ignore_ascii_case("false") || value == "0" {
-                    self.dedup = false;
+        if self.since.is_none() {
+            if let Ok(value) = std::env::var("SINCE_HOURS") {
+                if let Ok(hours) = value.trim().parse::<u64>() {
+                    self.since = Some(hours);
                 }
+            }
+        }
+        if !self.incremental {
+            if let Ok(value) = std::env::var("INCREMENTAL") {
+                self.incremental = value.eq_ignore_ascii_case("true") || value == "1";
             }
         }
     }
 }
 
-/// Derive the S3 key for a file written under `scratch_root` (`root/rel/dir/file`
-/// becomes `prefix/rel/dir/file`, or just `rel/dir/file` when `prefix` is empty).
-fn s3_key_for_output(scratch_root: &Path, local_path: &Path, prefix: &str) -> String {
-    let rel = local_path
-        .strip_prefix(scratch_root)
-        .unwrap_or(local_path)
-        .to_string_lossy()
-        .replace('\\', "/");
-    let prefix = prefix.trim_matches('/');
-    if prefix.is_empty() {
-        rel
-    } else {
-        format!("{}/{}", prefix, rel)
-    }
-}
-
-/// True when the run reads and writes the same place — any input directory
-/// equal to the output directory, or any input bucket equal to the output
-/// bucket at the same prefix. Best-effort: local paths are compared after
-/// canonicalization when both resolve, else by raw value.
-fn output_equals_input(args: &Args) -> bool {
-    if let Some(output) = &args.output_dir {
-        let output_canon = std::fs::canonicalize(output).ok();
-        return args.input_dir.iter().any(|input| {
-            match (std::fs::canonicalize(input).ok(), &output_canon) {
-                (Some(a), Some(b)) => a == *b,
-                _ => input == output,
-            }
-        });
-    }
-    if let Some(out_bucket) = &args.output_s3_bucket {
-        let same_prefix =
-            args.input_s3_prefix.trim_matches('/') == args.output_s3_prefix.trim_matches('/');
-        return same_prefix && args.input_s3_bucket.iter().any(|b| b == out_bucket);
-    }
-    false
+/// RFC 3339 label for a UTC millisecond timestamp, for log lines.
+fn format_ms(ms: i64) -> String {
+    chrono::Utc
+        .timestamp_millis_opt(ms)
+        .single()
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_else(|| format!("{ms}ms"))
 }
 
 const UPLOAD_MAX_ATTEMPTS: u32 = 3;
 
-/// Upload `local_path` to `key`, retrying transient failures with exponential
-/// backoff. `S3Storage::upload_file` only deletes the local file on success,
-/// so a retry after a failed attempt re-sends the same still-present file.
+/// Upload with exponential backoff on transient failures.
+/// `S3Storage::upload_file` deletes the local file only on success, so a
+/// retry re-sends the same still-present file.
 async fn upload_with_retries(storage: &S3Storage, local_path: &Path, key: &str) -> Result<()> {
     let mut last_error = None;
     for attempt in 1..=UPLOAD_MAX_ATTEMPTS {
@@ -292,33 +246,26 @@ async fn upload_with_retries(storage: &S3Storage, local_path: &Path, key: &str) 
     Err(last_error.expect("loop runs at least once and always records an error on failure"))
 }
 
-/// RFC 3339 label for a UTC millisecond timestamp, for log lines.
-fn format_ms(ms: i64) -> String {
-    chrono::Utc
-        .timestamp_millis_opt(ms)
-        .single()
-        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
-        .unwrap_or_else(|| format!("{ms}ms"))
-}
-
-/// Best-effort raise of the soft open-file limit toward the hard limit. The
-/// merge and concurrent S3 downloads can hold many descriptors at once, and
-/// some environments default the soft limit low (macOS 256, some containers
-/// 1024). Never fails the run.
-fn raise_open_file_limit() {
-    if let Err(error) = rlimit::increase_nofile_limit(u64::MAX) {
-        eprintln!("Warning: could not raise the open-file limit: {error}");
+fn s3_join(prefix: &str, rel: &str) -> String {
+    let prefix = prefix.trim_matches('/');
+    if prefix.is_empty() {
+        rel.to_string()
+    } else {
+        format!("{}/{}", prefix, rel)
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    raise_open_file_limit();
+    // Concurrent S3 downloads and open Parquet readers can hold many
+    // descriptors at once; raise the soft limit best-effort.
+    if let Err(error) = rlimit::increase_nofile_limit(u64::MAX) {
+        eprintln!("Warning: could not raise the open-file limit: {error}");
+    }
 
     let mut args = Args::parse();
     args.apply_env();
     let dry_run = !args.apply;
-    let status_mode = StatusMode::from_tty(!args.noui && std::io::stdout().is_terminal());
 
     match (args.input_dir.is_empty(), args.input_s3_bucket.is_empty()) {
         (false, false) => bail!("use either --input-dir or --input-s3-bucket, not both"),
@@ -330,15 +277,6 @@ async fn main() -> Result<()> {
         (None, None) => bail!("one of --output-dir or --output-s3-bucket is required"),
         _ => {}
     }
-
-    // A --since window is a rolling cutoff relative to "now": include every
-    // partition whose period ends after now - N hours. Saturating so an absurd
-    // N can't overflow the millisecond arithmetic.
-    let since_ms = args.since.map(|hours| {
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        now_ms.saturating_sub((hours as i64).saturating_mul(3_600_000))
-    });
-
     if args.incremental
         && (args.year.is_some()
             || args.month.is_some()
@@ -352,14 +290,17 @@ async fn main() -> Result<()> {
         );
     }
 
+    let since_ms = args.since.map(|hours| {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        now_ms.saturating_sub((hours as i64).saturating_mul(3_600_000))
+    });
+
     let partition_filter = dataset::PartitionFilter {
         year: args.year,
         month: args.month,
         day: args.day,
         hour: args.hour,
         minute: args.minute,
-        // In incremental mode --since only seeds the first run's watermark
-        // cutoff (applied to file mtimes below), not the period filter.
         since_ms: if args.incremental { None } else { since_ms },
     };
     partition_filter.validate(args.partition)?;
@@ -371,25 +312,10 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Dedup only makes sense when we are actually writing output.
-    let dedup_enabled = args.dedup && !dry_run;
-
-    if dedup_enabled && output_equals_input(&args) {
-        eprintln!(
-            "Warning: output target equals input target. With dedup on, the raw input and \
-             normalized rows have different payloads, so they will NOT dedup against each other \
-             and the partition will end up holding both. Use a separate output dir/bucket."
-        );
-    }
-
     if dry_run {
-        eprintln!("ais-normalize: dry run (pass --apply to write output)");
-        if args.dedup {
-            eprintln!("Dedup is enabled; it will merge touched partitions on --apply.");
-        }
+        eprintln!("ais-parse: dry run (pass --apply to write output)");
     }
 
-    // Set up Ctrl-C handler.
     let _signal = tokio::spawn(async move {
         #[cfg(unix)]
         {
@@ -407,13 +333,10 @@ async fn main() -> Result<()> {
         {
             let _ = tokio::signal::ctrl_c().await;
         }
-        status::request_cancel();
+        CANCELLED.store(true, Ordering::Relaxed);
         eprintln!("\nShutdown requested.");
     });
 
-    // Every input bucket lives on the same S3 endpoint/region/credentials; only
-    // the bucket name differs. Build one storage handle per input bucket; their
-    // order is the `storage_index` carried by each listed object.
     let mut input_storages: Vec<S3Storage> = Vec::with_capacity(args.input_s3_bucket.len());
     for bucket in &args.input_s3_bucket {
         input_storages.push(
@@ -449,23 +372,19 @@ async fn main() -> Result<()> {
         None => None,
     };
 
-    // --incremental: the watermark state lives at the output target, because
-    // it describes what has been written there. Load it before listing so the
-    // cutoff can drive partition selection.
+    // Incremental watermark, stored per tool at the output target.
     let state_store = if args.incremental {
         Some(match (&output_storage, &args.output_dir) {
             (Some(storage), _) => {
-                state::StateStore::s3(storage, &args.output_s3_prefix, "ais-normalize")
+                state::StateStore::s3(storage, &args.output_s3_prefix, "ais-parse")
             }
-            (None, Some(dir)) => state::StateStore::local(dir, "ais-normalize"),
+            (None, Some(dir)) => state::StateStore::local(dir, "ais-parse"),
             _ => unreachable!("validated exactly one output target above"),
         })
     } else {
         None
     };
     let mut prev_watermark_ms: Option<i64> = None;
-    // File-mtime cutoff for incremental selection; `None` in incremental mode
-    // means "first run, no seed" (process everything).
     let mut incremental_cutoff: Option<i64> = None;
     if let Some(store) = &state_store {
         match store.load().await? {
@@ -500,54 +419,40 @@ async fn main() -> Result<()> {
         }
     }
 
-    // The input scratch dir only ever holds copies of data still safely
-    // stored in the source bucket, so it's fine to auto-delete on drop
-    // regardless of how the run ends.
+    // Input scratch holds copies of data still safe in the source bucket:
+    // auto-delete on drop. Output scratch holds decoded data that exists
+    // nowhere else until uploaded: detached via `.keep()` and removed only
+    // after every upload succeeded.
     let input_scratch = input_is_s3
         .then(|| {
             tempfile::Builder::new()
-                .prefix("ais-normalize-input-")
+                .prefix("ais-parse-input-")
                 .tempdir()
         })
         .transpose()
         .context("creating input scratch directory")?;
-
-    // The output scratch dir holds normalized data that exists nowhere else
-    // until it's uploaded. `.keep()` detaches it from tempfile's
-    // delete-on-drop so a failed upload can't silently destroy work that was
-    // already produced; it's removed explicitly once every upload succeeds
-    // (see the end of `main`), and left in place — with its path logged — if
-    // the run errors out first.
     let output_scratch_path: Option<PathBuf> = if output_storage.is_some() {
         let dir = tempfile::Builder::new()
-            .prefix("ais-normalize-output-")
+            .prefix("ais-parse-output-")
             .tempdir()
             .context("creating output scratch directory")?;
         Some(dir.keep())
     } else {
         None
     };
-
     let output_root: PathBuf = match (&args.output_dir, &output_scratch_path) {
         (Some(dir), None) => dir.clone(),
         (None, Some(scratch_path)) => scratch_path.clone(),
         _ => unreachable!("validated exactly one output target above"),
     };
+    // Prior-run files are only deleted when the final output target is local
+    // disk; for S3 output the replace happens against object keys instead.
+    let replace_local = output_storage.is_none();
 
-    // A unit of work: either files already on local disk, or S3 objects the
-    // worker downloads just before processing (and deletes right after), so
-    // scratch disk usage stays bounded by `concurrency` partitions instead of
-    // the whole dataset.
     enum PartitionWork {
         Local(Vec<DatasetFile>),
         Remote(Vec<dataset::S3Entry>),
     }
-
-    // Which input indices contributed each source label. If any source is fed
-    // by more than one input, that source's rows can be merged into a single
-    // output file that already holds cross-input duplicates, so dedup must run
-    // even on single-file partitions (see `force_dedup` below).
-    let mut source_inputs: HashMap<String, HashSet<usize>> = HashMap::new();
 
     let mut partitions: Vec<(PartitionKey, PartitionWork)> = if input_is_s3 {
         eprintln!("Listing {} input S3 bucket(s)...", input_storages.len());
@@ -557,11 +462,6 @@ async fn main() -> Result<()> {
                  add --source to push it into the S3 LIST prefix."
             );
         }
-
-        // List each bucket, tag its objects with the bucket's index, and pool
-        // them. The per-bucket lists are each sorted, so re-sort the pool by
-        // partition key before grouping so identical keys from different buckets
-        // land in one group.
         let mut entries: Vec<dataset::S3Entry> = Vec::new();
         for (index, storage) in input_storages.iter().enumerate() {
             let mut bucket_entries = dataset::list_s3_parquet_entries(
@@ -575,14 +475,9 @@ async fn main() -> Result<()> {
             .with_context(|| format!("listing input S3 bucket {}", args.input_s3_bucket[index]))?;
             for entry in &mut bucket_entries {
                 entry.storage_index = index;
-                source_inputs
-                    .entry(entry.partition.source.clone())
-                    .or_default()
-                    .insert(index);
             }
             entries.extend(bucket_entries);
         }
-
         if entries.is_empty() {
             eprintln!(
                 "No matching Parquet objects found across {} bucket(s) under prefix {:?}.",
@@ -592,7 +487,6 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         eprintln!("Found {} matching object(s).", entries.len());
-
         entries.sort_by(|a, b| {
             a.partition
                 .sort_key()
@@ -606,7 +500,7 @@ async fn main() -> Result<()> {
     } else {
         eprintln!("Scanning {} input dir(s)...", args.input_dir.len());
         let mut files: Vec<DatasetFile> = Vec::new();
-        for (index, dir) in args.input_dir.iter().enumerate() {
+        for dir in &args.input_dir {
             let dir_files = dataset::list_parquet_files(
                 dir,
                 args.partition,
@@ -615,20 +509,12 @@ async fn main() -> Result<()> {
             )
             .await
             .with_context(|| format!("scanning input dataset {}", dir.display()))?;
-            for file in &dir_files {
-                source_inputs
-                    .entry(file.partition.source.clone())
-                    .or_default()
-                    .insert(index);
-            }
             files.extend(dir_files);
         }
-
         if files.is_empty() {
             eprintln!("No matching Parquet files found in the input dir(s).");
             return Ok(());
         }
-
         files.sort_by(|a, b| {
             a.partition
                 .sort_key()
@@ -641,9 +527,7 @@ async fn main() -> Result<()> {
             .collect()
     };
 
-    // --incremental: keep only partitions holding at least one file modified
-    // after the cutoff, and remember the newest mtime among the kept files —
-    // that becomes the next watermark once the run fully succeeds.
+    // --incremental: keep only partitions with files newer than the cutoff.
     let mut watermark_candidate_ms: Option<i64> = None;
     if args.incremental {
         let work_mtimes = |work: &PartitionWork| -> Vec<Option<i64>> {
@@ -664,8 +548,6 @@ async fn main() -> Result<()> {
             before
         );
         if partitions.is_empty() {
-            // Nothing will be written, so the detached output scratch dir
-            // (kept alive for upload-failure recovery) has no purpose.
             if let Some(scratch_path) = &output_scratch_path {
                 let _ = tokio::fs::remove_dir_all(scratch_path).await;
             }
@@ -674,35 +556,17 @@ async fn main() -> Result<()> {
         }
     }
 
-    // When a source is contributed by more than one input, its rows may be
-    // merged into a single output file that already contains cross-input
-    // duplicates, so the dedup pass must run even on single-file partitions.
-    let force_dedup = source_inputs.values().any(|inputs| inputs.len() > 1);
-    if dedup_enabled && force_dedup && status_mode.is_plain() {
-        eprintln!("A source is fed by multiple inputs; dedup will merge all touched partitions.");
-    }
-
     let total_partitions = partitions.len();
-    eprintln!(
-        "Found {} partition(s) across {} source(s).",
-        total_partitions,
-        {
-            let mut sources: Vec<_> = partitions.iter().map(|(k, _)| k.source.as_str()).collect();
-            sources.dedup();
-            sources.len()
-        }
-    );
+    eprintln!("Found {} partition(s).", total_partitions);
 
     let concurrency = args
         .concurrency
         .unwrap_or_else(default_concurrency)
         .clamp(1, total_partitions.max(1));
-    if status_mode.is_plain() && concurrency > 1 {
+    if concurrency > 1 {
         eprintln!("Processing partitions with {} worker(s).", concurrency);
     }
 
-    // Partitions are independent (processor state and writer pools are
-    // per-partition), so distribute them over a small worker pool.
     type PartitionQueue = Mutex<VecDeque<(PartitionKey, PartitionWork)>>;
     let queue: Arc<PartitionQueue> = Arc::new(Mutex::new(partitions.into()));
     let processed = Arc::new(AtomicUsize::new(0));
@@ -710,8 +574,6 @@ async fn main() -> Result<()> {
         .as_ref()
         .map(|scratch| scratch.path().to_path_buf());
 
-    // Per-worker parallelism for downloading one partition's objects; the
-    // worker count provides the cross-partition parallelism.
     const PARTITION_DOWNLOAD_CONCURRENCY: usize = 4;
 
     let mut workers = Vec::with_capacity(concurrency);
@@ -723,31 +585,21 @@ async fn main() -> Result<()> {
         let output_s3_prefix = args.output_s3_prefix.clone();
         let input_storages = input_storages.clone();
         let input_scratch_root = input_scratch_root.clone();
-        let granularity = args.partition;
         let batch_size = args.batch_size;
         let compression_level = args.compression_level;
 
         workers.push(tokio::spawn(async move {
-            let mut stats = NormalizeStats::default();
-            // When dedup runs, S3 upload is deferred to the dedup pass so it
-            // uploads a single merged object per partition instead of the raw
-            // per-run files.
-            let upload_inline = !dedup_enabled;
-            let mut partition_rows: BTreeMap<String, u64> = BTreeMap::new();
+            let mut stats = ParseStats::default();
 
             loop {
-                if status::is_cancelled() {
+                if is_cancelled() {
                     break;
                 }
-
                 let next = queue.lock().expect("partition queue lock").pop_front();
                 let Some((partition_key, work)) = next else {
                     break;
                 };
 
-                // Remote partitions are fetched here, just before processing,
-                // and their scratch copies removed right after — the whole
-                // dataset is never on local disk at once.
                 let downloaded_rel_dir = match &work {
                     PartitionWork::Remote(_) => Some(partition_key.relative_dir()),
                     PartitionWork::Local(_) => None,
@@ -769,89 +621,102 @@ async fn main() -> Result<()> {
                         {
                             Ok(files) => files,
                             Err(error) => {
-                                status::request_cancel();
+                                CANCELLED.store(true, Ordering::Relaxed);
                                 return Err(error);
                             }
                         }
                     }
                 };
 
+                let rel_dir = partition_key.relative_dir();
                 let output_root_for_task = output_root.clone();
                 let result = tokio::task::spawn_blocking(move || {
                     process_partition(
                         partition_key,
                         partition_files,
                         output_root_for_task,
-                        granularity,
                         batch_size,
                         compression_level,
                         dry_run,
+                        replace_local,
                     )
                 })
                 .await
                 .context("partition worker panicked")?;
 
-                if let (Some(rel_dir), Some(scratch_root)) =
-                    (&downloaded_rel_dir, &input_scratch_root)
+                if let (Some(rel), Some(scratch_root)) = (&downloaded_rel_dir, &input_scratch_root)
                 {
-                    let _ = tokio::fs::remove_dir_all(scratch_root.join(rel_dir)).await;
+                    let _ = tokio::fs::remove_dir_all(scratch_root.join(rel)).await;
                 }
 
-                match result {
-                    Ok((partition_stats, rows)) => {
+                let outputs = match result {
+                    Ok((partition_stats, outputs)) => {
                         stats.merge(&partition_stats);
-                        for (rel_dir, rows_written, local_path) in rows {
-                            *partition_rows.entry(rel_dir).or_default() += rows_written;
-
-                            if let Some(storage) = &output_storage {
-                                if !dry_run && rows_written > 0 && upload_inline {
-                                    let key = s3_key_for_output(
-                                        &output_root,
-                                        &local_path,
-                                        &output_s3_prefix,
-                                    );
-                                    if let Err(error) =
-                                        upload_with_retries(storage, &local_path, &key)
-                                            .await
-                                            .with_context(|| {
-                                                format!("uploading {} to S3", local_path.display())
-                                            })
-                                    {
-                                        status::request_cancel();
-                                        return Err(error);
-                                    }
-                                }
-                            }
-                        }
+                        outputs
                     }
                     Err(error) => {
-                        // Stop the other workers before surfacing the error.
-                        status::request_cancel();
+                        CANCELLED.store(true, Ordering::Relaxed);
                         return Err(error);
+                    }
+                };
+
+                // S3 output: replace the partition's prior objects with this
+                // run's file, per tree (positions/statics).
+                if let Some(storage) = &output_storage {
+                    if !dry_run {
+                        for tree in [POSITIONS_TREE, STATICS_TREE] {
+                            let tree_rel = format!("{tree}/{rel_dir}");
+                            let partition_prefix =
+                                format!("{}/", s3_join(&output_s3_prefix, &tree_rel));
+                            let prior = storage
+                                .list_keys_with_prefix(&partition_prefix)
+                                .await
+                                .with_context(|| format!("listing {partition_prefix}"))?;
+                            let prior_keys: Vec<String> = prior
+                                .into_iter()
+                                .map(|object| object.key)
+                                .filter(|key| key.ends_with(".parquet"))
+                                .collect();
+
+                            for (out_rel, local_path, _rows) in
+                                outputs.iter().filter(|(r, _, _)| r.starts_with(tree))
+                            {
+                                let key = s3_join(&output_s3_prefix, out_rel);
+                                if let Err(error) = upload_with_retries(storage, local_path, &key)
+                                    .await
+                                    .with_context(|| {
+                                        format!("uploading {} to S3", local_path.display())
+                                    })
+                                {
+                                    CANCELLED.store(true, Ordering::Relaxed);
+                                    return Err(error);
+                                }
+                            }
+                            for key in prior_keys {
+                                storage
+                                    .delete_key(&key)
+                                    .await
+                                    .with_context(|| format!("deleting prior object {key}"))?;
+                            }
+                        }
                     }
                 }
 
                 let done = processed.fetch_add(1, Ordering::SeqCst) + 1;
-                if status_mode.is_plain() && status::should_emit_plain_update(done, 10) {
-                    status::print_plain_update(done, total_partitions);
+                if done == 1 || done.is_multiple_of(10) || done == total_partitions {
+                    eprintln!("Processed {done}/{total_partitions} partition(s).");
                 }
             }
 
-            Ok::<_, anyhow::Error>((stats, partition_rows))
+            Ok::<_, anyhow::Error>(stats)
         }));
     }
 
-    let mut total_stats = NormalizeStats::default();
-    let mut partition_rows: BTreeMap<String, u64> = BTreeMap::new();
+    let mut total_stats = ParseStats::default();
     let mut first_error = None;
     for worker in workers {
         match worker.await {
-            Ok(Ok((stats, rows))) => {
-                total_stats.merge(&stats);
-                for (rel_dir, rows_written) in rows {
-                    *partition_rows.entry(rel_dir).or_default() += rows_written;
-                }
-            }
+            Ok(Ok(stats)) => total_stats.merge(&stats),
             Ok(Err(error)) => {
                 if first_error.is_none() {
                     first_error = Some(error);
@@ -868,7 +733,7 @@ async fn main() -> Result<()> {
     if let Some(error) = first_error {
         if let Some(scratch_path) = &output_scratch_path {
             eprintln!(
-                "Normalized output may remain un-uploaded in {} — inspect and upload it manually, \
+                "Decoded output may remain un-uploaded in {} — inspect and upload it manually, \
                  or re-run once the S3 issue is resolved (the same input regenerates equivalent output).",
                 scratch_path.display()
             );
@@ -876,63 +741,20 @@ async fn main() -> Result<()> {
         return Err(error);
     }
 
-    // Merge each touched output partition and drop exact (ts, payload)
-    // duplicates, so this run collapses cleanly with any prior runs' output.
-    let mut dedup_stats = dedup::DedupStats::default();
-    if dedup_enabled && !partition_rows.is_empty() {
-        if status_mode.is_plain() {
-            eprintln!(
-                "Deduplicating {} output partition(s)...",
-                partition_rows.len()
-            );
-        }
-        for rel_dir in partition_rows.keys() {
-            let stats = if let Some(storage) = &output_storage {
-                let new_files_dir = output_root.join(rel_dir);
-                let work_dir = output_root.join(".dedup").join(rel_dir);
-                dedup::dedup_s3_partition(
-                    storage,
-                    &args.output_s3_prefix,
-                    rel_dir,
-                    &new_files_dir,
-                    &work_dir,
-                    args.compression_level,
-                    force_dedup,
-                )
-                .await
-                .with_context(|| format!("deduplicating S3 partition {rel_dir}"))?
-            } else {
-                let dir = output_root.join(rel_dir);
-                let level = args.compression_level;
-                tokio::task::spawn_blocking(move || {
-                    dedup::dedup_local_partition(&dir, level, force_dedup)
-                })
-                .await
-                .context("dedup task panicked")?
-                .with_context(|| format!("deduplicating partition {rel_dir}"))?
-            };
-            dedup_stats.merge(&stats);
-        }
-    }
-
-    // Every upload succeeded (or there was nothing to upload): the scratch
-    // copies are redundant now, so reclaim the disk space.
     if let Some(scratch_path) = &output_scratch_path {
         let _ = tokio::fs::remove_dir_all(scratch_path).await;
     }
 
-    if status::is_cancelled() {
+    if is_cancelled() {
         eprintln!(
             "Cancelled after {} partition(s).",
             processed.load(Ordering::SeqCst)
         );
     }
 
-    // Advance the watermark only after a fully successful, applied run — a
-    // failed, cancelled, or dry run leaves it alone so the next run re-covers
-    // the same window (idempotent thanks to dedup). Never move it backwards.
+    // Advance the watermark only after a fully successful, applied run.
     if let Some(store) = &state_store {
-        if !dry_run && !status::is_cancelled() {
+        if !dry_run && !is_cancelled() {
             if let Some(candidate) = watermark_candidate_ms {
                 let new_watermark = prev_watermark_ms.map_or(candidate, |p| p.max(candidate));
                 store
@@ -950,23 +772,17 @@ async fn main() -> Result<()> {
         }
     }
 
-    let partitions_written = partition_rows.len();
     total_stats.print_summary();
-    dedup_stats.print_summary();
-
     if dry_run {
-        if !partition_rows.is_empty() {
-            eprintln!("Dry run — would write to {} partition(s):", partitions_written);
-            for (rel_dir, rows) in &partition_rows {
-                eprintln!("  {} ({} rows)", rel_dir, rows);
-            }
-        }
         eprintln!(
-            "Dry run complete. Pass --apply to write {} output partition(s).",
-            partitions_written
+            "Dry run complete. Pass --apply to decode {} partition(s).",
+            total_stats.partitions_processed
         );
     } else {
-        eprintln!("Done. Wrote {} output partition(s).", partitions_written);
+        eprintln!(
+            "Done. Decoded {} partition(s).",
+            total_stats.partitions_processed
+        );
     }
 
     Ok(())
@@ -979,55 +795,93 @@ fn default_concurrency() -> usize {
         .clamp(1, 8)
 }
 
-/// `(output partition rel_dir, rows written, local file path)` per partition
-/// file produced by one `process_partition` call.
-type PartitionOutputRows = Vec<(String, u64, PathBuf)>;
+/// `(output rel path like "positions/source=x/year=.../pos-....parquet",
+/// local file path, rows)` per file this partition produced.
+type PartitionOutputs = Vec<(String, PathBuf, u64)>;
 
-/// Process one source partition end to end with its own processor and writer
-/// pool, so partitions can run concurrently and writer memory stays bounded
-/// by the output partitions a single input partition touches.
+/// Decode one partition end to end: fresh parser (fragment state is
+/// per-partition), one positions file and one statics file, then — for local
+/// output — replace the prior run's files in the two output partitions.
+#[allow(clippy::too_many_arguments)]
 fn process_partition(
     partition_key: PartitionKey,
     files: Vec<DatasetFile>,
     output_root: PathBuf,
-    granularity: PartitionGranularity,
     batch_size: usize,
     compression_level: i32,
     dry_run: bool,
-) -> Result<(NormalizeStats, PartitionOutputRows)> {
-    let source_rel_dir: Arc<str> = Arc::from(partition_key.relative_dir());
-    let mut processor = PartitionProcessor::new(partition_key.source.clone(), granularity);
-    let mut pool = OutputWriterPool::new(output_root, compression_level, dry_run);
+    replace_local: bool,
+) -> Result<(ParseStats, PartitionOutputs)> {
+    let rel_dir = partition_key.relative_dir();
+    let positions_dir = output_root.join(POSITIONS_TREE).join(&rel_dir);
+    let statics_dir = output_root.join(STATICS_TREE).join(&rel_dir);
+
+    // Collected before writing so the new (uniquely-named) files are never in
+    // the deletion set.
+    let prior_files: Vec<PathBuf> = if !dry_run && replace_local {
+        let mut prior = existing_parquet_files(&positions_dir)?;
+        prior.extend(existing_parquet_files(&statics_dir)?);
+        prior
+    } else {
+        Vec::new()
+    };
+
+    let mut parser = NmeaParser::new();
+    let mut stats = ParseStats::default();
+    let mut positions = (!dry_run).then(|| PositionsWriter::new(positions_dir, compression_level));
+    let mut statics = (!dry_run).then(|| StaticsWriter::new(statics_dir, compression_level));
 
     for file in &files {
         process_parquet_file(
             &file.path,
-            &source_rel_dir,
-            &mut processor,
-            &mut pool,
+            &mut parser,
+            &mut stats,
+            positions.as_mut(),
+            statics.as_mut(),
             batch_size,
         )
         .with_context(|| format!("processing {}", file.path.display()))?;
     }
+    stats.partitions_processed += 1;
 
-    // Flush any incomplete fragment groups at the end of this partition.
-    let mut leftovers = Vec::new();
-    processor.flush_incomplete(&source_rel_dir, &mut leftovers);
-    for row in leftovers {
-        pool.write_row(&row.partition_rel_dir, row.ts_ms, &row.payload)?;
+    let mut outputs: PartitionOutputs = Vec::new();
+    if let Some(writer) = positions {
+        if let Some((path, rows)) = writer.finish().context("closing positions writer")? {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            outputs.push((
+                format!("{POSITIONS_TREE}/{rel_dir}/{name}"),
+                path.clone(),
+                rows,
+            ));
+        }
+    }
+    if let Some(writer) = statics {
+        if let Some((path, rows)) = writer.finish().context("closing statics writer")? {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            outputs.push((
+                format!("{STATICS_TREE}/{rel_dir}/{name}"),
+                path.clone(),
+                rows,
+            ));
+        }
     }
 
-    let mut stats = processor.stats;
-    stats.partitions_processed += 1;
-    let rows = pool.flush_all().context("flushing output writers")?;
-    Ok((stats, rows))
+    // New files are durable: the prior run's output for this partition is now
+    // redundant (decoding is deterministic, so this is a replace, not a loss).
+    for prior in prior_files {
+        std::fs::remove_file(&prior)
+            .with_context(|| format!("removing prior output {}", prior.display()))?;
+    }
+
+    Ok((stats, outputs))
 }
 
 fn process_parquet_file(
-    path: &std::path::Path,
-    source_rel_dir: &Arc<str>,
-    processor: &mut PartitionProcessor,
-    pool: &mut OutputWriterPool,
+    path: &Path,
+    parser: &mut NmeaParser,
+    stats: &mut ParseStats,
+    mut positions: Option<&mut PositionsWriter>,
+    mut statics: Option<&mut StaticsWriter>,
     batch_size: usize,
 ) -> Result<()> {
     let file = StdFile::open(path).with_context(|| format!("open {}", path.display()))?;
@@ -1049,17 +903,27 @@ fn process_parquet_file(
             .downcast_ref::<StringArray>()
             .context("expected string column at index 1")?;
 
-        let mut rows = Vec::with_capacity(4);
         for i in 0..batch.num_rows() {
-            if status::is_cancelled() {
+            if is_cancelled() {
                 return Ok(());
             }
-            let ts_ms = ts_col.value(i);
-            let payload = payload_col.value(i);
-
-            processor.process_row(source_rel_dir, ts_ms, payload, &mut rows);
-            for row in rows.drain(..) {
-                pool.write_row(&row.partition_rel_dir, row.ts_ms, &row.payload)?;
+            stats.rows_in += 1;
+            match decode_payload(parser, ts_col.value(i), payload_col.value(i)) {
+                Decoded::Position(row) => {
+                    stats.positions_out += 1;
+                    if let Some(writer) = positions.as_deref_mut() {
+                        writer.write(&row)?;
+                    }
+                }
+                Decoded::Static(row) => {
+                    stats.statics_out += 1;
+                    if let Some(writer) = statics.as_deref_mut() {
+                        writer.write(&row)?;
+                    }
+                }
+                Decoded::Other => stats.other_decoded += 1,
+                Decoded::Incomplete => stats.incomplete += 1,
+                Decoded::Failed => stats.failed += 1,
             }
         }
     }
@@ -1072,22 +936,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn s3_key_for_output_with_prefix() {
-        let root = Path::new("/tmp/scratch");
-        let path = root.join("source=x/year=2024/day=01/norm-1.parquet");
+    fn s3_join_handles_prefixes() {
         assert_eq!(
-            s3_key_for_output(root, &path, "normalized"),
-            "normalized/source=x/year=2024/day=01/norm-1.parquet"
+            s3_join("", "positions/source=x/f.parquet"),
+            "positions/source=x/f.parquet"
         );
-    }
-
-    #[test]
-    fn s3_key_for_output_without_prefix() {
-        let root = Path::new("/tmp/scratch");
-        let path = root.join("source=x/year=2024/day=01/norm-1.parquet");
         assert_eq!(
-            s3_key_for_output(root, &path, ""),
-            "source=x/year=2024/day=01/norm-1.parquet"
+            s3_join("/silver/", "positions/source=x/f.parquet"),
+            "silver/positions/source=x/f.parquet"
         );
     }
 }

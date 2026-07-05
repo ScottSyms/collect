@@ -3,10 +3,10 @@
 `ais-normalize` is a batch post-processing pass over a Hive-partitioned Parquet dataset already collected by `collect-file`, `collect-socket`, `collect-kafka`, or `collect-aisstream`. It sits between raw ingestion and compaction in the medallion pipeline:
 
 ```
-collect-* (bronze, raw)  →  ais-normalize  →  collect-maint compact  →  Iceberg
+collect-* (bronze, raw)  →  ais-normalize  →  collect-maint compact  →  ais-parse (silver)  →  Iceberg
 ```
 
-It is a CLI tool that runs to completion and exits — not a long-running service. It has no `--metrics-addr`/`/healthz` endpoint.
+It is a CLI tool that runs to completion and exits — not a long-running service. It has no `--metrics-addr`/`/healthz` endpoint. The next step of the pipeline — decoding the normalized sentences into typed columns — is [ais-parse](AIS_PARSE.md).
 
 ## What problem it solves
 
@@ -63,7 +63,8 @@ Rows that aren't AIS `VDM`/`VDO` sentences (heartbeats, other NMEA talkers, etc.
 | `--day` | *(all days)* | Narrow to one day; requires `--month` |
 | `--hour` | *(all hours)* | Narrow to one hour; requires `--day` and an `hour`-or-finer layout |
 | `--minute` | *(all minutes)* | Narrow to one minute; requires `--hour` and a `minute` layout |
-| `--since <HOURS>` | *(off)* | Process only partitions holding data from the last N hours (rolling window from now, UTC); env `SINCE_HOURS`. Mutually exclusive with `--year`…`--minute`. See [incremental hourly runs](#incremental-hourly-runs---since) |
+| `--since <HOURS>` | *(off)* | Process only partitions holding data from the last N hours (rolling window from now, UTC); env `SINCE_HOURS`. Mutually exclusive with `--year`…`--minute`. See [rolling windows](#rolling-windows---since) |
+| `--incremental` | *(off)* | Track a watermark at the output target and process only partitions holding files that arrived since the last successful run; env `INCREMENTAL=true`. Self-healing; preferred for scheduled runs. See [watermark runs](#watermark-runs---incremental) |
 | `--apply` | off (dry run) | Actually write output; omit to preview only |
 | `--batch-size` | `8192` | Rows per Parquet read batch |
 | `--compression-level` | `5` | Zstd level for output files |
@@ -119,9 +120,39 @@ Rules and behavior:
 - The selection is a *partition* filter, applied to where rows were **read from** — a row inside a selected partition whose corrected timestamp moves it elsewhere is still written to its correct output partition.
 - The filter is pushed down as far as possible: on local disk the directory walk prunes non-matching subtrees without descending into them, and on S3 — when `--source` is also given — it is folded into the LIST prefix (`source=X/year=Y/month=M/...`), so slicing one day out of a multi-year bucket lists only that day's keys. Without `--source`, S3 listing covers the whole prefix and filters client-side (the tool prints a hint when this happens).
 
-## Incremental hourly runs (`--since`)
+## Watermark runs (`--incremental`)
 
-`--since <HOURS>` selects a **rolling** window instead of a fixed calendar slice: it processes every partition whose time period extends past `now − N hours`. This is the natural fit for a cron/systemd timer that runs the tool every hour or two and only wants to touch the partitions that recently gained data:
+`--incremental` is the preferred mode for scheduled runs. The tool keeps a **watermark** — a small JSON document at the output target (`<output-dir>/_ais-normalize/watermark.json`, or the same path as a key under the output S3 prefix) recording the newest input-file modification time it has fully processed. Each run then selects only partitions holding at least one file **modified since the watermark**, and advances the watermark once the run fully succeeds:
+
+```bash
+# Hourly cron: process exactly what arrived since the last successful run
+cargo run -p ais-normalize -- \
+  --input-s3-bucket raw-ais --output-s3-bucket normalized-ais \
+  --s3-endpoint http://minio:9000 --s3-access-key … --s3-secret-key … --s3-disable-tls \
+  --partition day --incremental --apply
+
+# Env form
+INCREMENTAL=true INPUT_S3_BUCKET=raw-ais OUTPUT_S3_BUCKET=normalized-ais … \
+  cargo run -p ais-normalize -- --partition day --apply
+```
+
+Why this beats a fixed `--since` window for schedulers:
+
+- **Self-healing.** The watermark only advances on a fully successful, applied run. If the host is down for a weekend or three runs in a row fail, the next successful run automatically covers the whole gap — there is no window to outgrow.
+- **Catches late arrivals.** Selection is by file modification time (S3 `LastModified` / local mtime), not partition period, so a file uploaded late into an *old* partition (delayed collector flush, orphan sweep) still re-triggers that partition.
+
+Rules and behavior:
+
+- **First run** (no state yet) processes the full dataset. To bound it on a huge archive, add `--since N`: with `--incremental`, `--since` only seeds the first run's cutoff (`now − N hours`, applied to file mtimes) and is ignored once state exists.
+- **The watermark lives at the output target** — a different output dir/bucket+prefix is a different job with its own state. All inputs feeding one output share one watermark.
+- **A 60-second overlap lap** is applied when comparing mtimes, absorbing `LastModified` jitter around the previous run's listing. Files within the lap re-process; dedup makes that free. (Corollary: an idle feed keeps re-selecting its newest partition — harmless.)
+- **Dry runs, failures, and cancels never advance the watermark**, and it never moves backwards.
+- Mutually exclusive with `--year`…`--minute`. Combines normally with `--source` and multi-input merging.
+- The state directory is metadata, not data: `collect-maint` skips `_`- and `.`-prefixed path segments (the Hive/Spark convention), and Parquet dataset readers ignore non-`.parquet` files.
+
+## Rolling windows (`--since`)
+
+`--since <HOURS>` selects a **rolling** window instead of a fixed calendar slice: it processes every partition whose time period extends past `now − N hours`. It is stateless — nothing is written anywhere — which makes it right for ad-hoc re-processing ("redo the last day") and for schedulers where you'd rather not have state; for scheduled pipelines prefer [`--incremental`](#watermark-runs---incremental), which self-heals across downtime:
 
 ```bash
 # Every run: normalize whatever arrived in the last 2 hours
@@ -248,7 +279,7 @@ job "ais-normalize" {
           "--input-dir", "/data/bronze",
           "--output-dir", "/data/normalized",
           "--partition", "day",
-          "--since", "2",      # only the last 2h of partitions; overlaps the hourly schedule
+          "--incremental",     # watermark at the output: process only what arrived since the last successful run
           "--concurrency", "4",
           "--apply",
         ]
@@ -282,7 +313,7 @@ env {
 }
 ```
 
-The `--since 2` above keeps each scheduled run cheap: it only lists and normalizes partitions that gained data in the last two hours, rather than re-scanning the whole archive every hour, while the two-hour window overlaps the hourly schedule so a slow or skipped run leaves no gap (dedup makes the overlap idempotent). Drop `--since` for a one-shot full backfill.
+The `--incremental` above keeps each scheduled run cheap — it only normalizes partitions with files that arrived since the last successful run — and self-heals: after downtime or failed runs, the next success covers the whole gap automatically (see [watermark runs](#watermark-runs---incremental)). The first run processes the full archive; add `--since N` alongside it to bound that first pass. Drop `--incremental` for a one-shot full backfill.
 
 Size local disk for the S3 scratch space too (under the task's `$TMPDIR`): input needs room for about `--concurrency` partitions' worth of downloaded data at a time (partitions are fetched lazily and deleted after processing), and output needs room for the in-flight normalized files until each uploads. For a one-off pass over a very large archive, pair this with the [partition slice flags](#processing-a-slice-of-the-archive) to process one month or day per scheduled run.
 

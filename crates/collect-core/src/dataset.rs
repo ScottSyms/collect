@@ -1,6 +1,6 @@
+use crate::{PartitionGranularity, S3Storage};
 use anyhow::{Context, Result};
 use chrono::{Datelike, TimeZone, Utc};
-use collect_core::{PartitionGranularity, S3Storage};
 use futures_util::stream::{self, StreamExt};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -132,6 +132,29 @@ fn year_of_ms(ms: i64) -> i32 {
         .single()
         .map(|dt| dt.year())
         .unwrap_or(i32::MIN)
+}
+
+fn system_time_to_ms(time: std::time::SystemTime) -> i64 {
+    time.duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
+}
+
+/// Whether a partition contains at least one file modified after `cutoff_ms`
+/// — i.e. work an `--incremental` run still has to (re)process. Files with an
+/// unknown modification time count as new, so uncertainty errs toward
+/// processing (idempotent thanks to dedup).
+pub fn partition_is_new(modified: impl IntoIterator<Item = Option<i64>>, cutoff_ms: i64) -> bool {
+    modified
+        .into_iter()
+        .any(|m| m.is_none_or(|ms| ms > cutoff_ms))
+}
+
+/// Newest known modification time across files, for the next watermark.
+/// Unknown times are skipped — they were processed, but can't advance the
+/// watermark without risking skips on the next run.
+pub fn max_modified_ms(modified: impl IntoIterator<Item = Option<i64>>) -> Option<i64> {
+    modified.into_iter().flatten().max()
 }
 
 /// Optional partition-boundary selection: process only partitions whose
@@ -279,6 +302,10 @@ impl PartitionFilter {
 pub struct DatasetFile {
     pub partition: PartitionKey,
     pub path: PathBuf,
+    /// Filesystem mtime (or S3 `LastModified` for downloaded entries), as UTC
+    /// milliseconds. `None` when the platform/store didn't report one; such
+    /// files are conservatively treated as new by `--incremental` selection.
+    pub modified_ms: Option<i64>,
 }
 
 /// List all `.parquet` files under `root`, sorted chronologically by partition then path.
@@ -356,9 +383,16 @@ pub async fn list_parquet_files(
                 continue;
             }
 
+            let modified_ms = entry
+                .metadata()
+                .ok()
+                .and_then(|meta| meta.modified().ok())
+                .map(system_time_to_ms);
+
             files.push(DatasetFile {
                 partition,
                 path: path.to_path_buf(),
+                modified_ms,
             });
         }
 
@@ -386,6 +420,8 @@ pub struct S3Entry {
     pub rel_path: String,
     pub partition: PartitionKey,
     pub storage_index: usize,
+    /// Server-side `LastModified` (UTC milliseconds), when reported.
+    pub modified_ms: Option<i64>,
 }
 
 fn rel_from_key(prefix: &str, key: &str) -> String {
@@ -438,7 +474,8 @@ pub async fn list_s3_parquet_entries(
         .context("listing S3 input bucket")?;
 
     let mut entries: Vec<S3Entry> = Vec::new();
-    for (key, _size) in keys {
+    for object in keys {
+        let key = object.key;
         if !key.ends_with(".parquet") {
             continue;
         }
@@ -466,6 +503,7 @@ pub async fn list_s3_parquet_entries(
             rel_path,
             partition,
             storage_index: 0,
+            modified_ms: object.modified_ms,
         });
     }
 
@@ -510,6 +548,7 @@ pub async fn download_s3_entries(
                 Ok::<_, anyhow::Error>(DatasetFile {
                     partition: entry.partition,
                     path: local_path,
+                    modified_ms: entry.modified_ms,
                 })
             }
         })
@@ -613,6 +652,7 @@ mod tests {
             rel_path: "source=x/year=2026/month=07/day=01/part-0.parquet".into(),
             partition: day_key("x", 2026, 7, 1),
             storage_index: idx,
+            modified_ms: None,
         };
         let root = Path::new("/scratch");
         let a = namespaced_scratch_path(root, &entry(0));
@@ -689,6 +729,56 @@ mod tests {
             ..Default::default()
         };
         assert!(ok.validate(PartitionGranularity::Day).is_ok());
+    }
+
+    #[test]
+    fn partition_is_new_when_any_file_is_past_cutoff() {
+        assert!(partition_is_new([Some(100), Some(300)], 200));
+        // The comparison is strictly-after.
+        assert!(!partition_is_new([Some(100), Some(200)], 200));
+        // Unknown mtimes err toward processing.
+        assert!(partition_is_new([Some(100), None], 200));
+        assert!(!partition_is_new(std::iter::empty::<Option<i64>>(), 0));
+    }
+
+    #[test]
+    fn max_modified_skips_unknown_mtimes() {
+        assert_eq!(max_modified_ms([Some(100), None, Some(300)]), Some(300));
+        assert_eq!(max_modified_ms([None, None]), None);
+        assert_eq!(max_modified_ms(std::iter::empty::<Option<i64>>()), None);
+    }
+
+    #[test]
+    fn local_walk_reports_file_mtimes() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = root.path().join("source=x/year=2026/month=07/day=01");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("part-0.parquet");
+        std::fs::write(&path, b"stub").unwrap();
+        // Backdate the file so the reported mtime is deterministic.
+        let stamp = std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_700_000_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(stamp)
+            .unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let files = rt
+            .block_on(list_parquet_files(
+                root.path(),
+                PartitionGranularity::Day,
+                None,
+                PartitionFilter::default(),
+            ))
+            .expect("list");
+        assert_eq!(files.len(), 1);
+        let modified = files[0].modified_ms.expect("mtime reported");
+        // Filesystems may round to whole seconds; allow that much slack.
+        assert!((modified - 1_700_000_000_000).abs() < 1_000);
     }
 
     #[test]

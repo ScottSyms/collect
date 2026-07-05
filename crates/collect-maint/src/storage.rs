@@ -176,10 +176,19 @@ impl LocalStorage {
     }
 
     fn should_ignore(rel_path: &str) -> bool {
-        Path::new(rel_path)
+        if Path::new(rel_path)
             .file_name()
             .and_then(|value| value.to_str())
             == Some(".DS_Store")
+        {
+            return true;
+        }
+        // Hive/Spark convention: path segments starting with `_` or `.` are
+        // dataset metadata, not data — e.g. `_ais-normalize/watermark.json`
+        // (the ais-normalize incremental watermark) or `_SUCCESS` markers.
+        rel_path
+            .split('/')
+            .any(|segment| segment.starts_with('_') || segment.starts_with('.'))
     }
 
     async fn list_entries<F>(

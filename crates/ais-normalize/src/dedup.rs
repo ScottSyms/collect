@@ -537,7 +537,8 @@ pub async fn dedup_s3_partition(
         .await
         .with_context(|| format!("listing s3 partition {}", partition_prefix))?
         .into_iter()
-        .filter_map(|(key, _size)| {
+        .filter_map(|object| {
+            let key = object.key;
             let name = key.rsplit('/').next().unwrap_or(&key);
             (name.ends_with(".parquet") && !name.starts_with("tmp-")).then_some(key)
         })
