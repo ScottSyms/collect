@@ -956,7 +956,10 @@ async fn main() -> Result<()> {
 
     if dry_run {
         if !partition_rows.is_empty() {
-            eprintln!("Dry run — would write to {} partition(s):", partitions_written);
+            eprintln!(
+                "Dry run — would write to {} partition(s):",
+                partitions_written
+            );
             for (rel_dir, rows) in &partition_rows {
                 eprintln!("  {} ({} rows)", rel_dir, rows);
             }
@@ -1000,7 +1003,12 @@ fn process_partition(
     // output partition?) is against the source-less output layout.
     let source_rel_dir: Arc<str> = Arc::from(partition_key.relative_dir_time_only());
     let mut processor = PartitionProcessor::new(partition_key.source.clone(), granularity);
-    let mut pool = OutputWriterPool::new(output_root, compression_level, dry_run);
+    let mut pool = OutputWriterPool::new(
+        output_root,
+        &partition_key.source,
+        compression_level,
+        dry_run,
+    );
 
     for file in &files {
         process_parquet_file(

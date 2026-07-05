@@ -15,7 +15,7 @@ All collectors support optional remote storage (S3/MinIO).
 ## Features
 - **Multiple Input Sources**: Files, TCP streams, Kafka topics, and aisstream.io WebSocket
 - **Compressed Inputs**: Plain text, gzip, bzip2, and zip files
-- **AIS Normalization**: Fragment reassembly, tag-block/`$PGHP` re-timestamping, parallel partition processing, S3-to-S3, multi-source merge (several input dirs/buckets in one run), idempotent re-runs (exact `(ts, payload)` dedup-merge), and watermark-based incremental scheduling (`--incremental`)
+- **AIS Normalization**: Fragment reassembly, tag-block/`$PGHP` re-timestamping, parallel partition processing, S3-to-S3, multi-source merge into one time-partitioned dataset (source retained as a column), idempotent re-runs (exact `(ts, source, payload)` dedup-merge), and watermark-based incremental scheduling (`--incremental`)
 - **AIS Decoding**: Typed Parquet output (positions + vessel statics) decoded from AIVDM sentences — MMSI, lat/lon, SOG/COG, ship name, destination, ... — with idempotent partition-replace re-runs
 - **Hive Partitioning**: Automatic partitioning by source and selected time granularity
 - **Parquet Format**: Efficient columnar storage with Zstd compression, sorted by timestamp

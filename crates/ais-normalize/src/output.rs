@@ -11,8 +11,8 @@ use parquet::schema::types::ColumnPath;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 static FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -50,6 +50,10 @@ pub(crate) fn build_schema() -> Arc<Schema> {
             DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
             false,
         ),
+        // Provenance retained as a column (the dataset is no longer
+        // partitioned by source). Constant within one output file, so it
+        // dictionary-encodes to almost nothing.
+        Field::new("source", DataType::Utf8, false),
         Field::new("payload", DataType::Utf8, false),
     ]))
 }
@@ -71,7 +75,10 @@ pub(crate) fn open_writer(
         // files, and bounds writer memory to one batch per open partition.
         .set_max_row_group_size(FLUSH_BATCH_SIZE)
         .set_column_encoding(ColumnPath::from("ts"), Encoding::DELTA_BINARY_PACKED)
-        .set_column_encoding(ColumnPath::from("payload"), Encoding::DELTA_LENGTH_BYTE_ARRAY)
+        .set_column_encoding(
+            ColumnPath::from("payload"),
+            Encoding::DELTA_LENGTH_BYTE_ARRAY,
+        )
         .set_column_dictionary_enabled(ColumnPath::from("ts"), false)
         .set_column_dictionary_enabled(ColumnPath::from("payload"), false)
         .build();
@@ -83,7 +90,9 @@ struct PartitionWriter {
     final_path: PathBuf,
     writer: ArrowWriter<File>,
     schema: Arc<Schema>,
+    source: Arc<str>,
     ts: TimestampMillisecondBuilder,
+    source_col: StringBuilder,
     payload: StringBuilder,
     total_rows: u64,
     batch_rows: usize,
@@ -94,11 +103,11 @@ impl PartitionWriter {
         output_root: &Path,
         rel_dir: &str,
         schema: &Arc<Schema>,
+        source: &Arc<str>,
         compression_level: i32,
     ) -> Result<Self> {
         let dir = output_root.join(rel_dir);
-        fs::create_dir_all(&dir)
-            .with_context(|| format!("mkdir -p {}", dir.display()))?;
+        fs::create_dir_all(&dir).with_context(|| format!("mkdir -p {}", dir.display()))?;
         let file_name = parquet_file_name();
         let final_path = dir.join(&file_name);
         let temp_path = dir.join(format!("tmp-{}", file_name));
@@ -108,11 +117,13 @@ impl PartitionWriter {
             final_path,
             writer,
             schema: schema.clone(),
+            source: source.clone(),
             // Modest initial capacities: retimestamping can fan one input
             // partition out across many output partitions, and each open
             // writer holds its own builders. They grow geometrically as
             // needed, so undersizing costs a few reallocs, not throughput.
             ts: TimestampMillisecondBuilder::with_capacity(1024),
+            source_col: StringBuilder::with_capacity(1024, 1024),
             payload: StringBuilder::with_capacity(1024, 64 * 1024),
             total_rows: 0,
             batch_rows: 0,
@@ -121,6 +132,7 @@ impl PartitionWriter {
 
     fn push(&mut self, ts_ms: i64, payload: &str) -> Result<()> {
         self.ts.append_value(ts_ms);
+        self.source_col.append_value(&self.source);
         self.payload.append_value(payload);
         self.total_rows += 1;
         self.batch_rows += 1;
@@ -135,11 +147,13 @@ impl PartitionWriter {
             return Ok(());
         }
         let ts_array = self.ts.finish().with_timezone_opt(Some(Arc::from("UTC")));
+        let source_array = self.source_col.finish();
         let payload_array = self.payload.finish();
         let batch = RecordBatch::try_new(
             self.schema.clone(),
             vec![
                 Arc::new(ts_array) as Arc<dyn arrow::array::Array>,
+                Arc::new(source_array) as Arc<dyn arrow::array::Array>,
                 Arc::new(payload_array) as Arc<dyn arrow::array::Array>,
             ],
         )
@@ -156,8 +170,13 @@ impl PartitionWriter {
         self.flush_batch()?;
         self.writer.close().context("closing Parquet writer")?;
         if self.total_rows > 0 {
-            fs::rename(&self.temp_path, &self.final_path)
-                .with_context(|| format!("rename {} -> {}", self.temp_path.display(), self.final_path.display()))?;
+            fs::rename(&self.temp_path, &self.final_path).with_context(|| {
+                format!(
+                    "rename {} -> {}",
+                    self.temp_path.display(),
+                    self.final_path.display()
+                )
+            })?;
         } else {
             let _ = fs::remove_file(&self.temp_path);
         }
@@ -172,6 +191,9 @@ pub struct OutputWriterPool {
     output_root: PathBuf,
     compression_level: i32,
     schema: Arc<Schema>,
+    /// Provenance for every row this pool writes — one input partition is a
+    /// single source, so it is constant for the pool's lifetime.
+    source: Arc<str>,
     dry_run: bool,
     /// Active writers keyed by partition `relative_dir`.
     writers: HashMap<String, PartitionWriter>,
@@ -183,11 +205,12 @@ pub struct OutputWriterPool {
 }
 
 impl OutputWriterPool {
-    pub fn new(output_root: PathBuf, compression_level: i32, dry_run: bool) -> Self {
+    pub fn new(output_root: PathBuf, source: &str, compression_level: i32, dry_run: bool) -> Self {
         Self {
             output_root,
             compression_level,
             schema: build_schema(),
+            source: Arc::from(source),
             dry_run,
             writers: HashMap::new(),
             finished: Vec::new(),
@@ -225,6 +248,7 @@ impl OutputWriterPool {
             &self.output_root,
             partition_rel_dir,
             &self.schema,
+            &self.source,
             self.compression_level,
         )?;
         self.writers.insert(partition_rel_dir.to_string(), writer);
@@ -272,7 +296,7 @@ mod tests {
     #[test]
     fn writer_cap_rolls_over_generations_without_losing_rows() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut pool = OutputWriterPool::new(dir.path().to_path_buf(), 1, false);
+        let mut pool = OutputWriterPool::new(dir.path().to_path_buf(), "norway", 1, false);
 
         // Touch more partitions than the cap allows, then revisit the first
         // one so it gets a second file in a new generation.
@@ -308,5 +332,30 @@ mod tests {
                 path.display()
             );
         }
+
+        // Every written file carries the pool's source in a `source` column.
+        let sample = outputs
+            .iter()
+            .find(|(_, rows, _)| *rows > 0)
+            .map(|(_, _, path)| path)
+            .expect("a non-empty output file");
+        let file = File::open(sample).expect("open");
+        let batch = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+            .expect("builder")
+            .build()
+            .expect("build")
+            .next()
+            .expect("one batch")
+            .expect("batch ok");
+        let schema = batch.schema();
+        assert_eq!(schema.field(0).name(), "ts");
+        assert_eq!(schema.field(1).name(), "source");
+        assert_eq!(schema.field(2).name(), "payload");
+        let source = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("source col");
+        assert_eq!(source.value(0), "norway");
     }
 }

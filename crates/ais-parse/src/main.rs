@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use arrow::array::{StringArray, TimestampMillisecondArray};
+use arrow::array::{Array, StringArray, TimestampMillisecondArray};
 use chrono::TimeZone;
 use clap::Parser;
 use collect_core::dataset::{self, DatasetFile, PartitionKey};
@@ -858,6 +858,7 @@ fn process_partition(
         }
         process_parquet_file(
             &file.path,
+            &file.partition.source,
             &mut parser,
             &mut stats,
             positions.as_mut(),
@@ -902,6 +903,7 @@ fn process_partition(
 
 fn process_parquet_file(
     path: &Path,
+    path_source: &str,
     parser: &mut NmeaParser,
     stats: &mut ParseStats,
     mut positions: Option<&mut PositionsWriter>,
@@ -915,24 +917,49 @@ fn process_parquet_file(
         .build()
         .with_context(|| format!("build Parquet reader {}", path.display()))?;
 
+    // Columns are matched by name, not position: normalized input is
+    // (ts, source, payload) while raw bronze is (ts, payload). The `source`
+    // column (present in normalized data, per-row after a dedup merge pooled
+    // several sources) takes precedence; bronze has none, so we fall back to
+    // the source parsed from the file's partition path.
     while let Some(batch) = reader.next().transpose()? {
+        let schema = batch.schema();
+        let ts_idx = schema.index_of("ts").unwrap_or(0);
+        let payload_idx = schema
+            .index_of("payload")
+            .map_err(|_| anyhow::anyhow!("input {} has no payload column", path.display()))?;
+        let source_idx = schema.index_of("source").ok();
+
         let ts_col = batch
-            .column(0)
+            .column(ts_idx)
             .as_any()
             .downcast_ref::<TimestampMillisecondArray>()
-            .context("expected timestamp column at index 0")?;
+            .context("expected a timestamp `ts` column")?;
         let payload_col = batch
-            .column(1)
+            .column(payload_idx)
             .as_any()
             .downcast_ref::<StringArray>()
-            .context("expected string column at index 1")?;
+            .context("expected a string `payload` column")?;
+        let source_col = source_idx
+            .map(|idx| {
+                batch
+                    .column(idx)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .context("expected a string `source` column")
+            })
+            .transpose()?;
 
         for i in 0..batch.num_rows() {
             if is_cancelled() {
                 return Ok(());
             }
             stats.rows_in += 1;
-            match decode_payload(parser, ts_col.value(i), payload_col.value(i)) {
+            let source = match &source_col {
+                Some(col) if !col.is_null(i) => col.value(i),
+                _ => path_source,
+            };
+            match decode_payload(parser, ts_col.value(i), source, payload_col.value(i)) {
                 Decoded::Position(row) => {
                     stats.positions_out += 1;
                     if let Some(writer) = positions.as_deref_mut() {

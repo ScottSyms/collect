@@ -19,22 +19,26 @@ bucket, exactly like ais-normalize.
 
 Two sibling hive-partitioned datasets under the output root. The output is
 **not partitioned by source** — every source that falls in a time partition
-is decoded into it together, so downstream queries see one unified dataset:
+is decoded into it together, so downstream queries see one unified dataset —
+but each row keeps its origin in a `source` column:
 
 ```
 <output>/positions/year=YYYY/month=MM/day=DD/pos-....parquet
 <output>/statics/year=YYYY/month=MM/day=DD/stat-....parquet
 ```
 
-(The bronze input may still be `source=X/year=…`; ais-parse reads either
-layout. Each output time partition is rebuilt as a whole from all the sources
-that land in it, so the partition-replace re-run stays correct and race-free.)
+`source` is read from the input's `source` column when present (ais-normalize
+output), and otherwise from the input's `source=` partition segment (raw
+bronze). Either input layout works. Each output time partition is rebuilt as a
+whole from all the sources that land in it, so the partition-replace re-run
+stays correct and race-free.
 
 **`positions`** — one row per position report (AIS types 1–3, 18, 19, 27):
 
 | Column | Type | Notes |
 |--------|------|-------|
 | `ts` | timestamp (ms, UTC) | the row's corrected bronze timestamp |
+| `source` | utf8 | origin feed label (from the input's `source` column, or its `source=` partition when reading raw bronze) |
 | `mmsi` | uint32 | |
 | `ais_class` | utf8 | `Class A` / `Class B` |
 | `latitude`, `longitude` | float64, nullable | WGS-84 degrees |
@@ -51,7 +55,7 @@ that land in it, so the partition-replace re-run stays correct and race-free.)
 
 | Column | Type | Notes |
 |--------|------|-------|
-| `ts`, `mmsi`, `ais_class` | as above | |
+| `ts`, `source`, `mmsi`, `ais_class` | as above | |
 | `imo_number` | uint32, nullable | |
 | `call_sign`, `name` | utf8, nullable | |
 | `ship_type` | utf8 | |

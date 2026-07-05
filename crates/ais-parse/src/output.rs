@@ -52,6 +52,7 @@ fn ts_field(name: &str, nullable: bool) -> Field {
 fn positions_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         ts_field("ts", false),
+        Field::new("source", DataType::Utf8, false),
         Field::new("mmsi", DataType::UInt32, false),
         Field::new("ais_class", DataType::Utf8, false),
         Field::new("latitude", DataType::Float64, true),
@@ -70,6 +71,7 @@ fn positions_schema() -> Arc<Schema> {
 fn statics_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         ts_field("ts", false),
+        Field::new("source", DataType::Utf8, false),
         Field::new("mmsi", DataType::UInt32, false),
         Field::new("ais_class", DataType::Utf8, false),
         Field::new("imo_number", DataType::UInt32, true),
@@ -154,6 +156,7 @@ impl FileSink {
 pub struct PositionsWriter {
     sink: FileSink,
     ts: TimestampMillisecondBuilder,
+    source: StringBuilder,
     mmsi: UInt32Builder,
     ais_class: StringBuilder,
     latitude: Float64Builder,
@@ -173,6 +176,7 @@ impl PositionsWriter {
         PositionsWriter {
             sink: FileSink::new(dir, "pos", positions_schema(), compression_level),
             ts: TimestampMillisecondBuilder::new().with_timezone("UTC"),
+            source: StringBuilder::new(),
             mmsi: UInt32Builder::new(),
             ais_class: StringBuilder::new(),
             latitude: Float64Builder::new(),
@@ -190,6 +194,7 @@ impl PositionsWriter {
 
     pub fn write(&mut self, row: &PositionRow) -> Result<()> {
         self.ts.append_value(row.ts_ms);
+        self.source.append_value(&row.source);
         self.mmsi.append_value(row.mmsi);
         self.ais_class.append_value(&row.ais_class);
         self.latitude.append_option(row.latitude);
@@ -214,6 +219,7 @@ impl PositionsWriter {
         }
         let columns: Vec<ArrayRef> = vec![
             Arc::new(self.ts.finish()),
+            Arc::new(self.source.finish()),
             Arc::new(self.mmsi.finish()),
             Arc::new(self.ais_class.finish()),
             Arc::new(self.latitude.finish()),
@@ -243,6 +249,7 @@ impl PositionsWriter {
 pub struct StaticsWriter {
     sink: FileSink,
     ts: TimestampMillisecondBuilder,
+    source: StringBuilder,
     mmsi: UInt32Builder,
     ais_class: StringBuilder,
     imo_number: UInt32Builder,
@@ -264,6 +271,7 @@ impl StaticsWriter {
         StaticsWriter {
             sink: FileSink::new(dir, "stat", statics_schema(), compression_level),
             ts: TimestampMillisecondBuilder::new().with_timezone("UTC"),
+            source: StringBuilder::new(),
             mmsi: UInt32Builder::new(),
             ais_class: StringBuilder::new(),
             imo_number: UInt32Builder::new(),
@@ -283,6 +291,7 @@ impl StaticsWriter {
 
     pub fn write(&mut self, row: &StaticRow) -> Result<()> {
         self.ts.append_value(row.ts_ms);
+        self.source.append_value(&row.source);
         self.mmsi.append_value(row.mmsi);
         self.ais_class.append_value(&row.ais_class);
         self.imo_number.append_option(row.imo_number);
@@ -311,6 +320,7 @@ impl StaticsWriter {
         }
         let columns: Vec<ArrayRef> = vec![
             Arc::new(self.ts.finish()),
+            Arc::new(self.source.finish()),
             Arc::new(self.mmsi.finish()),
             Arc::new(self.ais_class.finish()),
             Arc::new(self.imo_number.finish()),
@@ -371,6 +381,7 @@ mod tests {
     fn sample_position(ts_ms: i64, mmsi: u32) -> PositionRow {
         PositionRow {
             ts_ms,
+            source: "norway".into(),
             mmsi,
             ais_class: "ClassA".into(),
             latitude: Some(60.5),
@@ -416,14 +427,21 @@ mod tests {
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 10);
         let first = &batches[0];
-        let mmsi = first
+        assert_eq!(first.schema().field(1).name(), "source");
+        let source = first
             .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("source col");
+        assert_eq!(source.value(0), "norway");
+        let mmsi = first
+            .column(2)
             .as_any()
             .downcast_ref::<UInt32Array>()
             .expect("mmsi col");
         assert_eq!(mmsi.value(0), 257_000_000);
         let lat = first
-            .column(3)
+            .column(4)
             .as_any()
             .downcast_ref::<Float64Array>()
             .expect("lat col");
@@ -445,6 +463,7 @@ mod tests {
         writer
             .write(&StaticRow {
                 ts_ms: 1_700_000_000_000,
+                source: "norway".into(),
                 mmsi: 366_998_410,
                 ais_class: "ClassA".into(),
                 imo_number: None,
@@ -474,14 +493,22 @@ mod tests {
             .next()
             .expect("one batch")
             .expect("batch ok");
+        // Columns shifted by +1 after inserting `source` at index 1.
+        assert_eq!(batch.schema().field(1).name(), "source");
+        let source = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("source col");
+        assert_eq!(source.value(0), "norway");
         let name = batch
-            .column(5)
+            .column(6)
             .as_any()
             .downcast_ref::<StringArray>()
             .expect("name col");
         assert_eq!(name.value(0), "EXAMPLE VESSEL");
         let imo = batch
-            .column(3)
+            .column(4)
             .as_any()
             .downcast_ref::<UInt32Array>()
             .expect("imo col");

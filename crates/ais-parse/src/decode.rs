@@ -16,6 +16,7 @@ use nmea_parser::{NmeaParser, ParsedMessage};
 /// One decoded position report (AIS types 1-3, 18, 19, 27).
 pub struct PositionRow {
     pub ts_ms: i64,
+    pub source: String,
     pub mmsi: u32,
     pub ais_class: String,
     pub latitude: Option<f64>,
@@ -33,6 +34,7 @@ pub struct PositionRow {
 /// One decoded static/voyage report (AIS types 5 and 24).
 pub struct StaticRow {
     pub ts_ms: i64,
+    pub source: String,
     pub mmsi: u32,
     pub ais_class: String,
     pub imo_number: Option<u32>,
@@ -70,17 +72,17 @@ fn strip_tag_block(payload: &str) -> &str {
     payload
 }
 
-pub fn decode_payload(parser: &mut NmeaParser, ts_ms: i64, payload: &str) -> Decoded {
+pub fn decode_payload(parser: &mut NmeaParser, ts_ms: i64, source: &str, payload: &str) -> Decoded {
     let sentence = strip_tag_block(payload.trim());
     if sentence.is_empty() {
         return Decoded::Failed;
     }
     match parser.parse_sentence(sentence) {
         Ok(ParsedMessage::VesselDynamicData(vdd)) => {
-            Decoded::Position(Box::new(position_row(ts_ms, vdd)))
+            Decoded::Position(Box::new(position_row(ts_ms, source, vdd)))
         }
         Ok(ParsedMessage::VesselStaticData(vsd)) => {
-            Decoded::Static(Box::new(static_row(ts_ms, vsd)))
+            Decoded::Static(Box::new(static_row(ts_ms, source, vsd)))
         }
         Ok(ParsedMessage::Incomplete) => Decoded::Incomplete,
         Ok(_) => Decoded::Other,
@@ -88,9 +90,10 @@ pub fn decode_payload(parser: &mut NmeaParser, ts_ms: i64, payload: &str) -> Dec
     }
 }
 
-fn position_row(ts_ms: i64, vdd: VesselDynamicData) -> PositionRow {
+fn position_row(ts_ms: i64, source: &str, vdd: VesselDynamicData) -> PositionRow {
     PositionRow {
         ts_ms,
+        source: source.to_string(),
         mmsi: vdd.mmsi,
         ais_class: vdd.ais_type.to_string(),
         latitude: vdd.latitude,
@@ -106,9 +109,10 @@ fn position_row(ts_ms: i64, vdd: VesselDynamicData) -> PositionRow {
     }
 }
 
-fn static_row(ts_ms: i64, vsd: VesselStaticData) -> StaticRow {
+fn static_row(ts_ms: i64, source: &str, vsd: VesselStaticData) -> StaticRow {
     StaticRow {
         ts_ms,
+        source: source.to_string(),
         mmsi: vsd.mmsi,
         ais_class: vsd.ais_type.to_string(),
         imo_number: vsd.imo_number,
@@ -152,11 +156,13 @@ mod tests {
         let decoded = decode_payload(
             &mut parser,
             1_700_000_000_000,
+            "norway",
             "!AIVDM,1,1,,A,15RTgt0PAso;90TKcjM8h6g208CQ,0*4A",
         );
         match decoded {
             Decoded::Position(row) => {
                 assert_eq!(row.ts_ms, 1_700_000_000_000);
+                assert_eq!(row.source, "norway");
                 assert_eq!(row.mmsi, 371_798_000);
                 let lat = row.latitude.expect("latitude");
                 let lon = row.longitude.expect("longitude");
@@ -174,6 +180,7 @@ mod tests {
         let decoded = decode_payload(
             &mut parser,
             1_700_000_000_000,
+            "norway",
             r"\c:1700000000*5E\!AIVDM,1,1,,A,15RTgt0PAso;90TKcjM8h6g208CQ,0*4A",
         );
         assert!(matches!(decoded, Decoded::Position(_)));
@@ -185,7 +192,7 @@ mod tests {
         // A type 5 message pre-combined into a single sentence, the way
         // ais-normalize emits it (payload of both fragments concatenated).
         let combined = "!AIVDM,1,1,,A,569qcJP000000000000P4V1QDr3777800000000o0p=220DP0388888888881CRR@CACP08,2*10";
-        let decoded = decode_payload(&mut parser, 1_700_000_000_000, combined);
+        let decoded = decode_payload(&mut parser, 1_700_000_000_000, "norway", combined);
         match decoded {
             Decoded::Static(row) => {
                 assert!(row.mmsi > 0);
@@ -203,11 +210,11 @@ mod tests {
         let mut parser = NmeaParser::new();
         let part1 = "!AIVDM,2,1,3,B,55P5TL01VIaAL@7WKO@mBplU@<PDhh000000001S;AJ::4A80?4i@E53,0*3E";
         let part2 = "!AIVDM,2,2,3,B,1@0000000000000,2*55";
-        match decode_payload(&mut parser, 1_700_000_000_000, part1) {
+        match decode_payload(&mut parser, 1_700_000_000_000, "s", part1) {
             Decoded::Incomplete => {}
             _ => panic!("first fragment should be Incomplete"),
         }
-        match decode_payload(&mut parser, 1_700_000_000_000, part2) {
+        match decode_payload(&mut parser, 1_700_000_000_000, "s", part2) {
             Decoded::Static(row) => {
                 assert_eq!(row.mmsi, 369_190_000);
                 assert!(row.name.is_some());
@@ -220,15 +227,20 @@ mod tests {
     fn garbage_is_failed_not_panic() {
         let mut parser = NmeaParser::new();
         assert!(matches!(
-            decode_payload(&mut parser, 0, "$PGHP,1,2013,1,9,4,37,45,298,,110,,1,26*19"),
+            decode_payload(
+                &mut parser,
+                0,
+                "s",
+                "$PGHP,1,2013,1,9,4,37,45,298,,110,,1,26*19"
+            ),
             Decoded::Failed | Decoded::Other
         ));
         assert!(matches!(
-            decode_payload(&mut parser, 0, "not a sentence at all"),
+            decode_payload(&mut parser, 0, "s", "not a sentence at all"),
             Decoded::Failed
         ));
         assert!(matches!(
-            decode_payload(&mut parser, 0, ""),
+            decode_payload(&mut parser, 0, "s", ""),
             Decoded::Failed
         ));
     }

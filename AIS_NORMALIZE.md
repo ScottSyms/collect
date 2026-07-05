@@ -3,10 +3,12 @@
 `ais-normalize` is a batch post-processing pass over a Hive-partitioned Parquet dataset already collected by `collect-file`, `collect-socket`, `collect-kafka`, or `collect-aisstream`. It sits between raw ingestion and compaction in the medallion pipeline:
 
 ```
-collect-* (bronze, raw)  →  ais-normalize  →  collect-maint compact  →  ais-parse (silver)  →  Iceberg
+collect-* (bronze, raw)  →  collect-maint compact  →  ais-normalize  →  ais-parse (silver)  →  Iceberg
 ```
 
 It is a CLI tool that runs to completion and exits — not a long-running service. It has no `--metrics-addr`/`/healthz` endpoint. The next step of the pipeline — decoding the normalized sentences into typed columns — is [ais-parse](AIS_PARSE.md).
+
+> **Compaction placement.** `collect-maint compact`/`validate` currently expect the bronze two-column `(ts, payload)` schema, so run compaction on the **raw** dataset (before normalize), as shown above. The normalized output carries an extra `source` column; compacting it needs the schema-general compaction update (tracked separately).
 
 ## What problem it solves
 
@@ -39,7 +41,7 @@ Rows that aren't AIS `VDM`/`VDO` sentences (heartbeats, other NMEA talkers, etc.
 - Buffered fragment groups are capped at 8192 concurrent groups per partition; if a new group would exceed the cap, the oldest incomplete group is evicted and its fragments are emitted individually (counted as an "incomplete group") rather than buffered indefinitely. Malformed or truncated fragment sequences can never grow memory without bound.
 - Any fragment groups still incomplete at the end of a partition's files are flushed the same way.
 
-**Output.** Rows are written with the same `(ts: Timestamp(ms, UTC), payload: Utf8)` schema as ingestion, Zstd-compressed, with row groups sized and sorted by timestamp on every flush — this is what lets `collect-maint compact` stream-merge the output later without a full re-sort. Open writers per pool are hard-capped at 64: if pathologically scattered timestamps fan an input partition out further than that, all open files are closed and affected partitions simply get an additional file, keeping worst-case memory bounded even on hostile data.
+**Output.** Rows are written with the schema `(ts: Timestamp(ms, UTC), source: Utf8, payload: Utf8)` — the same `ts`/`payload` as ingestion plus a `source` column carrying the input's `source=` label (the output itself is not partitioned by source; see [merging multiple sources](#merging-multiple-sources)). Files are Zstd-compressed, with row groups sized and sorted by timestamp on every flush. The `source` value is constant within a file, so it dictionary-encodes to almost nothing. Open writers per pool are hard-capped at 64: if pathologically scattered timestamps fan an input partition out further than that, all open files are closed and affected partitions simply get an additional file, keeping worst-case memory bounded even on hostile data.
 
 ## CLI reference
 
@@ -69,7 +71,7 @@ Rows that aren't AIS `VDM`/`VDO` sentences (heartbeats, other NMEA talkers, etc.
 | `--batch-size` | `8192` | Rows per Parquet read batch |
 | `--compression-level` | `5` | Zstd level for output files |
 | `--concurrency` | cores, clamped `[1, 8]` | Partitions processed concurrently |
-| `--dedup` | `true` | Merge touched output partitions and drop exact `(ts, payload)` duplicates so re-runs are idempotent; `--dedup false` (env `DEDUP=false`) appends instead. See [idempotent re-runs](#idempotent-re-runs-deduplication) |
+| `--dedup` | `true` | Merge touched output partitions and drop exact `(ts, source, payload)` duplicates so re-runs are idempotent; `--dedup false` (env `DEDUP=false`) appends instead. See [idempotent re-runs](#idempotent-re-runs-deduplication) |
 | `--noui` | off | Disable the TTY status display; print plain progress lines instead (auto-enabled when stdout isn't a terminal) |
 
 `--input-dir`/`--input-s3-bucket` are mutually exclusive (exactly one required), and likewise for `--output-dir`/`--output-s3-bucket`. `--input-s3-bucket` and `--output-s3-bucket` always share one endpoint/region/credentials — only the bucket name (and optional prefix) differs between them, matching how the same S3-compatible store (e.g. one MinIO deployment) typically hosts both the raw and normalized datasets side by side as separate buckets.
@@ -228,16 +230,16 @@ cargo run -p ais-normalize -- --input-dir /data/norway --input-dir /data/aisstre
 
 Rules and behavior:
 
-- **Output is not partitioned by source.** All inputs are merged into one dataset partitioned by time only (`year=…/month=…/day=…`, no `source=` segment). Rows from `norway` and `aisstream` for the same day land in the same output partition; the `(ts, payload)` [dedup merge](#idempotent-re-runs-deduplication) collapses any that are byte-identical. Provenance is not kept as a partition label — a message received by two stations usually still differs in its `\s:<station>` tag inside the payload, so both copies survive.
+- **Output is not partitioned by source, but source is retained as a column.** All inputs are merged into one dataset partitioned by time only (`year=…/month=…/day=…`, no `source=` segment); each row's origin is preserved in the `source` column instead. Rows from `norway` and `aisstream` for the same day land in the same output partition, each tagged with its own `source`.
 - **All inputs must be the same kind.** Either several `--input-dir` **or** several `--input-s3-bucket`, not a mix. Every input bucket shares one endpoint/region/credentials and one `--input-s3-prefix` (keep it empty for bucket-root datasets).
-- **Overlap is handled.** Because everything merges into shared time partitions, exact `(ts, payload)` duplicates — whether from re-runs, two snapshots of one feed, or two stations that produced byte-identical rows — are collapsed by the dedup merge.
+- **Overlap is handled.** Exact `(ts, source, payload)` duplicates — from re-runs or two snapshots of one feed — are collapsed by the dedup merge. Because `source` is part of the key, a message that two *different* sources reported byte-identically is kept once per source (provenance intact).
 - **`--source` and the partition-slice filters** apply to every input (they still select on the input's `source=`/time layout).
 
 ## Idempotent re-runs (deduplication)
 
-By default (`--dedup true`), after the run finishes ais-normalize merges every output partition it wrote to and removes exact `(ts, payload)` duplicates. Because normalize is deterministic — the true timestamp comes from the `\c:` tag block or `$PGHP`, and the combined payload is fixed — re-running over the same (or overlapping) input regenerates byte-identical rows, which the merge collapses. **Running the tool any number of times converges each partition to the same deduped set**, so you can safely re-run a day after fixing an upstream feed, or re-process overlapping ranges, without accumulating duplicates.
+By default (`--dedup true`), after the run finishes ais-normalize merges every output partition it wrote to and removes exact `(ts, source, payload)` duplicates. Because normalize is deterministic — the true timestamp comes from the `\c:` tag block or `$PGHP`, and the combined payload is fixed — re-running over the same (or overlapping) input regenerates byte-identical rows, which the merge collapses. **Running the tool any number of times converges each partition to the same deduped set**, so you can safely re-run a day after fixing an upstream feed, or re-process overlapping ranges, without accumulating duplicates.
 
-- **Duplicate = exact `(ts, payload)`.** Two rows are duplicates only if both the timestamp *and* the full payload match. Rows that differ in any way are all kept — including the `\s:<station>` receiver tag, so the same AIS message received by two base stations is preserved, not collapsed.
+- **Duplicate = exact `(ts, source, payload)`.** Two rows are duplicates only if the timestamp, the `source`, *and* the full payload all match. Rows that differ in any way are all kept — including the `\s:<station>` receiver tag, and the `source` column, so the same AIS message received by two base stations (or arriving from two sources) is preserved, not collapsed.
 - **Why this instead of "overwrite".** Normalize re-partitions rows (a row read from `day=01` can land in `day=02`), so a "clear the partition and rewrite" approach could delete a neighbor partition's real data when you run with `--day`/`--month` filters. Dedup-merge keeps the union of rows and removes only redundant ones, so spillover and overlapping selections merge safely.
 - **Scope.** Only partitions this run actually wrote to are merged; untouched partitions are never read or rewritten. A partition with a single fresh file and no prior data is left as-is (first runs stay cheap); the merge kicks in once a partition has 2+ files (a prior run's output, or a generation rollover).
 - **Cost.** When a partition is merged it is fully read and rewritten (≈ a compaction pass over that partition; on S3, its prior objects are downloaded, a single merged object is uploaded, and the old objects deleted). This is the price of idempotency — pass `--dedup false` (or `DEDUP=false`) to skip it and append instead (the pre-dedup behavior, where re-runs accumulate files).
