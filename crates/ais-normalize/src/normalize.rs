@@ -1,9 +1,9 @@
-use collect_core::dataset::PartitionKey;
 use crate::parse::{
     combine_ais_fragments, parse_ais_sentence_metadata, parse_pghp_timestamp_ms,
     parse_tag_block_timestamp_ms, split_tag_block,
 };
 use crate::stats::NormalizeStats;
+use collect_core::dataset::PartitionKey;
 use collect_core::PartitionGranularity;
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -66,7 +66,9 @@ impl PartitionProcessor {
         }
         let key = PartitionKey::from_timestamp_ms(&self.source, ts_ms, self.granularity);
         let (start_ms, end_ms) = self.granularity.period_bounds_ms(ts_ms);
-        let rel_dir: Arc<str> = Arc::from(key.relative_dir());
+        // Output is not partitioned by source: several sources merge into one
+        // time-only partition, deduplicated by the post-run merge pass.
+        let rel_dir: Arc<str> = Arc::from(key.relative_dir_time_only());
         self.out_cache = Some((start_ms, end_ms, rel_dir.clone()));
         rel_dir
     }

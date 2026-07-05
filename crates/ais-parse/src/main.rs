@@ -493,7 +493,12 @@ async fn main() -> Result<()> {
                 .cmp(&b.partition.sort_key())
                 .then(a.rel_path.cmp(&b.rel_path))
         });
-        dataset::group_by_partition(entries, |entry| entry.partition.clone())
+        // Group by the *time-only* key so every source that lands in a given
+        // output partition is one work item: the output is not partitioned by
+        // source, and one owner per output partition keeps the partition
+        // replace race-free. sort_key orders by time before source, so
+        // same-time entries from different sources are already contiguous.
+        dataset::group_by_partition(entries, |entry| entry.partition.without_source())
             .into_iter()
             .map(|(key, list)| (key, PartitionWork::Remote(list)))
             .collect()
@@ -521,7 +526,8 @@ async fn main() -> Result<()> {
                 .cmp(&b.partition.sort_key())
                 .then(a.path.cmp(&b.path))
         });
-        dataset::group_by_partition(files, |file| file.partition.clone())
+        // Group by time-only key — see the S3 branch above.
+        dataset::group_by_partition(files, |file| file.partition.without_source())
             .into_iter()
             .map(|(key, list)| (key, PartitionWork::Local(list)))
             .collect()
@@ -600,10 +606,7 @@ async fn main() -> Result<()> {
                     break;
                 };
 
-                let downloaded_rel_dir = match &work {
-                    PartitionWork::Remote(_) => Some(partition_key.relative_dir()),
-                    PartitionWork::Local(_) => None,
-                };
+                let is_remote = matches!(work, PartitionWork::Remote(_));
                 let partition_files = match work {
                     PartitionWork::Local(files) => files,
                     PartitionWork::Remote(entries) => {
@@ -628,7 +631,16 @@ async fn main() -> Result<()> {
                     }
                 };
 
-                let rel_dir = partition_key.relative_dir();
+                // A time-only work item can pool downloads from several source
+                // subtrees, so clean the scratch copies by file path rather
+                // than a single partition dir.
+                let scratch_files: Vec<PathBuf> = if is_remote {
+                    partition_files.iter().map(|f| f.path.clone()).collect()
+                } else {
+                    Vec::new()
+                };
+
+                let rel_dir = partition_key.relative_dir_time_only();
                 let output_root_for_task = output_root.clone();
                 let result = tokio::task::spawn_blocking(move || {
                     process_partition(
@@ -644,9 +656,8 @@ async fn main() -> Result<()> {
                 .await
                 .context("partition worker panicked")?;
 
-                if let (Some(rel), Some(scratch_root)) = (&downloaded_rel_dir, &input_scratch_root)
-                {
-                    let _ = tokio::fs::remove_dir_all(scratch_root.join(rel)).await;
+                for scratch_file in &scratch_files {
+                    let _ = tokio::fs::remove_file(scratch_file).await;
                 }
 
                 let outputs = match result {
@@ -795,13 +806,20 @@ fn default_concurrency() -> usize {
         .clamp(1, 8)
 }
 
-/// `(output rel path like "positions/source=x/year=.../pos-....parquet",
-/// local file path, rows)` per file this partition produced.
+/// `(output rel path like "positions/year=.../pos-....parquet", local file
+/// path, rows)` per file this partition produced. The output layout is not
+/// partitioned by source.
 type PartitionOutputs = Vec<(String, PathBuf, u64)>;
 
-/// Decode one partition end to end: fresh parser (fragment state is
-/// per-partition), one positions file and one statics file, then — for local
-/// output — replace the prior run's files in the two output partitions.
+/// Decode one output partition end to end into one positions file and one
+/// statics file, then — for local output — replace the prior run's files in
+/// the two output partitions.
+///
+/// The output is not partitioned by source, so `files` can pool several
+/// sources that map to this time partition. Fragment reassembly is per-source
+/// (a fresh parser when the source label changes; `files` is sorted so each
+/// source's files are contiguous), which keeps multi-part sequence ids from
+/// colliding across sources.
 #[allow(clippy::too_many_arguments)]
 fn process_partition(
     partition_key: PartitionKey,
@@ -812,7 +830,7 @@ fn process_partition(
     dry_run: bool,
     replace_local: bool,
 ) -> Result<(ParseStats, PartitionOutputs)> {
-    let rel_dir = partition_key.relative_dir();
+    let rel_dir = partition_key.relative_dir_time_only();
     let positions_dir = output_root.join(POSITIONS_TREE).join(&rel_dir);
     let statics_dir = output_root.join(STATICS_TREE).join(&rel_dir);
 
@@ -827,11 +845,17 @@ fn process_partition(
     };
 
     let mut parser = NmeaParser::new();
+    let mut current_source: Option<&str> = None;
     let mut stats = ParseStats::default();
     let mut positions = (!dry_run).then(|| PositionsWriter::new(positions_dir, compression_level));
     let mut statics = (!dry_run).then(|| StaticsWriter::new(statics_dir, compression_level));
 
     for file in &files {
+        // Reset fragment state at each source boundary.
+        if current_source != Some(file.partition.source.as_str()) {
+            parser = NmeaParser::new();
+            current_source = Some(file.partition.source.as_str());
+        }
         process_parquet_file(
             &file.path,
             &mut parser,

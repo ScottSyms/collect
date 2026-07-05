@@ -995,7 +995,10 @@ fn process_partition(
     compression_level: i32,
     dry_run: bool,
 ) -> Result<(NormalizeStats, PartitionOutputRows)> {
-    let source_rel_dir: Arc<str> = Arc::from(partition_key.relative_dir());
+    // The input partition's *time-only* dir, so the processor's re-partition
+    // comparison (did a row's corrected timestamp move it to a different
+    // output partition?) is against the source-less output layout.
+    let source_rel_dir: Arc<str> = Arc::from(partition_key.relative_dir_time_only());
     let mut processor = PartitionProcessor::new(partition_key.source.clone(), granularity);
     let mut pool = OutputWriterPool::new(output_root, compression_level, dry_run);
 

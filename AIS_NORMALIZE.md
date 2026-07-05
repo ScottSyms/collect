@@ -228,10 +228,10 @@ cargo run -p ais-normalize -- --input-dir /data/norway --input-dir /data/aisstre
 
 Rules and behavior:
 
-- **Each source keeps its own `source=` label.** The output is one dataset holding all the input sources as separate `source=` partition trees (e.g. `source=norway/…` and `source=aisstream/…`); labels are inherited from each input's path, never merged or rewritten. Provenance is preserved.
+- **Output is not partitioned by source.** All inputs are merged into one dataset partitioned by time only (`year=…/month=…/day=…`, no `source=` segment). Rows from `norway` and `aisstream` for the same day land in the same output partition; the `(ts, payload)` [dedup merge](#idempotent-re-runs-deduplication) collapses any that are byte-identical. Provenance is not kept as a partition label — a message received by two stations usually still differs in its `\s:<station>` tag inside the payload, so both copies survive.
 - **All inputs must be the same kind.** Either several `--input-dir` **or** several `--input-s3-bucket`, not a mix. Every input bucket shares one endpoint/region/credentials and one `--input-s3-prefix` (keep it empty for bucket-root datasets).
-- **Overlap is handled.** If the same `source=` appears in more than one input (e.g. two snapshots of one feed), those rows land in the same output partition and are deduplicated — the tool detects this case and forces the [dedup merge](#idempotent-re-runs-deduplication) even on a single output file, so one run yields a clean, duplicate-free result. When all sources are distinct (the common case), no such forcing happens and the merge stays cheap.
-- **`--source` and the partition-slice filters** apply to every input.
+- **Overlap is handled.** Because everything merges into shared time partitions, exact `(ts, payload)` duplicates — whether from re-runs, two snapshots of one feed, or two stations that produced byte-identical rows — are collapsed by the dedup merge.
+- **`--source` and the partition-slice filters** apply to every input (they still select on the input's `source=`/time layout).
 
 ## Idempotent re-runs (deduplication)
 

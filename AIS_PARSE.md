@@ -17,13 +17,18 @@ bucket, exactly like ais-normalize.
 
 ## What it produces
 
-Two sibling hive-partitioned datasets under the output root, mirroring the
-input's `source=`/time partitioning:
+Two sibling hive-partitioned datasets under the output root. The output is
+**not partitioned by source** — every source that falls in a time partition
+is decoded into it together, so downstream queries see one unified dataset:
 
 ```
-<output>/positions/source=X/year=YYYY/month=MM/day=DD/pos-....parquet
-<output>/statics/source=X/year=YYYY/month=MM/day=DD/stat-....parquet
+<output>/positions/year=YYYY/month=MM/day=DD/pos-....parquet
+<output>/statics/year=YYYY/month=MM/day=DD/stat-....parquet
 ```
+
+(The bronze input may still be `source=X/year=…`; ais-parse reads either
+layout. Each output time partition is rebuilt as a whole from all the sources
+that land in it, so the partition-replace re-run stays correct and race-free.)
 
 **`positions`** — one row per position report (AIS types 1–3, 18, 19, 27):
 
@@ -65,12 +70,15 @@ data still holds them, nothing is lost.
 ## Idempotent re-runs (partition replace)
 
 Decoding never re-partitions: a bronze row's corrected `ts` already places it
-in its partition, so each input partition maps 1:1 onto one `positions` and
-one `statics` output partition. ais-parse exploits that by **replacing** the
-output partitions it touches — new files are written first, then the prior
-run's files in those partitions are deleted (objects, for S3 output). Decoding
-is deterministic, so a re-run converges to the same result instead of
-accumulating duplicates. No dedup pass needed.
+in its output time partition. ais-parse **replaces** each output partition it
+touches — all the sources landing in that partition are decoded together into
+one `positions` and one `statics` file, written first, then the prior run's
+files in that partition are deleted (objects, for S3 output). Because the
+partition is rebuilt as a whole (not per source), and decoding is
+deterministic, a re-run converges to the same result instead of accumulating
+duplicates. No dedup pass needed. In `--incremental` mode a partition is
+rebuilt when *any* of its sources has a new file, re-reading that partition's
+other sources so the replaced partition stays complete.
 
 Don't run two instances against the same output concurrently (use
 `prohibit_overlap` in Nomad, as with the other batch tools).
@@ -82,6 +90,8 @@ sentences, which decode directly. Raw, un-normalized bronze data works too:
 the parser buffers `Incomplete` fragments and completes them when the matching
 part arrives (rows within a partition file are time-ordered, so pairs almost
 always meet). Fragments whose partner never arrives are counted `incomplete`.
+When a partition pools several sources, fragment state is reset at each source
+boundary so multi-part sequence ids can't collide across sources.
 
 ## Usage
 
@@ -136,7 +146,7 @@ for the shared semantics of each group:
 A quick way to eyeball decoded output:
 
 ```bash
-cargo run -p ais-parse --example dump -- silver/positions/source=x/year=2026/month=07/day=05/pos-....parquet
+cargo run -p ais-parse --example dump -- silver/positions/year=2026/month=07/day=05/pos-....parquet
 ```
 
 ## Deployment
