@@ -18,6 +18,8 @@ use nmea_parser::{NmeaParser, ParsedMessage};
 pub struct PositionRow {
     pub ts_ms: i64,
     pub source: String,
+    /// Source/base station from the NMEA tag block `s:` field, if present.
+    pub station: Option<String>,
     /// The AIS message type that produced this row (1/2/3/18/19/27).
     pub msg_type: u8,
     pub mmsi: u32,
@@ -38,6 +40,8 @@ pub struct PositionRow {
 pub struct StaticRow {
     pub ts_ms: i64,
     pub source: String,
+    /// Source/base station from the NMEA tag block `s:` field, if present.
+    pub station: Option<String>,
     /// The AIS message type that produced this row (5 or 24).
     pub msg_type: u8,
     pub mmsi: u32,
@@ -65,6 +69,8 @@ pub struct StaticRow {
 pub struct MeteoRow {
     pub ts_ms: i64,
     pub source: String,
+    /// Source/base station from the NMEA tag block `s:` field, if present.
+    pub station: Option<String>,
     /// The AIS message type that produced this row (always 8).
     pub msg_type: u8,
     pub mmsi: u32,
@@ -115,6 +121,8 @@ pub struct MeteoRow {
 pub struct BinaryRow {
     pub ts_ms: i64,
     pub source: String,
+    /// Source/base station from the NMEA tag block `s:` field, if present.
+    pub station: Option<String>,
     /// The AIS message type that produced this row (always 8).
     pub msg_type: u8,
     pub mmsi: u32,
@@ -141,21 +149,45 @@ pub enum Decoded {
     Failed,
 }
 
-/// Strip a leading NMEA 4.10 tag block (`\...\`) if present.
-fn strip_tag_block(payload: &str) -> &str {
+/// Split a leading NMEA 4.10 tag block (`\...\`) from the sentence, returning
+/// `(tag_body, sentence)`. `tag_body` is empty when there is no tag block.
+fn split_tag_block(payload: &str) -> (&str, &str) {
     if let Some(rest) = payload.strip_prefix('\\') {
         if let Some(end) = rest.find('\\') {
-            return &rest[end + 1..];
+            return (&rest[..end], &rest[end + 1..]);
         }
     }
-    payload
+    ("", payload)
+}
+
+/// Value of a single-letter tag-block field (e.g. `s` = source/base station),
+/// or `None` if absent. `tag_body` is the part between the two backslashes,
+/// e.g. `s:AIS_NOR,c:1620000000*5A`.
+fn tag_field<'a>(tag_body: &'a str, key: &str) -> Option<&'a str> {
+    let body = tag_body.split('*').next().unwrap_or(tag_body);
+    for field in body.split(',') {
+        if let Some(value) = field
+            .trim()
+            .strip_prefix(key)
+            .and_then(|rest| rest.strip_prefix(':'))
+        {
+            if !value.is_empty() {
+                return Some(value);
+            }
+        }
+    }
+    None
 }
 
 pub fn decode_payload(parser: &mut NmeaParser, ts_ms: i64, source: &str, payload: &str) -> Decoded {
-    let sentence = strip_tag_block(payload.trim());
+    let (tag_body, sentence) = split_tag_block(payload.trim());
     if sentence.is_empty() {
         return Decoded::Failed;
     }
+    // The NMEA tag block's `s:` field is the source/base station that received
+    // the message; retained as a column. Present on single sentences and, since
+    // ais-normalize preserves it, on combined multi-fragment sentences too.
+    let station = tag_field(tag_body, "s").map(str::to_string);
 
     // The message type is the first 6 bits of the AIS payload. It's read
     // directly (not via nmea-parser, which only reports a Class A/B category)
@@ -170,7 +202,7 @@ pub fn decode_payload(parser: &mut NmeaParser, ts_ms: i64, source: &str, payload
                 // Type 8 (Binary Broadcast) is not handled by nmea-parser, so
                 // decode it ourselves right here from the same bits.
                 if t == 8 {
-                    return (t, Some(decode_type8(ts_ms, source, &bits)));
+                    return (t, Some(decode_type8(ts_ms, source, station.clone(), &bits)));
                 }
                 (t, None)
             }),
@@ -183,12 +215,20 @@ pub fn decode_payload(parser: &mut NmeaParser, ts_ms: i64, source: &str, payload
     };
 
     match parser.parse_sentence(sentence) {
-        Ok(ParsedMessage::VesselDynamicData(vdd)) => {
-            Decoded::Position(Box::new(position_row(ts_ms, source, peeked_type, vdd)))
-        }
-        Ok(ParsedMessage::VesselStaticData(vsd)) => {
-            Decoded::Static(Box::new(static_row(ts_ms, source, peeked_type, vsd)))
-        }
+        Ok(ParsedMessage::VesselDynamicData(vdd)) => Decoded::Position(Box::new(position_row(
+            ts_ms,
+            source,
+            station,
+            peeked_type,
+            vdd,
+        ))),
+        Ok(ParsedMessage::VesselStaticData(vsd)) => Decoded::Static(Box::new(static_row(
+            ts_ms,
+            source,
+            station,
+            peeked_type,
+            vsd,
+        ))),
         Ok(ParsedMessage::Incomplete) => Decoded::Incomplete,
         Ok(_) => Decoded::Other,
         Err(_) => Decoded::Failed,
@@ -198,6 +238,7 @@ pub fn decode_payload(parser: &mut NmeaParser, ts_ms: i64, source: &str, payload
 fn position_row(
     ts_ms: i64,
     source: &str,
+    station: Option<String>,
     peeked_type: Option<u8>,
     vdd: VesselDynamicData,
 ) -> PositionRow {
@@ -210,6 +251,7 @@ fn position_row(
     PositionRow {
         ts_ms,
         source: source.to_string(),
+        station,
         msg_type,
         mmsi: vdd.mmsi,
         ais_class: vdd.ais_type.to_string(),
@@ -229,6 +271,7 @@ fn position_row(
 fn static_row(
     ts_ms: i64,
     source: &str,
+    station: Option<String>,
     peeked_type: Option<u8>,
     vsd: VesselStaticData,
 ) -> StaticRow {
@@ -244,6 +287,7 @@ fn static_row(
     StaticRow {
         ts_ms,
         source: source.to_string(),
+        station,
         msg_type,
         mmsi: vsd.mmsi,
         ais_class: vsd.ais_type.to_string(),
@@ -298,22 +342,23 @@ fn sal_opt(raw: u64, na_min: u64) -> Option<f64> {
     (raw < na_min).then_some(raw as f64 / 10.0)
 }
 
-fn decode_type8(ts_ms: i64, source: &str, b: &Bits) -> Decoded {
+fn decode_type8(ts_ms: i64, source: &str, station: Option<String>, b: &Bits) -> Decoded {
     let mmsi = b.u(8, 30) as u32;
     let dac = b.u(40, 10) as u16;
     let fid = b.u(50, 6) as u8;
     match (dac, fid) {
         (1, 31) if b.len() >= 360 => Decoded::Meteo(Box::new(decode_meteo_fid31(
-            ts_ms, source, mmsi, dac, fid, b,
+            ts_ms, source, station, mmsi, dac, fid, b,
         ))),
         (1, 11) if b.len() >= 352 => Decoded::Meteo(Box::new(decode_meteo_fid11(
-            ts_ms, source, mmsi, dac, fid, b,
+            ts_ms, source, station, mmsi, dac, fid, b,
         ))),
         // Any other DAC/FID (or a truncated met/hydro): keep the header and the
         // application payload as hex so nothing is lost.
         _ => Decoded::Binary(Box::new(BinaryRow {
             ts_ms,
             source: source.to_string(),
+            station,
             msg_type: 8,
             mmsi,
             dac,
@@ -325,9 +370,11 @@ fn decode_type8(ts_ms: i64, source: &str, b: &Bits) -> Decoded {
 }
 
 /// IMO289 (current) Met/Hydro, DAC=1 FID=31, 360 bits.
+#[allow(clippy::too_many_arguments)]
 fn decode_meteo_fid31(
     ts_ms: i64,
     source: &str,
+    station: Option<String>,
     mmsi: u32,
     dac: u16,
     fid: u8,
@@ -336,6 +383,7 @@ fn decode_meteo_fid31(
     MeteoRow {
         ts_ms,
         source: source.to_string(),
+        station,
         msg_type: 8,
         mmsi,
         dac,
@@ -385,9 +433,11 @@ fn decode_meteo_fid31(
 /// FID=31 but a different layout: lat before lon, unsigned offset-encoded
 /// temperatures, direction sentinel 511 (not 360), no position-accuracy or
 /// visibility-greater fields.
+#[allow(clippy::too_many_arguments)]
 fn decode_meteo_fid11(
     ts_ms: i64,
     source: &str,
+    station: Option<String>,
     mmsi: u32,
     dac: u16,
     fid: u8,
@@ -396,6 +446,7 @@ fn decode_meteo_fid11(
     MeteoRow {
         ts_ms,
         source: source.to_string(),
+        station,
         msg_type: 8,
         mmsi,
         dac,
@@ -446,17 +497,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn strips_tag_blocks() {
-        assert_eq!(
-            strip_tag_block(r"\c:1241544035*1D\!AIVDM,1,1,,B,15N4,0*00"),
-            "!AIVDM,1,1,,B,15N4,0*00"
-        );
-        assert_eq!(
-            strip_tag_block("!AIVDM,1,1,,B,15N4,0*00"),
-            "!AIVDM,1,1,,B,15N4,0*00"
-        );
-        // Unterminated tag block falls through unchanged.
-        assert_eq!(strip_tag_block(r"\c:12345"), r"\c:12345");
+    fn splits_tag_blocks_and_reads_station() {
+        let (tag, sentence) =
+            split_tag_block(r"\s:AIS_NOR,c:1241544035*1D\!AIVDM,1,1,,B,15N4,0*00");
+        assert_eq!(sentence, "!AIVDM,1,1,,B,15N4,0*00");
+        assert_eq!(tag_field(tag, "s"), Some("AIS_NOR"));
+        assert_eq!(tag_field(tag, "c"), Some("1241544035"));
+        assert_eq!(tag_field(tag, "d"), None);
+
+        // No tag block: whole payload is the sentence, no station.
+        let (tag, sentence) = split_tag_block("!AIVDM,1,1,,B,15N4,0*00");
+        assert_eq!(sentence, "!AIVDM,1,1,,B,15N4,0*00");
+        assert_eq!(tag_field(tag, "s"), None);
+
+        // Unterminated tag block falls through as the sentence unchanged.
+        let (tag, sentence) = split_tag_block(r"\c:12345");
+        assert_eq!(tag, "");
+        assert_eq!(sentence, r"\c:12345");
     }
 
     #[test]
@@ -619,11 +676,12 @@ mod tests {
     #[test]
     fn decodes_fid31_met_hydro_fields() {
         let bits = fid31_sample().into_bits();
-        let out = decode_type8(1_700_000_000_000, "norway", &bits);
+        let out = decode_type8(1_700_000_000_000, "norway", Some("AIS_NOR".into()), &bits);
         let Decoded::Meteo(m) = out else {
             panic!("expected a meteo row");
         };
         assert_eq!(m.msg_type, 8);
+        assert_eq!(m.station.as_deref(), Some("AIS_NOR"));
         assert_eq!(m.mmsi, 2_655_619);
         assert_eq!(m.dac, 1);
         assert_eq!(m.fid, 31);
@@ -691,7 +749,7 @@ mod tests {
         p.push(22, 6); // fid (not met/hydro)
         p.push(0xABCD, 40); // some application data
         let bits = p.into_bits();
-        match decode_type8(7, "s", &bits) {
+        match decode_type8(7, "s", None, &bits) {
             Decoded::Binary(b) => {
                 assert_eq!(b.mmsi, 123_456_789);
                 assert_eq!(b.dac, 1);
@@ -715,6 +773,9 @@ mod tests {
         p.push(31, 6);
         p.push(0, 20);
         let bits = p.into_bits();
-        assert!(matches!(decode_type8(0, "s", &bits), Decoded::Binary(_)));
+        assert!(matches!(
+            decode_type8(0, "s", None, &bits),
+            Decoded::Binary(_)
+        ));
     }
 }

@@ -43,6 +43,7 @@ stays correct and race-free.
 | `ts` | timestamp (ms, UTC) | the row's corrected bronze timestamp |
 | `source` | utf8 | origin feed label (from the input's `source` column, or its `source=` partition when reading raw bronze) |
 | `msg_type` | uint8 | the AIS message type that produced the row (1/2/3/18/19/27) |
+| `station` | utf8, nullable | source/base station from the NMEA tag block `s:` field, if present |
 | `mmsi` | uint32 | |
 | `ais_class` | utf8 | `Class A` / `Class B` |
 | `latitude`, `longitude` | float64, nullable | WGS-84 degrees |
@@ -59,7 +60,7 @@ stays correct and race-free.
 
 | Column | Type | Notes |
 |--------|------|-------|
-| `ts`, `source`, `ais_class` | as above | |
+| `ts`, `source`, `station`, `ais_class` | as above | |
 | `msg_type` | uint8 | the AIS message type (5 or 24) |
 | `mmsi` | uint32 | |
 | `imo_number` | uint32, nullable | |
@@ -108,8 +109,19 @@ ais-parse decodes the 6-bit payload itself. Two output datasets result:
   application payload retained as `payload_hex` (+ `payload_bits`), so nothing
   is lost and unrecognized subtypes can be decoded downstream later.
 
-Both datasets carry the same `ts`, `source`, and `msg_type` columns as the
-others (`msg_type` is 8 for every Type 8 row) and are partitioned by time only.
+Both datasets carry the same `ts`, `source`, `station`, and `msg_type` columns
+as the others (`msg_type` is 8 for every Type 8 row) and are partitioned by
+time only.
+
+### Tag block / base station
+
+Every dataset includes a **`station`** column carrying the NMEA 4.10 tag-block
+`s:` field — the source/base station (receiver) that reported the message —
+when the feed provides it. It is read from the tag block on single sentences,
+and ais-normalize preserves it into the rebuilt tag block when it combines
+multi-fragment messages, so combined statics keep their station too. Other tag
+fields (`d:`, `n:`, `r:`, `g:`, `t:`) are not currently extracted; only
+`c:` (used as `ts`) and `s:` are.
 
 Multi-fragment Type 8 messages (up to 5 sentences) are decoded once
 **ais-normalize has combined them** into a single sentence — the normal

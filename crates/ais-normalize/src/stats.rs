@@ -29,7 +29,10 @@ impl NormalizeStats {
         eprintln!("  re-partitioned       : {}", self.repartitioned_rows);
         eprintln!("  combined messages    : {}", self.combined_messages);
         if self.incomplete_groups > 0 {
-            eprintln!("  incomplete groups    : {} (emitted as-is)", self.incomplete_groups);
+            eprintln!(
+                "  incomplete groups    : {} (emitted as-is)",
+                self.incomplete_groups
+            );
         }
     }
 }

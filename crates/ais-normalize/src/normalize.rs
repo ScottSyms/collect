@@ -1,6 +1,6 @@
 use crate::parse::{
     combine_ais_fragments, parse_ais_sentence_metadata, parse_pghp_timestamp_ms,
-    parse_tag_block_timestamp_ms, split_tag_block,
+    parse_tag_block_field, parse_tag_block_timestamp_ms, split_tag_block,
 };
 use crate::stats::NormalizeStats;
 use collect_core::dataset::PartitionKey;
@@ -245,10 +245,18 @@ impl PartitionProcessor {
                 slots[fragment_number] = Some(sentence.to_string());
                 received_count = 1;
             }
-            // The rebuilt tag block for a combined sentence carries only
-            // the c: timestamp; g: grouping describes the original
-            // fragmentation, which no longer applies once combined.
-            let tag_block = tag_block_ts.map(|t| format!("c:{}", t / 1_000));
+            // The rebuilt tag block for a combined sentence carries the c:
+            // timestamp and the s: source/base station (preserved from the
+            // first fragment so downstream can attribute the message); g:
+            // grouping describes the original fragmentation, which no longer
+            // applies once combined.
+            let station = parse_tag_block_field(tag_prefix, "s");
+            let tag_block = match (tag_block_ts, station) {
+                (Some(t), Some(s)) => Some(format!("c:{},s:{}", t / 1_000, s)),
+                (Some(t), None) => Some(format!("c:{}", t / 1_000)),
+                (None, Some(s)) => Some(format!("s:{}", s)),
+                (None, None) => None,
+            };
             self.fragment_groups.insert(
                 group_key,
                 FragmentGroup {

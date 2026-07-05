@@ -67,6 +67,7 @@ fn positions_schema() -> Arc<Schema> {
         Field::new("high_accuracy", DataType::Boolean, false),
         Field::new("raim", DataType::Boolean, false),
         Field::new("special_manoeuvre", DataType::Boolean, true),
+        Field::new("station", DataType::Utf8, true),
     ]))
 }
 
@@ -89,6 +90,7 @@ fn statics_schema() -> Arc<Schema> {
         Field::new("destination", DataType::Utf8, true),
         ts_field("eta", true),
         Field::new("mothership_mmsi", DataType::UInt32, true),
+        Field::new("station", DataType::Utf8, true),
     ]))
 }
 
@@ -151,6 +153,7 @@ fn meteo_schema() -> Arc<Schema> {
         u8n("precipitation_type"),
         f64n("salinity_pct"),
         u8n("ice"),
+        Field::new("station", DataType::Utf8, true),
     ]))
 }
 
@@ -164,6 +167,7 @@ fn binary_schema() -> Arc<Schema> {
         Field::new("fid", DataType::UInt8, false),
         Field::new("payload_hex", DataType::Utf8, false),
         Field::new("payload_bits", DataType::UInt32, false),
+        Field::new("station", DataType::Utf8, true),
     ]))
 }
 
@@ -248,6 +252,7 @@ pub struct PositionsWriter {
     high_accuracy: BooleanBuilder,
     raim: BooleanBuilder,
     special_manoeuvre: BooleanBuilder,
+    station: StringBuilder,
 }
 
 impl PositionsWriter {
@@ -269,6 +274,7 @@ impl PositionsWriter {
             high_accuracy: BooleanBuilder::new(),
             raim: BooleanBuilder::new(),
             special_manoeuvre: BooleanBuilder::new(),
+            station: StringBuilder::new(),
         }
     }
 
@@ -288,6 +294,7 @@ impl PositionsWriter {
         self.high_accuracy.append_value(row.high_accuracy);
         self.raim.append_value(row.raim);
         self.special_manoeuvre.append_option(row.special_manoeuvre);
+        self.station.append_option(row.station.as_deref());
         if self.ts.len() >= FLUSH_BATCH_ROWS {
             self.flush()?;
         }
@@ -314,6 +321,7 @@ impl PositionsWriter {
             Arc::new(self.high_accuracy.finish()),
             Arc::new(self.raim.finish()),
             Arc::new(self.special_manoeuvre.finish()),
+            Arc::new(self.station.finish()),
         ];
         // The builder was created without a timezone after finish(); rebuild
         // consistency by constructing the batch against the schema.
@@ -347,6 +355,7 @@ pub struct StaticsWriter {
     destination: StringBuilder,
     eta: TimestampMillisecondBuilder,
     mothership_mmsi: UInt32Builder,
+    station: StringBuilder,
 }
 
 impl StaticsWriter {
@@ -370,6 +379,7 @@ impl StaticsWriter {
             destination: StringBuilder::new(),
             eta: TimestampMillisecondBuilder::new().with_timezone("UTC"),
             mothership_mmsi: UInt32Builder::new(),
+            station: StringBuilder::new(),
         }
     }
 
@@ -393,6 +403,7 @@ impl StaticsWriter {
         self.destination.append_option(row.destination.as_deref());
         self.eta.append_option(row.eta_ms);
         self.mothership_mmsi.append_option(row.mothership_mmsi);
+        self.station.append_option(row.station.as_deref());
         if self.ts.len() >= FLUSH_BATCH_ROWS {
             self.flush()?;
         }
@@ -421,6 +432,7 @@ impl StaticsWriter {
             Arc::new(self.destination.finish()),
             Arc::new(self.eta.finish()),
             Arc::new(self.mothership_mmsi.finish()),
+            Arc::new(self.station.finish()),
         ];
         let batch = RecordBatch::try_new(self.sink.schema.clone(), columns)
             .context("assembling statics batch")?;
@@ -524,6 +536,9 @@ impl MeteoWriter {
             u8_col(r, |x| x.precipitation_type),
             f64_col(r, |x| x.salinity_pct),
             u8_col(r, |x| x.ice),
+            Arc::new(StringArray::from(
+                r.iter().map(|x| x.station.as_deref()).collect::<Vec<_>>(),
+            )),
         ];
         let batch = RecordBatch::try_new(self.sink.schema.clone(), columns)
             .context("assembling meteo batch")?;
@@ -590,6 +605,9 @@ impl BinaryWriter {
             Arc::new(UInt32Array::from(
                 r.iter().map(|x| x.payload_bits).collect::<Vec<_>>(),
             )),
+            Arc::new(StringArray::from(
+                r.iter().map(|x| x.station.as_deref()).collect::<Vec<_>>(),
+            )),
         ];
         let batch = RecordBatch::try_new(self.sink.schema.clone(), columns)
             .context("assembling binary batch")?;
@@ -648,6 +666,7 @@ mod tests {
         PositionRow {
             ts_ms,
             source: "norway".into(),
+            station: Some("AIS_NOR".into()),
             msg_type: 1,
             mmsi,
             ais_class: "ClassA".into(),
@@ -738,6 +757,7 @@ mod tests {
             .write(&StaticRow {
                 ts_ms: 1_700_000_000_000,
                 source: "norway".into(),
+                station: None,
                 msg_type: 5,
                 mmsi: 366_998_410,
                 ais_class: "ClassA".into(),
