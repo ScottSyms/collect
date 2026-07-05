@@ -11,13 +11,15 @@
 //! which it usually does because rows within a partition file are ts-sorted.
 
 use crate::ais_bits::{extract_ais_payload, Bits};
-use nmea_parser::ais::{VesselDynamicData, VesselStaticData};
+use nmea_parser::ais::{AisClass, VesselDynamicData, VesselStaticData};
 use nmea_parser::{NmeaParser, ParsedMessage};
 
 /// One decoded position report (AIS types 1-3, 18, 19, 27).
 pub struct PositionRow {
     pub ts_ms: i64,
     pub source: String,
+    /// The AIS message type that produced this row (1/2/3/18/19/27).
+    pub msg_type: u8,
     pub mmsi: u32,
     pub ais_class: String,
     pub latitude: Option<f64>,
@@ -36,6 +38,8 @@ pub struct PositionRow {
 pub struct StaticRow {
     pub ts_ms: i64,
     pub source: String,
+    /// The AIS message type that produced this row (5 or 24).
+    pub msg_type: u8,
     pub mmsi: u32,
     pub ais_class: String,
     pub imo_number: Option<u32>,
@@ -61,6 +65,8 @@ pub struct StaticRow {
 pub struct MeteoRow {
     pub ts_ms: i64,
     pub source: String,
+    /// The AIS message type that produced this row (always 8).
+    pub msg_type: u8,
     pub mmsi: u32,
     pub dac: u16,
     pub fid: u8,
@@ -109,6 +115,8 @@ pub struct MeteoRow {
 pub struct BinaryRow {
     pub ts_ms: i64,
     pub source: String,
+    /// The AIS message type that produced this row (always 8).
+    pub msg_type: u8,
     pub mmsi: u32,
     pub dac: u16,
     pub fid: u8,
@@ -149,27 +157,37 @@ pub fn decode_payload(parser: &mut NmeaParser, ts_ms: i64, source: &str, payload
         return Decoded::Failed;
     }
 
-    // Type 8 (Binary Broadcast) is not handled by nmea-parser, so decode it
-    // ourselves. Only attempt it on a single/combined sentence — a raw
-    // multi-fragment Type 8 (count > 1) has a partial payload and is left to
-    // the parser path (the pipeline normalizes/combines first, so the primary
-    // input is single-sentence).
-    if let Some(p) = extract_ais_payload(sentence) {
-        if p.fragment_count == 1 {
-            if let Some(bits) = Bits::from_armored(p.armored, p.fill_bits) {
-                if bits.len() >= 6 && bits.u(0, 6) == 8 {
-                    return decode_type8(ts_ms, source, &bits);
+    // The message type is the first 6 bits of the AIS payload. It's read
+    // directly (not via nmea-parser, which only reports a Class A/B category)
+    // so a row can be tagged with its exact type (1 vs 2 vs 3, ...). Only a
+    // single/combined sentence carries the type in its first fragment; for a
+    // raw multi-fragment message we fall back to the decoded variant's class.
+    let peeked_type = match extract_ais_payload(sentence) {
+        Some(p) if p.fragment_count == 1 => Bits::from_armored(p.armored, p.fill_bits)
+            .filter(|bits| bits.len() >= 6)
+            .map(|bits| {
+                let t = bits.u(0, 6) as u8;
+                // Type 8 (Binary Broadcast) is not handled by nmea-parser, so
+                // decode it ourselves right here from the same bits.
+                if t == 8 {
+                    return (t, Some(decode_type8(ts_ms, source, &bits)));
                 }
-            }
-        }
-    }
+                (t, None)
+            }),
+        _ => None,
+    };
+    let peeked_type = match peeked_type {
+        Some((_, Some(decoded))) => return decoded,
+        Some((t, None)) => Some(t),
+        None => None,
+    };
 
     match parser.parse_sentence(sentence) {
         Ok(ParsedMessage::VesselDynamicData(vdd)) => {
-            Decoded::Position(Box::new(position_row(ts_ms, source, vdd)))
+            Decoded::Position(Box::new(position_row(ts_ms, source, peeked_type, vdd)))
         }
         Ok(ParsedMessage::VesselStaticData(vsd)) => {
-            Decoded::Static(Box::new(static_row(ts_ms, source, vsd)))
+            Decoded::Static(Box::new(static_row(ts_ms, source, peeked_type, vsd)))
         }
         Ok(ParsedMessage::Incomplete) => Decoded::Incomplete,
         Ok(_) => Decoded::Other,
@@ -177,10 +195,22 @@ pub fn decode_payload(parser: &mut NmeaParser, ts_ms: i64, source: &str, payload
     }
 }
 
-fn position_row(ts_ms: i64, source: &str, vdd: VesselDynamicData) -> PositionRow {
+fn position_row(
+    ts_ms: i64,
+    source: &str,
+    peeked_type: Option<u8>,
+    vdd: VesselDynamicData,
+) -> PositionRow {
+    // Position reports are single-fragment, so `peeked_type` is essentially
+    // always present; the class-based fallback only guards raw multi-fragment.
+    let msg_type = peeked_type.unwrap_or(match vdd.ais_type {
+        AisClass::ClassB => 18,
+        _ => 1,
+    });
     PositionRow {
         ts_ms,
         source: source.to_string(),
+        msg_type,
         mmsi: vdd.mmsi,
         ais_class: vdd.ais_type.to_string(),
         latitude: vdd.latitude,
@@ -196,10 +226,25 @@ fn position_row(ts_ms: i64, source: &str, vdd: VesselDynamicData) -> PositionRow
     }
 }
 
-fn static_row(ts_ms: i64, source: &str, vsd: VesselStaticData) -> StaticRow {
+fn static_row(
+    ts_ms: i64,
+    source: &str,
+    peeked_type: Option<u8>,
+    vsd: VesselStaticData,
+) -> StaticRow {
+    // Static reports are 2-fragment; a combined/normalized sentence peeks as
+    // 5 or 24, but a raw completing fragment peeks as junk — fall back to the
+    // class (Class A static = type 5, Class B static = type 24).
+    let msg_type = peeked_type
+        .filter(|t| *t == 5 || *t == 24)
+        .unwrap_or(match vsd.ais_type {
+            AisClass::ClassB => 24,
+            _ => 5,
+        });
     StaticRow {
         ts_ms,
         source: source.to_string(),
+        msg_type,
         mmsi: vsd.mmsi,
         ais_class: vsd.ais_type.to_string(),
         imo_number: vsd.imo_number,
@@ -269,6 +314,7 @@ fn decode_type8(ts_ms: i64, source: &str, b: &Bits) -> Decoded {
         _ => Decoded::Binary(Box::new(BinaryRow {
             ts_ms,
             source: source.to_string(),
+            msg_type: 8,
             mmsi,
             dac,
             fid,
@@ -290,6 +336,7 @@ fn decode_meteo_fid31(
     MeteoRow {
         ts_ms,
         source: source.to_string(),
+        msg_type: 8,
         mmsi,
         dac,
         fid,
@@ -349,6 +396,7 @@ fn decode_meteo_fid11(
     MeteoRow {
         ts_ms,
         source: source.to_string(),
+        msg_type: 8,
         mmsi,
         dac,
         fid,
@@ -425,6 +473,7 @@ mod tests {
             Decoded::Position(row) => {
                 assert_eq!(row.ts_ms, 1_700_000_000_000);
                 assert_eq!(row.source, "norway");
+                assert_eq!(row.msg_type, 1, "type-1 position report");
                 assert_eq!(row.mmsi, 371_798_000);
                 let lat = row.latitude.expect("latitude");
                 let lon = row.longitude.expect("longitude");
@@ -480,6 +529,11 @@ mod tests {
             Decoded::Static(row) => {
                 assert_eq!(row.mmsi, 369_190_000);
                 assert!(row.name.is_some());
+                // Raw 2-fragment static: the completing fragment carries no
+                // type, so msg_type falls back to the decoded class (a static
+                // type, 5 or 24). The exact value needs combined/normalized
+                // input — the pipeline's normal path.
+                assert!(matches!(row.msg_type, 5 | 24), "got {}", row.msg_type);
             }
             _ => panic!("second fragment should complete the static message"),
         }
@@ -569,6 +623,7 @@ mod tests {
         let Decoded::Meteo(m) = out else {
             panic!("expected a meteo row");
         };
+        assert_eq!(m.msg_type, 8);
         assert_eq!(m.mmsi, 2_655_619);
         assert_eq!(m.dac, 1);
         assert_eq!(m.fid, 31);

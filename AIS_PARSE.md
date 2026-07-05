@@ -42,6 +42,7 @@ stays correct and race-free.
 |--------|------|-------|
 | `ts` | timestamp (ms, UTC) | the row's corrected bronze timestamp |
 | `source` | utf8 | origin feed label (from the input's `source` column, or its `source=` partition when reading raw bronze) |
+| `msg_type` | uint8 | the AIS message type that produced the row (1/2/3/18/19/27) |
 | `mmsi` | uint32 | |
 | `ais_class` | utf8 | `Class A` / `Class B` |
 | `latitude`, `longitude` | float64, nullable | WGS-84 degrees |
@@ -58,7 +59,9 @@ stays correct and race-free.
 
 | Column | Type | Notes |
 |--------|------|-------|
-| `ts`, `source`, `mmsi`, `ais_class` | as above | |
+| `ts`, `source`, `ais_class` | as above | |
+| `msg_type` | uint8 | the AIS message type (5 or 24) |
+| `mmsi` | uint32 | |
 | `imo_number` | uint32, nullable | |
 | `call_sign`, `name` | utf8, nullable | |
 | `ship_type` | utf8 | |
@@ -105,8 +108,8 @@ ais-parse decodes the 6-bit payload itself. Two output datasets result:
   application payload retained as `payload_hex` (+ `payload_bits`), so nothing
   is lost and unrecognized subtypes can be decoded downstream later.
 
-Both datasets carry the same `ts` and `source` columns as the others and are
-partitioned by time only.
+Both datasets carry the same `ts`, `source`, and `msg_type` columns as the
+others (`msg_type` is 8 for every Type 8 row) and are partitioned by time only.
 
 Multi-fragment Type 8 messages (up to 5 sentences) are decoded once
 **ais-normalize has combined them** into a single sentence — the normal
