@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use chrono::{Datelike, TimeZone, Utc};
 use collect_core::{PartitionGranularity, S3Storage};
 use futures_util::stream::{self, StreamExt};
 use std::path::{Path, PathBuf};
@@ -93,6 +94,20 @@ impl PartitionKey {
         parts.join("/")
     }
 
+    /// Millisecond bounds `[start, end)` of this partition's time period.
+    pub fn period_bounds_ms(&self) -> (i64, i64) {
+        // Turn the partition's own components back into the instant at its
+        // start, then let the granularity compute the matching period width
+        // (calendar-correct for month/year). Fall back to the epoch if the
+        // components somehow don't form a valid date.
+        let start_ms = Utc
+            .with_ymd_and_hms(self.year, self.month, self.day, self.hour, self.minute, 0)
+            .single()
+            .map(|dt| dt.timestamp_millis())
+            .unwrap_or(0);
+        self.granularity.period_bounds_ms(start_ms)
+    }
+
     /// Chronological sort key.
     pub fn sort_key(&self) -> (i32, u32, u32, u32, u32, &str) {
         (
@@ -110,10 +125,24 @@ fn parse_kv<'a>(segment: &'a str, key: &str) -> Option<&'a str> {
     segment.strip_prefix(key).and_then(|s| s.strip_prefix('='))
 }
 
+/// UTC calendar year of a millisecond timestamp; clamps to `i32::MIN` on the
+/// impossible out-of-range case so year pruning stays conservative (keeps).
+fn year_of_ms(ms: i64) -> i32 {
+    Utc.timestamp_millis_opt(ms)
+        .single()
+        .map(|dt| dt.year())
+        .unwrap_or(i32::MIN)
+}
+
 /// Optional partition-boundary selection: process only partitions whose
 /// components match every specified value. Components are hierarchical —
 /// specifying `month` without `year` would match that month in every year,
 /// which is almost never intended, so `validate` rejects gaps.
+///
+/// `since_ms` is an alternative, rolling selection: a partition matches when
+/// its time period extends past that UTC-millisecond cutoff (i.e. it can hold
+/// data from the window `[cutoff, now]`). It is mutually exclusive with the
+/// fixed `year`..`minute` components.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PartitionFilter {
     pub year: Option<i32>,
@@ -121,6 +150,7 @@ pub struct PartitionFilter {
     pub day: Option<u32>,
     pub hour: Option<u32>,
     pub minute: Option<u32>,
+    pub since_ms: Option<i64>,
 }
 
 impl PartitionFilter {
@@ -130,10 +160,23 @@ impl PartitionFilter {
             && self.day.is_none()
             && self.hour.is_none()
             && self.minute.is_none()
+            && self.since_ms.is_none()
     }
 
     /// Reject gaps in the hierarchy and components finer than the dataset layout.
     pub fn validate(&self, granularity: PartitionGranularity) -> Result<()> {
+        if self.since_ms.is_some()
+            && (self.year.is_some()
+                || self.month.is_some()
+                || self.day.is_some()
+                || self.hour.is_some()
+                || self.minute.is_some())
+        {
+            anyhow::bail!(
+                "--since selects a rolling time window and cannot be combined with the fixed \
+                 --year/--month/--day/--hour/--minute partition components"
+            );
+        }
         let chain = [
             ("--year", self.year.is_some(), 1usize),
             ("--month", self.month.is_some(), 2),
@@ -167,6 +210,12 @@ impl PartitionFilter {
             && self.day.is_none_or(|d| key.day == d)
             && self.hour.is_none_or(|h| key.hour == h)
             && self.minute.is_none_or(|m| key.minute == m)
+            // A partition is "within the last N hours" when its period ends
+            // after the cutoff — that keeps the partition holding the cutoff
+            // instant plus every later one.
+            && self
+                .since_ms
+                .is_none_or(|cutoff| key.period_bounds_ms().1 > cutoff)
     }
 
     /// The Hive path fragment covered by this filter (e.g.
@@ -197,10 +246,18 @@ impl PartitionFilter {
     /// matching partitions. Unknown segment shapes are conservatively kept.
     fn dir_segment_may_match(&self, segment: &str) -> bool {
         if let Some(value) = parse_kv(segment, "year") {
-            return match (value.parse::<i32>(), self.year) {
-                (Ok(parsed), Some(wanted)) => parsed == wanted,
-                _ => true,
-            };
+            if let Ok(parsed) = value.parse::<i32>() {
+                if let Some(wanted) = self.year {
+                    return parsed == wanted;
+                }
+                // For a rolling --since window we can still prune whole years
+                // that ended before the cutoff. Finer segments need their
+                // parent's context to prune safely, so `matches` handles those.
+                if let Some(cutoff) = self.since_ms {
+                    return parsed >= year_of_ms(cutoff);
+                }
+            }
+            return true;
         }
         for (key, wanted) in [
             ("month", self.month),
@@ -578,6 +635,60 @@ mod tests {
         assert!(!filter.matches(&day_key("a", 2026, 6, 1)));
         assert!(!filter.matches(&day_key("a", 2025, 7, 1)));
         assert!(PartitionFilter::default().matches(&day_key("a", 1999, 1, 1)));
+    }
+
+    #[test]
+    fn since_matches_partitions_whose_period_ends_after_cutoff() {
+        // Cutoff at 2026-07-04 12:00:00 UTC.
+        let cutoff = Utc
+            .with_ymd_and_hms(2026, 7, 4, 12, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let filter = PartitionFilter {
+            since_ms: Some(cutoff),
+            ..Default::default()
+        };
+        // Same day as the cutoff: its period ends 2026-07-05 00:00 > cutoff.
+        assert!(filter.matches(&day_key("a", 2026, 7, 4)));
+        // Later day: kept.
+        assert!(filter.matches(&day_key("a", 2026, 7, 5)));
+        // Earlier day: its period ended 2026-07-04 00:00 <= cutoff, dropped.
+        assert!(!filter.matches(&day_key("a", 2026, 7, 3)));
+    }
+
+    #[test]
+    fn since_prunes_years_before_the_cutoff_year() {
+        let cutoff = Utc
+            .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let filter = PartitionFilter {
+            since_ms: Some(cutoff),
+            ..Default::default()
+        };
+        assert!(!filter.dir_segment_may_match("year=2025"));
+        assert!(filter.dir_segment_may_match("year=2026"));
+        assert!(filter.dir_segment_may_match("year=2027"));
+        // Finer segments can't be pruned without parent context: kept.
+        assert!(filter.dir_segment_may_match("month=01"));
+    }
+
+    #[test]
+    fn since_is_mutually_exclusive_with_fixed_components() {
+        let filter = PartitionFilter {
+            year: Some(2026),
+            since_ms: Some(0),
+            ..Default::default()
+        };
+        assert!(filter.validate(PartitionGranularity::Day).is_err());
+
+        let ok = PartitionFilter {
+            since_ms: Some(0),
+            ..Default::default()
+        };
+        assert!(ok.validate(PartitionGranularity::Day).is_ok());
     }
 
     #[test]

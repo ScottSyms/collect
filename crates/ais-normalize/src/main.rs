@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use arrow::array::{StringArray, TimestampMillisecondArray};
+use chrono::TimeZone;
 use clap::Parser;
 use collect_core::{PartitionGranularity, S3Storage};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -104,6 +105,12 @@ struct Args {
     #[arg(long, value_parser = clap::value_parser!(u32).range(0..=59))]
     minute: Option<u32>,
 
+    /// Process only partitions holding data from the last N hours (rolling
+    /// window from now, UTC). Ideal for an hourly cron re-run; mutually
+    /// exclusive with the fixed --year/--month/--day/--hour/--minute filters
+    #[arg(long, value_name = "HOURS")]
+    since: Option<u64>,
+
     /// Apply changes; dry-run by default
     #[arg(long)]
     apply: bool,
@@ -148,6 +155,13 @@ impl Args {
         if self.input_s3_prefix.is_empty() {
             if let Ok(value) = std::env::var("INPUT_S3_PREFIX") {
                 self.input_s3_prefix = value;
+            }
+        }
+        if self.since.is_none() {
+            if let Ok(value) = std::env::var("SINCE_HOURS") {
+                if let Ok(hours) = value.trim().parse::<u64>() {
+                    self.since = Some(hours);
+                }
             }
         }
         if self.output_dir.is_none() && self.output_s3_bucket.is_none() {
@@ -294,14 +308,32 @@ async fn main() -> Result<()> {
         _ => {}
     }
 
+    // A --since window is a rolling cutoff relative to "now": include every
+    // partition whose period ends after now - N hours. Saturating so an absurd
+    // N can't overflow the millisecond arithmetic.
+    let since_ms = args.since.map(|hours| {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        now_ms.saturating_sub((hours as i64).saturating_mul(3_600_000))
+    });
+
     let partition_filter = dataset::PartitionFilter {
         year: args.year,
         month: args.month,
         day: args.day,
         hour: args.hour,
         minute: args.minute,
+        since_ms,
     };
     partition_filter.validate(args.partition)?;
+
+    if let (Some(hours), Some(cutoff)) = (args.since, since_ms) {
+        let cutoff_label = chrono::Utc
+            .timestamp_millis_opt(cutoff)
+            .single()
+            .map(|dt| dt.to_rfc3339())
+            .unwrap_or_else(|| format!("{cutoff}ms"));
+        eprintln!("Processing partitions from the last {hours}h (since {cutoff_label}).");
+    }
 
     // Dedup only makes sense when we are actually writing output.
     let dedup_enabled = args.dedup && !dry_run;

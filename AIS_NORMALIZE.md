@@ -63,6 +63,7 @@ Rows that aren't AIS `VDM`/`VDO` sentences (heartbeats, other NMEA talkers, etc.
 | `--day` | *(all days)* | Narrow to one day; requires `--month` |
 | `--hour` | *(all hours)* | Narrow to one hour; requires `--day` and an `hour`-or-finer layout |
 | `--minute` | *(all minutes)* | Narrow to one minute; requires `--hour` and a `minute` layout |
+| `--since <HOURS>` | *(off)* | Process only partitions holding data from the last N hours (rolling window from now, UTC); env `SINCE_HOURS`. Mutually exclusive with `--year`…`--minute`. See [incremental hourly runs](#incremental-hourly-runs---since) |
 | `--apply` | off (dry run) | Actually write output; omit to preview only |
 | `--batch-size` | `8192` | Rows per Parquet read batch |
 | `--compression-level` | `5` | Zstd level for output files |
@@ -117,6 +118,30 @@ Rules and behavior:
 - A component finer than the dataset layout (e.g. `--hour` on a `--partition day` dataset) is rejected.
 - The selection is a *partition* filter, applied to where rows were **read from** — a row inside a selected partition whose corrected timestamp moves it elsewhere is still written to its correct output partition.
 - The filter is pushed down as far as possible: on local disk the directory walk prunes non-matching subtrees without descending into them, and on S3 — when `--source` is also given — it is folded into the LIST prefix (`source=X/year=Y/month=M/...`), so slicing one day out of a multi-year bucket lists only that day's keys. Without `--source`, S3 listing covers the whole prefix and filters client-side (the tool prints a hint when this happens).
+
+## Incremental hourly runs (`--since`)
+
+`--since <HOURS>` selects a **rolling** window instead of a fixed calendar slice: it processes every partition whose time period extends past `now − N hours`. This is the natural fit for a cron/systemd timer that runs the tool every hour or two and only wants to touch the partitions that recently gained data:
+
+```bash
+# Every run: normalize whatever arrived in the last 2 hours
+cargo run -p ais-normalize -- \
+  --input-s3-bucket raw-ais --output-s3-bucket normalized-ais \
+  --s3-endpoint http://minio:9000 --s3-access-key … --s3-secret-key … --s3-disable-tls \
+  --partition day --since 2 --apply
+
+# Env form (containers / cron)
+SINCE_HOURS=2 INPUT_S3_BUCKET=raw-ais OUTPUT_S3_BUCKET=normalized-ais … \
+  cargo run -p ais-normalize -- --partition day --apply
+```
+
+Rules and behavior:
+
+- **The window is `[now − N hours, now]` in UTC**, evaluated once at startup. A partition matches when its period *end* is after the cutoff, so the partition currently receiving data (and any that ended inside the window) is included.
+- **Pick N with a margin over the run interval.** Running hourly with `--since 2` (rather than `--since 1`) overlaps successive runs by an hour so a late-arriving or slow run never leaves a gap. The overlap is free: dedup makes re-processing a partition idempotent, so the doubly-covered hour just collapses back to the same rows.
+- **Granularity interacts with the window.** On a `--partition day` layout the smallest unit is a day, so `--since 2` reprocesses the whole current day (and yesterday near midnight) every run — correct, but heavier. For lighter incremental runs use an `hour`-granularity dataset, where `--since 2` touches only the last two or three hour-partitions.
+- **Mutually exclusive with `--year`…`--minute`** (a fixed slice and a rolling window can't both apply). `--source` and multi-input merging still combine with it normally.
+- **S3 listing note.** `--since` doesn't set a fixed `year=/month=` chain, so it can't be folded into the S3 LIST prefix the way a fixed slice with `--source` can; listing covers the source's prefix and the window is applied client-side (whole-year subtrees before the cutoff year are still pruned). For very large buckets, pair it with `--source` to at least scope the LIST to one feed.
 
 ## Usage
 
@@ -209,7 +234,7 @@ job "ais-normalize" {
   type        = "batch"
 
   periodic {
-    cron             = "0 */6 * * * *"   # every 6 hours
+    cron             = "0 * * * * *"     # every hour
     prohibit_overlap = true
   }
 
@@ -223,6 +248,7 @@ job "ais-normalize" {
           "--input-dir", "/data/bronze",
           "--output-dir", "/data/normalized",
           "--partition", "day",
+          "--since", "2",      # only the last 2h of partitions; overlaps the hourly schedule
           "--concurrency", "4",
           "--apply",
         ]
@@ -256,7 +282,9 @@ env {
 }
 ```
 
-Size local disk for the S3 scratch space too (under the task's `$TMPDIR`): input needs room for about `--concurrency` partitions' worth of downloaded data at a time (partitions are fetched lazily and deleted after processing), and output needs room for the in-flight normalized files until each uploads. For very large archives, pair this with the [partition slice flags](#processing-a-slice-of-the-archive) to process one month or day per scheduled run.
+The `--since 2` above keeps each scheduled run cheap: it only lists and normalizes partitions that gained data in the last two hours, rather than re-scanning the whole archive every hour, while the two-hour window overlaps the hourly schedule so a slow or skipped run leaves no gap (dedup makes the overlap idempotent). Drop `--since` for a one-shot full backfill.
+
+Size local disk for the S3 scratch space too (under the task's `$TMPDIR`): input needs room for about `--concurrency` partitions' worth of downloaded data at a time (partitions are fetched lazily and deleted after processing), and output needs room for the in-flight normalized files until each uploads. For a one-off pass over a very large archive, pair this with the [partition slice flags](#processing-a-slice-of-the-archive) to process one month or day per scheduled run.
 
 ### Cron / systemd timer alternative
 
