@@ -7,6 +7,7 @@ members = [
     "crates/collect-kafka",
     "crates/collect-maint",
     "crates/ais-normalize",
+    "crates/ais-parse",
     "crates/collect-aisstream",
 ]
 resolver = "2"
@@ -34,3 +35,10 @@ tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec", "io"] }
 walkdir = "2"
 tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+tempfile = "3"
+rlimit = "0.10"
+# Pinned to the fork's last library-only commit (the 0.11.0 release line).
+# Later fork commits fold a CLI, S3 I/O, and an iceberg 0.3 dependency into
+# the library itself; iceberg pins parquet 52, which conflicts with the
+# workspace's parquet 53 — and ais-parse provides that plumbing here instead.
+nmea-parser = { git = "https://github.com/ScottSyms/nmea-parser", rev = "a4ddb297c1ce654d329f158c2a709d410d016849" }

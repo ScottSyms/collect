@@ -31,6 +31,8 @@ COPY --from=builder /usr/src/app/target/release/collect-file /usr/local/bin/coll
 COPY --from=builder /usr/src/app/target/release/collect-socket /usr/local/bin/collect-socket
 COPY --from=builder /usr/src/app/target/release/collect-maint /usr/local/bin/collect-maint
 COPY --from=builder /usr/src/app/target/release/collect-aisstream /usr/local/bin/collect-aisstream
+COPY --from=builder /usr/src/app/target/release/ais-normalize /usr/local/bin/ais-normalize
+COPY --from=builder /usr/src/app/target/release/ais-parse /usr/local/bin/ais-parse
 
 # Create data directory
 RUN mkdir -p /data && chown appuser:appuser /data

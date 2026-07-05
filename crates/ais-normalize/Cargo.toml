@@ -12,8 +12,10 @@ crossterm.workspace = true
 futures-util.workspace = true
 parquet.workspace = true
 ratatui.workspace = true
+rlimit.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 walkdir.workspace = true
 collect-core = { path = "../collect-core" }

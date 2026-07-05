@@ -24,12 +24,14 @@ use std::sync::{
     Arc,
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::AsyncRead;
+use tokio::io::{AsyncRead, AsyncWriteExt};
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::codec::{FramedRead, LinesCodec};
 
+pub mod dataset;
 mod metrics;
+pub mod state;
 
 pub use async_trait::async_trait;
 pub use metrics::IngestMetrics;
@@ -1426,6 +1428,157 @@ impl S3Storage {
 
         Ok(())
     }
+
+    /// List every object under `prefix`, following pagination. Pass `""` to
+    /// list the whole bucket.
+    pub async fn list_keys_with_prefix(&self, prefix: &str) -> Result<Vec<S3ObjectInfo>> {
+        let mut keys = Vec::new();
+        let mut continuation_token = None;
+
+        loop {
+            let mut request = self.client.list_objects_v2().bucket(&self.bucket);
+            if !prefix.is_empty() {
+                request = request.prefix(prefix);
+            }
+            if let Some(token) = continuation_token.take() {
+                request = request.continuation_token(token);
+            }
+
+            let response = request
+                .send()
+                .await
+                .with_context(|| format!("listing s3://{}/{}", self.bucket, prefix))?;
+            for object in response.contents() {
+                let Some(key) = object.key() else {
+                    continue;
+                };
+                let size = object.size().unwrap_or(0).max(0) as u64;
+                let modified_ms = object.last_modified().map(|when| when.to_millis().ok());
+                keys.push(S3ObjectInfo {
+                    key: key.to_string(),
+                    size,
+                    modified_ms: modified_ms.flatten(),
+                });
+            }
+
+            if response.is_truncated().unwrap_or(false) {
+                continuation_token = response
+                    .next_continuation_token()
+                    .map(|value| value.to_string());
+            } else {
+                break;
+            }
+        }
+
+        Ok(keys)
+    }
+
+    /// Download an object to `local_path`, creating parent directories as needed.
+    pub async fn download_to_path(&self, key: &str, local_path: &Path) -> Result<()> {
+        let response = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .with_context(|| format!("downloading s3://{}/{}", self.bucket, key))?;
+
+        if let Some(parent) = local_path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("mkdir -p {}", parent.display()))?;
+        }
+
+        let mut file = tokio::fs::File::create(local_path)
+            .await
+            .with_context(|| format!("create {}", local_path.display()))?;
+        let mut reader = response.body.into_async_read();
+        tokio::io::copy(&mut reader, &mut file).await.with_context(|| {
+            format!(
+                "copy s3://{}/{} to {}",
+                self.bucket,
+                key,
+                local_path.display()
+            )
+        })?;
+        file.flush().await?;
+        Ok(())
+    }
+
+    /// Delete a single object by key. Deleting a key that does not exist is
+    /// treated as success by S3, so this is safe to call idempotently.
+    pub async fn delete_key(&self, key: &str) -> Result<()> {
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .with_context(|| format!("deleting s3://{}/{}", self.bucket, key))?;
+        Ok(())
+    }
+
+    /// Name of the bucket this handle points at.
+    pub fn bucket_name(&self) -> &str {
+        &self.bucket
+    }
+
+    /// Write a small object from an in-memory buffer (e.g. job state). Unlike
+    /// `upload_file` there is no local file involved and nothing is deleted.
+    pub async fn put_bytes(&self, key: &str, bytes: Vec<u8>) -> Result<()> {
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .body(bytes.into())
+            .send()
+            .await
+            .with_context(|| format!("writing s3://{}/{}", self.bucket, key))?;
+        Ok(())
+    }
+
+    /// Read a small object fully into memory. Returns `Ok(None)` when the key
+    /// does not exist, so callers can treat a missing object as first-run state.
+    pub async fn get_bytes(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        let response = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                if error
+                    .as_service_error()
+                    .map(|service| service.is_no_such_key())
+                    .unwrap_or(false)
+                {
+                    return Ok(None);
+                }
+                return Err(error)
+                    .with_context(|| format!("reading s3://{}/{}", self.bucket, key));
+            }
+        };
+        let bytes = response
+            .body
+            .collect()
+            .await
+            .with_context(|| format!("reading body of s3://{}/{}", self.bucket, key))?;
+        Ok(Some(bytes.into_bytes().to_vec()))
+    }
+}
+
+/// One object returned by `S3Storage::list_keys_with_prefix`.
+#[derive(Clone, Debug)]
+pub struct S3ObjectInfo {
+    pub key: String,
+    pub size: u64,
+    /// Server-side `LastModified`, as UTC milliseconds, when the store
+    /// reported one.
+    pub modified_ms: Option<i64>,
 }
 
 struct BatchBuf {
