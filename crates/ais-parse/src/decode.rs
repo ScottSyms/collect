@@ -14,13 +14,13 @@ use crate::ais_bits::{extract_ais_payload, Bits};
 use nmea_parser::ais::{AisClass, VesselDynamicData, VesselStaticData};
 use nmea_parser::{NmeaParser, ParsedMessage};
 
-/// One decoded position report (AIS types 1-3, 18, 19, 27).
+/// One decoded position report (AIS types 1-3, 9, 18, 19, 27).
 pub struct PositionRow {
     pub ts_ms: i64,
     pub source: String,
     /// Source/base station from the NMEA tag block `s:` field, if present.
     pub station: Option<String>,
-    /// The AIS message type that produced this row (1/2/3/18/19/27).
+    /// The AIS message type that produced this row (1/2/3/9/18/19/27).
     pub msg_type: u8,
     pub mmsi: u32,
     pub ais_class: String,
@@ -30,6 +30,7 @@ pub struct PositionRow {
     pub cog: Option<f64>,
     pub heading_true: Option<f64>,
     pub rot: Option<f64>,
+    pub altitude_m: Option<f64>,
     pub nav_status: String,
     pub high_accuracy: bool,
     pub raim: bool,
@@ -134,6 +135,33 @@ pub struct BinaryRow {
     pub payload_bits: u32,
 }
 
+/// AIS type 21 (Aids to Navigation) report.
+pub struct AtonRow {
+    pub ts_ms: i64,
+    pub source: String,
+    /// Source/base station from the NMEA tag block `s:` field, if present.
+    pub station: Option<String>,
+    /// The AIS message type that produced this row (always 21).
+    pub msg_type: u8,
+    pub mmsi: u32,
+    pub ais_class: String,
+    /// Textual representation of the aid type (NavAidType Display).
+    pub aid_type: String,
+    pub name: Option<String>,
+    pub name_extension: Option<String>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub dimension_to_bow: Option<u16>,
+    pub dimension_to_stern: Option<u16>,
+    pub dimension_to_port: Option<u16>,
+    pub dimension_to_starboard: Option<u16>,
+    pub off_position: bool,
+    pub virtual_aid: bool,
+    pub assigned_mode: bool,
+    pub high_accuracy: bool,
+    pub raim: bool,
+}
+
 pub enum Decoded {
     Position(Box<PositionRow>),
     Static(Box<StaticRow>),
@@ -141,6 +169,8 @@ pub enum Decoded {
     Meteo(Box<MeteoRow>),
     /// Type 8 with a DAC/FID we retain as raw hex.
     Binary(Box<BinaryRow>),
+    /// AIS type 21 Aids to Navigation.
+    Aton(Box<AtonRow>),
     /// Decoded fine, but not a message class we materialize.
     Other,
     /// Part of a multi-sentence message; the parser buffered it.
@@ -229,6 +259,16 @@ pub fn decode_payload(parser: &mut NmeaParser, ts_ms: i64, source: &str, payload
             peeked_type,
             vsd,
         ))),
+        Ok(ParsedMessage::StandardSarAircraftPositionReport(sar)) => {
+            Decoded::Position(Box::new(from_sar_aircraft(
+                ts_ms, source, station, peeked_type, sar,
+            )))
+        }
+        Ok(ParsedMessage::AidToNavigationReport(aid)) => {
+            Decoded::Aton(Box::new(from_aid_to_navigation(
+                ts_ms, source, station, aid,
+            )))
+        }
         Ok(ParsedMessage::Incomplete) => Decoded::Incomplete,
         Ok(_) => Decoded::Other,
         Err(_) => Decoded::Failed,
@@ -261,6 +301,7 @@ fn position_row(
         cog: vdd.cog,
         heading_true: vdd.heading_true,
         rot: vdd.rot,
+        altitude_m: None,
         nav_status: vdd.nav_status.to_string(),
         high_accuracy: vdd.high_position_accuracy,
         raim: vdd.raim_flag,
@@ -304,6 +345,69 @@ fn static_row(
         destination: vsd.destination,
         eta_ms: vsd.eta.map(|dt| dt.timestamp_millis()),
         mothership_mmsi: vsd.mothership_mmsi,
+    }
+}
+
+fn from_sar_aircraft(
+    ts_ms: i64,
+    source: &str,
+    station: Option<String>,
+    peeked_type: Option<u8>,
+    sar: nmea_parser::ais::StandardSarAircraftPositionReport,
+) -> PositionRow {
+    PositionRow {
+        ts_ms,
+        source: source.to_string(),
+        station,
+        msg_type: peeked_type.unwrap_or(9),
+        mmsi: sar.mmsi,
+        ais_class: "Class A".into(),
+        latitude: sar.latitude,
+        longitude: sar.longitude,
+        sog_knots: sar.sog_knots.map(|k| k as f64),
+        cog: sar.cog,
+        heading_true: None,
+        rot: None,
+        altitude_m: sar.altitude.map(|a| a as f64),
+        nav_status: "under way using engine".into(),
+        high_accuracy: sar.high_position_accuracy,
+        raim: sar.raim_flag,
+        special_manoeuvre: None,
+    }
+}
+
+fn from_aid_to_navigation(
+    ts_ms: i64,
+    source: &str,
+    station: Option<String>,
+    aid: nmea_parser::ais::AidToNavigationReport,
+) -> AtonRow {
+    let trim_name = |s: String| -> Option<String> {
+        let t = s.trim_end_matches(|c| c == ' ' || c == '@').to_string();
+        if t.is_empty() { None } else { Some(t) }
+    };
+
+    AtonRow {
+        ts_ms,
+        source: source.to_string(),
+        station,
+        msg_type: 21,
+        mmsi: aid.mmsi,
+        ais_class: "AtoN".into(),
+        aid_type: aid.aid_type.to_string(),
+        name: trim_name(aid.name),
+        name_extension: None,
+        latitude: aid.latitude,
+        longitude: aid.longitude,
+        dimension_to_bow: aid.dimension_to_bow,
+        dimension_to_stern: aid.dimension_to_stern,
+        dimension_to_port: aid.dimension_to_port,
+        dimension_to_starboard: aid.dimension_to_starboard,
+        off_position: aid.off_position_indicator,
+        virtual_aid: aid.virtual_aid_flag,
+        assigned_mode: aid.assigned_mode_flag,
+        high_accuracy: false,
+        raim: aid.raim_flag,
     }
 }
 

@@ -9,6 +9,7 @@ members = [
     "crates/ais-normalize",
     "crates/ais-parse",
     "crates/collect-aisstream",
+    "crates/aisstream-parse",
 ]
 resolver = "2"
 

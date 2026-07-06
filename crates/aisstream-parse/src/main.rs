@@ -5,7 +5,6 @@ use clap::Parser;
 use collect_core::dataset::{self, DatasetFile, PartitionKey};
 use collect_core::state;
 use collect_core::{PartitionGranularity, S3Storage};
-use nmea_parser::NmeaParser;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::collections::VecDeque;
 use std::fs::File as StdFile;
@@ -13,22 +12,20 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-mod ais_bits;
-mod decode;
+mod ais_stream;
+mod convert;
 mod output;
 mod stats;
 
-use decode::{decode_payload, Decoded};
-use output::{existing_parquet_files, AtonWriter, BinaryWriter, MeteoWriter, PositionsWriter, StaticsWriter};
+use convert::{decode_row, Decoded};
+use output::{AtonWriter, BinaryWriter, MeteoWriter, PositionsWriter, StaticsWriter};
 use stats::ParseStats;
 
-/// Decoded output lands in sibling hive datasets under the output root.
 const POSITIONS_TREE: &str = "positions";
 const STATICS_TREE: &str = "statics";
 const METEO_TREE: &str = "meteo";
 const BINARY_TREE: &str = "binary";
 const ATONS_TREE: &str = "atons";
-/// Every output dataset tree — used by the partition-replace logic.
 const OUTPUT_TREES: [&str; 5] = [POSITIONS_TREE, STATICS_TREE, METEO_TREE, BINARY_TREE, ATONS_TREE];
 
 static CANCELLED: AtomicBool = AtomicBool::new(false);
@@ -40,109 +37,84 @@ fn is_cancelled() -> bool {
 #[derive(Parser, Debug)]
 #[command(
     version,
-    about = "Decode normalized AIS sentences into typed Parquet (positions and vessel statics)"
+    about = "Decode AISStream JSON payloads into typed Parquet (positions, statics, meteo, binary)"
 )]
 struct Args {
-    /// Normalized Hive-partitioned Parquet root directory. Repeatable to
-    /// merge several sources in one run (mutually exclusive with --input-s3-bucket)
+    /// Input Hive-partitioned Parquet root (collect-aisstream output). Repeatable.
     #[arg(long)]
     input_dir: Vec<PathBuf>,
 
-    /// Output root; decoded data is written under <root>/positions and
-    /// <root>/statics (mutually exclusive with --output-s3-bucket)
+    /// Output root; decoded data is written under <root>/positions and <root>/statics
     #[arg(long)]
     output_dir: Option<PathBuf>,
 
-    /// S3 bucket to read the input dataset from, instead of --input-dir.
-    /// Repeatable to merge several buckets (all on the shared endpoint)
+    /// S3 bucket to read input from, instead of --input-dir. Repeatable.
     #[arg(long)]
     input_s3_bucket: Vec<String>,
 
-    /// Key prefix within the input S3 bucket; acts as the dataset root
+    /// Key prefix within the input S3 bucket
     #[arg(long, default_value = "")]
     input_s3_prefix: String,
 
-    /// S3 bucket to write decoded output to, instead of --output-dir
+    /// S3 bucket to write output to, instead of --output-dir
     #[arg(long)]
     output_s3_bucket: Option<String>,
 
-    /// Key prefix within the output S3 bucket; acts as the dataset root
+    /// Key prefix within the output S3 bucket
     #[arg(long, default_value = "")]
     output_s3_prefix: String,
 
-    /// S3 endpoint URL, shared by --input-s3-bucket and --output-s3-bucket (for MinIO or other S3-compatible storage)
     #[arg(long)]
     s3_endpoint: Option<String>,
 
-    /// S3 region, shared by --input-s3-bucket and --output-s3-bucket
     #[arg(long, default_value = "us-east-1")]
     s3_region: String,
 
-    /// S3 access key ID (can also use AWS_ACCESS_KEY_ID env var)
     #[arg(long)]
     s3_access_key: Option<String>,
 
-    /// S3 secret access key (can also use AWS_SECRET_ACCESS_KEY env var)
     #[arg(long)]
     s3_secret_key: Option<String>,
 
-    /// Disable TLS/HTTPS for the S3 endpoint (use plain HTTP instead)
     #[arg(long)]
     s3_disable_tls: bool,
 
-    /// Partition granularity; must match the input dataset layout (the
-    /// output trees mirror it)
     #[arg(long, default_value_t = PartitionGranularity::Day)]
     partition: PartitionGranularity,
 
-    /// Filter to a specific source label (processes all sources if omitted)
     #[arg(long)]
     source: Option<String>,
 
-    /// Process only this year's partitions (narrow further with --month, --day, ...)
     #[arg(long)]
     year: Option<i32>,
 
-    /// Process only this month's partitions; requires --year
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..=12))]
     month: Option<u32>,
 
-    /// Process only this day's partitions; requires --month
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..=31))]
     day: Option<u32>,
 
-    /// Process only this hour's partitions; requires --day and an hour-or-finer layout
     #[arg(long, value_parser = clap::value_parser!(u32).range(0..=23))]
     hour: Option<u32>,
 
-    /// Process only this minute's partitions; requires --hour and a minute layout
     #[arg(long, value_parser = clap::value_parser!(u32).range(0..=59))]
     minute: Option<u32>,
 
-    /// Process only partitions holding data from the last N hours (rolling
-    /// window from now, UTC); mutually exclusive with the fixed filters.
-    /// With --incremental, acts only as the first run's starting bound
     #[arg(long, value_name = "HOURS")]
     since: Option<u64>,
 
-    /// Track a watermark at the output target and process only partitions
-    /// holding files that arrived since the last successful run
     #[arg(long)]
     incremental: bool,
 
-    /// Apply changes; dry-run by default
     #[arg(long)]
     apply: bool,
 
-    /// Number of rows per Parquet read batch
     #[arg(long, default_value_t = 8192)]
     batch_size: usize,
 
-    /// Zstd compression level for output files
     #[arg(long, default_value_t = 5)]
     compression_level: i32,
 
-    /// Number of partitions to process concurrently; auto-selected when omitted
     #[arg(long)]
     concurrency: Option<usize>,
 }
@@ -216,7 +188,6 @@ impl Args {
     }
 }
 
-/// RFC 3339 label for a UTC millisecond timestamp, for log lines.
 fn format_ms(ms: i64) -> String {
     chrono::Utc
         .timestamp_millis_opt(ms)
@@ -227,9 +198,6 @@ fn format_ms(ms: i64) -> String {
 
 const UPLOAD_MAX_ATTEMPTS: u32 = 3;
 
-/// Upload with exponential backoff on transient failures.
-/// `S3Storage::upload_file` deletes the local file only on success, so a
-/// retry re-sends the same still-present file.
 async fn upload_with_retries(storage: &S3Storage, local_path: &Path, key: &str) -> Result<()> {
     let mut last_error = None;
     for attempt in 1..=UPLOAD_MAX_ATTEMPTS {
@@ -263,8 +231,6 @@ fn s3_join(prefix: &str, rel: &str) -> String {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Concurrent S3 downloads and open Parquet readers can hold many
-    // descriptors at once; raise the soft limit best-effort.
     if let Err(error) = rlimit::increase_nofile_limit(u64::MAX) {
         eprintln!("Warning: could not raise the open-file limit: {error}");
     }
@@ -319,7 +285,7 @@ async fn main() -> Result<()> {
     }
 
     if dry_run {
-        eprintln!("ais-parse: dry run (pass --apply to write output)");
+        eprintln!("aisstream-parse: dry run (pass --apply to write output)");
     }
 
     let _signal = tokio::spawn(async move {
@@ -378,13 +344,12 @@ async fn main() -> Result<()> {
         None => None,
     };
 
-    // Incremental watermark, stored per tool at the output target.
     let state_store = if args.incremental {
         Some(match (&output_storage, &args.output_dir) {
             (Some(storage), _) => {
-                state::StateStore::s3(storage, &args.output_s3_prefix, "ais-parse")
+                state::StateStore::s3(storage, &args.output_s3_prefix, "aisstream-parse")
             }
-            (None, Some(dir)) => state::StateStore::local(dir, "ais-parse"),
+            (None, Some(dir)) => state::StateStore::local(dir, "aisstream-parse"),
             _ => unreachable!("validated exactly one output target above"),
         })
     } else {
@@ -425,21 +390,17 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Input scratch holds copies of data still safe in the source bucket:
-    // auto-delete on drop. Output scratch holds decoded data that exists
-    // nowhere else until uploaded: detached via `.keep()` and removed only
-    // after every upload succeeded.
     let input_scratch = input_is_s3
         .then(|| {
             tempfile::Builder::new()
-                .prefix("ais-parse-input-")
+                .prefix("aisstream-parse-input-")
                 .tempdir()
         })
         .transpose()
         .context("creating input scratch directory")?;
     let output_scratch_path: Option<PathBuf> = if output_storage.is_some() {
         let dir = tempfile::Builder::new()
-            .prefix("ais-parse-output-")
+            .prefix("aisstream-parse-output-")
             .tempdir()
             .context("creating output scratch directory")?;
         Some(dir.keep())
@@ -451,10 +412,6 @@ async fn main() -> Result<()> {
         (None, Some(scratch_path)) => scratch_path.clone(),
         _ => unreachable!("validated exactly one output target above"),
     };
-    // Prior-run files are only deleted when the final output target is local
-    // disk; for S3 output the replace happens against object keys instead.
-    let replace_local = output_storage.is_none();
-
     enum PartitionWork {
         Local(Vec<DatasetFile>),
         Remote(Vec<dataset::S3Entry>),
@@ -499,11 +456,6 @@ async fn main() -> Result<()> {
                 .cmp(&b.partition.sort_key())
                 .then(a.rel_path.cmp(&b.rel_path))
         });
-        // Group by the *time-only* key so every source that lands in a given
-        // output partition is one work item: the output is not partitioned by
-        // source, and one owner per output partition keeps the partition
-        // replace race-free. sort_key orders by time before source, so
-        // same-time entries from different sources are already contiguous.
         dataset::group_by_partition(entries, |entry| entry.partition.without_source())
             .into_iter()
             .map(|(key, list)| (key, PartitionWork::Remote(list)))
@@ -532,14 +484,12 @@ async fn main() -> Result<()> {
                 .cmp(&b.partition.sort_key())
                 .then(a.path.cmp(&b.path))
         });
-        // Group by time-only key — see the S3 branch above.
         dataset::group_by_partition(files, |file| file.partition.without_source())
             .into_iter()
             .map(|(key, list)| (key, PartitionWork::Local(list)))
             .collect()
     };
 
-    // --incremental: keep only partitions with files newer than the cutoff.
     let mut watermark_candidate_ms: Option<i64> = None;
     if args.incremental {
         let work_mtimes = |work: &PartitionWork| -> Vec<Option<i64>> {
@@ -637,16 +587,12 @@ async fn main() -> Result<()> {
                     }
                 };
 
-                // A time-only work item can pool downloads from several source
-                // subtrees, so clean the scratch copies by file path rather
-                // than a single partition dir.
                 let scratch_files: Vec<PathBuf> = if is_remote {
                     partition_files.iter().map(|f| f.path.clone()).collect()
                 } else {
                     Vec::new()
                 };
 
-                let rel_dir = partition_key.relative_dir_time_only();
                 let output_root_for_task = output_root.clone();
                 let result = tokio::task::spawn_blocking(move || {
                     process_partition(
@@ -656,7 +602,6 @@ async fn main() -> Result<()> {
                         batch_size,
                         compression_level,
                         dry_run,
-                        replace_local,
                     )
                 })
                 .await
@@ -677,43 +622,23 @@ async fn main() -> Result<()> {
                     }
                 };
 
-                // S3 output: replace the partition's prior objects with this
-                // run's file, per tree (positions/statics).
                 if let Some(storage) = &output_storage {
                     if !dry_run {
                         for tree in OUTPUT_TREES {
-                            let tree_rel = format!("{tree}/{rel_dir}");
-                            let partition_prefix =
-                                format!("{}/", s3_join(&output_s3_prefix, &tree_rel));
-                            let prior = storage
-                                .list_keys_with_prefix(&partition_prefix)
-                                .await
-                                .with_context(|| format!("listing {partition_prefix}"))?;
-                            let prior_keys: Vec<String> = prior
-                                .into_iter()
-                                .map(|object| object.key)
-                                .filter(|key| key.ends_with(".parquet"))
-                                .collect();
-
                             for (out_rel, local_path, _rows) in
                                 outputs.iter().filter(|(r, _, _)| r.starts_with(tree))
                             {
                                 let key = s3_join(&output_s3_prefix, out_rel);
-                                if let Err(error) = upload_with_retries(storage, local_path, &key)
-                                    .await
-                                    .with_context(|| {
-                                        format!("uploading {} to S3", local_path.display())
-                                    })
+                                if let Err(error) =
+                                    upload_with_retries(storage, local_path, &key)
+                                        .await
+                                        .with_context(|| {
+                                            format!("uploading {} to S3", local_path.display())
+                                        })
                                 {
                                     CANCELLED.store(true, Ordering::Relaxed);
                                     return Err(error);
                                 }
-                            }
-                            for key in prior_keys {
-                                storage
-                                    .delete_key(&key)
-                                    .await
-                                    .with_context(|| format!("deleting prior object {key}"))?;
                             }
                         }
                     }
@@ -769,7 +694,6 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Advance the watermark only after a fully successful, applied run.
     if let Some(store) = &state_store {
         if !dry_run && !is_cancelled() {
             if let Some(candidate) = watermark_candidate_ms {
@@ -812,13 +736,8 @@ fn default_concurrency() -> usize {
         .clamp(1, 8)
 }
 
-/// `(output rel path like "positions/year=.../pos-....parquet", local file
-/// path, rows)` per file this partition produced. The output layout is not
-/// partitioned by source.
 type PartitionOutputs = Vec<(String, PathBuf, u64)>;
 
-/// Record a finished output file (if the writer produced one) under
-/// `<tree>/<rel_dir>/<name>`.
 fn push_output(
     outputs: &mut PartitionOutputs,
     tree: &str,
@@ -835,16 +754,6 @@ fn push_output(
     }
 }
 
-/// Decode one output partition end to end into one positions file and one
-/// statics file, then — for local output — replace the prior run's files in
-/// the two output partitions.
-///
-/// The output is not partitioned by source, so `files` can pool several
-/// sources that map to this time partition. Fragment reassembly is per-source
-/// (a fresh parser when the source label changes; `files` is sorted so each
-/// source's files are contiguous), which keeps multi-part sequence ids from
-/// colliding across sources.
-#[allow(clippy::too_many_arguments)]
 fn process_partition(
     partition_key: PartitionKey,
     files: Vec<DatasetFile>,
@@ -852,44 +761,26 @@ fn process_partition(
     batch_size: usize,
     compression_level: i32,
     dry_run: bool,
-    replace_local: bool,
 ) -> Result<(ParseStats, PartitionOutputs)> {
     let rel_dir = partition_key.relative_dir_time_only();
     let dir_for = |tree: &str| output_root.join(tree).join(&rel_dir);
 
-    // Collected before writing so the new (uniquely-named) files are never in
-    // the deletion set.
-    let prior_files: Vec<PathBuf> = if !dry_run && replace_local {
-        let mut prior = Vec::new();
-        for tree in OUTPUT_TREES {
-            prior.extend(existing_parquet_files(&dir_for(tree))?);
-        }
-        prior
-    } else {
-        Vec::new()
-    };
-
-    let mut parser = NmeaParser::new();
-    let mut current_source: Option<&str> = None;
     let mut stats = ParseStats::default();
     let mut positions =
         (!dry_run).then(|| PositionsWriter::new(dir_for(POSITIONS_TREE), compression_level));
     let mut statics =
         (!dry_run).then(|| StaticsWriter::new(dir_for(STATICS_TREE), compression_level));
-    let mut meteo = (!dry_run).then(|| MeteoWriter::new(dir_for(METEO_TREE), compression_level));
-    let mut binary = (!dry_run).then(|| BinaryWriter::new(dir_for(BINARY_TREE), compression_level));
-    let mut atons = (!dry_run).then(|| AtonWriter::new(dir_for(ATONS_TREE), compression_level));
+    let mut meteo =
+        (!dry_run).then(|| MeteoWriter::new(dir_for(METEO_TREE), compression_level));
+    let mut binary =
+        (!dry_run).then(|| BinaryWriter::new(dir_for(BINARY_TREE), compression_level));
+    let mut atons =
+        (!dry_run).then(|| AtonWriter::new(dir_for(ATONS_TREE), compression_level));
 
     for file in &files {
-        // Reset fragment state at each source boundary.
-        if current_source != Some(file.partition.source.as_str()) {
-            parser = NmeaParser::new();
-            current_source = Some(file.partition.source.as_str());
-        }
         process_parquet_file(
             &file.path,
             &file.partition.source,
-            &mut parser,
             &mut stats,
             Writers {
                 positions: positions.as_mut(),
@@ -946,18 +837,9 @@ fn process_partition(
         );
     }
 
-    // New files are durable: the prior run's output for this partition is now
-    // redundant (decoding is deterministic, so this is a replace, not a loss).
-    for prior in prior_files {
-        std::fs::remove_file(&prior)
-            .with_context(|| format!("removing prior output {}", prior.display()))?;
-    }
-
     Ok((stats, outputs))
 }
 
-/// The set of per-partition writers, threaded into the row loop. Each is
-/// `None` in dry-run mode.
 struct Writers<'a> {
     positions: Option<&'a mut PositionsWriter>,
     statics: Option<&'a mut StaticsWriter>,
@@ -969,7 +851,6 @@ struct Writers<'a> {
 fn process_parquet_file(
     path: &Path,
     path_source: &str,
-    parser: &mut NmeaParser,
     stats: &mut ParseStats,
     mut writers: Writers<'_>,
     batch_size: usize,
@@ -981,11 +862,6 @@ fn process_parquet_file(
         .build()
         .with_context(|| format!("build Parquet reader {}", path.display()))?;
 
-    // Columns are matched by name, not position: normalized input is
-    // (ts, source, payload) while raw bronze is (ts, payload). The `source`
-    // column (present in normalized data, per-row after a dedup merge pooled
-    // several sources) takes precedence; bronze has none, so we fall back to
-    // the source parsed from the file's partition path.
     while let Some(batch) = reader.next().transpose()? {
         let schema = batch.schema();
         let ts_idx = schema.index_of("ts").unwrap_or(0);
@@ -1023,7 +899,20 @@ fn process_parquet_file(
                 Some(col) if !col.is_null(i) => col.value(i),
                 _ => path_source,
             };
-            match decode_payload(parser, ts_col.value(i), source, payload_col.value(i)) {
+
+            let payload_str = payload_col.value(i);
+
+            let ais_msg: crate::ais_stream::AisStreamMessage = match serde_json::from_str(payload_str) {
+                Ok(msg) => msg,
+                Err(_) => {
+                    stats.failed += 1;
+                    continue;
+                }
+            };
+
+            let msg_type = ais_msg.MessageType.as_str();
+
+            match decode_row(ts_col.value(i), source, msg_type, &ais_msg.Message) {
                 Decoded::Position(row) => {
                     stats.positions_out += 1;
                     if let Some(writer) = writers.positions.as_deref_mut() {
@@ -1039,23 +928,22 @@ fn process_parquet_file(
                 Decoded::Meteo(row) => {
                     stats.meteo_out += 1;
                     if let Some(writer) = writers.meteo.as_deref_mut() {
-                        writer.write(*row)?;
+                        writer.write(row)?;
                     }
                 }
                 Decoded::Binary(row) => {
                     stats.binary_out += 1;
                     if let Some(writer) = writers.binary.as_deref_mut() {
-                        writer.write(*row)?;
+                        writer.write(row)?;
                     }
                 }
                 Decoded::Aton(row) => {
                     stats.atons_out += 1;
                     if let Some(writer) = writers.atons.as_deref_mut() {
-                        writer.write(*row)?;
+                        writer.write(row)?;
                     }
                 }
                 Decoded::Other => stats.other_decoded += 1,
-                Decoded::Incomplete => stats.incomplete += 1,
                 Decoded::Failed => stats.failed += 1,
             }
         }

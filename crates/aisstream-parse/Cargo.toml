@@ -1,0 +1,23 @@
+[package]
+name = "aisstream-parse"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+arrow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+parquet.workspace = true
+rlimit.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+walkdir.workspace = true
+collect-core = { path = "../collect-core" }
+
+[[bin]]
+name = "aisstream-parse"
+path = "src/main.rs"
