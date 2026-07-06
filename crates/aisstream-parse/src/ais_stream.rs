@@ -57,6 +57,28 @@ pub struct StandardClassBPositionReport {
     pub Raim: bool,
 }
 
+// ── ExtendedClassBPositionReport (AIS type 19) ─────────────────────────
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(non_snake_case)]
+pub struct ExtendedClassBPositionReport {
+    pub MessageID: u8,
+    pub UserID: u32,
+    pub Latitude: Option<f64>,
+    pub Longitude: Option<f64>,
+    pub Sog: Option<f64>,
+    pub Cog: Option<f64>,
+    pub TrueHeading: Option<u16>,
+    pub PositionAccuracy: bool,
+    pub Raim: bool,
+    pub Name: Option<String>,
+    #[serde(rename = "Type")]
+    pub ship_type: Option<u8>,
+    pub Dimension: Option<ShipDimensions>,
+    pub Dte: Option<bool>,
+    pub AssignedMode: Option<bool>,
+}
+
 // ── ShipStaticData (AIS type 5) ────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]

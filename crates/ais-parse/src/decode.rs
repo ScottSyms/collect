@@ -11,8 +11,14 @@
 //! which it usually does because rows within a partition file are ts-sorted.
 
 use crate::ais_bits::{extract_ais_payload, Bits};
+use h3o::{LatLng, Resolution};
 use nmea_parser::ais::{AisClass, VesselDynamicData, VesselStaticData};
 use nmea_parser::{NmeaParser, ParsedMessage};
+
+fn lat_lon_to_h3(lat: f64, lon: f64) -> Option<u64> {
+    let ll = LatLng::new(lat.to_radians(), lon.to_radians()).ok()?;
+    Some(ll.to_cell(Resolution::Ten).into())
+}
 
 /// One decoded position report (AIS types 1-3, 9, 18, 19, 27).
 pub struct PositionRow {
@@ -31,6 +37,7 @@ pub struct PositionRow {
     pub heading_true: Option<f64>,
     pub rot: Option<f64>,
     pub altitude_m: Option<f64>,
+    pub h3: Option<u64>,
     pub nav_status: String,
     pub high_accuracy: bool,
     pub raim: bool,
@@ -151,6 +158,7 @@ pub struct AtonRow {
     pub name_extension: Option<String>,
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
+    pub h3: Option<u64>,
     pub dimension_to_bow: Option<u16>,
     pub dimension_to_stern: Option<u16>,
     pub dimension_to_port: Option<u16>,
@@ -264,6 +272,11 @@ pub fn decode_payload(parser: &mut NmeaParser, ts_ms: i64, source: &str, payload
                 ts_ms, source, station, peeked_type, sar,
             )))
         }
+        Ok(ParsedMessage::BaseStationReport(br)) => {
+            Decoded::Position(Box::new(base_station_row(
+                ts_ms, source, station, peeked_type, br,
+            )))
+        }
         Ok(ParsedMessage::AidToNavigationReport(aid)) => {
             Decoded::Aton(Box::new(from_aid_to_navigation(
                 ts_ms, source, station, aid,
@@ -302,6 +315,7 @@ fn position_row(
         heading_true: vdd.heading_true,
         rot: vdd.rot,
         altitude_m: None,
+        h3: vdd.latitude.and_then(|lat| vdd.longitude.and_then(|lon| lat_lon_to_h3(lat, lon))),
         nav_status: vdd.nav_status.to_string(),
         high_accuracy: vdd.high_position_accuracy,
         raim: vdd.raim_flag,
@@ -369,9 +383,39 @@ fn from_sar_aircraft(
         heading_true: None,
         rot: None,
         altitude_m: sar.altitude.map(|a| a as f64),
+        h3: sar.latitude.and_then(|lat| sar.longitude.and_then(|lon| lat_lon_to_h3(lat, lon))),
         nav_status: "under way using engine".into(),
         high_accuracy: sar.high_position_accuracy,
         raim: sar.raim_flag,
+        special_manoeuvre: None,
+    }
+}
+
+fn base_station_row(
+    ts_ms: i64,
+    source: &str,
+    station: Option<String>,
+    peeked_type: Option<u8>,
+    br: nmea_parser::ais::BaseStationReport,
+) -> PositionRow {
+    PositionRow {
+        ts_ms,
+        source: source.to_string(),
+        station,
+        msg_type: peeked_type.unwrap_or(4),
+        mmsi: br.mmsi,
+        ais_class: "Base Station".into(),
+        latitude: br.latitude,
+        longitude: br.longitude,
+        sog_knots: None,
+        cog: None,
+        heading_true: None,
+        rot: None,
+        altitude_m: None,
+        h3: br.latitude.and_then(|lat| br.longitude.and_then(|lon| lat_lon_to_h3(lat, lon))),
+        nav_status: String::new(),
+        high_accuracy: br.high_position_accuracy,
+        raim: br.raim_flag,
         special_manoeuvre: None,
     }
 }
@@ -399,6 +443,7 @@ fn from_aid_to_navigation(
         name_extension: None,
         latitude: aid.latitude,
         longitude: aid.longitude,
+        h3: aid.latitude.and_then(|lat| aid.longitude.and_then(|lon| lat_lon_to_h3(lat, lon))),
         dimension_to_bow: aid.dimension_to_bow,
         dimension_to_stern: aid.dimension_to_stern,
         dimension_to_port: aid.dimension_to_port,

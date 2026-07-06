@@ -1,9 +1,16 @@
 use chrono::{Datelike, TimeZone, Utc};
+use h3o::{LatLng, Resolution};
 
 use crate::ais_stream::{
-    AidsToNavigationReport, BaseStationReport, PositionReport, ShipStaticData,
-    StandardClassBPositionReport, StandardSearchAndRescueAircraftReport, StaticDataReport,
+    AidsToNavigationReport, BaseStationReport, ExtendedClassBPositionReport, PositionReport,
+    ShipStaticData, StandardClassBPositionReport, StandardSearchAndRescueAircraftReport,
+    StaticDataReport,
 };
+
+fn lat_lon_to_h3(lat: f64, lon: f64) -> Option<u64> {
+    let ll = LatLng::new(lat.to_radians(), lon.to_radians()).ok()?;
+    Some(ll.to_cell(Resolution::Ten).into())
+}
 
 /// One decoded position report (AIS types 1-3, 9, 18).
 pub struct PositionRow {
@@ -20,6 +27,7 @@ pub struct PositionRow {
     pub heading_true: Option<f64>,
     pub rot: Option<f64>,
     pub altitude_m: Option<f64>,
+    pub h3: Option<u64>,
     pub nav_status: String,
     pub high_accuracy: bool,
     pub raim: bool,
@@ -120,6 +128,7 @@ pub struct AtonRow {
     pub name_extension: Option<String>,
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
+    pub h3: Option<u64>,
     pub dimension_to_bow: Option<u16>,
     pub dimension_to_stern: Option<u16>,
     pub dimension_to_port: Option<u16>,
@@ -177,7 +186,7 @@ pub fn decode_row(
         }
         "BaseStationReport" => {
             match serde_json::from_value::<BaseStationReport>(payload) {
-                Ok(_) => Decoded::Other,
+                Ok(br) => Decoded::Position(from_base_station_report(ts_ms, source, br)),
                 Err(_) => Decoded::Failed,
             }
         }
@@ -187,13 +196,19 @@ pub fn decode_row(
                 Err(_) => Decoded::Failed,
             }
         }
+        "ExtendedClassBPositionReport" => {
+            match serde_json::from_value::<ExtendedClassBPositionReport>(payload) {
+                Ok(pr) => Decoded::Position(from_extended_class_b(ts_ms, source, pr)),
+                Err(_) => Decoded::Failed,
+            }
+        }
         "AidsToNavigationReport" => {
             match serde_json::from_value::<AidsToNavigationReport>(payload) {
                 Ok(aid) => Decoded::Aton(from_aids_to_navigation(ts_ms, source, aid)),
                 Err(_) => Decoded::Failed,
             }
         }
-        "ExtendedClassBPositionReport" | "LongRangeAisBroadcastMessage"
+        "LongRangeAisBroadcastMessage"
         | "SafetyBroadcastMessage" | "AddressedSafetyMessage"
         | "AddressedBinaryMessage" | "SingleSlotBinaryMessage" | "MultiSlotBinaryMessage"
         | "DataLinkManagementMessage"
@@ -219,6 +234,7 @@ fn from_position_report(ts_ms: i64, source: &str, pr: PositionReport) -> Positio
         heading_true: pr.TrueHeading.and_then(heading_to_f64),
         rot: pr.RateOfTurn.and_then(rot_to_f64),
         altitude_m: None,
+        h3: pr.Latitude.and_then(|lat| pr.Longitude.and_then(|lon| lat_lon_to_h3(lat, lon))),
         nav_status: pr
             .NavigationalStatus
             .map(nav_status_str)
@@ -251,6 +267,7 @@ fn from_standard_class_b(
         heading_true: pr.TrueHeading.and_then(heading_to_f64),
         rot: None,
         altitude_m: None,
+        h3: pr.Latitude.and_then(|lat| pr.Longitude.and_then(|lon| lat_lon_to_h3(lat, lon))),
         nav_status: "under way using engine".into(),
         high_accuracy: pr.PositionAccuracy,
         raim: pr.Raim,
@@ -348,6 +365,7 @@ fn from_standard_sar_aircraft(
         heading_true: None,
         rot: None,
         altitude_m: sar.Altitude,
+        h3: sar.Latitude.and_then(|lat| sar.Longitude.and_then(|lon| lat_lon_to_h3(lat, lon))),
         nav_status: "under way using engine".into(),
         high_accuracy: sar.PositionAccuracy,
         raim: sar.Raim,
@@ -376,6 +394,7 @@ fn from_aids_to_navigation(
         name_extension: trim_ais_str(aid.NameExtension.as_deref()),
         latitude: aid.Latitude,
         longitude: aid.Longitude,
+        h3: aid.Latitude.and_then(|lat| aid.Longitude.and_then(|lon| lat_lon_to_h3(lat, lon))),
         dimension_to_bow: bow,
         dimension_to_stern: stern,
         dimension_to_port: port,
@@ -385,6 +404,56 @@ fn from_aids_to_navigation(
         assigned_mode: aid.AssignedMode,
         high_accuracy: aid.PositionAccuracy,
         raim: aid.Raim,
+    }
+}
+
+fn from_base_station_report(ts_ms: i64, source: &str, br: BaseStationReport) -> PositionRow {
+    PositionRow {
+        ts_ms,
+        source: source.to_string(),
+        station: None,
+        msg_type: br.MessageID,
+        mmsi: br.UserID,
+        ais_class: "Base Station".into(),
+        latitude: br.Latitude,
+        longitude: br.Longitude,
+        sog_knots: None,
+        cog: None,
+        heading_true: None,
+        rot: None,
+        altitude_m: None,
+        h3: br.Latitude.and_then(|lat| br.Longitude.and_then(|lon| lat_lon_to_h3(lat, lon))),
+        nav_status: String::new(),
+        high_accuracy: br.PositionAccuracy,
+        raim: br.Raim,
+        special_manoeuvre: None,
+    }
+}
+
+fn from_extended_class_b(
+    ts_ms: i64,
+    source: &str,
+    pr: ExtendedClassBPositionReport,
+) -> PositionRow {
+    PositionRow {
+        ts_ms,
+        source: source.to_string(),
+        station: None,
+        msg_type: pr.MessageID,
+        mmsi: pr.UserID,
+        ais_class: "Class B".into(),
+        latitude: pr.Latitude,
+        longitude: pr.Longitude,
+        sog_knots: pr.Sog,
+        cog: pr.Cog,
+        heading_true: pr.TrueHeading.and_then(heading_to_f64),
+        rot: None,
+        altitude_m: None,
+        h3: pr.Latitude.and_then(|lat| pr.Longitude.and_then(|lon| lat_lon_to_h3(lat, lon))),
+        nav_status: "under way using engine".into(),
+        high_accuracy: pr.PositionAccuracy,
+        raim: pr.Raim,
+        special_manoeuvre: None,
     }
 }
 

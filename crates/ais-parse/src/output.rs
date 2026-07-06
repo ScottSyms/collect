@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use arrow::array::{
     ArrayBuilder, ArrayRef, BooleanArray, BooleanBuilder, Float64Array, Float64Builder,
     StringArray, StringBuilder, TimestampMillisecondArray, TimestampMillisecondBuilder,
-    UInt16Array, UInt16Builder, UInt32Array, UInt32Builder, UInt8Array, UInt8Builder,
+    UInt16Array, UInt16Builder, UInt32Array, UInt32Builder, UInt64Array, UInt64Builder, UInt8Array, UInt8Builder,
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
@@ -64,6 +64,7 @@ fn positions_schema() -> Arc<Schema> {
         Field::new("heading_true", DataType::Float64, true),
         Field::new("rot", DataType::Float64, true),
         Field::new("altitude_m", DataType::Float64, true),
+        Field::new("h3", DataType::UInt64, true),
         Field::new("nav_status", DataType::Utf8, false),
         Field::new("high_accuracy", DataType::Boolean, false),
         Field::new("raim", DataType::Boolean, false),
@@ -250,6 +251,7 @@ pub struct PositionsWriter {
     heading_true: Float64Builder,
     rot: Float64Builder,
     altitude_m: Float64Builder,
+    h3: UInt64Builder,
     nav_status: StringBuilder,
     high_accuracy: BooleanBuilder,
     raim: BooleanBuilder,
@@ -273,6 +275,7 @@ impl PositionsWriter {
             heading_true: Float64Builder::new(),
             rot: Float64Builder::new(),
             altitude_m: Float64Builder::new(),
+            h3: UInt64Builder::new(),
             nav_status: StringBuilder::new(),
             high_accuracy: BooleanBuilder::new(),
             raim: BooleanBuilder::new(),
@@ -294,6 +297,7 @@ impl PositionsWriter {
         self.heading_true.append_option(row.heading_true);
         self.rot.append_option(row.rot);
         self.altitude_m.append_option(row.altitude_m);
+        self.h3.append_option(row.h3);
         self.nav_status.append_value(&row.nav_status);
         self.high_accuracy.append_value(row.high_accuracy);
         self.raim.append_value(row.raim);
@@ -322,6 +326,7 @@ impl PositionsWriter {
             Arc::new(self.heading_true.finish()),
             Arc::new(self.rot.finish()),
             Arc::new(self.altitude_m.finish()),
+            Arc::new(self.h3.finish()),
             Arc::new(self.nav_status.finish()),
             Arc::new(self.high_accuracy.finish()),
             Arc::new(self.raim.finish()),
@@ -638,6 +643,7 @@ fn atons_schema() -> Arc<Schema> {
         Field::new("name_extension", DataType::Utf8, true),
         Field::new("latitude", DataType::Float64, true),
         Field::new("longitude", DataType::Float64, true),
+        Field::new("h3", DataType::UInt64, true),
         Field::new("dimension_to_bow", DataType::UInt16, true),
         Field::new("dimension_to_stern", DataType::UInt16, true),
         Field::new("dimension_to_port", DataType::UInt16, true),
@@ -688,6 +694,7 @@ impl AtonWriter {
             Arc::new(StringArray::from(r.iter().map(|x| x.name_extension.as_deref()).collect::<Vec<_>>())),
             f64_aton_col(r, |x| x.latitude),
             f64_aton_col(r, |x| x.longitude),
+            Arc::new(UInt64Array::from(r.iter().map(|x| x.h3).collect::<Vec<_>>())),
             u16_aton_col(r, |x| x.dimension_to_bow),
             u16_aton_col(r, |x| x.dimension_to_stern),
             u16_aton_col(r, |x| x.dimension_to_port),
@@ -775,6 +782,7 @@ mod tests {
             heading_true: None,
             rot: None,
             altitude_m: None,
+            h3: None,
             nav_status: "under way using engine".into(),
             high_accuracy: true,
             raim: false,
