@@ -130,10 +130,6 @@ struct Args {
     #[arg(long)]
     incremental: bool,
 
-    /// Apply changes; dry-run by default
-    #[arg(long)]
-    apply: bool,
-
     /// Number of rows per Parquet read batch
     #[arg(long, default_value_t = 8192)]
     batch_size: usize,
@@ -271,7 +267,6 @@ async fn main() -> Result<()> {
 
     let mut args = Args::parse();
     args.apply_env();
-    let dry_run = !args.apply;
 
     match (args.input_dir.is_empty(), args.input_s3_bucket.is_empty()) {
         (false, false) => bail!("use either --input-dir or --input-s3-bucket, not both"),
@@ -316,10 +311,6 @@ async fn main() -> Result<()> {
             "Processing partitions from the last {hours}h (since {}).",
             format_ms(cutoff)
         );
-    }
-
-    if dry_run {
-        eprintln!("ais-parse: dry run (pass --apply to write output)");
     }
 
     let _signal = tokio::spawn(async move {
@@ -655,7 +646,6 @@ async fn main() -> Result<()> {
                         output_root_for_task,
                         batch_size,
                         compression_level,
-                        dry_run,
                         replace_local,
                     )
                 })
@@ -680,41 +670,39 @@ async fn main() -> Result<()> {
                 // S3 output: replace the partition's prior objects with this
                 // run's file, per tree (positions/statics).
                 if let Some(storage) = &output_storage {
-                    if !dry_run {
-                        for tree in OUTPUT_TREES {
-                            let tree_rel = format!("{tree}/{rel_dir}");
-                            let partition_prefix =
-                                format!("{}/", s3_join(&output_s3_prefix, &tree_rel));
-                            let prior = storage
-                                .list_keys_with_prefix(&partition_prefix)
-                                .await
-                                .with_context(|| format!("listing {partition_prefix}"))?;
-                            let prior_keys: Vec<String> = prior
-                                .into_iter()
-                                .map(|object| object.key)
-                                .filter(|key| key.ends_with(".parquet"))
-                                .collect();
+                    for tree in OUTPUT_TREES {
+                        let tree_rel = format!("{tree}/{rel_dir}");
+                        let partition_prefix =
+                            format!("{}/", s3_join(&output_s3_prefix, &tree_rel));
+                        let prior = storage
+                            .list_keys_with_prefix(&partition_prefix)
+                            .await
+                            .with_context(|| format!("listing {partition_prefix}"))?;
+                        let prior_keys: Vec<String> = prior
+                            .into_iter()
+                            .map(|object| object.key)
+                            .filter(|key| key.ends_with(".parquet"))
+                            .collect();
 
-                            for (out_rel, local_path, _rows) in
-                                outputs.iter().filter(|(r, _, _)| r.starts_with(tree))
+                        for (out_rel, local_path, _rows) in
+                            outputs.iter().filter(|(r, _, _)| r.starts_with(tree))
+                        {
+                            let key = s3_join(&output_s3_prefix, out_rel);
+                            if let Err(error) = upload_with_retries(storage, local_path, &key)
+                                .await
+                                .with_context(|| {
+                                    format!("uploading {} to S3", local_path.display())
+                                })
                             {
-                                let key = s3_join(&output_s3_prefix, out_rel);
-                                if let Err(error) = upload_with_retries(storage, local_path, &key)
-                                    .await
-                                    .with_context(|| {
-                                        format!("uploading {} to S3", local_path.display())
-                                    })
-                                {
-                                    CANCELLED.store(true, Ordering::Relaxed);
-                                    return Err(error);
-                                }
+                                CANCELLED.store(true, Ordering::Relaxed);
+                                return Err(error);
                             }
-                            for key in prior_keys {
-                                storage
-                                    .delete_key(&key)
-                                    .await
-                                    .with_context(|| format!("deleting prior object {key}"))?;
-                            }
+                        }
+                        for key in prior_keys {
+                            storage
+                                .delete_key(&key)
+                                .await
+                                .with_context(|| format!("deleting prior object {key}"))?;
                         }
                     }
                 }
@@ -771,7 +759,7 @@ async fn main() -> Result<()> {
 
     // Advance the watermark only after a fully successful, applied run.
     if let Some(store) = &state_store {
-        if !dry_run && !is_cancelled() {
+        if !is_cancelled() {
             if let Some(candidate) = watermark_candidate_ms {
                 let new_watermark = prev_watermark_ms.map_or(candidate, |p| p.max(candidate));
                 store
@@ -790,17 +778,10 @@ async fn main() -> Result<()> {
     }
 
     total_stats.print_summary();
-    if dry_run {
-        eprintln!(
-            "Dry run complete. Pass --apply to decode {} partition(s).",
-            total_stats.partitions_processed
-        );
-    } else {
-        eprintln!(
-            "Done. Decoded {} partition(s).",
-            total_stats.partitions_processed
-        );
-    }
+    eprintln!(
+        "Done. Decoded {} partition(s).",
+        total_stats.partitions_processed
+    );
 
     Ok(())
 }
@@ -851,7 +832,6 @@ fn process_partition(
     output_root: PathBuf,
     batch_size: usize,
     compression_level: i32,
-    dry_run: bool,
     replace_local: bool,
 ) -> Result<(ParseStats, PartitionOutputs)> {
     let rel_dir = partition_key.relative_dir_time_only();
@@ -859,7 +839,7 @@ fn process_partition(
 
     // Collected before writing so the new (uniquely-named) files are never in
     // the deletion set.
-    let prior_files: Vec<PathBuf> = if !dry_run && replace_local {
+    let prior_files: Vec<PathBuf> = if replace_local {
         let mut prior = Vec::new();
         for tree in OUTPUT_TREES {
             prior.extend(existing_parquet_files(&dir_for(tree))?);
@@ -872,13 +852,11 @@ fn process_partition(
     let mut parser = NmeaParser::new();
     let mut current_source: Option<&str> = None;
     let mut stats = ParseStats::default();
-    let mut positions =
-        (!dry_run).then(|| PositionsWriter::new(dir_for(POSITIONS_TREE), compression_level));
-    let mut statics =
-        (!dry_run).then(|| StaticsWriter::new(dir_for(STATICS_TREE), compression_level));
-    let mut meteo = (!dry_run).then(|| MeteoWriter::new(dir_for(METEO_TREE), compression_level));
-    let mut binary = (!dry_run).then(|| BinaryWriter::new(dir_for(BINARY_TREE), compression_level));
-    let mut atons = (!dry_run).then(|| AtonWriter::new(dir_for(ATONS_TREE), compression_level));
+    let mut positions = PositionsWriter::new(dir_for(POSITIONS_TREE), compression_level);
+    let mut statics = StaticsWriter::new(dir_for(STATICS_TREE), compression_level);
+    let mut meteo = MeteoWriter::new(dir_for(METEO_TREE), compression_level);
+    let mut binary = BinaryWriter::new(dir_for(BINARY_TREE), compression_level);
+    let mut atons = AtonWriter::new(dir_for(ATONS_TREE), compression_level);
 
     for file in &files {
         // Reset fragment state at each source boundary.
@@ -892,11 +870,11 @@ fn process_partition(
             &mut parser,
             &mut stats,
             Writers {
-                positions: positions.as_mut(),
-                statics: statics.as_mut(),
-                meteo: meteo.as_mut(),
-                binary: binary.as_mut(),
-                atons: atons.as_mut(),
+                positions: Some(&mut positions),
+                statics: Some(&mut statics),
+                meteo: Some(&mut meteo),
+                binary: Some(&mut binary),
+                atons: Some(&mut atons),
             },
             batch_size,
         )
@@ -905,46 +883,36 @@ fn process_partition(
     stats.partitions_processed += 1;
 
     let mut outputs: PartitionOutputs = Vec::new();
-    if let Some(w) = positions {
-        push_output(
-            &mut outputs,
-            POSITIONS_TREE,
-            &rel_dir,
-            w.finish().context("closing positions writer")?,
-        );
-    }
-    if let Some(w) = statics {
-        push_output(
-            &mut outputs,
-            STATICS_TREE,
-            &rel_dir,
-            w.finish().context("closing statics writer")?,
-        );
-    }
-    if let Some(w) = meteo {
-        push_output(
-            &mut outputs,
-            METEO_TREE,
-            &rel_dir,
-            w.finish().context("closing meteo writer")?,
-        );
-    }
-    if let Some(w) = binary {
-        push_output(
-            &mut outputs,
-            BINARY_TREE,
-            &rel_dir,
-            w.finish().context("closing binary writer")?,
-        );
-    }
-    if let Some(w) = atons {
-        push_output(
-            &mut outputs,
-            ATONS_TREE,
-            &rel_dir,
-            w.finish().context("closing atons writer")?,
-        );
-    }
+    push_output(
+        &mut outputs,
+        POSITIONS_TREE,
+        &rel_dir,
+        positions.finish().context("closing positions writer")?,
+    );
+    push_output(
+        &mut outputs,
+        STATICS_TREE,
+        &rel_dir,
+        statics.finish().context("closing statics writer")?,
+    );
+    push_output(
+        &mut outputs,
+        METEO_TREE,
+        &rel_dir,
+        meteo.finish().context("closing meteo writer")?,
+    );
+    push_output(
+        &mut outputs,
+        BINARY_TREE,
+        &rel_dir,
+        binary.finish().context("closing binary writer")?,
+    );
+    push_output(
+        &mut outputs,
+        ATONS_TREE,
+        &rel_dir,
+        atons.finish().context("closing atons writer")?,
+    );
 
     // New files are durable: the prior run's output for this partition is now
     // redundant (decoding is deterministic, so this is a replace, not a loss).

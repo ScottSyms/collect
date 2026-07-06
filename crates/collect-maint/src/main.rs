@@ -25,7 +25,7 @@ const DEFAULT_COMPACT_TARGET_FILE_SIZE_BYTES: u64 = 512 * 1024 * 1024;
 #[command(
     version,
     about = "Maintain hive-partitioned Parquet collections stored locally or on S3",
-    after_help = "Examples:\n  collect-maint --root data --partition day inspect\n  collect-maint --root data --partition hour compact\n  collect-maint --root data --partition day compact --apply\n  collect-maint --root data --partition month vacuum\n  collect-maint --root data --partition year vacuum --apply\n\nNotes:\n  partition is required and must match the dataset layout. compact and vacuum are dry-run by default. Re-run with --apply to make changes."
+    after_help = "Examples:\n  collect-maint --root data --partition day inspect\n  collect-maint --root data --partition hour compact\n  collect-maint --root data --partition day compact\n  collect-maint --root data --partition month vacuum\n\nNotes:\n  partition is required and must match the dataset layout."
 )]
 struct Cli {
     #[command(flatten)]
@@ -98,23 +98,15 @@ enum Command {
     /// Validate parquet files and partition timestamps
     Validate,
 
-    /// Compact small parquet files within a single partition (dry run by default; use --apply to execute)
+    /// Compact small parquet files within a single partition
     Compact {
         /// Target maximum bytes per compacted file
         #[arg(long, default_value_t = DEFAULT_COMPACT_TARGET_FILE_SIZE_BYTES)]
         target_file_size_bytes: u64,
-
-        /// Actually apply changes (dry run by default)
-        #[arg(long)]
-        apply: bool,
     },
 
-    /// Clean up temporary files and interrupted compaction manifests (dry run by default; use --apply to execute)
-    Vacuum {
-        /// Actually apply changes (dry run by default)
-        #[arg(long)]
-        apply: bool,
-    },
+    /// Clean up temporary files and interrupted compaction manifests
+    Vacuum,
 }
 
 #[tokio::main]
@@ -176,20 +168,18 @@ async fn main() -> Result<()> {
         Command::Validate => validate(&storage, &entries, concurrency).await,
         Command::Compact {
             target_file_size_bytes,
-            apply,
         } => {
             compact(
                 &storage,
                 &entries,
                 target_file_size_bytes,
-                apply,
                 concurrency,
                 cli.compression_level,
             )
             .await
         }
-        Command::Vacuum { apply } => {
-            vacuum(&storage, &entries, cli.partition, apply, concurrency).await
+        Command::Vacuum => {
+            vacuum(&storage, &entries, cli.partition, concurrency).await
         }
     };
 

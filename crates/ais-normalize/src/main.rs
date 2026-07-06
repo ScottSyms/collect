@@ -120,10 +120,6 @@ struct Args {
     #[arg(long)]
     incremental: bool,
 
-    /// Apply changes; dry-run by default
-    #[arg(long)]
-    apply: bool,
-
     /// Number of rows per Parquet read batch
     #[arg(long, default_value_t = 8192)]
     batch_size: usize,
@@ -317,7 +313,6 @@ async fn main() -> Result<()> {
 
     let mut args = Args::parse();
     args.apply_env();
-    let dry_run = !args.apply;
     let status_mode = StatusMode::from_tty(!args.noui && std::io::stdout().is_terminal());
 
     match (args.input_dir.is_empty(), args.input_s3_bucket.is_empty()) {
@@ -372,7 +367,7 @@ async fn main() -> Result<()> {
     }
 
     // Dedup only makes sense when we are actually writing output.
-    let dedup_enabled = args.dedup && !dry_run;
+    let dedup_enabled = args.dedup;
 
     if dedup_enabled && output_equals_input(&args) {
         eprintln!(
@@ -380,13 +375,6 @@ async fn main() -> Result<()> {
              normalized rows have different payloads, so they will NOT dedup against each other \
              and the partition will end up holding both. Use a separate output dir/bucket."
         );
-    }
-
-    if dry_run {
-        eprintln!("ais-normalize: dry run (pass --apply to write output)");
-        if args.dedup {
-            eprintln!("Dedup is enabled; it will merge touched partitions on --apply.");
-        }
     }
 
     // Set up Ctrl-C handler.
@@ -785,7 +773,6 @@ async fn main() -> Result<()> {
                         granularity,
                         batch_size,
                         compression_level,
-                        dry_run,
                     )
                 })
                 .await
@@ -804,7 +791,7 @@ async fn main() -> Result<()> {
                             *partition_rows.entry(rel_dir).or_default() += rows_written;
 
                             if let Some(storage) = &output_storage {
-                                if !dry_run && rows_written > 0 && upload_inline {
+                                if rows_written > 0 && upload_inline {
                                     let key = s3_key_for_output(
                                         &output_root,
                                         &local_path,
@@ -932,7 +919,7 @@ async fn main() -> Result<()> {
     // failed, cancelled, or dry run leaves it alone so the next run re-covers
     // the same window (idempotent thanks to dedup). Never move it backwards.
     if let Some(store) = &state_store {
-        if !dry_run && !status::is_cancelled() {
+        if !status::is_cancelled() {
             if let Some(candidate) = watermark_candidate_ms {
                 let new_watermark = prev_watermark_ms.map_or(candidate, |p| p.max(candidate));
                 store
@@ -954,23 +941,7 @@ async fn main() -> Result<()> {
     total_stats.print_summary();
     dedup_stats.print_summary();
 
-    if dry_run {
-        if !partition_rows.is_empty() {
-            eprintln!(
-                "Dry run — would write to {} partition(s):",
-                partitions_written
-            );
-            for (rel_dir, rows) in &partition_rows {
-                eprintln!("  {} ({} rows)", rel_dir, rows);
-            }
-        }
-        eprintln!(
-            "Dry run complete. Pass --apply to write {} output partition(s).",
-            partitions_written
-        );
-    } else {
-        eprintln!("Done. Wrote {} output partition(s).", partitions_written);
-    }
+    eprintln!("Done. Wrote {} output partition(s).", partitions_written);
 
     Ok(())
 }
@@ -996,7 +967,6 @@ fn process_partition(
     granularity: PartitionGranularity,
     batch_size: usize,
     compression_level: i32,
-    dry_run: bool,
 ) -> Result<(NormalizeStats, PartitionOutputRows)> {
     // The input partition's *time-only* dir, so the processor's re-partition
     // comparison (did a row's corrected timestamp move it to a different
@@ -1007,7 +977,6 @@ fn process_partition(
         output_root,
         &partition_key.source,
         compression_level,
-        dry_run,
     );
 
     for file in &files {

@@ -192,8 +192,8 @@ Subcommands:
 
 - `inspect [--verbose]`
 - `validate`
-- `compact [--target-file-size-bytes N] [--apply]`
-- `vacuum [--apply]`
+- `compact [--target-file-size-bytes N]`
+- `vacuum`
 
 ### Dataset Model
 
@@ -216,8 +216,7 @@ Leaf partitions contain Parquet files under the selected partition granularity l
 
 ### compact
 
-- Dry-run by default.
-- With `--apply`, compacts small Parquet files within leaf partitions.
+- Compacts small Parquet files within leaf partitions.
 - Default compacted output target size is about 512 MiB.
 - Only leaf partitions with more than one Parquet file are candidates.
 - Compaction groups files by partition, plans output files, writes manifests, materializes inputs, writes compacted Parquet, validates the result, publishes output, and deletes old inputs/manifests.
@@ -225,8 +224,7 @@ Leaf partitions contain Parquet files under the selected partition granularity l
 
 ### vacuum
 
-- Dry-run by default.
-- With `--apply`, removes temporary files and interrupted compaction manifests.
+- Removes temporary files and interrupted compaction manifests.
 - Also cleans up stale maintenance artifacts.
 
 ### Runtime Status
@@ -285,25 +283,23 @@ Incomplete groups (fragments missing their partner at end of scan) are emitted a
 - `--output-dir <path>`: destination root (may equal `--input-dir`)
 - `--partition <granularity>`: must match the dataset layout (default: `day`)
 - `--source <label>`: filter to one source label; all sources if omitted
-- `--apply`: write output; dry-run by default
 - `--batch-size <n>`: rows per Parquet read batch (default: 8192)
 - `--compression-level <n>`: Zstd level for output (default: 5)
 - `--noui`: disable TUI and print plain progress updates
 
 ### Defaults and Precedence
 
-Dry-run by default; `--apply` is required to write any output.
+Output is always written.
 
 ### Processing Behavior
 
 - Partitions are processed in chronological order.
 - Each partition's fragment buffer is independent; cross-partition fragment groups are flushed as-is at the end of each partition.
 - `$PGHP` rows are re-timestamped and re-partitioned using their own embedded time; they are preserved in the output.
-- Output files use fresh names (`norm-*.parquet`) and do not overwrite input files, so `--output-dir == --input-dir` is safe. Run `collect-maint compact --apply` afterward to consolidate.
+- Output files use fresh names (`norm-*.parquet`) and do not overwrite input files, so `--output-dir == --input-dir` is safe. Run `collect-maint compact` afterward to consolidate.
 
 ### Runtime Status
 
-- Prints a dry-run summary of affected partitions when `--apply` is not set.
 - Prints a stats summary on completion: input rows, output rows, re-timestamped, re-partitioned, combined messages, incomplete groups, partitions processed.
 - `--noui` prints plain partition progress updates every 10 partitions.
 - Cancellable with `Ctrl-C`.

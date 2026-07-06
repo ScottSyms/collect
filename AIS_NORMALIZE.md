@@ -67,11 +67,10 @@ Rows that aren't AIS `VDM`/`VDO` sentences (heartbeats, other NMEA talkers, etc.
 | `--minute` | *(all minutes)* | Narrow to one minute; requires `--hour` and a `minute` layout |
 | `--since <HOURS>` | *(off)* | Process only partitions holding data from the last N hours (rolling window from now, UTC); env `SINCE_HOURS`. Mutually exclusive with `--year`…`--minute`. See [rolling windows](#rolling-windows---since) |
 | `--incremental` | *(off)* | Track a watermark at the output target and process only partitions holding files that arrived since the last successful run; env `INCREMENTAL=true`. Self-healing; preferred for scheduled runs. See [watermark runs](#watermark-runs---incremental) |
-| `--apply` | off (dry run) | Actually write output; omit to preview only |
+| `--dedup` | `true` | Merge touched output partitions and drop exact `(ts, source, payload)` duplicates so re-runs are idempotent; `--dedup false` (env `DEDUP=false`) appends instead. See [idempotent re-runs](#idempotent-re-runs-deduplication) |
 | `--batch-size` | `8192` | Rows per Parquet read batch |
 | `--compression-level` | `5` | Zstd level for output files |
 | `--concurrency` | cores, clamped `[1, 8]` | Partitions processed concurrently |
-| `--dedup` | `true` | Merge touched output partitions and drop exact `(ts, source, payload)` duplicates so re-runs are idempotent; `--dedup false` (env `DEDUP=false`) appends instead. See [idempotent re-runs](#idempotent-re-runs-deduplication) |
 | `--noui` | off | Disable the TTY status display; print plain progress lines instead (auto-enabled when stdout isn't a terminal) |
 
 `--input-dir`/`--input-s3-bucket` are mutually exclusive (exactly one required), and likewise for `--output-dir`/`--output-s3-bucket`. `--input-s3-bucket` and `--output-s3-bucket` always share one endpoint/region/credentials — only the bucket name (and optional prefix) differs between them, matching how the same S3-compatible store (e.g. one MinIO deployment) typically hosts both the raw and normalized datasets side by side as separate buckets.
@@ -86,13 +85,13 @@ cargo run -p ais-normalize -- \
   --input-s3-bucket raw-ais --output-s3-bucket normalized-ais \
   --s3-endpoint http://minio:9000 --s3-region us-east-1 \
   --s3-access-key minioadmin --s3-secret-key minioadmin --s3-disable-tls \
-  --partition day --apply
+  --partition day
 
 # Local input, S3 output
 cargo run -p ais-normalize -- \
   --input-dir data --output-s3-bucket normalized-ais --output-s3-prefix ais \
   --s3-endpoint http://minio:9000 --s3-access-key minioadmin --s3-secret-key minioadmin --s3-disable-tls \
-  --partition day --apply
+  --partition day
 ```
 
 When either side is S3, the corresponding files are staged through a local scratch directory (under the OS temp dir) rather than read/written directly:
@@ -107,12 +106,12 @@ When either side is S3, the corresponding files are staged through a local scrat
 ```bash
 # One month
 cargo run -p ais-normalize -- --input-dir data --output-dir normalized \
-  --partition day --year 2026 --month 6 --apply
+  --partition day --year 2026 --month 6
 
 # One day of one source, straight from S3
 cargo run -p ais-normalize -- --input-s3-bucket raw-ais --output-s3-bucket normalized-ais \
   --s3-endpoint http://minio:9000 --source norway-tcp \
-  --partition day --year 2026 --month 7 --day 3 --apply
+  --partition day --year 2026 --month 7 --day 3
 ```
 
 Rules and behavior:
@@ -131,11 +130,11 @@ Rules and behavior:
 cargo run -p ais-normalize -- \
   --input-s3-bucket raw-ais --output-s3-bucket normalized-ais \
   --s3-endpoint http://minio:9000 --s3-access-key … --s3-secret-key … --s3-disable-tls \
-  --partition day --incremental --apply
+  --partition day --incremental
 
 # Env form
 INCREMENTAL=true INPUT_S3_BUCKET=raw-ais OUTPUT_S3_BUCKET=normalized-ais … \
-  cargo run -p ais-normalize -- --partition day --apply
+  cargo run -p ais-normalize -- --partition day
 ```
 
 Why this beats a fixed `--since` window for schedulers:
@@ -161,11 +160,11 @@ Rules and behavior:
 cargo run -p ais-normalize -- \
   --input-s3-bucket raw-ais --output-s3-bucket normalized-ais \
   --s3-endpoint http://minio:9000 --s3-access-key … --s3-secret-key … --s3-disable-tls \
-  --partition day --since 2 --apply
+  --partition day --since 2
 
 # Env form (containers / cron)
 SINCE_HOURS=2 INPUT_S3_BUCKET=raw-ais OUTPUT_S3_BUCKET=normalized-ais … \
-  cargo run -p ais-normalize -- --partition day --apply
+  cargo run -p ais-normalize -- --partition day
 ```
 
 Rules and behavior:
@@ -183,12 +182,12 @@ Rules and behavior:
 cargo run -p ais-normalize -- --input-dir data --output-dir normalized --partition day
 
 # Apply, writing normalized output to a separate directory
-cargo run -p ais-normalize -- --input-dir data --output-dir normalized --partition day --apply
+cargo run -p ais-normalize -- --input-dir data --output-dir normalized --partition day
 
 # Restrict to one source, tune concurrency and compression
 cargo run -p ais-normalize -- \
   --input-dir data --output-dir normalized --partition day \
-  --source norway-tcp --concurrency 4 --compression-level 3 --apply
+  --source norway-tcp --concurrency 4 --compression-level 3
 ```
 
 Ctrl-C / SIGTERM requests a clean stop: in-flight partitions finish their currently-open output files (properly closed and renamed, no leftover `tmp-` files) and processing of further files/partitions stops; already-completed partitions are unaffected.
@@ -219,13 +218,13 @@ cargo run -p ais-normalize -- \
   --input-s3-bucket norway --input-s3-bucket aisstream \
   --output-s3-bucket normalized-ais \
   --s3-endpoint http://minio:9000 --s3-access-key … --s3-secret-key … --s3-disable-tls \
-  --partition day --apply
+  --partition day
 
 # Comma-separated env form
-INPUT_S3_BUCKET=norway,aisstream OUTPUT_S3_BUCKET=normalized-ais … cargo run -p ais-normalize -- --partition day --apply
+INPUT_S3_BUCKET=norway,aisstream OUTPUT_S3_BUCKET=normalized-ais … cargo run -p ais-normalize -- --partition day
 
 # Two local dirs
-cargo run -p ais-normalize -- --input-dir /data/norway --input-dir /data/aisstream --output-dir /data/normalized --partition day --apply
+cargo run -p ais-normalize -- --input-dir /data/norway --input-dir /data/aisstream --output-dir /data/normalized --partition day
 ```
 
 Rules and behavior:
@@ -243,7 +242,6 @@ By default (`--dedup true`), after the run finishes ais-normalize merges every o
 - **Why this instead of "overwrite".** Normalize re-partitions rows (a row read from `day=01` can land in `day=02`), so a "clear the partition and rewrite" approach could delete a neighbor partition's real data when you run with `--day`/`--month` filters. Dedup-merge keeps the union of rows and removes only redundant ones, so spillover and overlapping selections merge safely.
 - **Scope.** Only partitions this run actually wrote to are merged; untouched partitions are never read or rewritten. A partition with a single fresh file and no prior data is left as-is (first runs stay cheap); the merge kicks in once a partition has 2+ files (a prior run's output, or a generation rollover).
 - **Cost.** When a partition is merged it is fully read and rewritten (≈ a compaction pass over that partition; on S3, its prior objects are downloaded, a single merged object is uploaded, and the old objects deleted). This is the price of idempotency — pass `--dedup false` (or `DEDUP=false`) to skip it and append instead (the pre-dedup behavior, where re-runs accumulate files).
-- **Only under `--apply`.** Dry runs never merge; they note that dedup will run on apply.
 - **`output == input` caveat.** With dedup on and the output target equal to the input target, raw and normalized rows share a partition but have different payloads, so they will **not** dedup against each other and the partition ends up holding both — a warning is printed. Use a separate output dir/bucket.
 
 The end-of-run summary reports `partitions merged`, `rows in`, `rows out`, and `duplicates removed`.
@@ -283,7 +281,6 @@ job "ais-normalize" {
           "--partition", "day",
           "--incremental",     # watermark at the output: process only what arrived since the last successful run
           "--concurrency", "4",
-          "--apply",
         ]
       }
 
@@ -307,7 +304,6 @@ args = [
   "--s3-endpoint", "http://minio.service.consul:9000",
   "--partition", "day",
   "--concurrency", "4",
-  "--apply",
 ]
 env {
   S3_ACCESS_KEY = "..."
@@ -323,7 +319,7 @@ Size local disk for the S3 scratch space too (under the task's `$TMPDIR`): input
 
 ```bash
 # crontab -e
-0 */6 * * * /usr/local/bin/ais-normalize --input-dir /data/bronze --output-dir /data/normalized --partition day --apply --noui >> /var/log/ais-normalize.log 2>&1
+0 */6 * * * /usr/local/bin/ais-normalize --input-dir /data/bronze --output-dir /data/normalized --partition day --noui >> /var/log/ais-normalize.log 2>&1
 ```
 
 `--noui` is automatic when stdout isn't a TTY (cron, systemd), so it's optional here but explicit is fine.

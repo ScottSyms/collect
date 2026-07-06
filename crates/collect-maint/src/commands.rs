@@ -426,7 +426,6 @@ pub async fn compact(
     storage: &StorageLocation,
     entries: &[DatasetEntry],
     target_file_size_bytes: u64,
-    apply: bool,
     concurrency: usize,
     compression_level: i32,
 ) -> Result<()> {
@@ -464,44 +463,6 @@ pub async fn compact(
             count(planned_partitions)
         ),
     );
-
-    if apply {
-        report("compact", "applying changes (--apply)");
-    } else {
-        report("compact", "dry run only; re-run with --apply to execute");
-    }
-
-    if !apply {
-        let mut completed_jobs = 0usize;
-        for (_partition, jobs) in &partition_groups {
-            check_cancelled()?;
-            for job in jobs {
-                completed_jobs += 1;
-                report_step(
-                    "compact",
-                    completed_jobs,
-                    total_jobs,
-                    format!(
-                        "would compact {} -> {}",
-                        job.partition.relative_dir(),
-                        job.output_rel
-                    ),
-                );
-                report(
-                    "compact",
-                    format!(
-                        "Would compact {} file(s) in {} -> {}",
-                        count(job.inputs.len()),
-                        job.partition.relative_dir(),
-                        job.output_rel
-                    ),
-                );
-            }
-            status::advance_progress(1);
-        }
-        report("compact", "dry run complete");
-        return Ok(());
-    }
 
     let workspace = tempfile::tempdir()?;
     let mut completed = 0usize;
@@ -589,7 +550,6 @@ pub async fn vacuum(
     storage: &StorageLocation,
     entries: &[DatasetEntry],
     partition: PartitionGranularity,
-    apply: bool,
     concurrency: usize,
 ) -> Result<()> {
     let entry_map: BTreeMap<String, DatasetEntry> = entries
@@ -609,12 +569,6 @@ pub async fn vacuum(
         ),
     );
 
-    if apply {
-        report("vacuum", "applying changes (--apply)");
-    } else {
-        report("vacuum", "dry run only; re-run with --apply to execute");
-    }
-
     let total = entries.len();
     let mut completed = 0usize;
     let mut results = Vec::with_capacity(entries.len());
@@ -624,7 +578,7 @@ pub async fn vacuum(
             let entry_map = &entry_map;
             async move {
                 let issues =
-                    vacuum_entry(storage, &entry, entry_map, partition, apply, concurrency).await?;
+                    vacuum_entry(storage, &entry, entry_map, partition, concurrency).await?;
                 Ok::<_, anyhow::Error>((index, entry.rel_path, issues))
             }
         })
@@ -640,17 +594,8 @@ pub async fn vacuum(
 
     results.sort_by_key(|(index, _, _)| *index);
 
-    if apply {
-        report("vacuum", "Vacuum complete");
-        report("vacuum", "complete");
-    } else {
-        for (_, _, entry_issues) in results {
-            for issue in entry_issues {
-                report("vacuum", issue);
-            }
-        }
-        report("vacuum", "dry run complete");
-    }
+    report("vacuum", "Vacuum complete");
+    report("vacuum", "complete");
 
     Ok(())
 }
@@ -1518,19 +1463,14 @@ async fn vacuum_entry(
     entry: &DatasetEntry,
     entry_map: &BTreeMap<String, DatasetEntry>,
     partition: PartitionGranularity,
-    apply: bool,
     concurrency: usize,
 ) -> Result<Vec<String>> {
     let mut issues = Vec::new();
 
     match entry.kind {
         EntryKind::Temp => {
-            if apply {
-                report("vacuum", format!("deleting temp {}", entry.rel_path));
-                storage.delete_rel_path(&entry.rel_path).await?;
-            } else {
-                issues.push(format!("would remove temp file {}", entry.rel_path));
-            }
+            report("vacuum", format!("deleting temp {}", entry.rel_path));
+            storage.delete_rel_path(&entry.rel_path).await?;
         }
         EntryKind::Manifest => {
             let manifest_bytes = storage.read_bytes(&entry.rel_path).await?;
@@ -1570,7 +1510,7 @@ async fn vacuum_entry(
                         manifest.output,
                         scan.issues.join(", ")
                     ));
-                } else if apply {
+                } else {
                     report(
                         "vacuum",
                         format!(
@@ -1583,34 +1523,22 @@ async fn vacuum_entry(
                         .delete_rel_paths(&manifest.inputs, concurrency)
                         .await?;
                     storage.delete_rel_path(&entry.rel_path).await?;
-                } else {
-                    issues.push(format!(
-                        "would finalize manifest {} and delete {} input file(s)",
-                        entry.rel_path,
-                        count(manifest.inputs.len())
-                    ));
                 }
-            } else if apply {
+            } else {
                 report(
                     "vacuum",
                     format!("removing stale manifest {}", entry.rel_path),
                 );
                 storage.delete_rel_path(&entry.rel_path).await?;
-            } else {
-                issues.push(format!("would remove stale manifest {}", entry.rel_path));
             }
         }
         EntryKind::Parquet | EntryKind::CompactedParquet | EntryKind::Other => {
             if entry.size == 0 {
-                if apply {
-                    report(
-                        "vacuum",
-                        format!("deleting zero-byte file {}", entry.rel_path),
-                    );
-                    storage.delete_rel_path(&entry.rel_path).await?;
-                } else {
-                    issues.push(format!("would remove zero-byte file {}", entry.rel_path));
-                }
+                report(
+                    "vacuum",
+                    format!("deleting zero-byte file {}", entry.rel_path),
+                );
+                storage.delete_rel_path(&entry.rel_path).await?;
             }
         }
     }

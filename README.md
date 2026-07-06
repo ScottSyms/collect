@@ -64,13 +64,13 @@ cargo run -p collect-aisstream -- --api-key $AISSTREAM_API_KEY --bounding-boxes 
 cargo run -p collect-file -- --input data.txt --source mydata --compression-level 1 --s3-bucket maritime-data
 
 # Normalize collected AIS data (combine fragments, re-timestamp/re-partition)
-cargo run -p ais-normalize -- --input-dir data --output-dir normalized --partition day --apply
+cargo run -p ais-normalize -- --input-dir data --output-dir normalized --partition day
 
 # Normalize straight from one S3 bucket to another (same endpoint/region/credentials)
-cargo run -p ais-normalize -- --input-s3-bucket raw-ais --output-s3-bucket normalized-ais --s3-endpoint http://minio:9000 --partition day --apply
+cargo run -p ais-normalize -- --input-s3-bucket raw-ais --output-s3-bucket normalized-ais --s3-endpoint http://minio:9000 --partition day
 
 # Decode normalized AIS into typed Parquet (positions + vessel statics)
-cargo run -p ais-parse -- --input-dir normalized --output-dir silver --partition day --apply
+cargo run -p ais-parse -- --input-dir normalized --output-dir silver --partition day
 ```
 
 See [AIS_NORMALIZE.md](AIS_NORMALIZE.md) for how fragment reassembly and re-timestamping work, the full CLI reference, and deployment as a scheduled batch job. See [AIS_PARSE.md](AIS_PARSE.md) for the decoded (silver) schemas and the bronze → silver pipeline.
@@ -79,23 +79,17 @@ See [AIS_NORMALIZE.md](AIS_NORMALIZE.md) for how fragment reassembly and re-time
 
 ## Maintenance
 
-`collect-maint` inspects, validates, compacts, and vacuums hive-partitioned datasets. It requires `--partition` so it can parse the on-disk layout. `compact` and `vacuum` are dry-run by default; add `--apply` to make changes. Worker concurrency is selected automatically unless `--concurrency` is provided. `compact` targets compacted files of about 512 MiB by default; override with `--target-file-size-bytes`. `--compression-level` controls Zstd speed vs file size for ingest and compaction.
+`collect-maint` inspects, validates, compacts, and vacuums hive-partitioned datasets. It requires `--partition` so it can parse the on-disk layout. Worker concurrency is selected automatically unless `--concurrency` is provided. `compact` targets compacted files of about 512 MiB by default; override with `--target-file-size-bytes`. `--compression-level` controls Zstd speed vs file size for ingest and compaction.
 
 ```bash
 # Read-only inspection
 cargo run -p collect-maint -- --root data --partition day inspect
 
-# Dry-run compaction plan
+# Compact small files
 cargo run -p collect-maint -- --root data --partition day compact
 
-# Real compaction run
-cargo run -p collect-maint -- --root data --partition day compact --apply
-
-# Dry-run cleanup plan
+# Clean up temp files and manifests
 cargo run -p collect-maint -- --root data --partition day vacuum
-
-# Real cleanup run
-cargo run -p collect-maint -- --root data --partition day vacuum --apply
 ```
 
 ## Environment Variables

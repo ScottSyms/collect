@@ -157,21 +157,18 @@ boundary so multi-part sequence ids can't collide across sources.
 ## Usage
 
 ```bash
-# Preview (dry run): decode counts only, nothing written
+# Decode locally
 cargo run -p ais-parse -- --input-dir normalized --output-dir silver --partition day
-
-# Apply locally
-cargo run -p ais-parse -- --input-dir normalized --output-dir silver --partition day --apply
 
 # S3 → S3 on one MinIO endpoint
 cargo run -p ais-parse -- \
   --input-s3-bucket normalized-ais --output-s3-bucket silver-ais \
   --s3-endpoint http://minio:9000 --s3-access-key … --s3-secret-key … --s3-disable-tls \
-  --partition day --apply
+  --partition day
 
 # Hourly scheduled run: only partitions with new bronze files
 cargo run -p ais-parse -- --input-s3-bucket normalized-ais --output-s3-bucket silver-ais \
-  --s3-endpoint http://minio:9000 --partition day --incremental --apply
+  --s3-endpoint http://minio:9000 --partition day --incremental
 ```
 
 ### CLI reference
@@ -188,7 +185,6 @@ for the shared semantics of each group:
 | `--source`, `--year`…`--minute` | *(all)* | partition slice, same rules as ais-normalize |
 | `--since <HOURS>` | *(off)* | rolling window (env `SINCE_HOURS`); with `--incremental`, first-run seed only |
 | `--incremental` | *(off)* | watermark at the output (`_ais-parse/watermark.json`), env `INCREMENTAL=true`. Independent of ais-normalize's watermark, so both tools can share an output tree |
-| `--apply` | off (dry run) | actually write |
 | `--batch-size` | `8192` | Parquet read batch rows |
 | `--compression-level` | `5` | Zstd level for output |
 | `--concurrency` | cores, clamped `[1, 8]` | partitions decoded in parallel |
@@ -239,7 +235,6 @@ job "ais-parse" {
           "--partition", "day",
           "--incremental",
           "--concurrency", "4",
-          "--apply",
         ]
       }
       env {

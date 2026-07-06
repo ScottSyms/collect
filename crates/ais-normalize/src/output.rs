@@ -194,27 +194,22 @@ pub struct OutputWriterPool {
     /// Provenance for every row this pool writes — one input partition is a
     /// single source, so it is constant for the pool's lifetime.
     source: Arc<str>,
-    dry_run: bool,
     /// Active writers keyed by partition `relative_dir`.
     writers: HashMap<String, PartitionWriter>,
     /// Files already closed by a generation rollover (see `MAX_OPEN_WRITERS`).
     finished: Vec<(String, u64, PathBuf)>,
-    /// Dry-run row counts keyed by partition `relative_dir`.
-    dry_run_counts: HashMap<String, u64>,
     pub total_rows_written: u64,
 }
 
 impl OutputWriterPool {
-    pub fn new(output_root: PathBuf, source: &str, compression_level: i32, dry_run: bool) -> Self {
+    pub fn new(output_root: PathBuf, source: &str, compression_level: i32) -> Self {
         Self {
             output_root,
             compression_level,
             schema: build_schema(),
             source: Arc::from(source),
-            dry_run,
             writers: HashMap::new(),
             finished: Vec::new(),
-            dry_run_counts: HashMap::new(),
             total_rows_written: 0,
         }
     }
@@ -226,15 +221,6 @@ impl OutputWriterPool {
     /// partition is seen.
     pub fn write_row(&mut self, partition_rel_dir: &str, ts_ms: i64, payload: &str) -> Result<()> {
         self.total_rows_written += 1;
-
-        if self.dry_run {
-            if let Some(count) = self.dry_run_counts.get_mut(partition_rel_dir) {
-                *count += 1;
-            } else {
-                self.dry_run_counts.insert(partition_rel_dir.to_string(), 1);
-            }
-            return Ok(());
-        }
 
         if let Some(writer) = self.writers.get_mut(partition_rel_dir) {
             return writer.push(ts_ms, payload);
@@ -276,14 +262,6 @@ impl OutputWriterPool {
     /// it mid-run. Callers aggregate for reporting and, for S3 output,
     /// upload each `local_path` under a key derived from it.
     pub fn flush_all(mut self) -> Result<Vec<(String, u64, PathBuf)>> {
-        if self.dry_run {
-            return Ok(self
-                .dry_run_counts
-                .into_iter()
-                .map(|(rel_dir, rows)| (rel_dir, rows, PathBuf::new()))
-                .collect());
-        }
-
         self.close_open_writers()?;
         Ok(self.finished)
     }
@@ -296,7 +274,7 @@ mod tests {
     #[test]
     fn writer_cap_rolls_over_generations_without_losing_rows() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut pool = OutputWriterPool::new(dir.path().to_path_buf(), "norway", 1, false);
+        let mut pool = OutputWriterPool::new(dir.path().to_path_buf(), "norway", 1);
 
         // Touch more partitions than the cap allows, then revisit the first
         // one so it gets a second file in a new generation.
