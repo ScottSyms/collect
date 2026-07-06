@@ -759,11 +759,11 @@ fn process_partition(
             &file.partition.source,
             &mut stats,
             Writers {
-                positions: Some(&mut positions),
-                statics: Some(&mut statics),
-                meteo: Some(&mut meteo),
-                binary: Some(&mut binary),
-                atons: Some(&mut atons),
+                positions: &mut positions,
+                statics: &mut statics,
+                meteo: &mut meteo,
+                binary: &mut binary,
+                atons: &mut atons,
             },
             batch_size,
         )
@@ -807,18 +807,18 @@ fn process_partition(
 }
 
 struct Writers<'a> {
-    positions: Option<&'a mut PositionsWriter>,
-    statics: Option<&'a mut StaticsWriter>,
-    meteo: Option<&'a mut MeteoWriter>,
-    binary: Option<&'a mut BinaryWriter>,
-    atons: Option<&'a mut AtonWriter>,
+    positions: &'a mut PositionsWriter,
+    statics: &'a mut StaticsWriter,
+    meteo: &'a mut MeteoWriter,
+    binary: &'a mut BinaryWriter,
+    atons: &'a mut AtonWriter,
 }
 
 fn process_parquet_file(
     path: &Path,
     path_source: &str,
     stats: &mut ParseStats,
-    mut writers: Writers<'_>,
+    writers: Writers<'_>,
     batch_size: usize,
 ) -> Result<()> {
     let file = StdFile::open(path).with_context(|| format!("open {}", path.display()))?;
@@ -881,33 +881,23 @@ fn process_parquet_file(
             match decode_row(ts_col.value(i), source, msg_type, &ais_msg.Message) {
                 Decoded::Position(row) => {
                     stats.positions_out += 1;
-                    if let Some(writer) = writers.positions.as_deref_mut() {
-                        writer.write(&row)?;
-                    }
+                    writers.positions.write(&row)?;
                 }
                 Decoded::Static(row) => {
                     stats.statics_out += 1;
-                    if let Some(writer) = writers.statics.as_deref_mut() {
-                        writer.write(&row)?;
-                    }
+                    writers.statics.write(&row)?;
                 }
                 Decoded::Meteo(row) => {
                     stats.meteo_out += 1;
-                    if let Some(writer) = writers.meteo.as_deref_mut() {
-                        writer.write(row)?;
-                    }
+                    writers.meteo.write(row)?;
                 }
                 Decoded::Binary(row) => {
                     stats.binary_out += 1;
-                    if let Some(writer) = writers.binary.as_deref_mut() {
-                        writer.write(row)?;
-                    }
+                    writers.binary.write(row)?;
                 }
                 Decoded::Aton(row) => {
                     stats.atons_out += 1;
-                    if let Some(writer) = writers.atons.as_deref_mut() {
-                        writer.write(row)?;
-                    }
+                    writers.atons.write(row)?;
                 }
                 Decoded::Other => stats.other_decoded += 1,
                 Decoded::Failed => stats.failed += 1,

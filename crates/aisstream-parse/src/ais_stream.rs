@@ -71,12 +71,6 @@ pub struct ExtendedClassBPositionReport {
     pub TrueHeading: Option<u16>,
     pub PositionAccuracy: bool,
     pub Raim: bool,
-    pub Name: Option<String>,
-    #[serde(rename = "Type")]
-    pub ship_type: Option<u8>,
-    pub Dimension: Option<ShipDimensions>,
-    pub Dte: Option<bool>,
-    pub AssignedMode: Option<bool>,
 }
 
 // ── ShipStaticData (AIS type 5) ────────────────────────────────────────
@@ -169,9 +163,6 @@ pub struct StandardSearchAndRescueAircraftReport {
     pub Longitude: Option<f64>,
     pub PositionAccuracy: bool,
     pub Raim: bool,
-    pub AltFromBaro: Option<bool>,
-    pub Dte: Option<bool>,
-    pub AssignedMode: Option<bool>,
 }
 
 // ── AidsToNavigationReport (AIS type 21) ───────────────────────────────
