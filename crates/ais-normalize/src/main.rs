@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use arrow::array::{StringArray, TimestampMillisecondArray};
 use chrono::TimeZone;
 use clap::Parser;
-use collect_core::{PartitionGranularity, S3Storage};
+use collect_core::{PartitionGranularity, S3ConnectionArgs, S3Storage};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::File as StdFile;
@@ -58,25 +58,8 @@ struct Args {
     #[arg(long, default_value = "")]
     output_s3_prefix: String,
 
-    /// S3 endpoint URL, shared by --input-s3-bucket and --output-s3-bucket (for MinIO or other S3-compatible storage)
-    #[arg(long)]
-    s3_endpoint: Option<String>,
-
-    /// S3 region, shared by --input-s3-bucket and --output-s3-bucket
-    #[arg(long, default_value = "us-east-1")]
-    s3_region: String,
-
-    /// S3 access key ID (can also use AWS_ACCESS_KEY_ID env var)
-    #[arg(long)]
-    s3_access_key: Option<String>,
-
-    /// S3 secret access key (can also use AWS_SECRET_ACCESS_KEY env var)
-    #[arg(long)]
-    s3_secret_key: Option<String>,
-
-    /// Disable TLS/HTTPS for the S3 endpoint (use plain HTTP instead)
-    #[arg(long)]
-    s3_disable_tls: bool,
+    #[command(flatten)]
+    s3_connection: S3ConnectionArgs,
 
     /// Partition granularity; must match the dataset layout
     #[arg(long, default_value_t = PartitionGranularity::Day)]
@@ -186,31 +169,7 @@ impl Args {
                 self.output_s3_prefix = value;
             }
         }
-        if self.s3_endpoint.is_none() {
-            if let Ok(value) = std::env::var("S3_ENDPOINT") {
-                self.s3_endpoint = Some(value);
-            }
-        }
-        if self.s3_region == "us-east-1" {
-            if let Ok(value) = std::env::var("S3_REGION") {
-                self.s3_region = value;
-            }
-        }
-        if self.s3_access_key.is_none() {
-            if let Ok(value) = std::env::var("S3_ACCESS_KEY") {
-                self.s3_access_key = Some(value);
-            }
-        }
-        if self.s3_secret_key.is_none() {
-            if let Ok(value) = std::env::var("S3_SECRET_KEY") {
-                self.s3_secret_key = Some(value);
-            }
-        }
-        if !self.s3_disable_tls {
-            if let Ok(value) = std::env::var("S3_DISABLE_TLS") {
-                self.s3_disable_tls = value.eq_ignore_ascii_case("true") || value == "1";
-            }
-        }
+        self.s3_connection.apply_env();
         // dedup defaults to true; only an explicit env value flips it off. A
         // command-line --dedup always wins because it is parsed before this.
         if self.dedup {
@@ -407,12 +366,12 @@ async fn main() -> Result<()> {
         input_storages.push(
             S3Storage::new(
                 bucket.clone(),
-                args.s3_region.clone(),
-                args.s3_endpoint.clone(),
-                args.s3_access_key.clone(),
-                args.s3_secret_key.clone(),
+                args.s3_connection.s3_region.clone(),
+                args.s3_connection.s3_endpoint.clone(),
+                args.s3_connection.s3_access_key.clone(),
+                args.s3_connection.s3_secret_key.clone(),
                 false,
-                args.s3_disable_tls,
+                args.s3_connection.s3_disable_tls,
             )
             .await
             .with_context(|| format!("connecting to input S3 bucket {bucket}"))?,
@@ -424,12 +383,12 @@ async fn main() -> Result<()> {
         Some(bucket) => Some(
             S3Storage::new(
                 bucket.clone(),
-                args.s3_region.clone(),
-                args.s3_endpoint.clone(),
-                args.s3_access_key.clone(),
-                args.s3_secret_key.clone(),
+                args.s3_connection.s3_region.clone(),
+                args.s3_connection.s3_endpoint.clone(),
+                args.s3_connection.s3_access_key.clone(),
+                args.s3_connection.s3_secret_key.clone(),
                 false,
-                args.s3_disable_tls,
+                args.s3_connection.s3_disable_tls,
             )
             .await
             .context("connecting to output S3 bucket")?,

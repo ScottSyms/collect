@@ -180,7 +180,7 @@ The TUI will show these values pre-filled.
 ### Mix CLI and TUI
 Provide some options via CLI, configure rest in TUI:
 ```bash
-cargo run -p collect-file -- --out-dir /data/output --s3-bucket my-bucket --tui
+cargo run -p collect-file -- --output-dir /data/output --s3-bucket my-bucket
 ```
 
 ## Tips

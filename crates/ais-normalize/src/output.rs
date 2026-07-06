@@ -71,7 +71,7 @@ pub(crate) fn open_writer(
     let props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(zstd_level))
         // One row group per flushed (sorted) batch: keeps every row group
-        // sorted by ts so collect-maint compaction can stream-merge these
+        // sorted by ts so compaction can stream-merge these
         // files, and bounds writer memory to one batch per open partition.
         .set_max_row_group_size(FLUSH_BATCH_SIZE)
         .set_column_encoding(ColumnPath::from("ts"), Encoding::DELTA_BINARY_PACKED)

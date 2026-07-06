@@ -1,6 +1,6 @@
 # Environment Variable Configuration
 
-Most `collect-file` and `collect-socket` command-line parameters can be configured using environment variables, making Docker deployments much easier to manage. `collect-maint` remains CLI-only. This document lists the supported environment variables and their usage.
+Most command-line parameters can be configured using environment variables, making Docker deployments much easier to manage. This document lists the supported environment variables and their usage.
 
 ## Environment Variable Reference
 
@@ -36,8 +36,8 @@ Most `collect-file` and `collect-socket` command-line parameters can be configur
   - Example: `AIS=true`
   - Default: `false`
 
-- `OUT_DIR`: Output root directory for Parquet files
-  - Example: `OUT_DIR=/data`
+- `OUTPUT_DIR`: Output root directory for Parquet files
+  - Example: `OUTPUT_DIR=/data`
   - Default: `data`
 
 - `MAX_ROWS`: Maximum rows to buffer per Parquet file before flush
@@ -130,7 +130,7 @@ services:
       - TCP_HOST=153.44.253.27
       - TCP_PORT=5631
       - SOURCE=norway-tcp
-      - OUT_DIR=/data
+      - OUTPUT_DIR=/data
       - MAX_ROWS=5000
     volumes:
       - ./output:/data
@@ -173,7 +173,7 @@ This allows for flexible configuration where you can:
 The application gracefully handles missing environment variables:
 
 - **Optional parameters** (like `S3_BUCKET`): Missing environment variables are treated as unset/empty
-- **Parameters with defaults** (like `S3_REGION`, `OUT_DIR`, `PARTITION`): Use their default values when environment variable is missing
+- **Parameters with defaults** (like `S3_REGION`, `OUTPUT_DIR`, `PARTITION`): Use their default values when environment variable is missing
 - **Boolean parameters** (like `HEALTH_CHECK`, `KEEP_LOCAL`): Default to `false` when environment variable is missing
 ## Docker Health Checks
 

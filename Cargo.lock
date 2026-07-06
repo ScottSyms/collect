@@ -1114,7 +1114,6 @@ dependencies = [
  "anyhow",
  "clap",
  "collect-core",
- "collect-tui",
  "futures-util",
  "serde",
  "serde_json",
@@ -1155,7 +1154,6 @@ dependencies = [
  "chrono",
  "clap",
  "collect-core",
- "collect-tui",
  "crossterm",
  "futures-util",
  "parquet",
@@ -1177,7 +1175,6 @@ dependencies = [
  "bytes",
  "clap",
  "collect-core",
- "collect-tui",
  "futures-util",
  "parquet",
  "rdkafka",
@@ -1190,50 +1187,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "collect-maint"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arrow",
- "aws-config",
- "aws-credential-types",
- "aws-sdk-s3",
- "chrono",
- "clap",
- "collect-core",
- "crossterm",
- "futures-util",
- "parquet",
- "ratatui",
- "rlimit",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "walkdir",
-]
-
-[[package]]
 name = "collect-socket"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
  "collect-core",
- "collect-tui",
  "serde",
  "tokio",
-]
-
-[[package]]
-name = "collect-tui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "crossterm",
- "ratatui",
- "serde",
- "serde_json",
 ]
 
 [[package]]

@@ -4,7 +4,6 @@ use collect_core::{
     default_source_from_path, health_file_path, run_ingest, update_health_status_async,
     CommonCliArgs, IngestOptions, S3CliArgs,
 };
-use collect_tui::{run_tui, TuiModel};
 use std::collections::VecDeque;
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -19,8 +18,6 @@ mod completion_manifest;
 mod input;
 mod status;
 
-mod tui;
-
 #[derive(Parser, Debug)]
 #[command(
     version,
@@ -28,7 +25,7 @@ mod tui;
 )]
 struct Args {
     /// Input file or directory to ingest
-    #[arg(short, long)]
+    #[arg(long = "input-dir")]
     input: Option<PathBuf>,
 
     /// Logical source label; defaults to input file stem or directory name
@@ -45,10 +42,6 @@ struct Args {
     #[command(flatten)]
     s3: S3CliArgs,
 
-    /// Launch interactive TUI for configuration
-    #[arg(long)]
-    tui: bool,
-
     /// Disable the runtime status UI and print aggregate updates every 10 files
     #[arg(long)]
     noui: bool,
@@ -58,25 +51,6 @@ struct Args {
 async fn main() -> Result<()> {
     let mut args = Args::parse();
     let noui = args.noui;
-    let concurrency = args.concurrency;
-
-    if args.tui {
-        let initial_config = tui::TuiConfig::load_from_env();
-
-        match run_tui(initial_config)? {
-            Some(config) => {
-                let mut full_args = vec!["collect-file".to_string()];
-                full_args.extend(config.to_cli_args());
-                args = Args::parse_from(full_args);
-                args.noui = noui;
-                args.concurrency = concurrency;
-            }
-            None => {
-                println!("Configuration cancelled.");
-                return Ok(());
-            }
-        }
-    }
 
     if args.input.is_none() {
         if let Ok(value) = std::env::var("INPUT_PATH") {

@@ -8,7 +8,6 @@ A Rust workspace for ingesting positional data into Hive-partitioned Parquet fil
 - **`collect-aisstream`** — aisstream.io WebSocket ingestion
 - **`ais-normalize`** — post-processing: re-timestamp, re-partition, and combine multi-part AIS sentences (input and output can each be local or S3)
 - **`ais-parse`** — silver layer: decode AIS sentences into typed Parquet (vessel positions and statics), via [ScottSyms/nmea-parser](https://github.com/ScottSyms/nmea-parser); local or S3 on both sides
-- **`collect-maint`** — inspect, validate, compact, and vacuum datasets (local or S3)
 
 All collectors support optional remote storage (S3/MinIO).
 
@@ -23,7 +22,6 @@ All collectors support optional remote storage (S3/MinIO).
 - **Background Uploads**: Non-blocking S3 uploads to prevent data collection pauses
 - **At-Least-Once Delivery**: Graceful-shutdown flush, startup sweep of orphaned files, and Kafka offsets committed only after data is durable on disk
 - **Observability**: Optional Prometheus `/metrics` and HTTP `/healthz` endpoint per collector
-- **Maintenance CLI**: Inspect, validate, compact (streaming k-way merge), and vacuum hive-partitioned datasets
 - **Docker Support**: Full Docker and docker-compose integration with health checks
 - **Environment Variables**: Complete environment variable support for containerized deployments
 - **Bounded Memory**: Byte-budgeted write pipeline; predictable footprint under backpressure
@@ -49,7 +47,7 @@ cargo run -p collect-socket --
 
 ```bash
 # File input
-cargo run -p collect-file -- --input data.txt --source mydata
+cargo run -p collect-file -- --input-dir data.txt --source mydata
 
 # TCP stream
 cargo run -p collect-socket -- --tcp-host 153.44.253.27 --tcp-port 5631 --source norway-tcp
@@ -61,7 +59,7 @@ cargo run -p collect-kafka -- --kafka-brokers broker:9092 --topic ais-raw --grou
 cargo run -p collect-aisstream -- --api-key $AISSTREAM_API_KEY --bounding-boxes '[[[-90,-180],[90,180]]]'
 
 # File input with S3
-cargo run -p collect-file -- --input data.txt --source mydata --compression-level 1 --s3-bucket maritime-data
+cargo run -p collect-file -- --input-dir data.txt --source mydata --compression-level 1 --s3-bucket maritime-data
 
 # Normalize collected AIS data (combine fragments, re-timestamp/re-partition)
 cargo run -p ais-normalize -- --input-dir data --output-dir normalized --partition day
@@ -75,36 +73,21 @@ cargo run -p ais-parse -- --input-dir normalized --output-dir silver --partition
 
 See [AIS_NORMALIZE.md](AIS_NORMALIZE.md) for how fragment reassembly and re-timestamping work, the full CLI reference, and deployment as a scheduled batch job. See [AIS_PARSE.md](AIS_PARSE.md) for the decoded (silver) schemas and the bronze → silver pipeline.
 
-`collect-file` auto-detects plain text, gzip, bzip2, and zip inputs. Zip archives are read entry-by-entry in archive order. Hidden dotfiles are skipped silently. `--concurrency` overrides the auto-selected file worker count. `--ais` applies to `collect-file` only; it prefers NMEA `c:<epoch>` tag block timestamps and `$PGHP` capture timestamps when present, and reuses the first sentence timestamp for grouped `\g:` fragments.
-
-## Maintenance
-
-`collect-maint` inspects, validates, compacts, and vacuums hive-partitioned datasets. It requires `--partition` so it can parse the on-disk layout. Worker concurrency is selected automatically unless `--concurrency` is provided. `compact` targets compacted files of about 512 MiB by default; override with `--target-file-size-bytes`. `--compression-level` controls Zstd speed vs file size for ingest and compaction.
-
-```bash
-# Read-only inspection
-cargo run -p collect-maint -- --root data --partition day inspect
-
-# Compact small files
-cargo run -p collect-maint -- --root data --partition day compact
-
-# Clean up temp files and manifests
-cargo run -p collect-maint -- --root data --partition day vacuum
-```
+`collect-file` auto-detects plain text, gzip, bzip2, and zip inputs. Zip archives are read entry-by-entry in archive order. Hidden dotfiles are skipped silently. `--concurrency` overrides the auto-selected file worker count.
 
 ## Environment Variables
 
-Most `collect-file` and `collect-socket` command-line parameters can be configured using environment variables. `collect-maint` remains CLI-only.
+Most command-line parameters can be configured using environment variables.
 
 | Environment Variable | CLI Argument | Description |
 |---------------------|--------------|-------------|
-| `INPUT_PATH` / `INPUT_FILE` | `--input` | Input file or directory path |
+| `INPUT_PATH` / `INPUT_FILE` | `--input-dir` | Input file or directory path |
 | `TCP_HOST` | `--tcp-host` | TCP host address |
 | `TCP_PORT` | `--tcp-port` | TCP port number |
 | `SOURCE` | `--source` | Logical source label |
 | `PARTITION` | `--partition` | Partition granularity for ingest layout |
 | `AIS` | `--ais` | Use NMEA `c:<epoch>` tag blocks or `$PGHP` capture timestamps (collect-file only) |
-| `OUT_DIR` | `--out-dir` | Output directory |
+| `OUTPUT_DIR` | `--output-dir` | Output directory |
 | `MAX_ROWS` | `--max-rows` | Max rows per file |
 | `MAX_BATCH_BYTES` | `--max-batch-bytes` | Max payload bytes per Parquet file |
 | `COMPRESSION_LEVEL` | `--compression-level` | Zstd compression level for Parquet output |
@@ -305,7 +288,6 @@ cargo build --release --workspace
 # Run
 ./target/release/collect-file --help
 ./target/release/collect-socket --help
-./target/release/collect-maint --help
 ```
 
 ## Performance Tuning

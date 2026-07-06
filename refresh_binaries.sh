@@ -5,7 +5,6 @@ rclone copy target/release/ais-parse rustfs:binaries
 rclone copy target/release/collect-file rustfs:binaries
 rclone copy target/release/collect-aisstream rustfs:binaries
 rclone copy target/release/collect-socket rustfs:binaries
-rclone copy target/release/collect-maint rustfs:binaries
 rclone copy target/release/collect-kafka rustfs:binaries
 rclone copy target/release/ais-normalize rustfs:binaries
 

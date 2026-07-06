@@ -3,12 +3,10 @@
 `ais-normalize` is a batch post-processing pass over a Hive-partitioned Parquet dataset already collected by `collect-file`, `collect-socket`, `collect-kafka`, or `collect-aisstream`. It sits between raw ingestion and compaction in the medallion pipeline:
 
 ```
-collect-* (bronze, raw)  →  collect-maint compact  →  ais-normalize  →  ais-parse (silver)  →  Iceberg
+collect-* (bronze, raw)  →  ais-normalize  →  ais-parse (silver)  →  Iceberg
 ```
 
 It is a CLI tool that runs to completion and exits — not a long-running service. It has no `--metrics-addr`/`/healthz` endpoint. The next step of the pipeline — decoding the normalized sentences into typed columns — is [ais-parse](AIS_PARSE.md).
-
-> **Compaction placement.** `collect-maint compact`/`validate` currently expect the bronze two-column `(ts, payload)` schema, so run compaction on the **raw** dataset (before normalize), as shown above. The normalized output carries an extra `source` column; compacting it needs the schema-general compaction update (tracked separately).
 
 ## What problem it solves
 
@@ -149,7 +147,7 @@ Rules and behavior:
 - **A 60-second overlap lap** is applied when comparing mtimes, absorbing `LastModified` jitter around the previous run's listing. Files within the lap re-process; dedup makes that free. (Corollary: an idle feed keeps re-selecting its newest partition — harmless.)
 - **Dry runs, failures, and cancels never advance the watermark**, and it never moves backwards.
 - Mutually exclusive with `--year`…`--minute`. Combines normally with `--source` and multi-input merging.
-- The state directory is metadata, not data: `collect-maint` skips `_`- and `.`-prefixed path segments (the Hive/Spark convention), and Parquet dataset readers ignore non-`.parquet` files.
+- The state directory is metadata, not data: the watermark skips `_`- and `.`-prefixed path segments (the Hive/Spark convention), and Parquet dataset readers ignore non-`.parquet` files.
 
 ## Rolling windows (`--since`)
 
@@ -251,7 +249,7 @@ The end-of-run summary reports `partitions merged`, `rows in`, `rows out`, and `
 `ais-normalize` never modifies or deletes the input dataset — it only reads it and writes new files. This applies equally to `--output-dir` and `--output-s3-bucket`:
 
 - **The output target may equal the input target** (same directory, or same bucket/prefix), but if it does, the original raw files remain in place alongside the new normalized files in the same partitions. Re-running the tool will also re-scan and re-normalize any previously-written normalized output sitting under that same root (harmless, since already-normalized rows have nothing left to reassemble or re-timestamp, but wasteful).
-- **Recommended pattern:** write to a separate output directory or bucket, verify the result (row counts, spot-check with `collect-maint inspect`), then swap the downstream read path (or move/delete the raw data) once satisfied. Keep the raw bronze data until you're confident in the normalized output — it's the only copy of the original ingest-time data.
+- **Recommended pattern:** write to a separate output directory or bucket, verify the result (row counts, spot-check with parquet tools), then swap the downstream read path (or move/delete the raw data) once satisfied. Keep the raw bronze data until you're confident in the normalized output — it's the only copy of the original ingest-time data.
 
 ## Deployment
 

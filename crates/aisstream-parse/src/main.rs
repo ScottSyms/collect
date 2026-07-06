@@ -4,7 +4,7 @@ use chrono::TimeZone;
 use clap::Parser;
 use collect_core::dataset::{self, DatasetFile, PartitionKey};
 use collect_core::state;
-use collect_core::{PartitionGranularity, S3Storage};
+use collect_core::{PartitionGranularity, S3ConnectionArgs, S3Storage};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::collections::VecDeque;
 use std::fs::File as StdFile;
@@ -64,54 +64,57 @@ struct Args {
     #[arg(long, default_value = "")]
     output_s3_prefix: String,
 
-    #[arg(long)]
-    s3_endpoint: Option<String>,
+    #[command(flatten)]
+    s3_connection: S3ConnectionArgs,
 
-    #[arg(long, default_value = "us-east-1")]
-    s3_region: String,
-
-    #[arg(long)]
-    s3_access_key: Option<String>,
-
-    #[arg(long)]
-    s3_secret_key: Option<String>,
-
-    #[arg(long)]
-    s3_disable_tls: bool,
-
+    /// Partition granularity; must match the dataset layout
     #[arg(long, default_value_t = PartitionGranularity::Day)]
     partition: PartitionGranularity,
 
+    /// Filter to a specific source label (processes all sources if omitted)
     #[arg(long)]
     source: Option<String>,
 
+    /// Process only this year's partitions (narrow further with --month, --day, ...)
     #[arg(long)]
     year: Option<i32>,
 
+    /// Process only this month's partitions; requires --year
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..=12))]
     month: Option<u32>,
 
+    /// Process only this day's partitions; requires --month
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..=31))]
     day: Option<u32>,
 
+    /// Process only this hour's partitions; requires --day and an hour-or-finer layout
     #[arg(long, value_parser = clap::value_parser!(u32).range(0..=23))]
     hour: Option<u32>,
 
+    /// Process only this minute's partitions; requires --hour and a minute layout
     #[arg(long, value_parser = clap::value_parser!(u32).range(0..=59))]
     minute: Option<u32>,
 
+    /// Process only partitions holding data from the last N hours (rolling
+    /// window from now, UTC); mutually exclusive with the fixed filters.
+    /// With --incremental, acts only as the first run's starting bound
     #[arg(long, value_name = "HOURS")]
     since: Option<u64>,
 
+    /// Track a watermark at the output target and process only partitions
+    /// holding files that arrived since the last successful run
     #[arg(long)]
     incremental: bool,
 
+    /// Number of rows per Parquet read batch
     #[arg(long, default_value_t = 8192)]
     batch_size: usize,
 
+    /// Zstd compression level for output files
     #[arg(long, default_value_t = 5)]
     compression_level: i32,
 
+    /// Number of partitions to process concurrently; auto-selected when omitted
     #[arg(long)]
     concurrency: Option<usize>,
 }
@@ -145,31 +148,7 @@ impl Args {
                 self.output_s3_prefix = value;
             }
         }
-        if self.s3_endpoint.is_none() {
-            if let Ok(value) = std::env::var("S3_ENDPOINT") {
-                self.s3_endpoint = Some(value);
-            }
-        }
-        if self.s3_region == "us-east-1" {
-            if let Ok(value) = std::env::var("S3_REGION") {
-                self.s3_region = value;
-            }
-        }
-        if self.s3_access_key.is_none() {
-            if let Ok(value) = std::env::var("S3_ACCESS_KEY") {
-                self.s3_access_key = Some(value);
-            }
-        }
-        if self.s3_secret_key.is_none() {
-            if let Ok(value) = std::env::var("S3_SECRET_KEY") {
-                self.s3_secret_key = Some(value);
-            }
-        }
-        if !self.s3_disable_tls {
-            if let Ok(value) = std::env::var("S3_DISABLE_TLS") {
-                self.s3_disable_tls = value.eq_ignore_ascii_case("true") || value == "1";
-            }
-        }
+        self.s3_connection.apply_env();
         if self.since.is_none() {
             if let Ok(value) = std::env::var("SINCE_HOURS") {
                 if let Ok(hours) = value.trim().parse::<u64>() {
@@ -306,12 +285,12 @@ async fn main() -> Result<()> {
         input_storages.push(
             S3Storage::new(
                 bucket.clone(),
-                args.s3_region.clone(),
-                args.s3_endpoint.clone(),
-                args.s3_access_key.clone(),
-                args.s3_secret_key.clone(),
+                args.s3_connection.s3_region.clone(),
+                args.s3_connection.s3_endpoint.clone(),
+                args.s3_connection.s3_access_key.clone(),
+                args.s3_connection.s3_secret_key.clone(),
                 false,
-                args.s3_disable_tls,
+                args.s3_connection.s3_disable_tls,
             )
             .await
             .with_context(|| format!("connecting to input S3 bucket {bucket}"))?,
@@ -323,12 +302,12 @@ async fn main() -> Result<()> {
         Some(bucket) => Some(
             S3Storage::new(
                 bucket.clone(),
-                args.s3_region.clone(),
-                args.s3_endpoint.clone(),
-                args.s3_access_key.clone(),
-                args.s3_secret_key.clone(),
+                args.s3_connection.s3_region.clone(),
+                args.s3_connection.s3_endpoint.clone(),
+                args.s3_connection.s3_access_key.clone(),
+                args.s3_connection.s3_secret_key.clone(),
                 false,
-                args.s3_disable_tls,
+                args.s3_connection.s3_disable_tls,
             )
             .await
             .context("connecting to output S3 bucket")?,

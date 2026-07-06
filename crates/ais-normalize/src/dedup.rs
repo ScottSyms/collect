@@ -12,9 +12,7 @@
 //! treat each row group as a sorted run and k-way merge them, deduplicating
 //! within each equal-`ts` group with a small per-timestamp payload set. Peak
 //! memory is one read batch per run plus one second's worth of payloads — not
-//! the whole partition. (This mirrors `collect-maint`'s compaction merge in
-//! `crates/collect-maint/src/commands.rs`; kept separate here to avoid coupling
-//! the two crates.)
+//! the whole partition.
 
 use crate::output::{build_schema, open_writer, parquet_file_name};
 use anyhow::{Context, Result};

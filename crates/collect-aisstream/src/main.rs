@@ -4,7 +4,6 @@ use collect_core::{
     health_file_path, line_reader_from_async_read, run_ingest, CommonCliArgs, IngestOptions,
     LineReader, LineSource, ReaderTransition, S3CliArgs,
 };
-use collect_tui::{run_tui, TuiModel};
 use futures_util::{SinkExt, StreamExt};
 use std::cmp::min;
 use std::io;
@@ -16,8 +15,6 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
-
-mod tui;
 
 const WS_URL: &str = "wss://stream.aisstream.io/v0/stream";
 const WS_RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(1);
@@ -55,10 +52,6 @@ struct Args {
 
     #[command(flatten)]
     s3: S3CliArgs,
-
-    /// Launch interactive TUI for configuration
-    #[arg(long)]
-    tui: bool,
 }
 
 struct WebSocketReadAdapter {
@@ -275,22 +268,6 @@ impl LineSource for AisStreamSource {
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut args = Args::parse();
-
-    if args.tui {
-        let initial_config = tui::TuiConfig::load_from_env();
-
-        match run_tui(initial_config)? {
-            Some(config) => {
-                let mut full_args = vec!["collect-aisstream".to_string()];
-                full_args.extend(config.to_cli_args());
-                args = Args::parse_from(full_args);
-            }
-            None => {
-                println!("Configuration cancelled.");
-                return Ok(());
-            }
-        }
-    }
 
     args.common.apply_env();
     args.s3.apply_env();

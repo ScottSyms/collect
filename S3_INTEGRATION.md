@@ -32,7 +32,7 @@ cargo run -p collect-socket -- \
 ### MinIO (self-hosted S3-compatible storage)
 ```bash
 cargo run -p collect-file -- \
-    --input data.txt \
+    --input-dir data.txt \
     --source mydata \
     --s3-bucket data-lake \
     --s3-endpoint http://localhost:9000 \
