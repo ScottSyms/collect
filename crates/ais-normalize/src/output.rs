@@ -8,11 +8,23 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use parquet::schema::types::ColumnPath;
+use rustc_hash::FxHashSet;
 use std::collections::HashMap;
 use std::fs::{self, File};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+/// Cheap 64-bit hash of `(ts_ms, payload)` for inline dedup within a single
+/// writer. Collision probability is ~2.7×10⁻⁶ at 10M rows — acceptable for
+/// an optimisation that catches a rare edge case.
+fn dedup_hash(ts_ms: i64, payload: &str) -> u64 {
+    let mut hasher = rustc_hash::FxHasher::default();
+    ts_ms.hash(&mut hasher);
+    payload.hash(&mut hasher);
+    hasher.finish()
+}
 
 static FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -96,6 +108,10 @@ struct PartitionWriter {
     payload: StringBuilder,
     total_rows: u64,
     batch_rows: usize,
+    /// `(ts_ms, payload)` hashes seen since the last flush. Cleared
+    /// on flush to bound memory; exact dedup can't span row groups,
+    /// but within-run duplicates overwhelmingly fall in the same batch.
+    seen: FxHashSet<u64>,
 }
 
 impl PartitionWriter {
@@ -127,10 +143,16 @@ impl PartitionWriter {
             payload: StringBuilder::with_capacity(1024, 64 * 1024),
             total_rows: 0,
             batch_rows: 0,
+            seen: FxHashSet::default(),
         })
     }
 
     fn push(&mut self, ts_ms: i64, payload: &str) -> Result<()> {
+        // Inline dedup: skip exact (ts, payload) duplicates within this writer.
+        // The hash set is cleared on every flush to bound memory.
+        if !self.seen.insert(dedup_hash(ts_ms, payload)) {
+            return Ok(());
+        }
         self.ts.append_value(ts_ms);
         self.source_col.append_value(&self.source);
         self.payload.append_value(payload);
@@ -163,6 +185,7 @@ impl PartitionWriter {
         let batch = sort_record_batch_by_ts(&batch)?;
         self.writer.write(&batch).context("writing Parquet batch")?;
         self.batch_rows = 0;
+        self.seen.clear();
         Ok(())
     }
 

@@ -36,6 +36,8 @@ walkdir = "2"
 tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 fast_hilbert = "2.1"
 tempfile = "3"
+rayon = "1"
+rustc-hash = "2"
 rlimit = "0.10"
 # Pinned to the fork's last library-only commit (the 0.11.0 release line).
 # Later fork commits fold a CLI, S3 I/O, and an iceberg 0.3 dependency into
