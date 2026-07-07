@@ -1,20 +1,20 @@
-job "collect-aisstream" {
+job "collect-duplicate" {
   datacenters = ["dc1"]
   type        = "service"
 
   group "ais_collection" {
     count = 1
 
-    task "collect-aisstream" {
+    task "collect-duplicate" {
       driver = "exec"
 
       config {
-        command = "local/collect-aisstream"
+        command = "local/collect-socket"
       }
 
       artifact {
-        source      = "http://192.168.99.107:9000/binaries/collect-aisstream"
-        destination = "local/collect-aisstream"
+        source      = "http://192.168.99.107:9000/binaries/collect-socket"
+        destination = "local/collect-socket"
         mode        = "file"
       }
 
@@ -22,14 +22,14 @@ job "collect-aisstream" {
 
       env {
         RUST_LOG       = "INFO"
-        AISSTREAM_API_KEY        = "4938596d4f90691fc50c08fcab77b716afb60c3c"
-        BOUNDING_BOXES = "[[[-90,-180],[90,180]]]"
-        SOURCE         = "aisstream"
+        TCP_HOST       = "192.168.99.107"
+        TCP_PORT       = "7001"
+        SOURCE         = "duplicate"
         PARTITION      = "minute"
         OUT_DIR        = "${NOMAD_TASK_DIR}/data"
         MAX_ROWS       = "10000"
         KEEP_LOCAL     = "false"
-        S3_BUCKET      = "aisstream"
+        S3_BUCKET      = "duplicate"
         S3_ENDPOINT    = "http://192.168.99.107:9000"
         S3_REGION      = "us-east-1"
         S3_ACCESS_KEY  = "WSF8aTTn5oKc4i1fVJvP"
@@ -38,14 +38,14 @@ job "collect-aisstream" {
       }
 
       service {
-        name = "collect-aisstream"
-        tags = ["norway", "tcp-collector"]
+        name = "collect-duplicate"
+        tags = ["duplicate", "tcp-collector"]
 
         check {
           name     = "alive"
           type     = "script"
           command  = "/bin/sh"
-          args     = ["-c", "pgrep -x collect-aisstre >/dev/null 2>&1"]
+          args     = ["-c", "pgrep -x collect-socket >/dev/null 2>&1"]
           interval = "15s"
           timeout  = "5s"
         }

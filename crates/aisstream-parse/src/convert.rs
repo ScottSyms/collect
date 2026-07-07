@@ -1,5 +1,6 @@
 use chrono::{Datelike, TimeZone, Utc};
 use h3o::{LatLng, Resolution};
+use fast_hilbert::xy2h;
 
 use crate::ais_stream::{
     AidsToNavigationReport, BaseStationReport, ExtendedClassBPositionReport, PositionReport,
@@ -10,6 +11,17 @@ use crate::ais_stream::{
 fn lat_lon_to_h3(lat: f64, lon: f64) -> Option<u64> {
     let ll = LatLng::new(lat.to_radians(), lon.to_radians()).ok()?;
     Some(ll.to_cell(Resolution::Ten).into())
+}
+
+const HILBERT_BITS: u32 = 31;
+
+fn lat_lon_to_hilbert(lat: f64, lon: f64) -> Option<u64> {
+    if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
+        return None;
+    }
+    let x = ((lon + 180.0) / 360.0 * ((1u64 << HILBERT_BITS) as f64)) as u32;
+    let y = ((lat + 90.0) / 180.0 * ((1u64 << HILBERT_BITS) as f64)) as u32;
+    Some(xy2h(x, y, HILBERT_BITS as u8))
 }
 
 /// One decoded position report (AIS types 1-3, 9, 18).
@@ -28,6 +40,7 @@ pub struct PositionRow {
     pub rot: Option<f64>,
     pub altitude_m: Option<f64>,
     pub h3: Option<u64>,
+    pub hilbert: Option<u64>,
     pub nav_status: String,
     pub high_accuracy: bool,
     pub raim: bool,
@@ -66,6 +79,7 @@ pub struct MeteoRow {
     pub fid: u8,
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
+    pub hilbert: Option<u64>,
     pub position_accuracy: Option<bool>,
     pub day: Option<u8>,
     pub hour: Option<u8>,
@@ -129,6 +143,7 @@ pub struct AtonRow {
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
     pub h3: Option<u64>,
+    pub hilbert: Option<u64>,
     pub dimension_to_bow: Option<u16>,
     pub dimension_to_stern: Option<u16>,
     pub dimension_to_port: Option<u16>,
@@ -235,6 +250,7 @@ fn from_position_report(ts_ms: i64, source: &str, pr: PositionReport) -> Positio
         rot: pr.RateOfTurn.and_then(rot_to_f64),
         altitude_m: None,
         h3: pr.Latitude.and_then(|lat| pr.Longitude.and_then(|lon| lat_lon_to_h3(lat, lon))),
+        hilbert: pr.Latitude.and_then(|lat| pr.Longitude.and_then(|lon| lat_lon_to_hilbert(lat, lon))),
         nav_status: pr
             .NavigationalStatus
             .map(nav_status_str)
@@ -268,6 +284,7 @@ fn from_standard_class_b(
         rot: None,
         altitude_m: None,
         h3: pr.Latitude.and_then(|lat| pr.Longitude.and_then(|lon| lat_lon_to_h3(lat, lon))),
+        hilbert: pr.Latitude.and_then(|lat| pr.Longitude.and_then(|lon| lat_lon_to_hilbert(lat, lon))),
         nav_status: "under way using engine".into(),
         high_accuracy: pr.PositionAccuracy,
         raim: pr.Raim,
@@ -366,6 +383,7 @@ fn from_standard_sar_aircraft(
         rot: None,
         altitude_m: sar.Altitude,
         h3: sar.Latitude.and_then(|lat| sar.Longitude.and_then(|lon| lat_lon_to_h3(lat, lon))),
+        hilbert: sar.Latitude.and_then(|lat| sar.Longitude.and_then(|lon| lat_lon_to_hilbert(lat, lon))),
         nav_status: "under way using engine".into(),
         high_accuracy: sar.PositionAccuracy,
         raim: sar.Raim,
@@ -395,6 +413,7 @@ fn from_aids_to_navigation(
         latitude: aid.Latitude,
         longitude: aid.Longitude,
         h3: aid.Latitude.and_then(|lat| aid.Longitude.and_then(|lon| lat_lon_to_h3(lat, lon))),
+        hilbert: aid.Latitude.and_then(|lat| aid.Longitude.and_then(|lon| lat_lon_to_hilbert(lat, lon))),
         dimension_to_bow: bow,
         dimension_to_stern: stern,
         dimension_to_port: port,
@@ -423,6 +442,7 @@ fn from_base_station_report(ts_ms: i64, source: &str, br: BaseStationReport) -> 
         rot: None,
         altitude_m: None,
         h3: br.Latitude.and_then(|lat| br.Longitude.and_then(|lon| lat_lon_to_h3(lat, lon))),
+        hilbert: br.Latitude.and_then(|lat| br.Longitude.and_then(|lon| lat_lon_to_hilbert(lat, lon))),
         nav_status: String::new(),
         high_accuracy: br.PositionAccuracy,
         raim: br.Raim,
@@ -450,6 +470,7 @@ fn from_extended_class_b(
         rot: None,
         altitude_m: None,
         h3: pr.Latitude.and_then(|lat| pr.Longitude.and_then(|lon| lat_lon_to_h3(lat, lon))),
+        hilbert: pr.Latitude.and_then(|lat| pr.Longitude.and_then(|lon| lat_lon_to_hilbert(lat, lon))),
         nav_status: "under way using engine".into(),
         high_accuracy: pr.PositionAccuracy,
         raim: pr.Raim,

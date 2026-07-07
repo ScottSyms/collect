@@ -9,6 +9,7 @@ arrow.workspace = true
 chrono.workspace = true
 clap.workspace = true
 futures-util.workspace = true
+fast_hilbert.workspace = true
 h3o = "0.10"
 nmea-parser.workspace = true
 parquet.workspace = true
@@ -19,6 +20,7 @@ tempfile.workspace = true
 tokio.workspace = true
 walkdir.workspace = true
 collect-core = { path = "../collect-core" }
+rayon = "1"
 
 [[bin]]
 name = "ais-parse"

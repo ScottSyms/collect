@@ -35,10 +35,21 @@ fn unique_file_name(prefix: &str) -> String {
     format!("{prefix}-{stamp}-{:06}.parquet", seq)
 }
 
+pub fn is_parse_output_file(name: &str, output_prefix: &str) -> bool {
+    name.starts_with(&format!("{output_prefix}-"))
+}
+
 fn writer_props(compression_level: i32) -> Result<WriterProperties> {
+    use parquet::schema::types::ColumnPath;
     let level = ZstdLevel::try_new(compression_level).context("invalid zstd level")?;
     Ok(WriterProperties::builder()
         .set_compression(Compression::ZSTD(level))
+        .set_column_bloom_filter_enabled(ColumnPath::from("mmsi"), true)
+        .set_column_bloom_filter_enabled(ColumnPath::from("station"), true)
+        .set_column_bloom_filter_enabled(ColumnPath::from("source"), true)
+        .set_column_bloom_filter_enabled(ColumnPath::from("imo_number"), true)
+        .set_column_bloom_filter_enabled(ColumnPath::from("call_sign"), true)
+        .set_column_bloom_filter_enabled(ColumnPath::from("name"), true)
         .build())
 }
 
@@ -65,6 +76,7 @@ fn positions_schema() -> Arc<Schema> {
         Field::new("rot", DataType::Float64, true),
         Field::new("altitude_m", DataType::Float64, true),
         Field::new("h3", DataType::UInt64, true),
+        Field::new("hilbert", DataType::UInt64, true),
         Field::new("nav_status", DataType::Utf8, false),
         Field::new("high_accuracy", DataType::Boolean, false),
         Field::new("raim", DataType::Boolean, false),
@@ -119,6 +131,7 @@ fn meteo_schema() -> Arc<Schema> {
         Field::new("fid", DataType::UInt8, false),
         f64n("latitude"),
         f64n("longitude"),
+        Field::new("hilbert", DataType::UInt64, true),
         booln("position_accuracy"),
         u8n("day"),
         u8n("hour"),
@@ -177,7 +190,7 @@ fn binary_schema() -> Arc<Schema> {
 /// into place on `finish`.
 struct FileSink {
     dir: PathBuf,
-    prefix: &'static str,
+    prefix: String,
     schema: Arc<Schema>,
     compression_level: i32,
     open: Option<(ArrowWriter<File>, PathBuf, PathBuf)>,
@@ -185,10 +198,10 @@ struct FileSink {
 }
 
 impl FileSink {
-    fn new(dir: PathBuf, prefix: &'static str, schema: Arc<Schema>, level: i32) -> Self {
+    fn new(dir: PathBuf, prefix: &str, schema: Arc<Schema>, level: i32) -> Self {
         FileSink {
             dir,
-            prefix,
+            prefix: prefix.to_string(),
             schema,
             compression_level: level,
             open: None,
@@ -200,7 +213,7 @@ impl FileSink {
         if self.open.is_none() {
             std::fs::create_dir_all(&self.dir)
                 .with_context(|| format!("creating {}", self.dir.display()))?;
-            let final_name = unique_file_name(self.prefix);
+            let final_name = unique_file_name(&self.prefix);
             let final_path = self.dir.join(&final_name);
             let tmp_path = self.dir.join(format!("tmp-{final_name}"));
             let file = File::create(&tmp_path)
@@ -252,6 +265,7 @@ pub struct PositionsWriter {
     rot: Float64Builder,
     altitude_m: Float64Builder,
     h3: UInt64Builder,
+    hilbert: UInt64Builder,
     nav_status: StringBuilder,
     high_accuracy: BooleanBuilder,
     raim: BooleanBuilder,
@@ -260,9 +274,10 @@ pub struct PositionsWriter {
 }
 
 impl PositionsWriter {
-    pub fn new(dir: PathBuf, compression_level: i32) -> Self {
+    pub fn new(dir: PathBuf, output_prefix: &str, compression_level: i32) -> Self {
+        let prefix = format!("{output_prefix}-pos");
         PositionsWriter {
-            sink: FileSink::new(dir, "pos", positions_schema(), compression_level),
+            sink: FileSink::new(dir, &prefix, positions_schema(), compression_level),
             ts: TimestampMillisecondBuilder::new().with_timezone("UTC"),
             source: StringBuilder::new(),
             msg_type: UInt8Builder::new(),
@@ -276,6 +291,7 @@ impl PositionsWriter {
             rot: Float64Builder::new(),
             altitude_m: Float64Builder::new(),
             h3: UInt64Builder::new(),
+            hilbert: UInt64Builder::new(),
             nav_status: StringBuilder::new(),
             high_accuracy: BooleanBuilder::new(),
             raim: BooleanBuilder::new(),
@@ -298,6 +314,7 @@ impl PositionsWriter {
         self.rot.append_option(row.rot);
         self.altitude_m.append_option(row.altitude_m);
         self.h3.append_option(row.h3);
+        self.hilbert.append_option(row.hilbert);
         self.nav_status.append_value(&row.nav_status);
         self.high_accuracy.append_value(row.high_accuracy);
         self.raim.append_value(row.raim);
@@ -327,6 +344,7 @@ impl PositionsWriter {
             Arc::new(self.rot.finish()),
             Arc::new(self.altitude_m.finish()),
             Arc::new(self.h3.finish()),
+            Arc::new(self.hilbert.finish()),
             Arc::new(self.nav_status.finish()),
             Arc::new(self.high_accuracy.finish()),
             Arc::new(self.raim.finish()),
@@ -369,9 +387,10 @@ pub struct StaticsWriter {
 }
 
 impl StaticsWriter {
-    pub fn new(dir: PathBuf, compression_level: i32) -> Self {
+    pub fn new(dir: PathBuf, output_prefix: &str, compression_level: i32) -> Self {
+        let prefix = format!("{output_prefix}-stat");
         StaticsWriter {
-            sink: FileSink::new(dir, "stat", statics_schema(), compression_level),
+            sink: FileSink::new(dir, &prefix, statics_schema(), compression_level),
             ts: TimestampMillisecondBuilder::new().with_timezone("UTC"),
             source: StringBuilder::new(),
             msg_type: UInt8Builder::new(),
@@ -464,9 +483,10 @@ pub struct MeteoWriter {
 }
 
 impl MeteoWriter {
-    pub fn new(dir: PathBuf, compression_level: i32) -> Self {
+    pub fn new(dir: PathBuf, output_prefix: &str, compression_level: i32) -> Self {
+        let prefix = format!("{output_prefix}-met");
         MeteoWriter {
-            sink: FileSink::new(dir, "met", meteo_schema(), compression_level),
+            sink: FileSink::new(dir, &prefix, meteo_schema(), compression_level),
             rows: Vec::new(),
         }
     }
@@ -483,6 +503,7 @@ impl MeteoWriter {
         if self.rows.is_empty() {
             return Ok(());
         }
+        self.rows.sort_by_key(|r| r.hilbert.unwrap_or(0));
         let r = &self.rows;
         let columns: Vec<ArrayRef> = vec![
             Arc::new(
@@ -506,6 +527,9 @@ impl MeteoWriter {
             )),
             f64_col(r, |x| x.latitude),
             f64_col(r, |x| x.longitude),
+            Arc::new(UInt64Array::from(
+                r.iter().map(|x| x.hilbert).collect::<Vec<_>>(),
+            )),
             Arc::new(BooleanArray::from(
                 r.iter().map(|x| x.position_accuracy).collect::<Vec<_>>(),
             )),
@@ -569,9 +593,10 @@ pub struct BinaryWriter {
 }
 
 impl BinaryWriter {
-    pub fn new(dir: PathBuf, compression_level: i32) -> Self {
+    pub fn new(dir: PathBuf, output_prefix: &str, compression_level: i32) -> Self {
+        let prefix = format!("{output_prefix}-bin");
         BinaryWriter {
-            sink: FileSink::new(dir, "bin", binary_schema(), compression_level),
+            sink: FileSink::new(dir, &prefix, binary_schema(), compression_level),
             rows: Vec::new(),
         }
     }
@@ -644,6 +669,7 @@ fn atons_schema() -> Arc<Schema> {
         Field::new("latitude", DataType::Float64, true),
         Field::new("longitude", DataType::Float64, true),
         Field::new("h3", DataType::UInt64, true),
+        Field::new("hilbert", DataType::UInt64, true),
         Field::new("dimension_to_bow", DataType::UInt16, true),
         Field::new("dimension_to_stern", DataType::UInt16, true),
         Field::new("dimension_to_port", DataType::UInt16, true),
@@ -663,9 +689,10 @@ pub struct AtonWriter {
 }
 
 impl AtonWriter {
-    pub fn new(dir: PathBuf, compression_level: i32) -> Self {
+    pub fn new(dir: PathBuf, output_prefix: &str, compression_level: i32) -> Self {
+        let prefix = format!("{output_prefix}-aton");
         AtonWriter {
-            sink: FileSink::new(dir, "aton", atons_schema(), compression_level),
+            sink: FileSink::new(dir, &prefix, atons_schema(), compression_level),
             rows: Vec::new(),
         }
     }
@@ -682,6 +709,7 @@ impl AtonWriter {
         if self.rows.is_empty() {
             return Ok(());
         }
+        self.rows.sort_by_key(|r| r.hilbert.unwrap_or(0));
         let r = &self.rows;
         let columns: Vec<ArrayRef> = vec![
             Arc::new(TimestampMillisecondArray::from(r.iter().map(|x| x.ts_ms).collect::<Vec<_>>()).with_timezone("UTC")),
@@ -695,6 +723,7 @@ impl AtonWriter {
             f64_aton_col(r, |x| x.latitude),
             f64_aton_col(r, |x| x.longitude),
             Arc::new(UInt64Array::from(r.iter().map(|x| x.h3).collect::<Vec<_>>())),
+            Arc::new(UInt64Array::from(r.iter().map(|x| x.hilbert).collect::<Vec<_>>())),
             u16_aton_col(r, |x| x.dimension_to_bow),
             u16_aton_col(r, |x| x.dimension_to_stern),
             u16_aton_col(r, |x| x.dimension_to_port),
@@ -783,6 +812,7 @@ mod tests {
             rot: None,
             altitude_m: None,
             h3: None,
+            hilbert: None,
             nav_status: "under way using engine".into(),
             high_accuracy: true,
             raim: false,
@@ -793,7 +823,7 @@ mod tests {
     #[test]
     fn positions_round_trip() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut writer = PositionsWriter::new(dir.path().to_path_buf(), 3);
+        let mut writer = PositionsWriter::new(dir.path().to_path_buf(), "test", 3);
         for i in 0..10 {
             writer
                 .write(&sample_position(
@@ -809,7 +839,7 @@ mod tests {
             .unwrap()
             .to_str()
             .unwrap()
-            .starts_with("pos-"));
+            .starts_with("test-pos-"));
 
         let file = File::open(&path).expect("open");
         let reader = ParquetRecordBatchReaderBuilder::try_new(file)
@@ -851,7 +881,7 @@ mod tests {
     #[test]
     fn no_rows_means_no_file() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let writer = StaticsWriter::new(dir.path().join("statics"), 3);
+        let writer = StaticsWriter::new(dir.path().join("statics"), "test", 3);
         assert!(writer.finish().expect("finish").is_none());
         assert!(!dir.path().join("statics").exists());
     }
@@ -859,7 +889,7 @@ mod tests {
     #[test]
     fn statics_round_trip_with_nulls() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut writer = StaticsWriter::new(dir.path().to_path_buf(), 3);
+        let mut writer = StaticsWriter::new(dir.path().to_path_buf(), "test", 3);
         writer
             .write(&StaticRow {
                 ts_ms: 1_700_000_000_000,

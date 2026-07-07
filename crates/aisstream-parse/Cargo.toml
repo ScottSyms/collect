@@ -9,6 +9,7 @@ arrow.workspace = true
 chrono.workspace = true
 clap.workspace = true
 futures-util.workspace = true
+fast_hilbert.workspace = true
 h3o = "0.10"
 parquet.workspace = true
 rlimit.workspace = true
@@ -18,6 +19,8 @@ tempfile.workspace = true
 tokio.workspace = true
 walkdir.workspace = true
 collect-core = { path = "../collect-core" }
+rayon = "1"
+simd-json = "0.14"
 
 [[bin]]
 name = "aisstream-parse"
