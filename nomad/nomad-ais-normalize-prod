@@ -1,0 +1,54 @@
+job "ais-normalize" {
+  datacenters = ["dc1"]
+  type        = "batch"
+
+  periodic {
+    cron             = "*/1 * * * * *"
+    prohibit_overlap = true
+  }
+
+  group "normalize" {
+    count = 1
+
+    task "ais-normalize" {
+      driver = "exec"
+
+      config {
+        command = "local/ais-normalize"
+        args = [
+          "--input-s3-bucket", "norway",
+          "--input-s3-bucket", "duplicate",
+          "--output-s3-bucket", "norway-norm",
+          "--incremental",
+          "--concurrency", "4",
+        ]
+      }
+
+      artifact {
+        source      = "http://192.168.99.107:9000/binaries/ais-normalize"
+        destination = "local/ais-normalize"
+        mode        = "file"
+      }
+
+      env {
+        S3_ENDPOINT    = "http://192.168.99.107:9000"
+        S3_REGION      = "us-east-1"
+        S3_ACCESS_KEY  = "WSF8aTTn5oKc4i1fVJvP"
+        S3_SECRET_KEY  = "OqaL2H8UcUJByliObQp9ujZGHVZF1GKd91IqAkYY"
+        S3_DISABLE_TLS = "true"
+      }
+
+      resources {
+        cpu    = 500
+        memory = 1024
+      }
+
+      restart {
+        attempts = 3
+        interval = "5m"
+        delay    = "15s"
+        mode     = "delay"
+      }
+    }
+  }
+}
