@@ -162,7 +162,7 @@ impl FromStr for PartitionGranularity {
 #[derive(Clone, Debug, Args)]
 pub struct CommonCliArgs {
     /// Output root directory
-    #[arg(short = 'o', long, default_value = "data")]
+    #[arg(long = "output-dir", default_value = "data")]
     pub out_dir: PathBuf,
 
     /// Partition granularity for dataset layout
@@ -177,7 +177,7 @@ pub struct CommonCliArgs {
     #[arg(long)]
     pub max_batch_bytes: Option<usize>,
 
-    /// Zstd compression level for Parquet output
+    /// Zstd compression level for Parquet output (default: 5)
     #[arg(long)]
     pub compression_level: Option<i32>,
 
@@ -223,6 +223,29 @@ pub struct S3CliArgs {
     /// Keep local files after S3 upload (default: delete after successful upload)
     #[arg(long)]
     pub keep_local: bool,
+
+    /// Disable TLS/HTTPS for S3 endpoint (use plain HTTP instead)
+    #[arg(long)]
+    pub s3_disable_tls: bool,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct S3ConnectionArgs {
+    /// S3 endpoint URL (for MinIO or custom S3-compatible storage)
+    #[arg(long)]
+    pub s3_endpoint: Option<String>,
+
+    /// S3 region (default: us-east-1)
+    #[arg(long, default_value = "us-east-1")]
+    pub s3_region: String,
+
+    /// S3 access key ID (can also use AWS_ACCESS_KEY_ID env var)
+    #[arg(long)]
+    pub s3_access_key: Option<String>,
+
+    /// S3 secret access key (can also use AWS_SECRET_ACCESS_KEY env var)
+    #[arg(long)]
+    pub s3_secret_key: Option<String>,
 
     /// Disable TLS/HTTPS for S3 endpoint (use plain HTTP instead)
     #[arg(long)]
@@ -345,7 +368,7 @@ pub trait LineSource {
 impl CommonCliArgs {
     pub fn apply_env(&mut self) {
         if self.out_dir == PathBuf::from(DEFAULT_OUT_DIR) {
-            if let Ok(value) = std::env::var("OUT_DIR") {
+            if let Ok(value) = std::env::var("OUTPUT_DIR") {
                 self.out_dir = PathBuf::from(value);
             }
         }
@@ -479,6 +502,40 @@ impl S3CliArgs {
             keep_local: self.keep_local,
             disable_tls: self.s3_disable_tls,
         })
+    }
+}
+
+impl S3ConnectionArgs {
+    pub fn apply_env(&mut self) {
+        if self.s3_endpoint.is_none() {
+            if let Ok(value) = std::env::var("S3_ENDPOINT") {
+                self.s3_endpoint = Some(value);
+            }
+        }
+
+        if self.s3_region == "us-east-1" {
+            if let Ok(value) = std::env::var("S3_REGION") {
+                self.s3_region = value;
+            }
+        }
+
+        if self.s3_access_key.is_none() {
+            if let Ok(value) = std::env::var("S3_ACCESS_KEY") {
+                self.s3_access_key = Some(value);
+            }
+        }
+
+        if self.s3_secret_key.is_none() {
+            if let Ok(value) = std::env::var("S3_SECRET_KEY") {
+                self.s3_secret_key = Some(value);
+            }
+        }
+
+        if !self.s3_disable_tls {
+            if let Some(value) = parse_bool_env("S3_DISABLE_TLS") {
+                self.s3_disable_tls = value;
+            }
+        }
     }
 }
 

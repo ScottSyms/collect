@@ -51,6 +51,24 @@ pub fn parse_tag_block_timestamp_ms(prefix: &str) -> Option<i64> {
     None
 }
 
+/// Extract the value of a single-letter tag-block field (e.g. `s` for the
+/// source/base station) from a tag-block prefix, or `None` if absent.
+pub fn parse_tag_block_field<'a>(prefix: &'a str, key: &str) -> Option<&'a str> {
+    for raw_field in prefix.split(',') {
+        let field = raw_field.trim_matches('\\');
+        let field = field.split('*').next().unwrap_or(field).trim();
+        if let Some(value) = field
+            .strip_prefix(key)
+            .and_then(|rest| rest.strip_prefix(':'))
+        {
+            if !value.is_empty() {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
 pub fn parse_ais_sentence_metadata(sentence: &str) -> AisSentenceMetadata {
     let mut fields = sentence.split(',').map(normalize_sentence_field);
     let Some(sentence_type) = fields.next() else {
@@ -206,9 +224,7 @@ pub fn combine_ais_fragments(sentences: &[String], tag_block: Option<&str>) -> O
     let checksum_input = sentence_body
         .trim_start_matches('!')
         .trim_start_matches('$');
-    let checksum = checksum_input
-        .bytes()
-        .fold(0u8, |acc, b| acc ^ b);
+    let checksum = checksum_input.bytes().fold(0u8, |acc, b| acc ^ b);
 
     let combined = format!("{}*{:02X}", sentence_body, checksum);
 
@@ -235,6 +251,17 @@ mod tests {
             .timestamp_millis()
             + 298;
         assert_eq!(ts, expected);
+    }
+
+    #[test]
+    fn parses_tag_block_station_field() {
+        let (prefix, _) = split_tag_block(r"\s:AIS_NOR,c:1620000000*5A\!AIVDM,1,1,,A,15N4,0*00");
+        assert_eq!(parse_tag_block_field(prefix, "s"), Some("AIS_NOR"));
+        assert_eq!(parse_tag_block_field(prefix, "c"), Some("1620000000"));
+        assert_eq!(parse_tag_block_field(prefix, "d"), None);
+        // No tag block → nothing.
+        let (p2, _) = split_tag_block("!AIVDM,1,1,,A,15N4,0*00");
+        assert_eq!(parse_tag_block_field(p2, "s"), None);
     }
 
     #[test]
@@ -271,15 +298,23 @@ mod tests {
 
     #[test]
     fn combines_two_fragment_sentences() {
-        let part1 = "!AIVDM,2,1,3,A,569qcJP000000000000P4V1QDr3777800000000o0p=220DP03888888,0*49".to_string();
+        let part1 = "!AIVDM,2,1,3,A,569qcJP000000000000P4V1QDr3777800000000o0p=220DP03888888,0*49"
+            .to_string();
         let part2 = "!AIVDM,2,2,3,A,88881CRR@CACP08,2*3C".to_string();
 
         let combined = combine_ais_fragments(&[part1, part2], None).expect("should combine");
 
         assert!(combined.starts_with("!AIVDM,1,1,,A,"));
-        assert!(combined.contains("569qcJP000000000000P4V1QDr3777800000000o0p=220DP0388888888881CRR@CACP08"));
+        assert!(combined
+            .contains("569qcJP000000000000P4V1QDr3777800000000o0p=220DP0388888888881CRR@CACP08"));
         // fill_bits from last fragment is 2
-        let fill = combined.split(',').nth(6).unwrap_or("").split('*').next().unwrap_or("");
+        let fill = combined
+            .split(',')
+            .nth(6)
+            .unwrap_or("")
+            .split('*')
+            .next()
+            .unwrap_or("");
         assert_eq!(fill, "2");
     }
 
@@ -288,8 +323,8 @@ mod tests {
         let part1 = "!AIVDM,2,1,0,A,AAAA,0*00".to_string();
         let part2 = "!AIVDM,2,2,0,A,BBBB,2*00".to_string();
 
-        let combined = combine_ais_fragments(&[part1, part2], Some("c:1700000000"))
-            .expect("should combine");
+        let combined =
+            combine_ais_fragments(&[part1, part2], Some("c:1700000000")).expect("should combine");
 
         assert!(combined.starts_with('\\'));
         assert!(combined.contains("c:1700000000"));

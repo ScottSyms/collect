@@ -4,13 +4,10 @@ use collect_core::{
     health_file_path, line_reader_from_async_read, run_ingest, CommonCliArgs, IngestOptions,
     LineReader, LineSource, ReaderTransition, S3CliArgs,
 };
-use collect_tui::{run_tui, TuiModel};
 use std::cmp::min;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 use tokio::net::TcpStream;
-
-mod tui;
 
 const TCP_RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(1);
 const TCP_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(5);
@@ -38,10 +35,6 @@ struct Args {
 
     #[command(flatten)]
     s3: S3CliArgs,
-
-    /// Launch interactive TUI for configuration
-    #[arg(long)]
-    tui: bool,
 }
 
 struct TcpInputSource {
@@ -133,22 +126,6 @@ impl LineSource for TcpInputSource {
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut args = Args::parse();
-
-    if args.tui {
-        let initial_config = tui::TuiConfig::load_from_env();
-
-        match run_tui(initial_config)? {
-            Some(config) => {
-                let mut full_args = vec!["collect-socket".to_string()];
-                full_args.extend(config.to_cli_args());
-                args = Args::parse_from(full_args);
-            }
-            None => {
-                println!("Configuration cancelled.");
-                return Ok(());
-            }
-        }
-    }
 
     if args.tcp_host.is_none() {
         if let Ok(value) = std::env::var("TCP_HOST") {

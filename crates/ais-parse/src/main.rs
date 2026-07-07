@@ -1,10 +1,10 @@
 use anyhow::{bail, Context, Result};
-use arrow::array::{StringArray, TimestampMillisecondArray};
+use arrow::array::{Array, StringArray, TimestampMillisecondArray};
 use chrono::TimeZone;
 use clap::Parser;
 use collect_core::dataset::{self, DatasetFile, PartitionKey};
 use collect_core::state;
-use collect_core::{PartitionGranularity, S3Storage};
+use collect_core::{PartitionGranularity, S3ConnectionArgs, S3Storage};
 use nmea_parser::NmeaParser;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::collections::VecDeque;
@@ -13,17 +13,23 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+mod ais_bits;
 mod decode;
 mod output;
 mod stats;
 
 use decode::{decode_payload, Decoded};
-use output::{existing_parquet_files, PositionsWriter, StaticsWriter};
+use output::{existing_parquet_files, AtonWriter, BinaryWriter, MeteoWriter, PositionsWriter, StaticsWriter};
 use stats::ParseStats;
 
-/// Decoded output lands in two sibling hive datasets under the output root.
+/// Decoded output lands in sibling hive datasets under the output root.
 const POSITIONS_TREE: &str = "positions";
 const STATICS_TREE: &str = "statics";
+const METEO_TREE: &str = "meteo";
+const BINARY_TREE: &str = "binary";
+const ATONS_TREE: &str = "atons";
+/// Every output dataset tree — used by the partition-replace logic.
+const OUTPUT_TREES: [&str; 5] = [POSITIONS_TREE, STATICS_TREE, METEO_TREE, BINARY_TREE, ATONS_TREE];
 
 static CANCELLED: AtomicBool = AtomicBool::new(false);
 
@@ -64,25 +70,8 @@ struct Args {
     #[arg(long, default_value = "")]
     output_s3_prefix: String,
 
-    /// S3 endpoint URL, shared by --input-s3-bucket and --output-s3-bucket (for MinIO or other S3-compatible storage)
-    #[arg(long)]
-    s3_endpoint: Option<String>,
-
-    /// S3 region, shared by --input-s3-bucket and --output-s3-bucket
-    #[arg(long, default_value = "us-east-1")]
-    s3_region: String,
-
-    /// S3 access key ID (can also use AWS_ACCESS_KEY_ID env var)
-    #[arg(long)]
-    s3_access_key: Option<String>,
-
-    /// S3 secret access key (can also use AWS_SECRET_ACCESS_KEY env var)
-    #[arg(long)]
-    s3_secret_key: Option<String>,
-
-    /// Disable TLS/HTTPS for the S3 endpoint (use plain HTTP instead)
-    #[arg(long)]
-    s3_disable_tls: bool,
+    #[command(flatten)]
+    s3_connection: S3ConnectionArgs,
 
     /// Partition granularity; must match the input dataset layout (the
     /// output trees mirror it)
@@ -123,10 +112,6 @@ struct Args {
     /// holding files that arrived since the last successful run
     #[arg(long)]
     incremental: bool,
-
-    /// Apply changes; dry-run by default
-    #[arg(long)]
-    apply: bool,
 
     /// Number of rows per Parquet read batch
     #[arg(long, default_value_t = 8192)]
@@ -170,31 +155,7 @@ impl Args {
                 self.output_s3_prefix = value;
             }
         }
-        if self.s3_endpoint.is_none() {
-            if let Ok(value) = std::env::var("S3_ENDPOINT") {
-                self.s3_endpoint = Some(value);
-            }
-        }
-        if self.s3_region == "us-east-1" {
-            if let Ok(value) = std::env::var("S3_REGION") {
-                self.s3_region = value;
-            }
-        }
-        if self.s3_access_key.is_none() {
-            if let Ok(value) = std::env::var("S3_ACCESS_KEY") {
-                self.s3_access_key = Some(value);
-            }
-        }
-        if self.s3_secret_key.is_none() {
-            if let Ok(value) = std::env::var("S3_SECRET_KEY") {
-                self.s3_secret_key = Some(value);
-            }
-        }
-        if !self.s3_disable_tls {
-            if let Ok(value) = std::env::var("S3_DISABLE_TLS") {
-                self.s3_disable_tls = value.eq_ignore_ascii_case("true") || value == "1";
-            }
-        }
+        self.s3_connection.apply_env();
         if self.since.is_none() {
             if let Ok(value) = std::env::var("SINCE_HOURS") {
                 if let Ok(hours) = value.trim().parse::<u64>() {
@@ -265,7 +226,6 @@ async fn main() -> Result<()> {
 
     let mut args = Args::parse();
     args.apply_env();
-    let dry_run = !args.apply;
 
     match (args.input_dir.is_empty(), args.input_s3_bucket.is_empty()) {
         (false, false) => bail!("use either --input-dir or --input-s3-bucket, not both"),
@@ -312,10 +272,6 @@ async fn main() -> Result<()> {
         );
     }
 
-    if dry_run {
-        eprintln!("ais-parse: dry run (pass --apply to write output)");
-    }
-
     let _signal = tokio::spawn(async move {
         #[cfg(unix)]
         {
@@ -342,12 +298,12 @@ async fn main() -> Result<()> {
         input_storages.push(
             S3Storage::new(
                 bucket.clone(),
-                args.s3_region.clone(),
-                args.s3_endpoint.clone(),
-                args.s3_access_key.clone(),
-                args.s3_secret_key.clone(),
+                args.s3_connection.s3_region.clone(),
+                args.s3_connection.s3_endpoint.clone(),
+                args.s3_connection.s3_access_key.clone(),
+                args.s3_connection.s3_secret_key.clone(),
                 false,
-                args.s3_disable_tls,
+                args.s3_connection.s3_disable_tls,
             )
             .await
             .with_context(|| format!("connecting to input S3 bucket {bucket}"))?,
@@ -359,12 +315,12 @@ async fn main() -> Result<()> {
         Some(bucket) => Some(
             S3Storage::new(
                 bucket.clone(),
-                args.s3_region.clone(),
-                args.s3_endpoint.clone(),
-                args.s3_access_key.clone(),
-                args.s3_secret_key.clone(),
+                args.s3_connection.s3_region.clone(),
+                args.s3_connection.s3_endpoint.clone(),
+                args.s3_connection.s3_access_key.clone(),
+                args.s3_connection.s3_secret_key.clone(),
                 false,
-                args.s3_disable_tls,
+                args.s3_connection.s3_disable_tls,
             )
             .await
             .context("connecting to output S3 bucket")?,
@@ -493,7 +449,12 @@ async fn main() -> Result<()> {
                 .cmp(&b.partition.sort_key())
                 .then(a.rel_path.cmp(&b.rel_path))
         });
-        dataset::group_by_partition(entries, |entry| entry.partition.clone())
+        // Group by the *time-only* key so every source that lands in a given
+        // output partition is one work item: the output is not partitioned by
+        // source, and one owner per output partition keeps the partition
+        // replace race-free. sort_key orders by time before source, so
+        // same-time entries from different sources are already contiguous.
+        dataset::group_by_partition(entries, |entry| entry.partition.without_source())
             .into_iter()
             .map(|(key, list)| (key, PartitionWork::Remote(list)))
             .collect()
@@ -521,7 +482,8 @@ async fn main() -> Result<()> {
                 .cmp(&b.partition.sort_key())
                 .then(a.path.cmp(&b.path))
         });
-        dataset::group_by_partition(files, |file| file.partition.clone())
+        // Group by time-only key — see the S3 branch above.
+        dataset::group_by_partition(files, |file| file.partition.without_source())
             .into_iter()
             .map(|(key, list)| (key, PartitionWork::Local(list)))
             .collect()
@@ -600,10 +562,7 @@ async fn main() -> Result<()> {
                     break;
                 };
 
-                let downloaded_rel_dir = match &work {
-                    PartitionWork::Remote(_) => Some(partition_key.relative_dir()),
-                    PartitionWork::Local(_) => None,
-                };
+                let is_remote = matches!(work, PartitionWork::Remote(_));
                 let partition_files = match work {
                     PartitionWork::Local(files) => files,
                     PartitionWork::Remote(entries) => {
@@ -628,7 +587,16 @@ async fn main() -> Result<()> {
                     }
                 };
 
-                let rel_dir = partition_key.relative_dir();
+                // A time-only work item can pool downloads from several source
+                // subtrees, so clean the scratch copies by file path rather
+                // than a single partition dir.
+                let scratch_files: Vec<PathBuf> = if is_remote {
+                    partition_files.iter().map(|f| f.path.clone()).collect()
+                } else {
+                    Vec::new()
+                };
+
+                let rel_dir = partition_key.relative_dir_time_only();
                 let output_root_for_task = output_root.clone();
                 let result = tokio::task::spawn_blocking(move || {
                     process_partition(
@@ -637,16 +605,14 @@ async fn main() -> Result<()> {
                         output_root_for_task,
                         batch_size,
                         compression_level,
-                        dry_run,
                         replace_local,
                     )
                 })
                 .await
                 .context("partition worker panicked")?;
 
-                if let (Some(rel), Some(scratch_root)) = (&downloaded_rel_dir, &input_scratch_root)
-                {
-                    let _ = tokio::fs::remove_dir_all(scratch_root.join(rel)).await;
+                for scratch_file in &scratch_files {
+                    let _ = tokio::fs::remove_file(scratch_file).await;
                 }
 
                 let outputs = match result {
@@ -663,41 +629,39 @@ async fn main() -> Result<()> {
                 // S3 output: replace the partition's prior objects with this
                 // run's file, per tree (positions/statics).
                 if let Some(storage) = &output_storage {
-                    if !dry_run {
-                        for tree in [POSITIONS_TREE, STATICS_TREE] {
-                            let tree_rel = format!("{tree}/{rel_dir}");
-                            let partition_prefix =
-                                format!("{}/", s3_join(&output_s3_prefix, &tree_rel));
-                            let prior = storage
-                                .list_keys_with_prefix(&partition_prefix)
-                                .await
-                                .with_context(|| format!("listing {partition_prefix}"))?;
-                            let prior_keys: Vec<String> = prior
-                                .into_iter()
-                                .map(|object| object.key)
-                                .filter(|key| key.ends_with(".parquet"))
-                                .collect();
+                    for tree in OUTPUT_TREES {
+                        let tree_rel = format!("{tree}/{rel_dir}");
+                        let partition_prefix =
+                            format!("{}/", s3_join(&output_s3_prefix, &tree_rel));
+                        let prior = storage
+                            .list_keys_with_prefix(&partition_prefix)
+                            .await
+                            .with_context(|| format!("listing {partition_prefix}"))?;
+                        let prior_keys: Vec<String> = prior
+                            .into_iter()
+                            .map(|object| object.key)
+                            .filter(|key| key.ends_with(".parquet"))
+                            .collect();
 
-                            for (out_rel, local_path, _rows) in
-                                outputs.iter().filter(|(r, _, _)| r.starts_with(tree))
+                        for (out_rel, local_path, _rows) in
+                            outputs.iter().filter(|(r, _, _)| r.starts_with(tree))
+                        {
+                            let key = s3_join(&output_s3_prefix, out_rel);
+                            if let Err(error) = upload_with_retries(storage, local_path, &key)
+                                .await
+                                .with_context(|| {
+                                    format!("uploading {} to S3", local_path.display())
+                                })
                             {
-                                let key = s3_join(&output_s3_prefix, out_rel);
-                                if let Err(error) = upload_with_retries(storage, local_path, &key)
-                                    .await
-                                    .with_context(|| {
-                                        format!("uploading {} to S3", local_path.display())
-                                    })
-                                {
-                                    CANCELLED.store(true, Ordering::Relaxed);
-                                    return Err(error);
-                                }
+                                CANCELLED.store(true, Ordering::Relaxed);
+                                return Err(error);
                             }
-                            for key in prior_keys {
-                                storage
-                                    .delete_key(&key)
-                                    .await
-                                    .with_context(|| format!("deleting prior object {key}"))?;
-                            }
+                        }
+                        for key in prior_keys {
+                            storage
+                                .delete_key(&key)
+                                .await
+                                .with_context(|| format!("deleting prior object {key}"))?;
                         }
                     }
                 }
@@ -754,7 +718,7 @@ async fn main() -> Result<()> {
 
     // Advance the watermark only after a fully successful, applied run.
     if let Some(store) = &state_store {
-        if !dry_run && !is_cancelled() {
+        if !is_cancelled() {
             if let Some(candidate) = watermark_candidate_ms {
                 let new_watermark = prev_watermark_ms.map_or(candidate, |p| p.max(candidate));
                 store
@@ -773,17 +737,10 @@ async fn main() -> Result<()> {
     }
 
     total_stats.print_summary();
-    if dry_run {
-        eprintln!(
-            "Dry run complete. Pass --apply to decode {} partition(s).",
-            total_stats.partitions_processed
-        );
-    } else {
-        eprintln!(
-            "Done. Decoded {} partition(s).",
-            total_stats.partitions_processed
-        );
-    }
+    eprintln!(
+        "Done. Decoded {} partition(s).",
+        total_stats.partitions_processed
+    );
 
     Ok(())
 }
@@ -795,13 +752,38 @@ fn default_concurrency() -> usize {
         .clamp(1, 8)
 }
 
-/// `(output rel path like "positions/source=x/year=.../pos-....parquet",
-/// local file path, rows)` per file this partition produced.
+/// `(output rel path like "positions/year=.../pos-....parquet", local file
+/// path, rows)` per file this partition produced. The output layout is not
+/// partitioned by source.
 type PartitionOutputs = Vec<(String, PathBuf, u64)>;
 
-/// Decode one partition end to end: fresh parser (fragment state is
-/// per-partition), one positions file and one statics file, then — for local
-/// output — replace the prior run's files in the two output partitions.
+/// Record a finished output file (if the writer produced one) under
+/// `<tree>/<rel_dir>/<name>`.
+fn push_output(
+    outputs: &mut PartitionOutputs,
+    tree: &str,
+    rel_dir: &str,
+    done: Option<(PathBuf, u64)>,
+) {
+    if let Some((path, rows)) = done {
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        outputs.push((format!("{tree}/{rel_dir}/{name}"), path, rows));
+    }
+}
+
+/// Decode one output partition end to end into one positions file and one
+/// statics file, then — for local output — replace the prior run's files in
+/// the two output partitions.
+///
+/// The output is not partitioned by source, so `files` can pool several
+/// sources that map to this time partition. Fragment reassembly is per-source
+/// (a fresh parser when the source label changes; `files` is sorted so each
+/// source's files are contiguous), which keeps multi-part sequence ids from
+/// colliding across sources.
 #[allow(clippy::too_many_arguments)]
 fn process_partition(
     partition_key: PartitionKey,
@@ -809,35 +791,50 @@ fn process_partition(
     output_root: PathBuf,
     batch_size: usize,
     compression_level: i32,
-    dry_run: bool,
     replace_local: bool,
 ) -> Result<(ParseStats, PartitionOutputs)> {
-    let rel_dir = partition_key.relative_dir();
-    let positions_dir = output_root.join(POSITIONS_TREE).join(&rel_dir);
-    let statics_dir = output_root.join(STATICS_TREE).join(&rel_dir);
+    let rel_dir = partition_key.relative_dir_time_only();
+    let dir_for = |tree: &str| output_root.join(tree).join(&rel_dir);
 
     // Collected before writing so the new (uniquely-named) files are never in
     // the deletion set.
-    let prior_files: Vec<PathBuf> = if !dry_run && replace_local {
-        let mut prior = existing_parquet_files(&positions_dir)?;
-        prior.extend(existing_parquet_files(&statics_dir)?);
+    let prior_files: Vec<PathBuf> = if replace_local {
+        let mut prior = Vec::new();
+        for tree in OUTPUT_TREES {
+            prior.extend(existing_parquet_files(&dir_for(tree))?);
+        }
         prior
     } else {
         Vec::new()
     };
 
     let mut parser = NmeaParser::new();
+    let mut current_source: Option<&str> = None;
     let mut stats = ParseStats::default();
-    let mut positions = (!dry_run).then(|| PositionsWriter::new(positions_dir, compression_level));
-    let mut statics = (!dry_run).then(|| StaticsWriter::new(statics_dir, compression_level));
+    let mut positions = PositionsWriter::new(dir_for(POSITIONS_TREE), compression_level);
+    let mut statics = StaticsWriter::new(dir_for(STATICS_TREE), compression_level);
+    let mut meteo = MeteoWriter::new(dir_for(METEO_TREE), compression_level);
+    let mut binary = BinaryWriter::new(dir_for(BINARY_TREE), compression_level);
+    let mut atons = AtonWriter::new(dir_for(ATONS_TREE), compression_level);
 
     for file in &files {
+        // Reset fragment state at each source boundary.
+        if current_source != Some(file.partition.source.as_str()) {
+            parser = NmeaParser::new();
+            current_source = Some(file.partition.source.as_str());
+        }
         process_parquet_file(
             &file.path,
+            &file.partition.source,
             &mut parser,
             &mut stats,
-            positions.as_mut(),
-            statics.as_mut(),
+            Writers {
+                positions: &mut positions,
+                statics: &mut statics,
+                meteo: &mut meteo,
+                binary: &mut binary,
+                atons: &mut atons,
+            },
             batch_size,
         )
         .with_context(|| format!("processing {}", file.path.display()))?;
@@ -845,26 +842,36 @@ fn process_partition(
     stats.partitions_processed += 1;
 
     let mut outputs: PartitionOutputs = Vec::new();
-    if let Some(writer) = positions {
-        if let Some((path, rows)) = writer.finish().context("closing positions writer")? {
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
-            outputs.push((
-                format!("{POSITIONS_TREE}/{rel_dir}/{name}"),
-                path.clone(),
-                rows,
-            ));
-        }
-    }
-    if let Some(writer) = statics {
-        if let Some((path, rows)) = writer.finish().context("closing statics writer")? {
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
-            outputs.push((
-                format!("{STATICS_TREE}/{rel_dir}/{name}"),
-                path.clone(),
-                rows,
-            ));
-        }
-    }
+    push_output(
+        &mut outputs,
+        POSITIONS_TREE,
+        &rel_dir,
+        positions.finish().context("closing positions writer")?,
+    );
+    push_output(
+        &mut outputs,
+        STATICS_TREE,
+        &rel_dir,
+        statics.finish().context("closing statics writer")?,
+    );
+    push_output(
+        &mut outputs,
+        METEO_TREE,
+        &rel_dir,
+        meteo.finish().context("closing meteo writer")?,
+    );
+    push_output(
+        &mut outputs,
+        BINARY_TREE,
+        &rel_dir,
+        binary.finish().context("closing binary writer")?,
+    );
+    push_output(
+        &mut outputs,
+        ATONS_TREE,
+        &rel_dir,
+        atons.finish().context("closing atons writer")?,
+    );
 
     // New files are durable: the prior run's output for this partition is now
     // redundant (decoding is deterministic, so this is a replace, not a loss).
@@ -876,12 +883,21 @@ fn process_partition(
     Ok((stats, outputs))
 }
 
+/// The set of per-partition writers, threaded into the row loop.
+struct Writers<'a> {
+    positions: &'a mut PositionsWriter,
+    statics: &'a mut StaticsWriter,
+    meteo: &'a mut MeteoWriter,
+    binary: &'a mut BinaryWriter,
+    atons: &'a mut AtonWriter,
+}
+
 fn process_parquet_file(
     path: &Path,
+    path_source: &str,
     parser: &mut NmeaParser,
     stats: &mut ParseStats,
-    mut positions: Option<&mut PositionsWriter>,
-    mut statics: Option<&mut StaticsWriter>,
+    writers: Writers<'_>,
     batch_size: usize,
 ) -> Result<()> {
     let file = StdFile::open(path).with_context(|| format!("open {}", path.display()))?;
@@ -891,35 +907,68 @@ fn process_parquet_file(
         .build()
         .with_context(|| format!("build Parquet reader {}", path.display()))?;
 
+    // Columns are matched by name, not position: normalized input is
+    // (ts, source, payload) while raw bronze is (ts, payload). The `source`
+    // column (present in normalized data, per-row after a dedup merge pooled
+    // several sources) takes precedence; bronze has none, so we fall back to
+    // the source parsed from the file's partition path.
     while let Some(batch) = reader.next().transpose()? {
+        let schema = batch.schema();
+        let ts_idx = schema.index_of("ts").unwrap_or(0);
+        let payload_idx = schema
+            .index_of("payload")
+            .map_err(|_| anyhow::anyhow!("input {} has no payload column", path.display()))?;
+        let source_idx = schema.index_of("source").ok();
+
         let ts_col = batch
-            .column(0)
+            .column(ts_idx)
             .as_any()
             .downcast_ref::<TimestampMillisecondArray>()
-            .context("expected timestamp column at index 0")?;
+            .context("expected a timestamp `ts` column")?;
         let payload_col = batch
-            .column(1)
+            .column(payload_idx)
             .as_any()
             .downcast_ref::<StringArray>()
-            .context("expected string column at index 1")?;
+            .context("expected a string `payload` column")?;
+        let source_col = source_idx
+            .map(|idx| {
+                batch
+                    .column(idx)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .context("expected a string `source` column")
+            })
+            .transpose()?;
 
         for i in 0..batch.num_rows() {
             if is_cancelled() {
                 return Ok(());
             }
             stats.rows_in += 1;
-            match decode_payload(parser, ts_col.value(i), payload_col.value(i)) {
+            let source = match &source_col {
+                Some(col) if !col.is_null(i) => col.value(i),
+                _ => path_source,
+            };
+            match decode_payload(parser, ts_col.value(i), source, payload_col.value(i)) {
                 Decoded::Position(row) => {
                     stats.positions_out += 1;
-                    if let Some(writer) = positions.as_deref_mut() {
-                        writer.write(&row)?;
-                    }
+                    writers.positions.write(&row)?;
                 }
                 Decoded::Static(row) => {
                     stats.statics_out += 1;
-                    if let Some(writer) = statics.as_deref_mut() {
-                        writer.write(&row)?;
-                    }
+                    writers.statics.write(&row)?;
+                }
+                Decoded::Meteo(row) => {
+                    stats.meteo_out += 1;
+                    writers.meteo.write(*row)?;
+                }
+                Decoded::Binary(row) => {
+                    stats.binary_out += 1;
+                    writers.binary.write(*row)?;
+                }
+                Decoded::Aton(row) => {
+                    stats.atons_out += 1;
+                    writers.atons.write(*row)?;
                 }
                 Decoded::Other => stats.other_decoded += 1,
                 Decoded::Incomplete => stats.incomplete += 1,

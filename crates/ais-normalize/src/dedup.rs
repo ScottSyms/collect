@@ -12,9 +12,7 @@
 //! treat each row group as a sorted run and k-way merge them, deduplicating
 //! within each equal-`ts` group with a small per-timestamp payload set. Peak
 //! memory is one read batch per run plus one second's worth of payloads — not
-//! the whole partition. (This mirrors `collect-maint`'s compaction merge in
-//! `crates/collect-maint/src/commands.rs`; kept separate here to avoid coupling
-//! the two crates.)
+//! the whole partition.
 
 use crate::output::{build_schema, open_writer, parquet_file_name};
 use anyhow::{Context, Result};
@@ -70,6 +68,7 @@ impl DedupStats {
 struct MergeRun {
     reader: Option<ParquetRecordBatchReader>,
     ts: TimestampMillisecondArray,
+    source: StringArray,
     payload: StringArray,
     pos: usize,
 }
@@ -84,6 +83,7 @@ impl MergeRun {
         let mut run = Self {
             reader: Some(reader),
             ts: TimestampMillisecondArray::from(Vec::<i64>::new()),
+            source: StringArray::from(Vec::<&str>::new()),
             payload: StringArray::from(Vec::<&str>::new()),
             pos: 0,
         };
@@ -112,10 +112,11 @@ impl MergeRun {
         let schema = batches[0].schema();
         let combined = concat_batches(&schema, &batches).context("concatenate record batches")?;
         let sorted = sort_record_batch_by_ts(&combined)?;
-        let (ts, payload) = split_columns(&sorted)?;
+        let (ts, source, payload) = split_columns(&sorted)?;
         Ok(Some(Self {
             reader: None,
             ts,
+            source,
             payload,
             pos: 0,
         }))
@@ -123,6 +124,10 @@ impl MergeRun {
 
     fn current_ts(&self) -> i64 {
         self.ts.value(self.pos)
+    }
+
+    fn current_source(&self) -> &str {
+        self.source.value(self.pos)
     }
 
     fn current_payload(&self) -> &str {
@@ -133,8 +138,9 @@ impl MergeRun {
         while let Some(reader) = self.reader.as_mut() {
             match reader.next().transpose().context("reading parquet batch")? {
                 Some(batch) if batch.num_rows() > 0 => {
-                    let (ts, payload) = split_columns(&batch)?;
+                    let (ts, source, payload) = split_columns(&batch)?;
                     self.ts = ts;
+                    self.source = source;
                     self.payload = payload;
                     self.pos = 0;
                     return Ok(true);
@@ -200,8 +206,10 @@ fn row_group_is_sorted_by_ts(
     Ok(true)
 }
 
-fn split_columns(batch: &RecordBatch) -> Result<(TimestampMillisecondArray, StringArray)> {
-    if batch.num_columns() < 2 {
+fn split_columns(
+    batch: &RecordBatch,
+) -> Result<(TimestampMillisecondArray, StringArray, StringArray)> {
+    if batch.num_columns() < 3 {
         anyhow::bail!("unexpected column count: {}", batch.num_columns());
     }
     let ts = batch
@@ -210,13 +218,19 @@ fn split_columns(batch: &RecordBatch) -> Result<(TimestampMillisecondArray, Stri
         .downcast_ref::<TimestampMillisecondArray>()
         .ok_or_else(|| anyhow::anyhow!("missing ts column"))?
         .clone();
-    let payload = batch
+    let source = batch
         .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| anyhow::anyhow!("missing source column"))?
+        .clone();
+    let payload = batch
+        .column(2)
         .as_any()
         .downcast_ref::<StringArray>()
         .ok_or_else(|| anyhow::anyhow!("missing payload column"))?
         .clone();
-    Ok((ts, payload))
+    Ok((ts, source, payload))
 }
 
 /// Buffers merged rows and writes them out in fixed-size chunks. Rows arrive
@@ -225,6 +239,7 @@ struct MergedWriter {
     writer: ArrowWriter<File>,
     schema: Arc<Schema>,
     ts: TimestampMillisecondBuilder,
+    source: StringBuilder,
     payload: StringBuilder,
     chunk_rows: usize,
 }
@@ -237,13 +252,15 @@ impl MergedWriter {
             writer,
             schema,
             ts: TimestampMillisecondBuilder::with_capacity(MERGE_BATCH_ROWS),
+            source: StringBuilder::with_capacity(MERGE_BATCH_ROWS, MERGE_BATCH_ROWS * 8),
             payload: StringBuilder::with_capacity(MERGE_BATCH_ROWS, MERGE_BATCH_ROWS * 64),
             chunk_rows: 0,
         })
     }
 
-    fn push(&mut self, ts_ms: i64, payload: &str) -> Result<()> {
+    fn push(&mut self, ts_ms: i64, source: &str, payload: &str) -> Result<()> {
         self.ts.append_value(ts_ms);
+        self.source.append_value(source);
         self.payload.append_value(payload);
         self.chunk_rows += 1;
         if self.chunk_rows >= MERGE_BATCH_ROWS {
@@ -257,11 +274,13 @@ impl MergedWriter {
             return Ok(());
         }
         let ts_array = self.ts.finish().with_timezone_opt(Some(Arc::from("UTC")));
+        let source_array = self.source.finish();
         let payload_array = self.payload.finish();
         let batch = RecordBatch::try_new(
             self.schema.clone(),
             vec![
                 Arc::new(ts_array) as Arc<dyn Array>,
+                Arc::new(source_array) as Arc<dyn Array>,
                 Arc::new(payload_array) as Arc<dyn Array>,
             ],
         )
@@ -418,22 +437,27 @@ fn merge_run_batch(
         .collect();
 
     // All rows sharing a timestamp are emitted consecutively (heap orders by
-    // ts), so a set holding one timestamp's payloads is enough to dedup; it is
-    // cleared when the timestamp advances.
+    // ts), so a set holding one timestamp's `(source, payload)` keys is enough
+    // to dedup; it is cleared when the timestamp advances. Source is part of
+    // the key so a message that two sources reported byte-identically is kept
+    // once per source (provenance is retained), while a re-run of the same
+    // source still collapses to one row.
     let mut current_ts = i64::MIN;
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut seen: HashSet<(String, String)> = HashSet::new();
     while let Some(Reverse((ts_ms, index))) = heap.pop() {
         stats.rows_in += 1;
+        let source = runs[index].current_source();
         let payload = runs[index].current_payload();
         if ts_ms != current_ts {
             current_ts = ts_ms;
             seen.clear();
         }
-        if seen.contains(payload) {
+        let key = (source.to_string(), payload.to_string());
+        if seen.contains(&key) {
             stats.duplicates_removed += 1;
         } else {
-            seen.insert(payload.to_string());
-            writer.push(ts_ms, payload)?;
+            writer.push(ts_ms, source, payload)?;
+            seen.insert(key);
             stats.rows_out += 1;
         }
         if runs[index].advance()? {
@@ -620,25 +644,21 @@ fn file_name_of(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::datatypes::{DataType, Field, TimeUnit};
 
-    fn write_parquet(path: &Path, rows: &[(i64, &str)]) {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(
-                "ts",
-                DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
-                false,
-            ),
-            Field::new("payload", DataType::Utf8, false),
-        ]));
+    /// Rows are `(ts, source, payload)`.
+    fn write_parquet(path: &Path, rows: &[(i64, &str, &str)]) {
+        let schema = build_schema();
         let mut w = open_writer(path, &schema, 1).expect("open");
-        let ts = TimestampMillisecondArray::from(rows.iter().map(|(t, _)| *t).collect::<Vec<_>>())
-            .with_timezone_opt(Some(Arc::from("UTC")));
-        let payload = StringArray::from(rows.iter().map(|(_, p)| *p).collect::<Vec<_>>());
+        let ts =
+            TimestampMillisecondArray::from(rows.iter().map(|(t, _, _)| *t).collect::<Vec<_>>())
+                .with_timezone_opt(Some(Arc::from("UTC")));
+        let source = StringArray::from(rows.iter().map(|(_, s, _)| *s).collect::<Vec<_>>());
+        let payload = StringArray::from(rows.iter().map(|(_, _, p)| *p).collect::<Vec<_>>());
         let batch = RecordBatch::try_new(
             schema,
             vec![
                 Arc::new(ts) as Arc<dyn Array>,
+                Arc::new(source) as Arc<dyn Array>,
                 Arc::new(payload) as Arc<dyn Array>,
             ],
         )
@@ -647,7 +667,7 @@ mod tests {
         w.close().expect("close");
     }
 
-    fn read_all(path: &Path) -> Vec<(i64, String)> {
+    fn read_all(path: &Path) -> Vec<(i64, String, String)> {
         let file = File::open(path).expect("open");
         let reader = ParquetRecordBatchReaderBuilder::try_new(file)
             .expect("builder")
@@ -656,9 +676,13 @@ mod tests {
         let mut out = Vec::new();
         for batch in reader {
             let batch = batch.expect("batch");
-            let (ts, payload) = split_columns(&batch).expect("cols");
+            let (ts, source, payload) = split_columns(&batch).expect("cols");
             for i in 0..ts.len() {
-                out.push((ts.value(i), payload.value(i).to_string()));
+                out.push((
+                    ts.value(i),
+                    source.value(i).to_string(),
+                    payload.value(i).to_string(),
+                ));
             }
         }
         out
@@ -670,8 +694,8 @@ mod tests {
         let a = dir.path().join("a.parquet");
         let b = dir.path().join("b.parquet");
         // b fully duplicates a; both have an internal-distinct row at ts=100.
-        write_parquet(&a, &[(100, "X"), (100, "Y"), (200, "Z")]);
-        write_parquet(&b, &[(100, "X"), (100, "Y"), (200, "Z")]);
+        write_parquet(&a, &[(100, "s", "X"), (100, "s", "Y"), (200, "s", "Z")]);
+        write_parquet(&b, &[(100, "s", "X"), (100, "s", "Y"), (200, "s", "Z")]);
         let out = dir.path().join("out.parquet");
         let stats = merge_dedup_files(&[a, b], &out, 1).expect("merge");
         assert_eq!(stats.rows_in, 6);
@@ -681,7 +705,31 @@ mod tests {
         assert_eq!(rows.len(), 3);
         // sorted by ts, all distinct
         assert_eq!(rows[0].0, 100);
-        assert_eq!(rows[2], (200, "Z".to_string()));
+        assert_eq!(rows[2], (200, "s".to_string(), "Z".to_string()));
+    }
+
+    #[test]
+    fn keeps_same_ts_and_payload_from_distinct_sources() {
+        // Two sources reported a byte-identical message at the same ts. Source
+        // is part of the dedup key, so both survive (provenance retained),
+        // while the within-source repeat is dropped.
+        let dir = tempfile::tempdir().expect("tmp");
+        let a = dir.path().join("a.parquet");
+        write_parquet(
+            &a,
+            &[
+                (100, "norway", "M"),
+                (100, "sweden", "M"),
+                (100, "norway", "M"),
+            ],
+        );
+        let out = dir.path().join("out.parquet");
+        let stats = merge_dedup_files(&[a], &out, 1).expect("merge");
+        assert_eq!(stats.rows_out, 2);
+        assert_eq!(stats.duplicates_removed, 1);
+        let mut sources: Vec<String> = read_all(&out).into_iter().map(|(_, s, _)| s).collect();
+        sources.sort();
+        assert_eq!(sources, vec!["norway".to_string(), "sweden".to_string()]);
     }
 
     #[test]
@@ -694,7 +742,7 @@ mod tests {
         for i in 0..n {
             let path = dir.path().join(format!("in-{i:05}.parquet"));
             // Every file is identical, so the whole pile collapses to 2 rows.
-            write_parquet(&path, &[(100, "X"), (200, "Y")]);
+            write_parquet(&path, &[(100, "s", "X"), (200, "s", "Y")]);
             inputs.push(path);
         }
         let out = dir.path().join("out.parquet");
@@ -703,7 +751,13 @@ mod tests {
         assert_eq!(stats.rows_out, 2);
         assert_eq!(stats.duplicates_removed, (n * 2 - 2) as u64);
         let rows = read_all(&out);
-        assert_eq!(rows, vec![(100, "X".to_string()), (200, "Y".to_string())]);
+        assert_eq!(
+            rows,
+            vec![
+                (100, "s".to_string(), "X".to_string()),
+                (200, "s".to_string(), "Y".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -715,7 +769,7 @@ mod tests {
         let mut inputs = Vec::new();
         for i in 0..n {
             let path = dir.path().join(format!("in-{i:05}.parquet"));
-            write_parquet(&path, &[(i as i64, "p")]);
+            write_parquet(&path, &[(i as i64, "s", "p")]);
             inputs.push(path);
         }
         let out = dir.path().join("out.parquet");
@@ -734,7 +788,11 @@ mod tests {
         // Same timestamp, different payloads (e.g. different \s: stations) are kept.
         write_parquet(
             &a,
-            &[(100, "station-A"), (100, "station-B"), (100, "station-A")],
+            &[
+                (100, "s", "station-A"),
+                (100, "s", "station-B"),
+                (100, "s", "station-A"),
+            ],
         );
         let out = dir.path().join("out.parquet");
         let stats = merge_dedup_files(&[a], &out, 1).expect("merge");
@@ -746,7 +804,7 @@ mod tests {
     fn local_partition_single_file_is_untouched() {
         let dir = tempfile::tempdir().expect("tmp");
         let only = dir.path().join("norm-1.parquet");
-        write_parquet(&only, &[(100, "X"), (200, "Y")]);
+        write_parquet(&only, &[(100, "s", "X"), (200, "s", "Y")]);
         let stats = dedup_local_partition(dir.path(), 1, false).expect("dedup");
         assert_eq!(stats.partitions_merged, 0);
         assert!(only.exists(), "single file should be left in place");
@@ -758,7 +816,7 @@ mod tests {
         let only = dir.path().join("norm-1.parquet");
         // One file that already holds an internal duplicate (e.g. two inputs of
         // the same source merged into one output file).
-        write_parquet(&only, &[(100, "X"), (100, "X"), (200, "Y")]);
+        write_parquet(&only, &[(100, "s", "X"), (100, "s", "X"), (200, "s", "Y")]);
         let stats = dedup_local_partition(dir.path(), 1, true).expect("dedup");
         assert_eq!(stats.partitions_merged, 1);
         assert_eq!(stats.duplicates_removed, 1);
@@ -772,11 +830,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tmp");
         write_parquet(
             &dir.path().join("norm-1.parquet"),
-            &[(100, "X"), (200, "Y")],
+            &[(100, "s", "X"), (200, "s", "Y")],
         );
         write_parquet(
             &dir.path().join("norm-2.parquet"),
-            &[(100, "X"), (300, "Z")],
+            &[(100, "s", "X"), (300, "s", "Z")],
         );
         let stats = dedup_local_partition(dir.path(), 1, false).expect("dedup");
         assert_eq!(stats.partitions_merged, 1);

@@ -1,0 +1,53 @@
+job "aisstream-parse" {
+  datacenters = ["dc1"]
+  type        = "batch"
+
+  periodic {
+    cron             = "*/1 * * * * *"
+    prohibit_overlap = true
+  }
+
+  group "decode" {
+    count = 1
+
+    task "aisstream-parse" {
+      driver = "exec"
+
+      config {
+        command = "local/aisstream-parse"
+        args = [
+          "--input-s3-bucket", "aisstream",
+          "--output-s3-bucket", "ais",
+          "--incremental",
+          "--concurrency", "4",
+        ]
+      }
+
+      artifact {
+        source      = "http://192.168.99.107:9000/binaries/aisstream-parse"
+        destination = "local/aisstream-parse"
+        mode        = "file"
+      }
+
+      env {
+        S3_ENDPOINT    = "http://192.168.99.107:9000"
+        S3_REGION      = "us-east-1"
+        S3_ACCESS_KEY  = "WSF8aTTn5oKc4i1fVJvP"
+        S3_SECRET_KEY  = "OqaL2H8UcUJByliObQp9ujZGHVZF1GKd91IqAkYY"
+        S3_DISABLE_TLS = "true"
+      }
+
+      resources {
+        cpu    = 500
+        memory = 1024
+      }
+
+      restart {
+        attempts = 3
+        interval = "5m"
+        delay    = "15s"
+        mode     = "delay"
+      }
+    }
+  }
+}

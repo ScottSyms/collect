@@ -12,7 +12,6 @@ futures-util.workspace = true
 tokio-util.workspace = true
 
 collect-core = { path = "../collect-core" }
-collect-tui = { path = "../collect-tui" }
 
 rdkafka = { version = "0.36", features = ["tokio"] }
 bytes = "1"

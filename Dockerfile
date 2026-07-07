@@ -29,7 +29,6 @@ RUN useradd -m -u 1000 appuser
 # Copy the binaries from the builder stage
 COPY --from=builder /usr/src/app/target/release/collect-file /usr/local/bin/collect-file
 COPY --from=builder /usr/src/app/target/release/collect-socket /usr/local/bin/collect-socket
-COPY --from=builder /usr/src/app/target/release/collect-maint /usr/local/bin/collect-maint
 COPY --from=builder /usr/src/app/target/release/collect-aisstream /usr/local/bin/collect-aisstream
 COPY --from=builder /usr/src/app/target/release/ais-normalize /usr/local/bin/ais-normalize
 COPY --from=builder /usr/src/app/target/release/ais-parse /usr/local/bin/ais-parse

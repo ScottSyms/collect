@@ -10,4 +10,3 @@ serde.workspace = true
 tokio.workspace = true
 
 collect-core = { path = "../collect-core" }
-collect-tui = { path = "../collect-tui" }

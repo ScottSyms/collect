@@ -3,7 +3,7 @@
 `ais-normalize` is a batch post-processing pass over a Hive-partitioned Parquet dataset already collected by `collect-file`, `collect-socket`, `collect-kafka`, or `collect-aisstream`. It sits between raw ingestion and compaction in the medallion pipeline:
 
 ```
-collect-* (bronze, raw)  →  ais-normalize  →  collect-maint compact  →  ais-parse (silver)  →  Iceberg
+collect-* (bronze, raw)  →  ais-normalize  →  ais-parse (silver)  →  Iceberg
 ```
 
 It is a CLI tool that runs to completion and exits — not a long-running service. It has no `--metrics-addr`/`/healthz` endpoint. The next step of the pipeline — decoding the normalized sentences into typed columns — is [ais-parse](AIS_PARSE.md).
@@ -39,7 +39,7 @@ Rows that aren't AIS `VDM`/`VDO` sentences (heartbeats, other NMEA talkers, etc.
 - Buffered fragment groups are capped at 8192 concurrent groups per partition; if a new group would exceed the cap, the oldest incomplete group is evicted and its fragments are emitted individually (counted as an "incomplete group") rather than buffered indefinitely. Malformed or truncated fragment sequences can never grow memory without bound.
 - Any fragment groups still incomplete at the end of a partition's files are flushed the same way.
 
-**Output.** Rows are written with the same `(ts: Timestamp(ms, UTC), payload: Utf8)` schema as ingestion, Zstd-compressed, with row groups sized and sorted by timestamp on every flush — this is what lets `collect-maint compact` stream-merge the output later without a full re-sort. Open writers per pool are hard-capped at 64: if pathologically scattered timestamps fan an input partition out further than that, all open files are closed and affected partitions simply get an additional file, keeping worst-case memory bounded even on hostile data.
+**Output.** Rows are written with the schema `(ts: Timestamp(ms, UTC), source: Utf8, payload: Utf8)` — the same `ts`/`payload` as ingestion plus a `source` column carrying the input's `source=` label (the output itself is not partitioned by source; see [merging multiple sources](#merging-multiple-sources)). Files are Zstd-compressed, with row groups sized and sorted by timestamp on every flush. The `source` value is constant within a file, so it dictionary-encodes to almost nothing. Open writers per pool are hard-capped at 64: if pathologically scattered timestamps fan an input partition out further than that, all open files are closed and affected partitions simply get an additional file, keeping worst-case memory bounded even on hostile data.
 
 ## CLI reference
 
@@ -65,11 +65,10 @@ Rows that aren't AIS `VDM`/`VDO` sentences (heartbeats, other NMEA talkers, etc.
 | `--minute` | *(all minutes)* | Narrow to one minute; requires `--hour` and a `minute` layout |
 | `--since <HOURS>` | *(off)* | Process only partitions holding data from the last N hours (rolling window from now, UTC); env `SINCE_HOURS`. Mutually exclusive with `--year`…`--minute`. See [rolling windows](#rolling-windows---since) |
 | `--incremental` | *(off)* | Track a watermark at the output target and process only partitions holding files that arrived since the last successful run; env `INCREMENTAL=true`. Self-healing; preferred for scheduled runs. See [watermark runs](#watermark-runs---incremental) |
-| `--apply` | off (dry run) | Actually write output; omit to preview only |
+| `--dedup` | `true` | Merge touched output partitions and drop exact `(ts, source, payload)` duplicates so re-runs are idempotent; `--dedup false` (env `DEDUP=false`) appends instead. See [idempotent re-runs](#idempotent-re-runs-deduplication) |
 | `--batch-size` | `8192` | Rows per Parquet read batch |
 | `--compression-level` | `5` | Zstd level for output files |
 | `--concurrency` | cores, clamped `[1, 8]` | Partitions processed concurrently |
-| `--dedup` | `true` | Merge touched output partitions and drop exact `(ts, payload)` duplicates so re-runs are idempotent; `--dedup false` (env `DEDUP=false`) appends instead. See [idempotent re-runs](#idempotent-re-runs-deduplication) |
 | `--noui` | off | Disable the TTY status display; print plain progress lines instead (auto-enabled when stdout isn't a terminal) |
 
 `--input-dir`/`--input-s3-bucket` are mutually exclusive (exactly one required), and likewise for `--output-dir`/`--output-s3-bucket`. `--input-s3-bucket` and `--output-s3-bucket` always share one endpoint/region/credentials — only the bucket name (and optional prefix) differs between them, matching how the same S3-compatible store (e.g. one MinIO deployment) typically hosts both the raw and normalized datasets side by side as separate buckets.
@@ -84,13 +83,13 @@ cargo run -p ais-normalize -- \
   --input-s3-bucket raw-ais --output-s3-bucket normalized-ais \
   --s3-endpoint http://minio:9000 --s3-region us-east-1 \
   --s3-access-key minioadmin --s3-secret-key minioadmin --s3-disable-tls \
-  --partition day --apply
+  --partition day
 
 # Local input, S3 output
 cargo run -p ais-normalize -- \
   --input-dir data --output-s3-bucket normalized-ais --output-s3-prefix ais \
   --s3-endpoint http://minio:9000 --s3-access-key minioadmin --s3-secret-key minioadmin --s3-disable-tls \
-  --partition day --apply
+  --partition day
 ```
 
 When either side is S3, the corresponding files are staged through a local scratch directory (under the OS temp dir) rather than read/written directly:
@@ -105,12 +104,12 @@ When either side is S3, the corresponding files are staged through a local scrat
 ```bash
 # One month
 cargo run -p ais-normalize -- --input-dir data --output-dir normalized \
-  --partition day --year 2026 --month 6 --apply
+  --partition day --year 2026 --month 6
 
 # One day of one source, straight from S3
 cargo run -p ais-normalize -- --input-s3-bucket raw-ais --output-s3-bucket normalized-ais \
   --s3-endpoint http://minio:9000 --source norway-tcp \
-  --partition day --year 2026 --month 7 --day 3 --apply
+  --partition day --year 2026 --month 7 --day 3
 ```
 
 Rules and behavior:
@@ -129,11 +128,11 @@ Rules and behavior:
 cargo run -p ais-normalize -- \
   --input-s3-bucket raw-ais --output-s3-bucket normalized-ais \
   --s3-endpoint http://minio:9000 --s3-access-key … --s3-secret-key … --s3-disable-tls \
-  --partition day --incremental --apply
+  --partition day --incremental
 
 # Env form
 INCREMENTAL=true INPUT_S3_BUCKET=raw-ais OUTPUT_S3_BUCKET=normalized-ais … \
-  cargo run -p ais-normalize -- --partition day --apply
+  cargo run -p ais-normalize -- --partition day
 ```
 
 Why this beats a fixed `--since` window for schedulers:
@@ -148,7 +147,7 @@ Rules and behavior:
 - **A 60-second overlap lap** is applied when comparing mtimes, absorbing `LastModified` jitter around the previous run's listing. Files within the lap re-process; dedup makes that free. (Corollary: an idle feed keeps re-selecting its newest partition — harmless.)
 - **Dry runs, failures, and cancels never advance the watermark**, and it never moves backwards.
 - Mutually exclusive with `--year`…`--minute`. Combines normally with `--source` and multi-input merging.
-- The state directory is metadata, not data: `collect-maint` skips `_`- and `.`-prefixed path segments (the Hive/Spark convention), and Parquet dataset readers ignore non-`.parquet` files.
+- The state directory is metadata, not data: the watermark skips `_`- and `.`-prefixed path segments (the Hive/Spark convention), and Parquet dataset readers ignore non-`.parquet` files.
 
 ## Rolling windows (`--since`)
 
@@ -159,11 +158,11 @@ Rules and behavior:
 cargo run -p ais-normalize -- \
   --input-s3-bucket raw-ais --output-s3-bucket normalized-ais \
   --s3-endpoint http://minio:9000 --s3-access-key … --s3-secret-key … --s3-disable-tls \
-  --partition day --since 2 --apply
+  --partition day --since 2
 
 # Env form (containers / cron)
 SINCE_HOURS=2 INPUT_S3_BUCKET=raw-ais OUTPUT_S3_BUCKET=normalized-ais … \
-  cargo run -p ais-normalize -- --partition day --apply
+  cargo run -p ais-normalize -- --partition day
 ```
 
 Rules and behavior:
@@ -181,12 +180,12 @@ Rules and behavior:
 cargo run -p ais-normalize -- --input-dir data --output-dir normalized --partition day
 
 # Apply, writing normalized output to a separate directory
-cargo run -p ais-normalize -- --input-dir data --output-dir normalized --partition day --apply
+cargo run -p ais-normalize -- --input-dir data --output-dir normalized --partition day
 
 # Restrict to one source, tune concurrency and compression
 cargo run -p ais-normalize -- \
   --input-dir data --output-dir normalized --partition day \
-  --source norway-tcp --concurrency 4 --compression-level 3 --apply
+  --source norway-tcp --concurrency 4 --compression-level 3
 ```
 
 Ctrl-C / SIGTERM requests a clean stop: in-flight partitions finish their currently-open output files (properly closed and renamed, no leftover `tmp-` files) and processing of further files/partitions stops; already-completed partitions are unaffected.
@@ -217,31 +216,30 @@ cargo run -p ais-normalize -- \
   --input-s3-bucket norway --input-s3-bucket aisstream \
   --output-s3-bucket normalized-ais \
   --s3-endpoint http://minio:9000 --s3-access-key … --s3-secret-key … --s3-disable-tls \
-  --partition day --apply
+  --partition day
 
 # Comma-separated env form
-INPUT_S3_BUCKET=norway,aisstream OUTPUT_S3_BUCKET=normalized-ais … cargo run -p ais-normalize -- --partition day --apply
+INPUT_S3_BUCKET=norway,aisstream OUTPUT_S3_BUCKET=normalized-ais … cargo run -p ais-normalize -- --partition day
 
 # Two local dirs
-cargo run -p ais-normalize -- --input-dir /data/norway --input-dir /data/aisstream --output-dir /data/normalized --partition day --apply
+cargo run -p ais-normalize -- --input-dir /data/norway --input-dir /data/aisstream --output-dir /data/normalized --partition day
 ```
 
 Rules and behavior:
 
-- **Each source keeps its own `source=` label.** The output is one dataset holding all the input sources as separate `source=` partition trees (e.g. `source=norway/…` and `source=aisstream/…`); labels are inherited from each input's path, never merged or rewritten. Provenance is preserved.
+- **Output is not partitioned by source, but source is retained as a column.** All inputs are merged into one dataset partitioned by time only (`year=…/month=…/day=…`, no `source=` segment); each row's origin is preserved in the `source` column instead. Rows from `norway` and `aisstream` for the same day land in the same output partition, each tagged with its own `source`.
 - **All inputs must be the same kind.** Either several `--input-dir` **or** several `--input-s3-bucket`, not a mix. Every input bucket shares one endpoint/region/credentials and one `--input-s3-prefix` (keep it empty for bucket-root datasets).
-- **Overlap is handled.** If the same `source=` appears in more than one input (e.g. two snapshots of one feed), those rows land in the same output partition and are deduplicated — the tool detects this case and forces the [dedup merge](#idempotent-re-runs-deduplication) even on a single output file, so one run yields a clean, duplicate-free result. When all sources are distinct (the common case), no such forcing happens and the merge stays cheap.
-- **`--source` and the partition-slice filters** apply to every input.
+- **Overlap is handled.** Exact `(ts, source, payload)` duplicates — from re-runs or two snapshots of one feed — are collapsed by the dedup merge. Because `source` is part of the key, a message that two *different* sources reported byte-identically is kept once per source (provenance intact).
+- **`--source` and the partition-slice filters** apply to every input (they still select on the input's `source=`/time layout).
 
 ## Idempotent re-runs (deduplication)
 
-By default (`--dedup true`), after the run finishes ais-normalize merges every output partition it wrote to and removes exact `(ts, payload)` duplicates. Because normalize is deterministic — the true timestamp comes from the `\c:` tag block or `$PGHP`, and the combined payload is fixed — re-running over the same (or overlapping) input regenerates byte-identical rows, which the merge collapses. **Running the tool any number of times converges each partition to the same deduped set**, so you can safely re-run a day after fixing an upstream feed, or re-process overlapping ranges, without accumulating duplicates.
+By default (`--dedup true`), after the run finishes ais-normalize merges every output partition it wrote to and removes exact `(ts, source, payload)` duplicates. Because normalize is deterministic — the true timestamp comes from the `\c:` tag block or `$PGHP`, and the combined payload is fixed — re-running over the same (or overlapping) input regenerates byte-identical rows, which the merge collapses. **Running the tool any number of times converges each partition to the same deduped set**, so you can safely re-run a day after fixing an upstream feed, or re-process overlapping ranges, without accumulating duplicates.
 
-- **Duplicate = exact `(ts, payload)`.** Two rows are duplicates only if both the timestamp *and* the full payload match. Rows that differ in any way are all kept — including the `\s:<station>` receiver tag, so the same AIS message received by two base stations is preserved, not collapsed.
+- **Duplicate = exact `(ts, source, payload)`.** Two rows are duplicates only if the timestamp, the `source`, *and* the full payload all match. Rows that differ in any way are all kept — including the `\s:<station>` receiver tag, and the `source` column, so the same AIS message received by two base stations (or arriving from two sources) is preserved, not collapsed.
 - **Why this instead of "overwrite".** Normalize re-partitions rows (a row read from `day=01` can land in `day=02`), so a "clear the partition and rewrite" approach could delete a neighbor partition's real data when you run with `--day`/`--month` filters. Dedup-merge keeps the union of rows and removes only redundant ones, so spillover and overlapping selections merge safely.
 - **Scope.** Only partitions this run actually wrote to are merged; untouched partitions are never read or rewritten. A partition with a single fresh file and no prior data is left as-is (first runs stay cheap); the merge kicks in once a partition has 2+ files (a prior run's output, or a generation rollover).
 - **Cost.** When a partition is merged it is fully read and rewritten (≈ a compaction pass over that partition; on S3, its prior objects are downloaded, a single merged object is uploaded, and the old objects deleted). This is the price of idempotency — pass `--dedup false` (or `DEDUP=false`) to skip it and append instead (the pre-dedup behavior, where re-runs accumulate files).
-- **Only under `--apply`.** Dry runs never merge; they note that dedup will run on apply.
 - **`output == input` caveat.** With dedup on and the output target equal to the input target, raw and normalized rows share a partition but have different payloads, so they will **not** dedup against each other and the partition ends up holding both — a warning is printed. Use a separate output dir/bucket.
 
 The end-of-run summary reports `partitions merged`, `rows in`, `rows out`, and `duplicates removed`.
@@ -251,7 +249,7 @@ The end-of-run summary reports `partitions merged`, `rows in`, `rows out`, and `
 `ais-normalize` never modifies or deletes the input dataset — it only reads it and writes new files. This applies equally to `--output-dir` and `--output-s3-bucket`:
 
 - **The output target may equal the input target** (same directory, or same bucket/prefix), but if it does, the original raw files remain in place alongside the new normalized files in the same partitions. Re-running the tool will also re-scan and re-normalize any previously-written normalized output sitting under that same root (harmless, since already-normalized rows have nothing left to reassemble or re-timestamp, but wasteful).
-- **Recommended pattern:** write to a separate output directory or bucket, verify the result (row counts, spot-check with `collect-maint inspect`), then swap the downstream read path (or move/delete the raw data) once satisfied. Keep the raw bronze data until you're confident in the normalized output — it's the only copy of the original ingest-time data.
+- **Recommended pattern:** write to a separate output directory or bucket, verify the result (row counts, spot-check with parquet tools), then swap the downstream read path (or move/delete the raw data) once satisfied. Keep the raw bronze data until you're confident in the normalized output — it's the only copy of the original ingest-time data.
 
 ## Deployment
 
@@ -281,7 +279,6 @@ job "ais-normalize" {
           "--partition", "day",
           "--incremental",     # watermark at the output: process only what arrived since the last successful run
           "--concurrency", "4",
-          "--apply",
         ]
       }
 
@@ -305,7 +302,6 @@ args = [
   "--s3-endpoint", "http://minio.service.consul:9000",
   "--partition", "day",
   "--concurrency", "4",
-  "--apply",
 ]
 env {
   S3_ACCESS_KEY = "..."
@@ -321,7 +317,7 @@ Size local disk for the S3 scratch space too (under the task's `$TMPDIR`): input
 
 ```bash
 # crontab -e
-0 */6 * * * /usr/local/bin/ais-normalize --input-dir /data/bronze --output-dir /data/normalized --partition day --apply --noui >> /var/log/ais-normalize.log 2>&1
+0 */6 * * * /usr/local/bin/ais-normalize --input-dir /data/bronze --output-dir /data/normalized --partition day --noui >> /var/log/ais-normalize.log 2>&1
 ```
 
 `--noui` is automatic when stdout isn't a TTY (cron, systemd), so it's optional here but explicit is fine.

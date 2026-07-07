@@ -4,11 +4,10 @@
 
 `collect` is a Rust workspace for ingesting newline-delimited text into Hive-partitioned Parquet datasets and for maintaining those datasets afterward.
 
-It has four user-facing binaries:
+It has three user-facing binaries:
 
 - `collect-file`: ingest files and directories
 - `collect-socket`: ingest newline-delimited TCP streams
-- `collect-maint`: inspect, validate, compact, and vacuum datasets
 - `ais-normalize`: re-timestamp, re-partition, and combine multi-part AIS sentences in collected Parquet data
 
 ## Workspace Goals
@@ -82,15 +81,14 @@ Recursively ingest files from a path into partitioned Parquet. Rows are timestam
 
 Required / common flags:
 
-- `--input <path>`: file or directory to ingest
+- `--input-dir <path>`: file or directory to ingest
 - `--source <label>`: logical source name
 - `--concurrency <n>`: override the auto-selected file worker count
-- `--tui`: launch the configuration TUI
 - `--noui`: disable runtime status TUI and print plain aggregate updates
 
 Inherited ingest options:
 
-- `--out-dir`
+- `--output-dir`
 - `--partition`
 - `--max-rows`
 - `--max-batch-bytes`
@@ -108,7 +106,7 @@ Precedence order:
 2. environment variables
 3. defaults
 
-If `--input` is omitted, `INPUT_PATH` or `INPUT_FILE` is used.
+If `--input-dir` is omitted, `INPUT_PATH` or `INPUT_FILE` is used.
 If `--source` is omitted, `SOURCE` is used.
 
 ### Runtime Status
@@ -165,87 +163,6 @@ Inherited ingest options are the same as `collect-file`, except there is no runt
 - Uses the shared ingest progress reporting from `collect-core`.
 - Emits periodic progress while ingesting.
 
-## collect-maint
-
-### Purpose
-
-Inspect and repair Hive-partitioned datasets.
-
-### CLI
-
-Global flags:
-
-- `--root <path>` for local datasets
-- `--s3-bucket <bucket>` for S3 datasets
-- `--s3-prefix <prefix>`
-- `--s3-endpoint <url>`
-- `--s3-region <region>`
-- `--s3-access-key <key>`
-- `--s3-secret-key <secret>`
-- `--s3-disable-tls`
-- `--partition <granularity>`
-- `--concurrency <n>`; if omitted, `collect-maint` auto-selects a worker count
-- `--noui`: disable runtime status TUI and print plain updates every 10 items
-- `--compression-level <level>`
-
-Subcommands:
-
-- `inspect [--verbose]`
-- `validate`
-- `compact [--target-file-size-bytes N] [--apply]`
-- `vacuum [--apply]`
-
-### Dataset Model
-
-`collect-maint` works on leaf partitions where data is actually stored.
-
-Leaf partitions contain Parquet files under the selected partition granularity layout.
-
-### inspect
-
-- Summarizes partition counts, file counts, sizes, and time range.
-- Reports recommendations for compact, vacuum, and validate.
-- `--verbose` prints per-partition details.
-- Non-compactable or non-data files are classified and counted.
-
-### validate
-
-- Reads parquet files and checks partition/timestamp consistency.
-- Reports per-file validation issues.
-- Fails the command if issues exist.
-
-### compact
-
-- Dry-run by default.
-- With `--apply`, compacts small Parquet files within leaf partitions.
-- Default compacted output target size is about 512 MiB.
-- Only leaf partitions with more than one Parquet file are candidates.
-- Compaction groups files by partition, plans output files, writes manifests, materializes inputs, writes compacted Parquet, validates the result, publishes output, and deletes old inputs/manifests.
-- Partition writes are isolated so one partition's compaction does not interfere with another.
-
-### vacuum
-
-- Dry-run by default.
-- With `--apply`, removes temporary files and interrupted compaction manifests.
-- Also cleans up stale maintenance artifacts.
-
-### Runtime Status
-
-- When stdout is a TTY, a full-screen runtime status view is used automatically.
-- `--noui` forces plain text mode.
-- Plain mode prints aggregate updates every 10 items.
-- TUI mode shows:
-  - processed / remaining leaf partitions
-  - aggregate stats
-  - current clock and elapsed time
-- `Ctrl-C`, `q`, and `Esc` cancel cleanly.
-
-### Maintenance Progress Semantics
-
-- `processed` means leaf partitions already consolidated to a single Parquet file at startup, plus partitions consolidated during the current run.
-- `remaining` means leaf partitions still needing consolidation.
-- Progress is updated as partition compactions finish, not per job.
-
 ## ais-normalize
 
 ### Purpose
@@ -285,25 +202,23 @@ Incomplete groups (fragments missing their partner at end of scan) are emitted a
 - `--output-dir <path>`: destination root (may equal `--input-dir`)
 - `--partition <granularity>`: must match the dataset layout (default: `day`)
 - `--source <label>`: filter to one source label; all sources if omitted
-- `--apply`: write output; dry-run by default
 - `--batch-size <n>`: rows per Parquet read batch (default: 8192)
 - `--compression-level <n>`: Zstd level for output (default: 5)
 - `--noui`: disable TUI and print plain progress updates
 
 ### Defaults and Precedence
 
-Dry-run by default; `--apply` is required to write any output.
+Output is always written.
 
 ### Processing Behavior
 
 - Partitions are processed in chronological order.
 - Each partition's fragment buffer is independent; cross-partition fragment groups are flushed as-is at the end of each partition.
 - `$PGHP` rows are re-timestamped and re-partitioned using their own embedded time; they are preserved in the output.
-- Output files use fresh names (`norm-*.parquet`) and do not overwrite input files, so `--output-dir == --input-dir` is safe. Run `collect-maint compact --apply` afterward to consolidate.
+- Output files use fresh names (`norm-*.parquet`) and do not overwrite input files, so `--output-dir == --input-dir` is safe. Run `collect-maint compact` afterward to consolidate.
 
 ### Runtime Status
 
-- Prints a dry-run summary of affected partitions when `--apply` is not set.
 - Prints a stats summary on completion: input rows, output rows, re-timestamped, re-partitioned, combined messages, incomplete groups, partitions processed.
 - `--noui` prints plain partition progress updates every 10 partitions.
 - Cancellable with `Ctrl-C`.

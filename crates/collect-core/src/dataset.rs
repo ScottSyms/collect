@@ -19,33 +19,35 @@ pub struct PartitionKey {
 impl PartitionKey {
     /// Parse from a path relative to the dataset root.
     ///
-    /// For Day granularity, expects: `source=X/year=YYYY/month=MM/day=DD/<file>`
+    /// The leading `source=X` segment is optional: bronze datasets written by
+    /// the collectors are `source=X/year=YYYY/month=MM/day=DD/<file>`, but the
+    /// normalized/decoded datasets ais-normalize and ais-parse write are no
+    /// longer partitioned by source (`year=YYYY/month=MM/day=DD/<file>`).
+    /// When the source segment is absent, `source` is the empty string.
     pub fn parse(rel_path: &str, granularity: PartitionGranularity) -> Option<Self> {
-        // number of directory segments = depth + 1 (source + time components)
-        let dir_depth = granularity.depth() + 1;
-        let mut segments = rel_path.split('/');
-        let mut source = String::new();
+        let mut segments = rel_path.split('/').peekable();
+        let source = if segments.peek().is_some_and(|s| s.starts_with("source=")) {
+            parse_kv(segments.next()?, "source")?.to_string()
+        } else {
+            String::new()
+        };
+
         let mut year = 0i32;
         let mut month = 1u32;
         let mut day = 1u32;
         let mut hour = 0u32;
         let mut minute = 0u32;
 
-        for i in 0..dir_depth {
+        for i in 0..granularity.depth() {
             let seg = segments.next()?;
             match i {
-                0 => source = parse_kv(seg, "source")?.to_string(),
-                1 => year = parse_kv(seg, "year")?.parse().ok()?,
-                2 => month = parse_kv(seg, "month")?.parse().ok()?,
-                3 => day = parse_kv(seg, "day")?.parse().ok()?,
-                4 => hour = parse_kv(seg, "hour")?.parse().ok()?,
-                5 => minute = parse_kv(seg, "minute")?.parse().ok()?,
+                0 => year = parse_kv(seg, "year")?.parse().ok()?,
+                1 => month = parse_kv(seg, "month")?.parse().ok()?,
+                2 => day = parse_kv(seg, "day")?.parse().ok()?,
+                3 => hour = parse_kv(seg, "hour")?.parse().ok()?,
+                4 => minute = parse_kv(seg, "minute")?.parse().ok()?,
                 _ => {}
             }
-        }
-
-        if source.is_empty() {
-            return None;
         }
 
         Some(PartitionKey {
@@ -73,12 +75,30 @@ impl PartitionKey {
         }
     }
 
-    /// Returns the relative directory path, e.g. `source=foo/year=2024/month=03/day=15`
+    /// Returns the relative directory path. Includes the `source=` segment
+    /// only when this key carries a source (e.g. `source=foo/year=2024/month=03/day=15`);
+    /// for a source-less key it is the time-only path (`year=2024/month=03/day=15`),
+    /// so it round-trips whatever layout `parse` read.
     pub fn relative_dir(&self) -> String {
-        let depth = self.granularity.depth();
+        if self.source.is_empty() {
+            return self.relative_dir_time_only();
+        }
         let mut parts = vec![format!("source={}", self.source)];
+        parts.extend(self.time_segments());
+        parts.join("/")
+    }
+
+    /// Returns the time-only relative directory (`year=YYYY[/month=MM[/...]]`),
+    /// never including `source=`. Used for the normalized/decoded output
+    /// layout, which is not partitioned by source.
+    pub fn relative_dir_time_only(&self) -> String {
+        self.time_segments().join("/")
+    }
+
+    fn time_segments(&self) -> Vec<String> {
+        let depth = self.granularity.depth();
         // year is always present (depth >= 1)
-        parts.push(format!("year={:04}", self.year));
+        let mut parts = vec![format!("year={:04}", self.year)];
         if depth >= 2 {
             parts.push(format!("month={:02}", self.month));
         }
@@ -91,7 +111,17 @@ impl PartitionKey {
         if depth >= 5 {
             parts.push(format!("minute={:02}", self.minute));
         }
-        parts.join("/")
+        parts
+    }
+
+    /// A copy of this key with the source cleared, so several source
+    /// partitions collapse to one time-only key (used to group input from
+    /// many sources into a single source-less output partition).
+    pub fn without_source(&self) -> PartitionKey {
+        PartitionKey {
+            source: String::new(),
+            ..self.clone()
+        }
     }
 
     /// Millisecond bounds `[start, end)` of this partition's time period.
@@ -646,6 +676,26 @@ mod tests {
     }
 
     #[test]
+    fn group_by_without_source_merges_sources_of_the_same_time() {
+        // Sorted by sort_key (time before source), two sources of the same day
+        // are contiguous, so grouping by the source-less key merges them into
+        // one time-only work item — the source-less output partition.
+        let mut keys = vec![
+            day_key("alpha", 2026, 7, 1),
+            day_key("beta", 2026, 7, 1),
+            day_key("alpha", 2026, 7, 2),
+        ];
+        keys.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+        let groups = group_by_partition(keys, |k| k.without_source());
+        assert_eq!(groups.len(), 2, "two days -> two groups");
+        assert_eq!(groups[0].0.source, "", "grouped key is source-less");
+        assert_eq!(groups[0].0.day, 1);
+        assert_eq!(groups[0].1.len(), 2, "alpha+beta merged into day 1");
+        assert_eq!(groups[1].0.day, 2);
+        assert_eq!(groups[1].1.len(), 1);
+    }
+
+    #[test]
     fn namespaced_scratch_path_is_per_storage() {
         let entry = |idx| S3Entry {
             key: "k".into(),
@@ -925,6 +975,37 @@ mod tests {
             key.relative_dir(),
             "source=ais/year=2024/month=03/day=15/hour=07"
         );
+    }
+
+    #[test]
+    fn relative_dir_time_only_and_source_less_round_trip() {
+        let key = day_key("norway", 2026, 7, 5);
+        // With a source, relative_dir keeps it; time_only never does.
+        assert_eq!(
+            key.relative_dir(),
+            "source=norway/year=2026/month=07/day=05"
+        );
+        assert_eq!(key.relative_dir_time_only(), "year=2026/month=07/day=05");
+        assert_eq!(
+            key.without_source().relative_dir(),
+            "year=2026/month=07/day=05"
+        );
+    }
+
+    #[test]
+    fn parses_source_less_path() {
+        // The normalized/decoded layout has no source= segment.
+        let key = PartitionKey::parse(
+            "year=2026/month=07/day=05/pos-abc.parquet",
+            PartitionGranularity::Day,
+        )
+        .expect("should parse a source-less path");
+        assert_eq!(key.source, "");
+        assert_eq!(key.year, 2026);
+        assert_eq!(key.month, 7);
+        assert_eq!(key.day, 5);
+        // And still round-trips.
+        assert_eq!(key.relative_dir(), "year=2026/month=07/day=05");
     }
 
     #[test]

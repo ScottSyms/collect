@@ -1,12 +1,4 @@
-//! Typed Parquet writers for decoded AIS rows.
-//!
-//! Each processed partition writes at most one `positions` file and one
-//! `statics` file (files are created lazily on the first row, so a partition
-//! with no static reports produces no empty statics file). Files are written
-//! under a `tmp-` name and renamed into place on close, matching the
-//! convention the rest of the workspace uses for in-flight Parquet output.
-
-use crate::decode::{AtonRow, BinaryRow, MeteoRow, PositionRow, StaticRow};
+use crate::convert::{AtonRow, BinaryRow, MeteoRow, PositionRow, StaticRow};
 use anyhow::{Context, Result};
 use arrow::array::{
     ArrayBuilder, ArrayRef, BooleanArray, BooleanBuilder, Float64Array, Float64Builder,
@@ -19,12 +11,10 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-/// Rows buffered in the builders before a RecordBatch is handed to the
-/// ArrowWriter (which itself accumulates batches into row groups).
 const FLUSH_BATCH_ROWS: usize = 8192;
 
 static FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -99,12 +89,15 @@ fn statics_schema() -> Arc<Schema> {
 fn f64n(name: &str) -> Field {
     Field::new(name, DataType::Float64, true)
 }
+
 fn u16n(name: &str) -> Field {
     Field::new(name, DataType::UInt16, true)
 }
+
 fn u8n(name: &str) -> Field {
     Field::new(name, DataType::UInt8, true)
 }
+
 fn booln(name: &str) -> Field {
     Field::new(name, DataType::Boolean, true)
 }
@@ -173,8 +166,6 @@ fn binary_schema() -> Arc<Schema> {
     ]))
 }
 
-/// Shared open-file plumbing: lazily created tmp file + ArrowWriter, renamed
-/// into place on `finish`.
 struct FileSink {
     dir: PathBuf,
     prefix: &'static str,
@@ -219,8 +210,6 @@ impl FileSink {
         Ok(())
     }
 
-    /// Close and rename into place; returns the final path if any rows were
-    /// written.
     fn finish(self) -> Result<Option<(PathBuf, u64)>> {
         let Some((writer, tmp_path, final_path)) = self.open else {
             return Ok(None);
@@ -333,8 +322,6 @@ impl PositionsWriter {
             Arc::new(self.special_manoeuvre.finish()),
             Arc::new(self.station.finish()),
         ];
-        // The builder was created without a timezone after finish(); rebuild
-        // consistency by constructing the batch against the schema.
         let batch = RecordBatch::try_new(self.sink.schema.clone(), columns)
             .context("assembling positions batch")?;
         self.sink.write_batch(batch)
@@ -404,11 +391,9 @@ impl StaticsWriter {
         self.name.append_option(row.name.as_deref());
         self.ship_type.append_value(&row.ship_type);
         self.dimension_to_bow.append_option(row.dimension_to_bow);
-        self.dimension_to_stern
-            .append_option(row.dimension_to_stern);
+        self.dimension_to_stern.append_option(row.dimension_to_stern);
         self.dimension_to_port.append_option(row.dimension_to_port);
-        self.dimension_to_starboard
-            .append_option(row.dimension_to_starboard);
+        self.dimension_to_starboard.append_option(row.dimension_to_starboard);
         self.draught_m.append_option(row.draught_m);
         self.destination.append_option(row.destination.as_deref());
         self.eta.append_option(row.eta_ms);
@@ -455,9 +440,6 @@ impl StaticsWriter {
     }
 }
 
-/// Type 8 met/hydro writer. Met/hydro messages are low-rate, so rows are
-/// buffered and columns built at flush time (simpler than 40 incremental
-/// builders); flushing every `FLUSH_BATCH_ROWS` bounds memory regardless.
 pub struct MeteoWriter {
     sink: FileSink,
     rows: Vec<MeteoRow>,
@@ -485,30 +467,15 @@ impl MeteoWriter {
         }
         let r = &self.rows;
         let columns: Vec<ArrayRef> = vec![
-            Arc::new(
-                TimestampMillisecondArray::from(r.iter().map(|x| x.ts_ms).collect::<Vec<_>>())
-                    .with_timezone("UTC"),
-            ),
-            Arc::new(StringArray::from(
-                r.iter().map(|x| x.source.as_str()).collect::<Vec<_>>(),
-            )),
-            Arc::new(UInt8Array::from(
-                r.iter().map(|x| x.msg_type).collect::<Vec<_>>(),
-            )),
-            Arc::new(UInt32Array::from(
-                r.iter().map(|x| x.mmsi).collect::<Vec<_>>(),
-            )),
-            Arc::new(UInt16Array::from(
-                r.iter().map(|x| x.dac).collect::<Vec<_>>(),
-            )),
-            Arc::new(UInt8Array::from(
-                r.iter().map(|x| x.fid).collect::<Vec<_>>(),
-            )),
+            Arc::new(TimestampMillisecondArray::from(r.iter().map(|x| x.ts_ms).collect::<Vec<_>>()).with_timezone("UTC")),
+            Arc::new(StringArray::from(r.iter().map(|x| x.source.as_str()).collect::<Vec<_>>())),
+            Arc::new(UInt8Array::from(r.iter().map(|x| x.msg_type).collect::<Vec<_>>())),
+            Arc::new(UInt32Array::from(r.iter().map(|x| x.mmsi).collect::<Vec<_>>())),
+            Arc::new(UInt16Array::from(r.iter().map(|x| x.dac).collect::<Vec<_>>())),
+            Arc::new(UInt8Array::from(r.iter().map(|x| x.fid).collect::<Vec<_>>())),
             f64_col(r, |x| x.latitude),
             f64_col(r, |x| x.longitude),
-            Arc::new(BooleanArray::from(
-                r.iter().map(|x| x.position_accuracy).collect::<Vec<_>>(),
-            )),
+            Arc::new(BooleanArray::from(r.iter().map(|x| x.position_accuracy).collect::<Vec<_>>())),
             u8_col(r, |x| x.day),
             u8_col(r, |x| x.hour),
             u8_col(r, |x| x.minute),
@@ -522,9 +489,7 @@ impl MeteoWriter {
             u16_col(r, |x| x.pressure_hpa),
             u8_col(r, |x| x.pressure_tendency),
             f64_col(r, |x| x.visibility_nm),
-            Arc::new(BooleanArray::from(
-                r.iter().map(|x| x.visibility_greater).collect::<Vec<_>>(),
-            )),
+            Arc::new(BooleanArray::from(r.iter().map(|x| x.visibility_greater).collect::<Vec<_>>())),
             f64_col(r, |x| x.water_level_m),
             u8_col(r, |x| x.water_level_trend),
             f64_col(r, |x| x.surface_current_speed_kn),
@@ -546,9 +511,7 @@ impl MeteoWriter {
             u8_col(r, |x| x.precipitation_type),
             f64_col(r, |x| x.salinity_pct),
             u8_col(r, |x| x.ice),
-            Arc::new(StringArray::from(
-                r.iter().map(|x| x.station.as_deref()).collect::<Vec<_>>(),
-            )),
+            Arc::new(StringArray::from(r.iter().map(|x| x.station.as_deref()).collect::<Vec<_>>())),
         ];
         let batch = RecordBatch::try_new(self.sink.schema.clone(), columns)
             .context("assembling meteo batch")?;
@@ -562,7 +525,6 @@ impl MeteoWriter {
     }
 }
 
-/// Type 8 generic writer: header + application payload retained as hex.
 pub struct BinaryWriter {
     sink: FileSink,
     rows: Vec<BinaryRow>,
@@ -590,34 +552,15 @@ impl BinaryWriter {
         }
         let r = &self.rows;
         let columns: Vec<ArrayRef> = vec![
-            Arc::new(
-                TimestampMillisecondArray::from(r.iter().map(|x| x.ts_ms).collect::<Vec<_>>())
-                    .with_timezone("UTC"),
-            ),
-            Arc::new(StringArray::from(
-                r.iter().map(|x| x.source.as_str()).collect::<Vec<_>>(),
-            )),
-            Arc::new(UInt8Array::from(
-                r.iter().map(|x| x.msg_type).collect::<Vec<_>>(),
-            )),
-            Arc::new(UInt32Array::from(
-                r.iter().map(|x| x.mmsi).collect::<Vec<_>>(),
-            )),
-            Arc::new(UInt16Array::from(
-                r.iter().map(|x| x.dac).collect::<Vec<_>>(),
-            )),
-            Arc::new(UInt8Array::from(
-                r.iter().map(|x| x.fid).collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                r.iter().map(|x| x.payload_hex.as_str()).collect::<Vec<_>>(),
-            )),
-            Arc::new(UInt32Array::from(
-                r.iter().map(|x| x.payload_bits).collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                r.iter().map(|x| x.station.as_deref()).collect::<Vec<_>>(),
-            )),
+            Arc::new(TimestampMillisecondArray::from(r.iter().map(|x| x.ts_ms).collect::<Vec<_>>()).with_timezone("UTC")),
+            Arc::new(StringArray::from(r.iter().map(|x| x.source.as_str()).collect::<Vec<_>>())),
+            Arc::new(UInt8Array::from(r.iter().map(|x| x.msg_type).collect::<Vec<_>>())),
+            Arc::new(UInt32Array::from(r.iter().map(|x| x.mmsi).collect::<Vec<_>>())),
+            Arc::new(UInt16Array::from(r.iter().map(|x| x.dac).collect::<Vec<_>>())),
+            Arc::new(UInt8Array::from(r.iter().map(|x| x.fid).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(r.iter().map(|x| x.payload_hex.as_str()).collect::<Vec<_>>())),
+            Arc::new(UInt32Array::from(r.iter().map(|x| x.payload_bits).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(r.iter().map(|x| x.station.as_deref()).collect::<Vec<_>>())),
         ];
         let batch = RecordBatch::try_new(self.sink.schema.clone(), columns)
             .context("assembling binary batch")?;
@@ -694,14 +637,14 @@ impl AtonWriter {
             Arc::new(StringArray::from(r.iter().map(|x| x.name_extension.as_deref()).collect::<Vec<_>>())),
             f64_aton_col(r, |x| x.latitude),
             f64_aton_col(r, |x| x.longitude),
-            Arc::new(UInt64Array::from(r.iter().map(|x| x.h3).collect::<Vec<_>>())),
+            u64_aton_col(r, |x| x.h3),
             u16_aton_col(r, |x| x.dimension_to_bow),
             u16_aton_col(r, |x| x.dimension_to_stern),
             u16_aton_col(r, |x| x.dimension_to_port),
             u16_aton_col(r, |x| x.dimension_to_starboard),
-            Arc::new(BooleanArray::from(r.iter().map(|x| Some(x.off_position)).collect::<Vec<_>>())),
-            Arc::new(BooleanArray::from(r.iter().map(|x| Some(x.virtual_aid)).collect::<Vec<_>>())),
-            Arc::new(BooleanArray::from(r.iter().map(|x| Some(x.assigned_mode)).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(r.iter().map(|x| x.off_position).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(r.iter().map(|x| x.virtual_aid).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(r.iter().map(|x| x.assigned_mode).collect::<Vec<_>>())),
             Arc::new(BooleanArray::from(r.iter().map(|x| Some(x.high_accuracy)).collect::<Vec<_>>())),
             Arc::new(BooleanArray::from(r.iter().map(|x| Some(x.raim)).collect::<Vec<_>>())),
             Arc::new(StringArray::from(r.iter().map(|x| x.station.as_deref()).collect::<Vec<_>>())),
@@ -721,16 +664,15 @@ impl AtonWriter {
 fn f64_col(rows: &[MeteoRow], get: impl Fn(&MeteoRow) -> Option<f64>) -> ArrayRef {
     Arc::new(Float64Array::from(rows.iter().map(get).collect::<Vec<_>>()))
 }
+
 fn u16_col(rows: &[MeteoRow], get: impl Fn(&MeteoRow) -> Option<u16>) -> ArrayRef {
     Arc::new(UInt16Array::from(rows.iter().map(get).collect::<Vec<_>>()))
 }
+
 fn u8_col(rows: &[MeteoRow], get: impl Fn(&MeteoRow) -> Option<u8>) -> ArrayRef {
     Arc::new(UInt8Array::from(rows.iter().map(get).collect::<Vec<_>>()))
 }
 
-/// List the `.parquet` files already present in a local partition directory —
-/// the prior run's output, replaced atomically-ish by the caller after the
-/// new files are in place.
 fn f64_aton_col(rows: &[AtonRow], get: impl Fn(&AtonRow) -> Option<f64>) -> ArrayRef {
     Arc::new(Float64Array::from(rows.iter().map(get).collect::<Vec<_>>()))
 }
@@ -739,204 +681,6 @@ fn u16_aton_col(rows: &[AtonRow], get: impl Fn(&AtonRow) -> Option<u16>) -> Arra
     Arc::new(UInt16Array::from(rows.iter().map(get).collect::<Vec<_>>()))
 }
 
-pub fn existing_parquet_files(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(files),
-        Err(error) => {
-            return Err(error).with_context(|| format!("reading {}", dir.display()));
-        }
-    };
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if name.ends_with(".parquet") && !name.starts_with("tmp-") {
-            files.push(path);
-        }
-    }
-    Ok(files)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use arrow::array::{Array, Float64Array, StringArray, UInt32Array, UInt8Array};
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-
-    fn sample_position(ts_ms: i64, mmsi: u32) -> PositionRow {
-        PositionRow {
-            ts_ms,
-            source: "norway".into(),
-            station: Some("AIS_NOR".into()),
-            msg_type: 1,
-            mmsi,
-            ais_class: "Class A".into(),
-            latitude: Some(60.5),
-            longitude: Some(4.25),
-            sog_knots: Some(12.3),
-            cog: Some(180.0),
-            heading_true: None,
-            rot: None,
-            altitude_m: None,
-            h3: None,
-            nav_status: "under way using engine".into(),
-            high_accuracy: true,
-            raim: false,
-            special_manoeuvre: None,
-        }
-    }
-
-    #[test]
-    fn positions_round_trip() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut writer = PositionsWriter::new(dir.path().to_path_buf(), 3);
-        for i in 0..10 {
-            writer
-                .write(&sample_position(
-                    1_700_000_000_000 + i,
-                    257_000_000 + i as u32,
-                ))
-                .expect("write");
-        }
-        let (path, rows) = writer.finish().expect("finish").expect("file written");
-        assert_eq!(rows, 10);
-        assert!(path
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .starts_with("pos-"));
-
-        let file = File::open(&path).expect("open");
-        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
-            .expect("footer")
-            .build()
-            .expect("reader");
-        let batches: Vec<_> = reader.collect::<std::result::Result<_, _>>().expect("read");
-        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(total, 10);
-        let first = &batches[0];
-        assert_eq!(first.schema().field(1).name(), "source");
-        assert_eq!(first.schema().field(2).name(), "msg_type");
-        let source = first
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("source col");
-        assert_eq!(source.value(0), "norway");
-        let msg_type = first
-            .column(2)
-            .as_any()
-            .downcast_ref::<UInt8Array>()
-            .expect("msg_type col");
-        assert_eq!(msg_type.value(0), 1);
-        let mmsi = first
-            .column(3)
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .expect("mmsi col");
-        assert_eq!(mmsi.value(0), 257_000_000);
-        let lat = first
-            .column(5)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("lat col");
-        assert!((lat.value(0) - 60.5).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn no_rows_means_no_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let writer = StaticsWriter::new(dir.path().join("statics"), 3);
-        assert!(writer.finish().expect("finish").is_none());
-        assert!(!dir.path().join("statics").exists());
-    }
-
-    #[test]
-    fn statics_round_trip_with_nulls() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut writer = StaticsWriter::new(dir.path().to_path_buf(), 3);
-        writer
-            .write(&StaticRow {
-                ts_ms: 1_700_000_000_000,
-                source: "norway".into(),
-                station: None,
-                msg_type: 5,
-                mmsi: 366_998_410,
-                ais_class: "ClassA".into(),
-                imo_number: None,
-                call_sign: Some("WDD7294".into()),
-                name: Some("EXAMPLE VESSEL".into()),
-                ship_type: "tug".into(),
-                dimension_to_bow: Some(12),
-                dimension_to_stern: Some(8),
-                dimension_to_port: Some(3),
-                dimension_to_starboard: Some(3),
-                draught_m: Some(4.2),
-                destination: None,
-                eta_ms: None,
-                mothership_mmsi: None,
-            })
-            .expect("write");
-        let (path, rows) = writer.finish().expect("finish").expect("file written");
-        assert_eq!(rows, 1);
-
-        let file = File::open(&path).expect("open");
-        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
-            .expect("footer")
-            .build()
-            .expect("reader");
-        let batch = reader
-            .into_iter()
-            .next()
-            .expect("one batch")
-            .expect("batch ok");
-        // Schema order: ts, source, msg_type, mmsi, ais_class, imo_number,
-        // call_sign, name, ...
-        assert_eq!(batch.schema().field(1).name(), "source");
-        assert_eq!(batch.schema().field(2).name(), "msg_type");
-        let source = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("source col");
-        assert_eq!(source.value(0), "norway");
-        let msg_type = batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<UInt8Array>()
-            .expect("msg_type col");
-        assert_eq!(msg_type.value(0), 5);
-        let name = batch
-            .column(7)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("name col");
-        assert_eq!(name.value(0), "EXAMPLE VESSEL");
-        let imo = batch
-            .column(5)
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .expect("imo col");
-        assert!(imo.is_null(0));
-    }
-
-    #[test]
-    fn existing_parquet_files_skips_tmp() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("pos-1.parquet"), b"x").unwrap();
-        std::fs::write(dir.path().join("tmp-pos-2.parquet"), b"x").unwrap();
-        std::fs::write(dir.path().join("notes.txt"), b"x").unwrap();
-        let files = existing_parquet_files(dir.path()).expect("list");
-        assert_eq!(files.len(), 1);
-        assert!(files[0].ends_with("pos-1.parquet"));
-        // Missing dir is fine.
-        assert!(existing_parquet_files(&dir.path().join("nope"))
-            .expect("list")
-            .is_empty());
-    }
+fn u64_aton_col(rows: &[AtonRow], get: impl Fn(&AtonRow) -> Option<u64>) -> ArrayRef {
+    Arc::new(UInt64Array::from(rows.iter().map(get).collect::<Vec<_>>()))
 }

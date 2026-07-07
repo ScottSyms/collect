@@ -1,14 +1,13 @@
 [workspace]
 members = [
     "crates/collect-core",
-    "crates/collect-tui",
     "crates/collect-file",
     "crates/collect-socket",
     "crates/collect-kafka",
-    "crates/collect-maint",
     "crates/ais-normalize",
     "crates/ais-parse",
     "crates/collect-aisstream",
+    "crates/aisstream-parse",
 ]
 resolver = "2"
 

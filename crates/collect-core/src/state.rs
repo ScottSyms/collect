@@ -4,7 +4,7 @@
 //! `<output-dir>/_<tool>/watermark.json` locally (e.g.
 //! `_ais-normalize/watermark.json`), or the same path as a key under the
 //! output prefix on S3. Dataset listings only match `*.parquet`, so the state
-//! never shows up as data, and `collect-maint` skips `_`-prefixed segments.
+//! never shows up as data, and tooling skips `_`-prefixed segments.
 //!
 //! Reading is deliberately forgiving: a missing state means "first run", and
 //! a corrupt state is downgraded to a warning plus "first run" rather than

@@ -4,7 +4,6 @@ use collect_core::{
     health_file_path, line_reader_from_async_read, run_ingest, CommonCliArgs, IngestOptions,
     LineReader, LineSource, ReaderTransition, S3CliArgs,
 };
-use collect_tui::{run_tui, TuiModel};
 use futures_util::StreamExt;
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::message::Message;
@@ -20,7 +19,6 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::StreamReader;
 
 mod offsets;
-mod tui;
 
 use offsets::{OffsetTracker, PendingLines};
 
@@ -58,10 +56,6 @@ struct Args {
 
     #[command(flatten)]
     s3: S3CliArgs,
-
-    /// Launch interactive TUI for configuration
-    #[arg(long)]
-    tui: bool,
 }
 
 struct KafkaInputSource {
@@ -260,21 +254,6 @@ impl LineSource for KafkaInputSource {
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut args = Args::parse();
-
-    if args.tui {
-        let initial_config = tui::TuiConfig::load_from_env();
-        match run_tui(initial_config)? {
-            Some(config) => {
-                let mut full_args = vec!["collect-kafka".to_string()];
-                full_args.extend(config.to_cli_args());
-                args = Args::parse_from(full_args);
-            }
-            None => {
-                println!("Configuration cancelled.");
-                return Ok(());
-            }
-        }
-    }
 
     // Apply env fallbacks (consistent with other binaries)
     if args.kafka_brokers.is_none() {
