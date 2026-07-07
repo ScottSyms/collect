@@ -4,6 +4,7 @@ use chrono::TimeZone;
 use clap::Parser;
 use collect_core::{PartitionGranularity, S3ConnectionArgs, S3Storage};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::File as StdFile;
 use std::io::IsTerminal;
@@ -21,7 +22,7 @@ mod status;
 use collect_core::{dataset, state};
 
 use dataset::{DatasetFile, PartitionKey};
-use normalize::PartitionProcessor;
+use normalize::{preprocess_row, OutputRow, PartitionProcessor};
 use output::OutputWriterPool;
 use stats::NormalizeStats;
 use status::StatusMode;
@@ -909,16 +910,16 @@ fn default_concurrency() -> usize {
     std::thread::available_parallelism()
         .map(|count| count.get())
         .unwrap_or(4)
-        .clamp(1, 8)
 }
 
 /// `(output partition rel_dir, rows written, local file path)` per partition
 /// file produced by one `process_partition` call.
 type PartitionOutputRows = Vec<(String, u64, PathBuf)>;
 
-/// Process one source partition end to end with its own processor and writer
-/// pool, so partitions can run concurrently and writer memory stays bounded
-/// by the output partitions a single input partition touches.
+/// Process one source partition end to end. Files within the partition are
+/// processed in parallel via rayon (each file gets its own processor since
+/// fragment groups and carry-forward timestamps are file-local). Output rows
+/// are collected per-file and then written to the shared pool sequentially.
 fn process_partition(
     partition_key: PartitionKey,
     files: Vec<DatasetFile>,
@@ -927,46 +928,53 @@ fn process_partition(
     batch_size: usize,
     compression_level: i32,
 ) -> Result<(NormalizeStats, PartitionOutputRows)> {
-    // The input partition's *time-only* dir, so the processor's re-partition
-    // comparison (did a row's corrected timestamp move it to a different
-    // output partition?) is against the source-less output layout.
     let source_rel_dir: Arc<str> = Arc::from(partition_key.relative_dir_time_only());
-    let mut processor = PartitionProcessor::new(partition_key.source.clone(), granularity);
-    let mut pool = OutputWriterPool::new(
-        output_root,
-        &partition_key.source,
-        compression_level,
-    );
+    let source = partition_key.source.clone();
 
-    for file in &files {
-        process_parquet_file(
-            &file.path,
-            &source_rel_dir,
-            &mut processor,
-            &mut pool,
-            batch_size,
-        )
-        .with_context(|| format!("processing {}", file.path.display()))?;
+    // Process files in parallel — each gets its own PartitionProcessor.
+    let results: Vec<Result<(NormalizeStats, Vec<OutputRow>)>> = files
+        .par_iter()
+        .map(|file| {
+            let mut processor = PartitionProcessor::new(source.clone(), granularity);
+            let mut rows = Vec::new();
+            process_parquet_file(
+                &file.path,
+                &source_rel_dir,
+                &mut processor,
+                &mut rows,
+                batch_size,
+            )
+            .with_context(|| format!("processing {}", file.path.display()))?;
+            // Flush any incomplete fragment groups at the end of this file.
+            processor.flush_incomplete(&source_rel_dir, &mut rows);
+            Ok((processor.stats, rows))
+        })
+        .collect();
+
+    // Collect stats and write all output rows to a single pool.
+    let mut total_stats = NormalizeStats::default();
+    let mut pool = OutputWriterPool::new(output_root, &source, compression_level);
+    for result in results {
+        let (stats, rows) = result?;
+        total_stats.merge(&stats);
+        for row in rows {
+            pool.write_row(&row.partition_rel_dir, row.ts_ms, &row.payload)?;
+        }
     }
 
-    // Flush any incomplete fragment groups at the end of this partition.
-    let mut leftovers = Vec::new();
-    processor.flush_incomplete(&source_rel_dir, &mut leftovers);
-    for row in leftovers {
-        pool.write_row(&row.partition_rel_dir, row.ts_ms, &row.payload)?;
-    }
-
-    let mut stats = processor.stats;
-    stats.partitions_processed += 1;
-    let rows = pool.flush_all().context("flushing output writers")?;
-    Ok((stats, rows))
+    total_stats.partitions_processed += 1;
+    let file_rows = pool.flush_all().context("flushing output writers")?;
+    Ok((total_stats, file_rows))
 }
 
+/// Process a single Parquet file, emitting output rows. Tag-block splitting
+/// and metadata parsing are parallelised across rows with rayon; the stateful
+/// fragment-grouping pass remains sequential within each file.
 fn process_parquet_file(
-    path: &std::path::Path,
+    path: &Path,
     source_rel_dir: &Arc<str>,
     processor: &mut PartitionProcessor,
-    pool: &mut OutputWriterPool,
+    output_rows: &mut Vec<OutputRow>,
     batch_size: usize,
 ) -> Result<()> {
     let file = StdFile::open(path).with_context(|| format!("open {}", path.display()))?;
@@ -975,6 +983,8 @@ fn process_parquet_file(
         .with_batch_size(batch_size)
         .build()
         .with_context(|| format!("build Parquet reader {}", path.display()))?;
+
+    let mut cancel_counter: u32 = 0;
 
     while let Some(batch) = reader.next().transpose()? {
         let ts_col = batch
@@ -988,18 +998,34 @@ fn process_parquet_file(
             .downcast_ref::<StringArray>()
             .context("expected string column at index 1")?;
 
-        let mut rows = Vec::with_capacity(4);
-        for i in 0..batch.num_rows() {
+        let n = batch.num_rows();
+
+        // Fast batched cancellation check (~every 1024 rows instead of every row).
+        cancel_counter += n as u32;
+        if cancel_counter >= 1024 {
             if status::is_cancelled() {
                 return Ok(());
             }
-            let ts_ms = ts_col.value(i);
-            let payload = payload_col.value(i);
+            cancel_counter = 0;
+        }
 
-            processor.process_row(source_rel_dir, ts_ms, payload, &mut rows);
-            for row in rows.drain(..) {
-                pool.write_row(&row.partition_rel_dir, row.ts_ms, &row.payload)?;
-            }
+        // Phase 1 — stateless parsing in parallel.
+        let payloads: Vec<&str> = (0..n).map(|i| payload_col.value(i)).collect();
+        let ts_values: Vec<i64> = (0..n).map(|i| ts_col.value(i)).collect();
+        let preprocessed: Vec<_> = payloads
+            .par_iter()
+            .map(|payload| preprocess_row(payload))
+            .collect();
+
+        // Phase 2 — stateful fragment processing (sequential).
+        for i in 0..n {
+            processor.process_row(
+                source_rel_dir,
+                ts_values[i],
+                payloads[i],
+                &preprocessed[i],
+                output_rows,
+            );
         }
     }
 
