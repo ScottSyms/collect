@@ -6,6 +6,8 @@ use collect_core::dataset::{self, DatasetFile, PartitionKey};
 use collect_core::state;
 use collect_core::{PartitionGranularity, S3ConnectionArgs, S3Storage};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use rayon::prelude::*;
+use simd_json::serde as simd_serde;
 use std::collections::VecDeque;
 use std::fs::File as StdFile;
 use std::path::{Path, PathBuf};
@@ -117,6 +119,10 @@ struct Args {
     /// Number of partitions to process concurrently; auto-selected when omitted
     #[arg(long)]
     concurrency: Option<usize>,
+
+    /// Output file name prefix (added before tree suffix, e.g. `{prefix}-pos-*.parquet`)
+    #[arg(long, default_value = "aisstream")]
+    output_prefix: String,
 }
 
 impl Args {
@@ -516,6 +522,7 @@ async fn main() -> Result<()> {
         let output_root = output_root.clone();
         let output_storage = output_storage.clone();
         let output_s3_prefix = args.output_s3_prefix.clone();
+        let output_prefix = args.output_prefix.clone();
         let input_storages = input_storages.clone();
         let input_scratch_root = input_scratch_root.clone();
         let batch_size = args.batch_size;
@@ -565,6 +572,7 @@ async fn main() -> Result<()> {
                 };
 
                 let output_root_for_task = output_root.clone();
+                let output_prefix_for_task = output_prefix.clone();
                 let result = tokio::task::spawn_blocking(move || {
                     process_partition(
                         partition_key,
@@ -572,6 +580,7 @@ async fn main() -> Result<()> {
                         output_root_for_task,
                         batch_size,
                         compression_level,
+                        &output_prefix_for_task,
                     )
                 })
                 .await
@@ -721,16 +730,17 @@ fn process_partition(
     output_root: PathBuf,
     batch_size: usize,
     compression_level: i32,
+    output_prefix: &str,
 ) -> Result<(ParseStats, PartitionOutputs)> {
     let rel_dir = partition_key.relative_dir_time_only();
     let dir_for = |tree: &str| output_root.join(tree).join(&rel_dir);
 
     let mut stats = ParseStats::default();
-    let mut positions = PositionsWriter::new(dir_for(POSITIONS_TREE), compression_level);
-    let mut statics = StaticsWriter::new(dir_for(STATICS_TREE), compression_level);
-    let mut meteo = MeteoWriter::new(dir_for(METEO_TREE), compression_level);
-    let mut binary = BinaryWriter::new(dir_for(BINARY_TREE), compression_level);
-    let mut atons = AtonWriter::new(dir_for(ATONS_TREE), compression_level);
+    let mut positions = PositionsWriter::new(dir_for(POSITIONS_TREE), output_prefix, compression_level);
+    let mut statics = StaticsWriter::new(dir_for(STATICS_TREE), output_prefix, compression_level);
+    let mut meteo = MeteoWriter::new(dir_for(METEO_TREE), output_prefix, compression_level);
+    let mut binary = BinaryWriter::new(dir_for(BINARY_TREE), output_prefix, compression_level);
+    let mut atons = AtonWriter::new(dir_for(ATONS_TREE), output_prefix, compression_level);
 
     for file in &files {
         process_parquet_file(
@@ -835,29 +845,35 @@ fn process_parquet_file(
             })
             .transpose()?;
 
-        for i in 0..batch.num_rows() {
-            if is_cancelled() {
-                return Ok(());
-            }
-            stats.rows_in += 1;
-            let source = match &source_col {
+        let n = batch.num_rows();
+
+        let sources: Vec<&str> = (0..n)
+            .map(|i| match &source_col {
                 Some(col) if !col.is_null(i) => col.value(i),
                 _ => path_source,
-            };
+            })
+            .collect();
 
-            let payload_str = payload_col.value(i);
+        let mut decoded: Vec<(usize, Decoded)> = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let payload_str = payload_col.value(i);
+                let mut buf = payload_str.to_string();
+                let ais_msg: crate::ais_stream::AisStreamMessage = match unsafe { simd_serde::from_str(&mut buf) } {
+                    Ok(msg) => msg,
+                    Err(_) => return (i, Decoded::Failed),
+                };
+                let msg_type = ais_msg.MessageType.as_str();
+                let result = decode_row(ts_col.value(i), sources[i], msg_type, &ais_msg.Message);
+                (i, result)
+            })
+            .collect();
 
-            let ais_msg: crate::ais_stream::AisStreamMessage = match serde_json::from_str(payload_str) {
-                Ok(msg) => msg,
-                Err(_) => {
-                    stats.failed += 1;
-                    continue;
-                }
-            };
+        decoded.sort_by_key(|(i, _)| *i);
 
-            let msg_type = ais_msg.MessageType.as_str();
-
-            match decode_row(ts_col.value(i), source, msg_type, &ais_msg.Message) {
+        stats.rows_in += n as u64;
+        for (_, result) in decoded {
+            match result {
                 Decoded::Position(row) => {
                     stats.positions_out += 1;
                     writers.positions.write(&row)?;

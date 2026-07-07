@@ -12,12 +12,25 @@
 
 use crate::ais_bits::{extract_ais_payload, Bits};
 use h3o::{LatLng, Resolution};
+use fast_hilbert::xy2h;
 use nmea_parser::ais::{AisClass, VesselDynamicData, VesselStaticData};
 use nmea_parser::{NmeaParser, ParsedMessage};
 
 fn lat_lon_to_h3(lat: f64, lon: f64) -> Option<u64> {
     let ll = LatLng::new(lat.to_radians(), lon.to_radians()).ok()?;
     Some(ll.to_cell(Resolution::Ten).into())
+}
+
+// 31 bits per dimension → ~0.3 m resolution at the equator, fits in u64
+const HILBERT_BITS: u32 = 31;
+
+fn lat_lon_to_hilbert(lat: f64, lon: f64) -> Option<u64> {
+    if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
+        return None;
+    }
+    let x = ((lon + 180.0) / 360.0 * ((1u64 << HILBERT_BITS) as f64)) as u32;
+    let y = ((lat + 90.0) / 180.0 * ((1u64 << HILBERT_BITS) as f64)) as u32;
+    Some(xy2h(x, y, HILBERT_BITS as u8))
 }
 
 /// One decoded position report (AIS types 1-3, 9, 18, 19, 27).
@@ -38,6 +51,7 @@ pub struct PositionRow {
     pub rot: Option<f64>,
     pub altitude_m: Option<f64>,
     pub h3: Option<u64>,
+    pub hilbert: Option<u64>,
     pub nav_status: String,
     pub high_accuracy: bool,
     pub raim: bool,
@@ -86,6 +100,7 @@ pub struct MeteoRow {
     pub fid: u8,
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
+    pub hilbert: Option<u64>,
     pub position_accuracy: Option<bool>,
     pub day: Option<u8>,
     pub hour: Option<u8>,
@@ -159,6 +174,7 @@ pub struct AtonRow {
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
     pub h3: Option<u64>,
+    pub hilbert: Option<u64>,
     pub dimension_to_bow: Option<u16>,
     pub dimension_to_stern: Option<u16>,
     pub dimension_to_port: Option<u16>,
@@ -316,6 +332,7 @@ fn position_row(
         rot: vdd.rot,
         altitude_m: None,
         h3: vdd.latitude.and_then(|lat| vdd.longitude.and_then(|lon| lat_lon_to_h3(lat, lon))),
+        hilbert: vdd.latitude.and_then(|lat| vdd.longitude.and_then(|lon| lat_lon_to_hilbert(lat, lon))),
         nav_status: vdd.nav_status.to_string(),
         high_accuracy: vdd.high_position_accuracy,
         raim: vdd.raim_flag,
@@ -384,6 +401,7 @@ fn from_sar_aircraft(
         rot: None,
         altitude_m: sar.altitude.map(|a| a as f64),
         h3: sar.latitude.and_then(|lat| sar.longitude.and_then(|lon| lat_lon_to_h3(lat, lon))),
+        hilbert: sar.latitude.and_then(|lat| sar.longitude.and_then(|lon| lat_lon_to_hilbert(lat, lon))),
         nav_status: "under way using engine".into(),
         high_accuracy: sar.high_position_accuracy,
         raim: sar.raim_flag,
@@ -413,6 +431,7 @@ fn base_station_row(
         rot: None,
         altitude_m: None,
         h3: br.latitude.and_then(|lat| br.longitude.and_then(|lon| lat_lon_to_h3(lat, lon))),
+        hilbert: br.latitude.and_then(|lat| br.longitude.and_then(|lon| lat_lon_to_hilbert(lat, lon))),
         nav_status: String::new(),
         high_accuracy: br.high_position_accuracy,
         raim: br.raim_flag,
@@ -444,6 +463,7 @@ fn from_aid_to_navigation(
         latitude: aid.latitude,
         longitude: aid.longitude,
         h3: aid.latitude.and_then(|lat| aid.longitude.and_then(|lon| lat_lon_to_h3(lat, lon))),
+        hilbert: aid.latitude.and_then(|lat| aid.longitude.and_then(|lon| lat_lon_to_hilbert(lat, lon))),
         dimension_to_bow: aid.dimension_to_bow,
         dimension_to_stern: aid.dimension_to_stern,
         dimension_to_port: aid.dimension_to_port,
@@ -529,6 +549,9 @@ fn decode_meteo_fid31(
     fid: u8,
     b: &Bits,
 ) -> MeteoRow {
+    let lon31 = latlon(b.i(56, 25), 181 * 60 * 1000, 180.0);
+    let lat31 = latlon(b.i(81, 24), 91 * 60 * 1000, 90.0);
+    let hilbert = lat31.and_then(|lat| lon31.and_then(|lon| lat_lon_to_hilbert(lat, lon)));
     MeteoRow {
         ts_ms,
         source: source.to_string(),
@@ -537,8 +560,9 @@ fn decode_meteo_fid31(
         mmsi,
         dac,
         fid,
-        longitude: latlon(b.i(56, 25), 181 * 60 * 1000, 180.0),
-        latitude: latlon(b.i(81, 24), 91 * 60 * 1000, 90.0),
+        longitude: lon31,
+        latitude: lat31,
+        hilbert,
         position_accuracy: Some(b.boolean(105)),
         day: u_opt(b, 106, 5, 0).map(|v| v as u8),
         hour: u_opt(b, 111, 5, 24).map(|v| v as u8),
@@ -592,6 +616,9 @@ fn decode_meteo_fid11(
     fid: u8,
     b: &Bits,
 ) -> MeteoRow {
+    let lat11 = latlon(b.i(56, 24), 0x7F_FFFF, 90.0);
+    let lon11 = latlon(b.i(80, 25), 0xFF_FFFF, 180.0);
+    let hilbert = lat11.and_then(|lat| lon11.and_then(|lon| lat_lon_to_hilbert(lat, lon)));
     MeteoRow {
         ts_ms,
         source: source.to_string(),
@@ -600,8 +627,9 @@ fn decode_meteo_fid11(
         mmsi,
         dac,
         fid,
-        latitude: latlon(b.i(56, 24), 0x7F_FFFF, 90.0),
-        longitude: latlon(b.i(80, 25), 0xFF_FFFF, 180.0),
+        latitude: lat11,
+        longitude: lon11,
+        hilbert,
         position_accuracy: None,
         day: u_opt(b, 105, 5, 0).map(|v| v as u8),
         hour: u_opt(b, 110, 5, 24).map(|v| v as u8),

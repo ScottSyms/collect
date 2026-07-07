@@ -7,6 +7,7 @@ use collect_core::state;
 use collect_core::{PartitionGranularity, S3ConnectionArgs, S3Storage};
 use nmea_parser::NmeaParser;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use rayon::prelude::*;
 use std::collections::VecDeque;
 use std::fs::File as StdFile;
 use std::path::{Path, PathBuf};
@@ -19,7 +20,7 @@ mod output;
 mod stats;
 
 use decode::{decode_payload, Decoded};
-use output::{existing_parquet_files, AtonWriter, BinaryWriter, MeteoWriter, PositionsWriter, StaticsWriter};
+use output::{existing_parquet_files, is_parse_output_file, AtonWriter, BinaryWriter, MeteoWriter, PositionsWriter, StaticsWriter};
 use stats::ParseStats;
 
 /// Decoded output lands in sibling hive datasets under the output root.
@@ -124,6 +125,10 @@ struct Args {
     /// Number of partitions to process concurrently; auto-selected when omitted
     #[arg(long)]
     concurrency: Option<usize>,
+
+    /// Output file name prefix (added before tree suffix, e.g. `{prefix}-pos-*.parquet`)
+    #[arg(long, default_value = "ais")]
+    output_prefix: String,
 }
 
 impl Args {
@@ -538,6 +543,8 @@ async fn main() -> Result<()> {
 
     const PARTITION_DOWNLOAD_CONCURRENCY: usize = 4;
 
+    let output_prefix = args.output_prefix.clone();
+
     let mut workers = Vec::with_capacity(concurrency);
     for _ in 0..concurrency {
         let queue = queue.clone();
@@ -545,6 +552,7 @@ async fn main() -> Result<()> {
         let output_root = output_root.clone();
         let output_storage = output_storage.clone();
         let output_s3_prefix = args.output_s3_prefix.clone();
+        let output_prefix = output_prefix.clone();
         let input_storages = input_storages.clone();
         let input_scratch_root = input_scratch_root.clone();
         let batch_size = args.batch_size;
@@ -598,6 +606,7 @@ async fn main() -> Result<()> {
 
                 let rel_dir = partition_key.relative_dir_time_only();
                 let output_root_for_task = output_root.clone();
+                let output_prefix_for_task = output_prefix.clone();
                 let result = tokio::task::spawn_blocking(move || {
                     process_partition(
                         partition_key,
@@ -606,6 +615,7 @@ async fn main() -> Result<()> {
                         batch_size,
                         compression_level,
                         replace_local,
+                        &output_prefix_for_task,
                     )
                 })
                 .await
@@ -640,7 +650,12 @@ async fn main() -> Result<()> {
                         let prior_keys: Vec<String> = prior
                             .into_iter()
                             .map(|object| object.key)
-                            .filter(|key| key.ends_with(".parquet"))
+                            .filter(|key| {
+                                key.ends_with(".parquet")
+                                    && key.rsplit('/').next()
+                                        .map(|name| is_parse_output_file(name, &output_prefix))
+                                        .unwrap_or(false)
+                            })
                             .collect();
 
                         for (out_rel, local_path, _rows) in
@@ -792,6 +807,7 @@ fn process_partition(
     batch_size: usize,
     compression_level: i32,
     replace_local: bool,
+    output_prefix: &str,
 ) -> Result<(ParseStats, PartitionOutputs)> {
     let rel_dir = partition_key.relative_dir_time_only();
     let dir_for = |tree: &str| output_root.join(tree).join(&rel_dir);
@@ -801,32 +817,33 @@ fn process_partition(
     let prior_files: Vec<PathBuf> = if replace_local {
         let mut prior = Vec::new();
         for tree in OUTPUT_TREES {
-            prior.extend(existing_parquet_files(&dir_for(tree))?);
+            prior.extend(
+                existing_parquet_files(&dir_for(tree))?
+                    .into_iter()
+                    .filter(|p| {
+                        p.file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|n| is_parse_output_file(n, output_prefix))
+                            .unwrap_or(false)
+                    }),
+            );
         }
         prior
     } else {
         Vec::new()
     };
 
-    let mut parser = NmeaParser::new();
-    let mut current_source: Option<&str> = None;
     let mut stats = ParseStats::default();
-    let mut positions = PositionsWriter::new(dir_for(POSITIONS_TREE), compression_level);
-    let mut statics = StaticsWriter::new(dir_for(STATICS_TREE), compression_level);
-    let mut meteo = MeteoWriter::new(dir_for(METEO_TREE), compression_level);
-    let mut binary = BinaryWriter::new(dir_for(BINARY_TREE), compression_level);
-    let mut atons = AtonWriter::new(dir_for(ATONS_TREE), compression_level);
+    let mut positions = PositionsWriter::new(dir_for(POSITIONS_TREE), output_prefix, compression_level);
+    let mut statics = StaticsWriter::new(dir_for(STATICS_TREE), output_prefix, compression_level);
+    let mut meteo = MeteoWriter::new(dir_for(METEO_TREE), output_prefix, compression_level);
+    let mut binary = BinaryWriter::new(dir_for(BINARY_TREE), output_prefix, compression_level);
+    let mut atons = AtonWriter::new(dir_for(ATONS_TREE), output_prefix, compression_level);
 
     for file in &files {
-        // Reset fragment state at each source boundary.
-        if current_source != Some(file.partition.source.as_str()) {
-            parser = NmeaParser::new();
-            current_source = Some(file.partition.source.as_str());
-        }
         process_parquet_file(
             &file.path,
             &file.partition.source,
-            &mut parser,
             &mut stats,
             Writers {
                 positions: &mut positions,
@@ -895,7 +912,6 @@ struct Writers<'a> {
 fn process_parquet_file(
     path: &Path,
     path_source: &str,
-    parser: &mut NmeaParser,
     stats: &mut ParseStats,
     writers: Writers<'_>,
     batch_size: usize,
@@ -940,16 +956,34 @@ fn process_parquet_file(
             })
             .transpose()?;
 
-        for i in 0..batch.num_rows() {
-            if is_cancelled() {
-                return Ok(());
-            }
-            stats.rows_in += 1;
-            let source = match &source_col {
+        let n = batch.num_rows();
+
+        let sources: Vec<&str> = (0..n)
+            .map(|i| match &source_col {
                 Some(col) if !col.is_null(i) => col.value(i),
                 _ => path_source,
-            };
-            match decode_payload(parser, ts_col.value(i), source, payload_col.value(i)) {
+            })
+            .collect();
+
+        let mut decoded: Vec<(usize, Decoded)> = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let mut local_parser = NmeaParser::new();
+                let result = decode_payload(
+                    &mut local_parser,
+                    ts_col.value(i),
+                    sources[i],
+                    payload_col.value(i),
+                );
+                (i, result)
+            })
+            .collect();
+
+        decoded.sort_by_key(|(i, _)| *i);
+
+        stats.rows_in += n as u64;
+        for (_, result) in decoded {
+            match result {
                 Decoded::Position(row) => {
                     stats.positions_out += 1;
                     writers.positions.write(&row)?;
