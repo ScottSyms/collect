@@ -1,6 +1,8 @@
 use chrono::{Datelike, TimeZone, Utc};
-use h3o::{LatLng, Resolution};
 use fast_hilbert::xy2h;
+use h3o::{LatLng, Resolution};
+use std::borrow::Cow;
+use std::sync::Arc;
 
 use crate::ais_stream::{
     AidsToNavigationReport, BaseStationReport, ExtendedClassBPositionReport, PositionReport,
@@ -27,11 +29,11 @@ fn lat_lon_to_hilbert(lat: f64, lon: f64) -> Option<u64> {
 /// One decoded position report (AIS types 1-3, 9, 18).
 pub struct PositionRow {
     pub ts_ms: i64,
-    pub source: String,
+    pub source: Arc<str>,
     pub station: Option<String>,
     pub msg_type: u8,
     pub mmsi: u32,
-    pub ais_class: String,
+    pub ais_class: Cow<'static, str>,
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
     pub sog_knots: Option<f64>,
@@ -41,7 +43,7 @@ pub struct PositionRow {
     pub altitude_m: Option<f64>,
     pub h3: Option<u64>,
     pub hilbert: Option<u64>,
-    pub nav_status: String,
+    pub nav_status: Cow<'static, str>,
     pub high_accuracy: bool,
     pub raim: bool,
     pub special_manoeuvre: Option<bool>,
@@ -50,15 +52,15 @@ pub struct PositionRow {
 /// One decoded static/voyage report (AIS types 5 and 24).
 pub struct StaticRow {
     pub ts_ms: i64,
-    pub source: String,
+    pub source: Arc<str>,
     pub station: Option<String>,
     pub msg_type: u8,
     pub mmsi: u32,
-    pub ais_class: String,
+    pub ais_class: Cow<'static, str>,
     pub imo_number: Option<u32>,
     pub call_sign: Option<String>,
     pub name: Option<String>,
-    pub ship_type: String,
+    pub ship_type: Cow<'static, str>,
     pub dimension_to_bow: Option<u16>,
     pub dimension_to_stern: Option<u16>,
     pub dimension_to_port: Option<u16>,
@@ -71,7 +73,7 @@ pub struct StaticRow {
 
 pub struct MeteoRow {
     pub ts_ms: i64,
-    pub source: String,
+    pub source: Arc<str>,
     pub station: Option<String>,
     pub msg_type: u8,
     pub mmsi: u32,
@@ -120,7 +122,7 @@ pub struct MeteoRow {
 
 pub struct BinaryRow {
     pub ts_ms: i64,
-    pub source: String,
+    pub source: Arc<str>,
     pub station: Option<String>,
     pub msg_type: u8,
     pub mmsi: u32,
@@ -132,11 +134,11 @@ pub struct BinaryRow {
 
 pub struct AtonRow {
     pub ts_ms: i64,
-    pub source: String,
+    pub source: Arc<str>,
     pub station: Option<String>,
     pub msg_type: u8,
     pub mmsi: u32,
-    pub ais_class: String,
+    pub ais_class: Cow<'static, str>,
     pub aid_type: String,
     pub name: Option<String>,
     pub name_extension: Option<String>,
@@ -170,56 +172,60 @@ pub fn decode_row(
     ts_ms: i64,
     source: &str,
     msg_type: &str,
-    message: &serde_json::Value,
+    message: &mut serde_json::Value,
 ) -> Decoded {
-    // AISStream API wraps the actual message payload under Message[MessageType].
-    let payload = message.get(msg_type).cloned().unwrap_or_else(|| message.clone());
+    let src: Arc<str> = Arc::from(source);
+    let payload = if let Some(obj) = message.as_object_mut() {
+        obj.remove(msg_type).unwrap_or_else(|| std::mem::take(message))
+    } else {
+        std::mem::take(message)
+    };
     match msg_type {
         "PositionReport" => {
             match serde_json::from_value::<PositionReport>(payload) {
-                Ok(pr) => Decoded::Position(from_position_report(ts_ms, source, pr)),
+                Ok(pr) => Decoded::Position(from_position_report(ts_ms, &src, pr)),
                 Err(_) => Decoded::Failed,
             }
         }
         "StandardClassBPositionReport" => {
             match serde_json::from_value::<StandardClassBPositionReport>(payload) {
-                Ok(pr) => Decoded::Position(from_standard_class_b(ts_ms, source, pr)),
+                Ok(pr) => Decoded::Position(from_standard_class_b(ts_ms, &src, pr)),
                 Err(_) => Decoded::Failed,
             }
         }
         "ShipStaticData" => {
             match serde_json::from_value::<ShipStaticData>(payload) {
-                Ok(sd) => Decoded::Static(from_ship_static_data(ts_ms, source, sd)),
+                Ok(sd) => Decoded::Static(from_ship_static_data(ts_ms, &src, sd)),
                 Err(_) => Decoded::Failed,
             }
         }
         "StaticDataReport" => {
             match serde_json::from_value::<StaticDataReport>(payload) {
-                Ok(sr) => Decoded::Static(from_static_data_report(ts_ms, source, sr)),
+                Ok(sr) => Decoded::Static(from_static_data_report(ts_ms, &src, sr)),
                 Err(_) => Decoded::Failed,
             }
         }
         "BaseStationReport" => {
             match serde_json::from_value::<BaseStationReport>(payload) {
-                Ok(br) => Decoded::Position(from_base_station_report(ts_ms, source, br)),
+                Ok(br) => Decoded::Position(from_base_station_report(ts_ms, &src, br)),
                 Err(_) => Decoded::Failed,
             }
         }
         "StandardSearchAndRescueAircraftReport" => {
             match serde_json::from_value::<StandardSearchAndRescueAircraftReport>(payload) {
-                Ok(sar) => Decoded::Position(from_standard_sar_aircraft(ts_ms, source, sar)),
+                Ok(sar) => Decoded::Position(from_standard_sar_aircraft(ts_ms, &src, sar)),
                 Err(_) => Decoded::Failed,
             }
         }
         "ExtendedClassBPositionReport" => {
             match serde_json::from_value::<ExtendedClassBPositionReport>(payload) {
-                Ok(pr) => Decoded::Position(from_extended_class_b(ts_ms, source, pr)),
+                Ok(pr) => Decoded::Position(from_extended_class_b(ts_ms, &src, pr)),
                 Err(_) => Decoded::Failed,
             }
         }
         "AidsToNavigationReport" => {
             match serde_json::from_value::<AidsToNavigationReport>(payload) {
-                Ok(aid) => Decoded::Aton(from_aids_to_navigation(ts_ms, source, aid)),
+                Ok(aid) => Decoded::Aton(from_aids_to_navigation(ts_ms, &src, aid)),
                 Err(_) => Decoded::Failed,
             }
         }
@@ -234,14 +240,14 @@ pub fn decode_row(
     }
 }
 
-fn from_position_report(ts_ms: i64, source: &str, pr: PositionReport) -> PositionRow {
+fn from_position_report(ts_ms: i64, source: &Arc<str>, pr: PositionReport) -> PositionRow {
     PositionRow {
         ts_ms,
-        source: source.to_string(),
+        source: source.clone(),
         station: None,
         msg_type: pr.MessageID,
         mmsi: pr.UserID,
-        ais_class: "Class A".into(),
+        ais_class: Cow::Borrowed("Class A"),
         latitude: pr.Latitude,
         longitude: pr.Longitude,
         sog_knots: pr.Sog,
@@ -251,11 +257,12 @@ fn from_position_report(ts_ms: i64, source: &str, pr: PositionReport) -> Positio
         altitude_m: None,
         h3: pr.Latitude.and_then(|lat| pr.Longitude.and_then(|lon| lat_lon_to_h3(lat, lon))),
         hilbert: pr.Latitude.and_then(|lat| pr.Longitude.and_then(|lon| lat_lon_to_hilbert(lat, lon))),
-        nav_status: pr
-            .NavigationalStatus
-            .map(nav_status_str)
-            .unwrap_or("(notDefined)")
-            .to_string(),
+        nav_status: Cow::Owned(
+            pr.NavigationalStatus
+                .map(nav_status_str)
+                .unwrap_or("(notDefined)")
+                .to_string(),
+        ),
         high_accuracy: pr.PositionAccuracy,
         raim: pr.Raim,
         special_manoeuvre: pr
@@ -266,16 +273,16 @@ fn from_position_report(ts_ms: i64, source: &str, pr: PositionReport) -> Positio
 
 fn from_standard_class_b(
     ts_ms: i64,
-    source: &str,
+    source: &Arc<str>,
     pr: StandardClassBPositionReport,
 ) -> PositionRow {
     PositionRow {
         ts_ms,
-        source: source.to_string(),
+        source: source.clone(),
         station: None,
         msg_type: pr.MessageID,
         mmsi: pr.UserID,
-        ais_class: "Class B".into(),
+        ais_class: Cow::Borrowed("Class B"),
         latitude: pr.Latitude,
         longitude: pr.Longitude,
         sog_knots: pr.Sog,
@@ -285,29 +292,29 @@ fn from_standard_class_b(
         altitude_m: None,
         h3: pr.Latitude.and_then(|lat| pr.Longitude.and_then(|lon| lat_lon_to_h3(lat, lon))),
         hilbert: pr.Latitude.and_then(|lat| pr.Longitude.and_then(|lon| lat_lon_to_hilbert(lat, lon))),
-        nav_status: "under way using engine".into(),
+        nav_status: Cow::Borrowed("under way using engine"),
         high_accuracy: pr.PositionAccuracy,
         raim: pr.Raim,
         special_manoeuvre: None,
     }
 }
 
-fn from_ship_static_data(ts_ms: i64, source: &str, sd: ShipStaticData) -> StaticRow {
+fn from_ship_static_data(ts_ms: i64, source: &Arc<str>, sd: ShipStaticData) -> StaticRow {
     let (bow, stern, port, starboard) = sd.Dimension.map_or((None, None, None, None), |d| {
         (d.A, d.B, d.C, d.D)
     });
 
     StaticRow {
         ts_ms,
-        source: source.to_string(),
+        source: source.clone(),
         station: None,
         msg_type: sd.MessageID,
         mmsi: sd.UserID,
-        ais_class: "Class A".into(),
+        ais_class: Cow::Borrowed("Class A"),
         imo_number: sd.ImoNumber.filter(|&n| n != 0),
         call_sign: trim_ais_str(sd.CallSign.as_deref()),
         name: trim_ais_str(sd.Name.as_deref()),
-        ship_type: sd.ship_type.map(ship_type_str).unwrap_or_default(),
+        ship_type: Cow::from(sd.ship_type.map(ship_type_str).unwrap_or_default()),
         dimension_to_bow: bow,
         dimension_to_stern: stern,
         dimension_to_port: port,
@@ -317,9 +324,9 @@ fn from_ship_static_data(ts_ms: i64, source: &str, sd: ShipStaticData) -> Static
         eta_ms: sd.Eta.and_then(eta_to_ms),
         mothership_mmsi: None,
     }
-}
+} 
 
-fn from_static_data_report(ts_ms: i64, source: &str, sr: StaticDataReport) -> StaticRow {
+fn from_static_data_report(ts_ms: i64, source: &Arc<str>, sr: StaticDataReport) -> StaticRow {
     let (name, call_sign, ship_type, bow, stern, port, starboard) = if !sr.PartNumber {
         let name = sr
             .ReportA
@@ -343,15 +350,15 @@ fn from_static_data_report(ts_ms: i64, source: &str, sr: StaticDataReport) -> St
 
     StaticRow {
         ts_ms,
-        source: source.to_string(),
+        source: source.clone(),
         station: None,
         msg_type: sr.MessageID,
         mmsi: sr.UserID,
-        ais_class: "Class B".into(),
+        ais_class: Cow::Borrowed("Class B"),
         imo_number: None,
         call_sign,
         name,
-        ship_type: ship_type.unwrap_or_default(),
+        ship_type: Cow::from(ship_type.unwrap_or_default()),
         dimension_to_bow: bow,
         dimension_to_stern: stern,
         dimension_to_port: port,
@@ -365,16 +372,16 @@ fn from_static_data_report(ts_ms: i64, source: &str, sr: StaticDataReport) -> St
 
 fn from_standard_sar_aircraft(
     ts_ms: i64,
-    source: &str,
+    source: &Arc<str>,
     sar: StandardSearchAndRescueAircraftReport,
 ) -> PositionRow {
     PositionRow {
         ts_ms,
-        source: source.to_string(),
+        source: source.clone(),
         station: None,
         msg_type: sar.MessageID,
         mmsi: sar.UserID,
-        ais_class: "Class A".into(),
+        ais_class: Cow::Borrowed("Class A"),
         latitude: sar.Latitude,
         longitude: sar.Longitude,
         sog_knots: sar.Sog,
@@ -384,7 +391,7 @@ fn from_standard_sar_aircraft(
         altitude_m: sar.Altitude,
         h3: sar.Latitude.and_then(|lat| sar.Longitude.and_then(|lon| lat_lon_to_h3(lat, lon))),
         hilbert: sar.Latitude.and_then(|lat| sar.Longitude.and_then(|lon| lat_lon_to_hilbert(lat, lon))),
-        nav_status: "under way using engine".into(),
+        nav_status: Cow::Borrowed("under way using engine"),
         high_accuracy: sar.PositionAccuracy,
         raim: sar.Raim,
         special_manoeuvre: None,
@@ -393,7 +400,7 @@ fn from_standard_sar_aircraft(
 
 fn from_aids_to_navigation(
     ts_ms: i64,
-    source: &str,
+    source: &Arc<str>,
     aid: AidsToNavigationReport,
 ) -> AtonRow {
     let (bow, stern, port, starboard) = aid.Dimension.map_or((None, None, None, None), |d| {
@@ -402,11 +409,11 @@ fn from_aids_to_navigation(
 
     AtonRow {
         ts_ms,
-        source: source.to_string(),
+        source: source.clone(),
         station: None,
         msg_type: aid.MessageID,
         mmsi: aid.UserID,
-        ais_class: "AtoN".into(),
+        ais_class: Cow::Borrowed("AtoN"),
         aid_type: aid.aid_type.map(navaid_type_str).unwrap_or("not specified").to_string(),
         name: trim_ais_str(aid.Name.as_deref()),
         name_extension: trim_ais_str(aid.NameExtension.as_deref()),
@@ -426,14 +433,14 @@ fn from_aids_to_navigation(
     }
 }
 
-fn from_base_station_report(ts_ms: i64, source: &str, br: BaseStationReport) -> PositionRow {
+fn from_base_station_report(ts_ms: i64, source: &Arc<str>, br: BaseStationReport) -> PositionRow {
     PositionRow {
         ts_ms,
-        source: source.to_string(),
+        source: source.clone(),
         station: None,
         msg_type: br.MessageID,
         mmsi: br.UserID,
-        ais_class: "Base Station".into(),
+        ais_class: Cow::Borrowed("Base Station"),
         latitude: br.Latitude,
         longitude: br.Longitude,
         sog_knots: None,
@@ -443,7 +450,7 @@ fn from_base_station_report(ts_ms: i64, source: &str, br: BaseStationReport) -> 
         altitude_m: None,
         h3: br.Latitude.and_then(|lat| br.Longitude.and_then(|lon| lat_lon_to_h3(lat, lon))),
         hilbert: br.Latitude.and_then(|lat| br.Longitude.and_then(|lon| lat_lon_to_hilbert(lat, lon))),
-        nav_status: String::new(),
+        nav_status: Cow::Borrowed(""),
         high_accuracy: br.PositionAccuracy,
         raim: br.Raim,
         special_manoeuvre: None,
@@ -452,16 +459,16 @@ fn from_base_station_report(ts_ms: i64, source: &str, br: BaseStationReport) -> 
 
 fn from_extended_class_b(
     ts_ms: i64,
-    source: &str,
+    source: &Arc<str>,
     pr: ExtendedClassBPositionReport,
 ) -> PositionRow {
     PositionRow {
         ts_ms,
-        source: source.to_string(),
+        source: source.clone(),
         station: None,
         msg_type: pr.MessageID,
         mmsi: pr.UserID,
-        ais_class: "Class B".into(),
+        ais_class: Cow::Borrowed("Class B"),
         latitude: pr.Latitude,
         longitude: pr.Longitude,
         sog_knots: pr.Sog,
@@ -471,7 +478,7 @@ fn from_extended_class_b(
         altitude_m: None,
         h3: pr.Latitude.and_then(|lat| pr.Longitude.and_then(|lon| lat_lon_to_h3(lat, lon))),
         hilbert: pr.Latitude.and_then(|lat| pr.Longitude.and_then(|lon| lat_lon_to_hilbert(lat, lon))),
-        nav_status: "under way using engine".into(),
+        nav_status: Cow::Borrowed("under way using engine"),
         high_accuracy: pr.PositionAccuracy,
         raim: pr.Raim,
         special_manoeuvre: None,
@@ -559,7 +566,7 @@ fn nav_status_str(v: u8) -> &'static str {
 
 /// Convert an AIS ship type code to the standard English category string,
 /// matching the style ais-parse produces via nmea-parser.
-fn ship_type_str(v: u8) -> String {
+fn ship_type_str(v: u8) -> &'static str {
     match v {
         0..=19 => "(not available)",
         20..=29 => "wing in ground",
@@ -580,7 +587,6 @@ fn ship_type_str(v: u8) -> String {
         90..=99 => "other",
         _ => "(not available)",
     }
-    .to_string()
 }
 
 fn navaid_type_str(v: u8) -> &'static str {

@@ -11,10 +11,17 @@
 //! which it usually does because rows within a partition file are ts-sorted.
 
 use crate::ais_bits::{extract_ais_payload, Bits};
-use h3o::{LatLng, Resolution};
 use fast_hilbert::xy2h;
+use h3o::{LatLng, Resolution};
 use nmea_parser::ais::{AisClass, VesselDynamicData, VesselStaticData};
 use nmea_parser::{NmeaParser, ParsedMessage};
+use std::borrow::Cow;
+use std::sync::Arc;
+
+thread_local! {
+    static PARSER: std::cell::RefCell<NmeaParser> =
+        std::cell::RefCell::new(NmeaParser::new());
+}
 
 fn lat_lon_to_h3(lat: f64, lon: f64) -> Option<u64> {
     let ll = LatLng::new(lat.to_radians(), lon.to_radians()).ok()?;
@@ -36,13 +43,13 @@ fn lat_lon_to_hilbert(lat: f64, lon: f64) -> Option<u64> {
 /// One decoded position report (AIS types 1-3, 9, 18, 19, 27).
 pub struct PositionRow {
     pub ts_ms: i64,
-    pub source: String,
+    pub source: Arc<str>,
     /// Source/base station from the NMEA tag block `s:` field, if present.
     pub station: Option<String>,
     /// The AIS message type that produced this row (1/2/3/9/18/19/27).
     pub msg_type: u8,
     pub mmsi: u32,
-    pub ais_class: String,
+    pub ais_class: Cow<'static, str>,
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
     pub sog_knots: Option<f64>,
@@ -52,7 +59,7 @@ pub struct PositionRow {
     pub altitude_m: Option<f64>,
     pub h3: Option<u64>,
     pub hilbert: Option<u64>,
-    pub nav_status: String,
+    pub nav_status: Cow<'static, str>,
     pub high_accuracy: bool,
     pub raim: bool,
     pub special_manoeuvre: Option<bool>,
@@ -61,17 +68,17 @@ pub struct PositionRow {
 /// One decoded static/voyage report (AIS types 5 and 24).
 pub struct StaticRow {
     pub ts_ms: i64,
-    pub source: String,
+    pub source: Arc<str>,
     /// Source/base station from the NMEA tag block `s:` field, if present.
     pub station: Option<String>,
     /// The AIS message type that produced this row (5 or 24).
     pub msg_type: u8,
     pub mmsi: u32,
-    pub ais_class: String,
+    pub ais_class: Cow<'static, str>,
     pub imo_number: Option<u32>,
     pub call_sign: Option<String>,
     pub name: Option<String>,
-    pub ship_type: String,
+    pub ship_type: Cow<'static, str>,
     pub dimension_to_bow: Option<u16>,
     pub dimension_to_stern: Option<u16>,
     pub dimension_to_port: Option<u16>,
@@ -90,7 +97,7 @@ pub struct StaticRow {
 /// `visibility_greater`) are `None` for the deprecated FID=11.
 pub struct MeteoRow {
     pub ts_ms: i64,
-    pub source: String,
+    pub source: Arc<str>,
     /// Source/base station from the NMEA tag block `s:` field, if present.
     pub station: Option<String>,
     /// The AIS message type that produced this row (always 8).
@@ -143,7 +150,7 @@ pub struct MeteoRow {
 /// plus the application payload retained as hex, so nothing is lost.
 pub struct BinaryRow {
     pub ts_ms: i64,
-    pub source: String,
+    pub source: Arc<str>,
     /// Source/base station from the NMEA tag block `s:` field, if present.
     pub station: Option<String>,
     /// The AIS message type that produced this row (always 8).
@@ -160,13 +167,13 @@ pub struct BinaryRow {
 /// AIS type 21 (Aids to Navigation) report.
 pub struct AtonRow {
     pub ts_ms: i64,
-    pub source: String,
+    pub source: Arc<str>,
     /// Source/base station from the NMEA tag block `s:` field, if present.
     pub station: Option<String>,
     /// The AIS message type that produced this row (always 21).
     pub msg_type: u8,
     pub mmsi: u32,
-    pub ais_class: String,
+    pub ais_class: Cow<'static, str>,
     /// Textual representation of the aid type (NavAidType Display).
     pub aid_type: String,
     pub name: Option<String>,
@@ -233,28 +240,19 @@ fn tag_field<'a>(tag_body: &'a str, key: &str) -> Option<&'a str> {
     None
 }
 
-pub fn decode_payload(parser: &mut NmeaParser, ts_ms: i64, source: &str, payload: &str) -> Decoded {
+pub fn decode_payload(ts_ms: i64, source: &str, payload: &str) -> Decoded {
     let (tag_body, sentence) = split_tag_block(payload.trim());
     if sentence.is_empty() {
         return Decoded::Failed;
     }
-    // The NMEA tag block's `s:` field is the source/base station that received
-    // the message; retained as a column. Present on single sentences and, since
-    // ais-normalize preserves it, on combined multi-fragment sentences too.
     let station = tag_field(tag_body, "s").map(str::to_string);
+    let src: Arc<str> = Arc::from(source);
 
-    // The message type is the first 6 bits of the AIS payload. It's read
-    // directly (not via nmea-parser, which only reports a Class A/B category)
-    // so a row can be tagged with its exact type (1 vs 2 vs 3, ...). Only a
-    // single/combined sentence carries the type in its first fragment; for a
-    // raw multi-fragment message we fall back to the decoded variant's class.
     let peeked_type = match extract_ais_payload(sentence) {
         Some(p) if p.fragment_count == 1 => Bits::from_armored(p.armored, p.fill_bits)
             .filter(|bits| bits.len() >= 6)
             .map(|bits| {
                 let t = bits.u(0, 6) as u8;
-                // Type 8 (Binary Broadcast) is not handled by nmea-parser, so
-                // decode it ourselves right here from the same bits.
                 if t == 8 {
                     return (t, Some(decode_type8(ts_ms, source, station.clone(), &bits)));
                 }
@@ -268,62 +266,55 @@ pub fn decode_payload(parser: &mut NmeaParser, ts_ms: i64, source: &str, payload
         None => None,
     };
 
-    match parser.parse_sentence(sentence) {
-        Ok(ParsedMessage::VesselDynamicData(vdd)) => Decoded::Position(Box::new(position_row(
-            ts_ms,
-            source,
-            station,
-            peeked_type,
-            vdd,
-        ))),
-        Ok(ParsedMessage::VesselStaticData(vsd)) => Decoded::Static(Box::new(static_row(
-            ts_ms,
-            source,
-            station,
-            peeked_type,
-            vsd,
-        ))),
-        Ok(ParsedMessage::StandardSarAircraftPositionReport(sar)) => {
-            Decoded::Position(Box::new(from_sar_aircraft(
-                ts_ms, source, station, peeked_type, sar,
-            )))
+    PARSER.with(|pcell| {
+        let mut parser = pcell.borrow_mut();
+        match parser.parse_sentence(sentence) {
+            Ok(ParsedMessage::VesselDynamicData(vdd)) => Decoded::Position(Box::new(position_row(
+                ts_ms, &src, station, peeked_type, vdd,
+            ))),
+            Ok(ParsedMessage::VesselStaticData(vsd)) => Decoded::Static(Box::new(static_row(
+                ts_ms, &src, station, peeked_type, vsd,
+            ))),
+            Ok(ParsedMessage::StandardSarAircraftPositionReport(sar)) => {
+                Decoded::Position(Box::new(from_sar_aircraft(
+                    ts_ms, &src, station, peeked_type, sar,
+                )))
+            }
+            Ok(ParsedMessage::BaseStationReport(br)) => {
+                Decoded::Position(Box::new(base_station_row(
+                    ts_ms, &src, station, peeked_type, br,
+                )))
+            }
+            Ok(ParsedMessage::AidToNavigationReport(aid)) => {
+                Decoded::Aton(Box::new(from_aid_to_navigation(
+                    ts_ms, &src, station, aid,
+                )))
+            }
+            Ok(ParsedMessage::Incomplete) => Decoded::Incomplete,
+            Ok(_) => Decoded::Other,
+            Err(_) => Decoded::Failed,
         }
-        Ok(ParsedMessage::BaseStationReport(br)) => {
-            Decoded::Position(Box::new(base_station_row(
-                ts_ms, source, station, peeked_type, br,
-            )))
-        }
-        Ok(ParsedMessage::AidToNavigationReport(aid)) => {
-            Decoded::Aton(Box::new(from_aid_to_navigation(
-                ts_ms, source, station, aid,
-            )))
-        }
-        Ok(ParsedMessage::Incomplete) => Decoded::Incomplete,
-        Ok(_) => Decoded::Other,
-        Err(_) => Decoded::Failed,
-    }
+    })
 }
 
 fn position_row(
     ts_ms: i64,
-    source: &str,
+    source: &Arc<str>,
     station: Option<String>,
     peeked_type: Option<u8>,
     vdd: VesselDynamicData,
 ) -> PositionRow {
-    // Position reports are single-fragment, so `peeked_type` is essentially
-    // always present; the class-based fallback only guards raw multi-fragment.
     let msg_type = peeked_type.unwrap_or(match vdd.ais_type {
         AisClass::ClassB => 18,
         _ => 1,
     });
     PositionRow {
         ts_ms,
-        source: source.to_string(),
+        source: source.clone(),
         station,
         msg_type,
         mmsi: vdd.mmsi,
-        ais_class: vdd.ais_type.to_string(),
+        ais_class: Cow::Owned(vdd.ais_type.to_string()),
         latitude: vdd.latitude,
         longitude: vdd.longitude,
         sog_knots: vdd.sog_knots,
@@ -333,7 +324,7 @@ fn position_row(
         altitude_m: None,
         h3: vdd.latitude.and_then(|lat| vdd.longitude.and_then(|lon| lat_lon_to_h3(lat, lon))),
         hilbert: vdd.latitude.and_then(|lat| vdd.longitude.and_then(|lon| lat_lon_to_hilbert(lat, lon))),
-        nav_status: vdd.nav_status.to_string(),
+        nav_status: Cow::Owned(vdd.nav_status.to_string()),
         high_accuracy: vdd.high_position_accuracy,
         raim: vdd.raim_flag,
         special_manoeuvre: vdd.special_manoeuvre,
@@ -342,14 +333,11 @@ fn position_row(
 
 fn static_row(
     ts_ms: i64,
-    source: &str,
+    source: &Arc<str>,
     station: Option<String>,
     peeked_type: Option<u8>,
     vsd: VesselStaticData,
 ) -> StaticRow {
-    // Static reports are 2-fragment; a combined/normalized sentence peeks as
-    // 5 or 24, but a raw completing fragment peeks as junk — fall back to the
-    // class (Class A static = type 5, Class B static = type 24).
     let msg_type = peeked_type
         .filter(|t| *t == 5 || *t == 24)
         .unwrap_or(match vsd.ais_type {
@@ -358,20 +346,19 @@ fn static_row(
         });
     StaticRow {
         ts_ms,
-        source: source.to_string(),
+        source: source.clone(),
         station,
         msg_type,
         mmsi: vsd.mmsi,
-        ais_class: vsd.ais_type.to_string(),
+        ais_class: Cow::Owned(vsd.ais_type.to_string()),
         imo_number: vsd.imo_number,
         call_sign: vsd.call_sign,
         name: vsd.name,
-        ship_type: vsd.ship_type.to_string(),
+        ship_type: Cow::Owned(vsd.ship_type.to_string()),
         dimension_to_bow: vsd.dimension_to_bow,
         dimension_to_stern: vsd.dimension_to_stern,
         dimension_to_port: vsd.dimension_to_port,
         dimension_to_starboard: vsd.dimension_to_starboard,
-        // draught10 is the draught in decimetres.
         draught_m: vsd.draught10.map(|d| f64::from(d) / 10.0),
         destination: vsd.destination,
         eta_ms: vsd.eta.map(|dt| dt.timestamp_millis()),
@@ -381,18 +368,18 @@ fn static_row(
 
 fn from_sar_aircraft(
     ts_ms: i64,
-    source: &str,
+    source: &Arc<str>,
     station: Option<String>,
     peeked_type: Option<u8>,
     sar: nmea_parser::ais::StandardSarAircraftPositionReport,
 ) -> PositionRow {
     PositionRow {
         ts_ms,
-        source: source.to_string(),
+        source: source.clone(),
         station,
         msg_type: peeked_type.unwrap_or(9),
         mmsi: sar.mmsi,
-        ais_class: "Class A".into(),
+        ais_class: Cow::Borrowed("Class A"),
         latitude: sar.latitude,
         longitude: sar.longitude,
         sog_knots: sar.sog_knots.map(|k| k as f64),
@@ -402,7 +389,7 @@ fn from_sar_aircraft(
         altitude_m: sar.altitude.map(|a| a as f64),
         h3: sar.latitude.and_then(|lat| sar.longitude.and_then(|lon| lat_lon_to_h3(lat, lon))),
         hilbert: sar.latitude.and_then(|lat| sar.longitude.and_then(|lon| lat_lon_to_hilbert(lat, lon))),
-        nav_status: "under way using engine".into(),
+        nav_status: Cow::Borrowed("under way using engine"),
         high_accuracy: sar.high_position_accuracy,
         raim: sar.raim_flag,
         special_manoeuvre: None,
@@ -411,18 +398,18 @@ fn from_sar_aircraft(
 
 fn base_station_row(
     ts_ms: i64,
-    source: &str,
+    source: &Arc<str>,
     station: Option<String>,
     peeked_type: Option<u8>,
     br: nmea_parser::ais::BaseStationReport,
 ) -> PositionRow {
     PositionRow {
         ts_ms,
-        source: source.to_string(),
+        source: source.clone(),
         station,
         msg_type: peeked_type.unwrap_or(4),
         mmsi: br.mmsi,
-        ais_class: "Base Station".into(),
+        ais_class: Cow::Borrowed("Base Station"),
         latitude: br.latitude,
         longitude: br.longitude,
         sog_knots: None,
@@ -432,7 +419,7 @@ fn base_station_row(
         altitude_m: None,
         h3: br.latitude.and_then(|lat| br.longitude.and_then(|lon| lat_lon_to_h3(lat, lon))),
         hilbert: br.latitude.and_then(|lat| br.longitude.and_then(|lon| lat_lon_to_hilbert(lat, lon))),
-        nav_status: String::new(),
+        nav_status: Cow::Borrowed(""),
         high_accuracy: br.high_position_accuracy,
         raim: br.raim_flag,
         special_manoeuvre: None,
@@ -441,7 +428,7 @@ fn base_station_row(
 
 fn from_aid_to_navigation(
     ts_ms: i64,
-    source: &str,
+    source: &Arc<str>,
     station: Option<String>,
     aid: nmea_parser::ais::AidToNavigationReport,
 ) -> AtonRow {
@@ -452,11 +439,11 @@ fn from_aid_to_navigation(
 
     AtonRow {
         ts_ms,
-        source: source.to_string(),
+        source: source.clone(),
         station,
         msg_type: 21,
         mmsi: aid.mmsi,
-        ais_class: "AtoN".into(),
+        ais_class: Cow::Borrowed("AtoN"),
         aid_type: aid.aid_type.to_string(),
         name: trim_name(aid.name),
         name_extension: None,
@@ -515,18 +502,17 @@ fn decode_type8(ts_ms: i64, source: &str, station: Option<String>, b: &Bits) -> 
     let mmsi = b.u(8, 30) as u32;
     let dac = b.u(40, 10) as u16;
     let fid = b.u(50, 6) as u8;
+    let src: Arc<str> = Arc::from(source);
     match (dac, fid) {
         (1, 31) if b.len() >= 360 => Decoded::Meteo(Box::new(decode_meteo_fid31(
-            ts_ms, source, station, mmsi, dac, fid, b,
+            ts_ms, &src, station, mmsi, dac, fid, b,
         ))),
         (1, 11) if b.len() >= 352 => Decoded::Meteo(Box::new(decode_meteo_fid11(
-            ts_ms, source, station, mmsi, dac, fid, b,
+            ts_ms, &src, station, mmsi, dac, fid, b,
         ))),
-        // Any other DAC/FID (or a truncated met/hydro): keep the header and the
-        // application payload as hex so nothing is lost.
         _ => Decoded::Binary(Box::new(BinaryRow {
             ts_ms,
-            source: source.to_string(),
+            source: src,
             station,
             msg_type: 8,
             mmsi,
@@ -542,7 +528,7 @@ fn decode_type8(ts_ms: i64, source: &str, station: Option<String>, b: &Bits) -> 
 #[allow(clippy::too_many_arguments)]
 fn decode_meteo_fid31(
     ts_ms: i64,
-    source: &str,
+    source: &Arc<str>,
     station: Option<String>,
     mmsi: u32,
     dac: u16,
@@ -554,7 +540,7 @@ fn decode_meteo_fid31(
     let hilbert = lat31.and_then(|lat| lon31.and_then(|lon| lat_lon_to_hilbert(lat, lon)));
     MeteoRow {
         ts_ms,
-        source: source.to_string(),
+        source: source.clone(),
         station,
         msg_type: 8,
         mmsi,
@@ -609,7 +595,7 @@ fn decode_meteo_fid31(
 #[allow(clippy::too_many_arguments)]
 fn decode_meteo_fid11(
     ts_ms: i64,
-    source: &str,
+    source: &Arc<str>,
     station: Option<String>,
     mmsi: u32,
     dac: u16,
@@ -621,7 +607,7 @@ fn decode_meteo_fid11(
     let hilbert = lat11.and_then(|lat| lon11.and_then(|lon| lat_lon_to_hilbert(lat, lon)));
     MeteoRow {
         ts_ms,
-        source: source.to_string(),
+        source: source.clone(),
         station,
         msg_type: 8,
         mmsi,
@@ -695,10 +681,7 @@ mod tests {
 
     #[test]
     fn decodes_class_a_position() {
-        let mut parser = NmeaParser::new();
-        // Canonical class A position report (AIVDM reference example).
         let decoded = decode_payload(
-            &mut parser,
             1_700_000_000_000,
             "norway",
             "!AIVDM,1,1,,A,15RTgt0PAso;90TKcjM8h6g208CQ,0*4A",
@@ -706,7 +689,7 @@ mod tests {
         match decoded {
             Decoded::Position(row) => {
                 assert_eq!(row.ts_ms, 1_700_000_000_000);
-                assert_eq!(row.source, "norway");
+                assert_eq!(row.source.as_ref(), "norway");
                 assert_eq!(row.msg_type, 1, "type-1 position report");
                 assert_eq!(row.mmsi, 371_798_000);
                 let lat = row.latitude.expect("latitude");
@@ -720,10 +703,7 @@ mod tests {
 
     #[test]
     fn decodes_position_with_tag_block_prefix() {
-        let mut parser = NmeaParser::new();
-        // The shape ais-normalize emits: rebuilt \c:\ tag block + sentence.
         let decoded = decode_payload(
-            &mut parser,
             1_700_000_000_000,
             "norway",
             r"\c:1700000000*5E\!AIVDM,1,1,,A,15RTgt0PAso;90TKcjM8h6g208CQ,0*4A",
@@ -733,40 +713,29 @@ mod tests {
 
     #[test]
     fn decodes_static_voyage_data_from_combined_sentence() {
-        let mut parser = NmeaParser::new();
-        // A type 5 message pre-combined into a single sentence, the way
-        // ais-normalize emits it (payload of both fragments concatenated).
         let combined = "!AIVDM,1,1,,A,569qcJP000000000000P4V1QDr3777800000000o0p=220DP0388888888881CRR@CACP08,2*10";
-        let decoded = decode_payload(&mut parser, 1_700_000_000_000, "norway", combined);
+        let decoded = decode_payload(1_700_000_000_000, "norway", combined);
         match decoded {
             Decoded::Static(row) => {
                 assert!(row.mmsi > 0);
             }
-            Decoded::Failed => {
-                // Checksum of this hand-built sentence may not match; the
-                // multi-part test below is authoritative.
-            }
+            Decoded::Failed => {}
             _ => panic!("expected static row or checksum failure"),
         }
     }
 
     #[test]
     fn buffers_and_completes_raw_fragments() {
-        let mut parser = NmeaParser::new();
         let part1 = "!AIVDM,2,1,3,B,55P5TL01VIaAL@7WKO@mBplU@<PDhh000000001S;AJ::4A80?4i@E53,0*3E";
         let part2 = "!AIVDM,2,2,3,B,1@0000000000000,2*55";
-        match decode_payload(&mut parser, 1_700_000_000_000, "s", part1) {
+        match decode_payload(1_700_000_000_000, "s", part1) {
             Decoded::Incomplete => {}
             _ => panic!("first fragment should be Incomplete"),
         }
-        match decode_payload(&mut parser, 1_700_000_000_000, "s", part2) {
+        match decode_payload(1_700_000_000_000, "s", part2) {
             Decoded::Static(row) => {
                 assert_eq!(row.mmsi, 369_190_000);
                 assert!(row.name.is_some());
-                // Raw 2-fragment static: the completing fragment carries no
-                // type, so msg_type falls back to the decoded class (a static
-                // type, 5 or 24). The exact value needs combined/normalized
-                // input — the pipeline's normal path.
                 assert!(matches!(row.msg_type, 5 | 24), "got {}", row.msg_type);
             }
             _ => panic!("second fragment should complete the static message"),
@@ -775,22 +744,16 @@ mod tests {
 
     #[test]
     fn garbage_is_failed_not_panic() {
-        let mut parser = NmeaParser::new();
         assert!(matches!(
-            decode_payload(
-                &mut parser,
-                0,
-                "s",
-                "$PGHP,1,2013,1,9,4,37,45,298,,110,,1,26*19"
-            ),
+            decode_payload(0, "s", "$PGHP,1,2013,1,9,4,37,45,298,,110,,1,26*19"),
             Decoded::Failed | Decoded::Other
         ));
         assert!(matches!(
-            decode_payload(&mut parser, 0, "s", "not a sentence at all"),
+            decode_payload(0, "s", "not a sentence at all"),
             Decoded::Failed
         ));
         assert!(matches!(
-            decode_payload(&mut parser, 0, "s", ""),
+            decode_payload(0, "s", ""),
             Decoded::Failed
         ));
     }
@@ -899,12 +862,9 @@ mod tests {
 
     #[test]
     fn fid31_decodes_through_the_full_sentence_path() {
-        // Re-armor the same message into an AIVDM sentence and run the whole
-        // decode_payload path (extract → peek type 8 → decode).
         let armored = fid31_sample().armored();
         let sentence = format!("!AIVDM,1,1,,A,{armored},0*00");
-        let mut parser = NmeaParser::new();
-        match decode_payload(&mut parser, 42, "s", &sentence) {
+        match decode_payload(42, "s", &sentence) {
             Decoded::Meteo(m) => {
                 assert_eq!(m.ts_ms, 42);
                 assert_eq!(m.fid, 31);

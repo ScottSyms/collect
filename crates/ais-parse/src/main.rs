@@ -5,7 +5,6 @@ use clap::Parser;
 use collect_core::dataset::{self, DatasetFile, PartitionKey};
 use collect_core::state;
 use collect_core::{PartitionGranularity, S3ConnectionArgs, S3Storage};
-use nmea_parser::NmeaParser;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use rayon::prelude::*;
 use std::collections::VecDeque;
@@ -764,7 +763,6 @@ fn default_concurrency() -> usize {
     std::thread::available_parallelism()
         .map(|count| count.get())
         .unwrap_or(4)
-        .clamp(1, 8)
 }
 
 /// `(output rel path like "positions/year=.../pos-....parquet", local file
@@ -965,12 +963,10 @@ fn process_parquet_file(
             })
             .collect();
 
-        let mut decoded: Vec<(usize, Decoded)> = (0..n)
+        let decoded: Vec<(usize, Decoded)> = (0..n)
             .into_par_iter()
             .map(|i| {
-                let mut local_parser = NmeaParser::new();
                 let result = decode_payload(
-                    &mut local_parser,
                     ts_col.value(i),
                     sources[i],
                     payload_col.value(i),
@@ -978,8 +974,6 @@ fn process_parquet_file(
                 (i, result)
             })
             .collect();
-
-        decoded.sort_by_key(|(i, _)| *i);
 
         stats.rows_in += n as u64;
         for (_, result) in decoded {
