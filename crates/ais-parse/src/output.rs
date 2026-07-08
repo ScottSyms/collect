@@ -511,7 +511,7 @@ impl MeteoWriter {
                     .with_timezone("UTC"),
             ),
             Arc::new(StringArray::from(
-                r.iter().map(|x| x.source.as_str()).collect::<Vec<_>>(),
+                r.iter().map(|x| x.source.as_ref()).collect::<Vec<_>>(),
             )),
             Arc::new(UInt8Array::from(
                 r.iter().map(|x| x.msg_type).collect::<Vec<_>>(),
@@ -620,7 +620,7 @@ impl BinaryWriter {
                     .with_timezone("UTC"),
             ),
             Arc::new(StringArray::from(
-                r.iter().map(|x| x.source.as_str()).collect::<Vec<_>>(),
+                r.iter().map(|x| x.source.as_ref()).collect::<Vec<_>>(),
             )),
             Arc::new(UInt8Array::from(
                 r.iter().map(|x| x.msg_type).collect::<Vec<_>>(),
@@ -713,10 +713,10 @@ impl AtonWriter {
         let r = &self.rows;
         let columns: Vec<ArrayRef> = vec![
             Arc::new(TimestampMillisecondArray::from(r.iter().map(|x| x.ts_ms).collect::<Vec<_>>()).with_timezone("UTC")),
-            Arc::new(StringArray::from(r.iter().map(|x| x.source.as_str()).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(r.iter().map(|x| x.source.as_ref()).collect::<Vec<_>>())),
             Arc::new(UInt8Array::from(r.iter().map(|x| x.msg_type).collect::<Vec<_>>())),
             Arc::new(UInt32Array::from(r.iter().map(|x| x.mmsi).collect::<Vec<_>>())),
-            Arc::new(StringArray::from(r.iter().map(|x| x.ais_class.as_str()).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(r.iter().map(|x| x.ais_class.as_ref()).collect::<Vec<_>>())),
             Arc::new(StringArray::from(r.iter().map(|x| x.aid_type.as_str()).collect::<Vec<_>>())),
             Arc::new(StringArray::from(r.iter().map(|x| x.name.as_deref()).collect::<Vec<_>>())),
             Arc::new(StringArray::from(r.iter().map(|x| x.name_extension.as_deref()).collect::<Vec<_>>())),

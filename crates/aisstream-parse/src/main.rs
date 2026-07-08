@@ -8,6 +8,7 @@ use collect_core::{PartitionGranularity, S3ConnectionArgs, S3Storage};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use rayon::prelude::*;
 use simd_json::serde as simd_serde;
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::fs::File as StdFile;
 use std::path::{Path, PathBuf};
@@ -703,7 +704,6 @@ fn default_concurrency() -> usize {
     std::thread::available_parallelism()
         .map(|count| count.get())
         .unwrap_or(4)
-        .clamp(1, 8)
 }
 
 type PartitionOutputs = Vec<(String, PathBuf, u64)>;
@@ -854,22 +854,30 @@ fn process_parquet_file(
             })
             .collect();
 
-        let mut decoded: Vec<(usize, Decoded)> = (0..n)
+        thread_local! {
+            static JSON_BUF: RefCell<String> = const { RefCell::new(String::new()) };
+        }
+
+        let decoded: Vec<(usize, Decoded)> = (0..n)
             .into_par_iter()
             .map(|i| {
                 let payload_str = payload_col.value(i);
-                let mut buf = payload_str.to_string();
-                let ais_msg: crate::ais_stream::AisStreamMessage = match unsafe { simd_serde::from_str(&mut buf) } {
-                    Ok(msg) => msg,
-                    Err(_) => return (i, Decoded::Failed),
-                };
-                let msg_type = ais_msg.MessageType.as_str();
-                let result = decode_row(ts_col.value(i), sources[i], msg_type, &ais_msg.Message);
+                let result = JSON_BUF.with(|buf_cell| {
+                    let mut buf = buf_cell.borrow_mut();
+                    buf.clear();
+                    buf.push_str(payload_str);
+                    let mut ais_msg: crate::ais_stream::AisStreamMessage = match unsafe {
+                        simd_serde::from_str(&mut buf)
+                    } {
+                        Ok(msg) => msg,
+                        Err(_) => return Decoded::Failed,
+                    };
+                    let msg_type = ais_msg.MessageType.as_str();
+                    decode_row(ts_col.value(i), sources[i], msg_type, &mut ais_msg.Message)
+                });
                 (i, result)
             })
             .collect();
-
-        decoded.sort_by_key(|(i, _)| *i);
 
         stats.rows_in += n as u64;
         for (_, result) in decoded {
