@@ -43,9 +43,16 @@ struct Args {
     output_dir: Option<PathBuf>,
 
     /// S3 bucket to read the input dataset from, instead of --input-dir.
-    /// Repeatable to merge several buckets (all on the shared endpoint)
+    /// Repeatable to merge several buckets (all on the shared endpoint).
+    /// A `bucket/path` syntax is supported — the path component becomes that
+    /// bucket's own prefix, prepended to the shared `--input-s3-prefix`.
     #[arg(long)]
     input_s3_bucket: Vec<String>,
+
+    /// Per-bucket key prefix extracted from `input_s3_bucket` entries that
+    /// contain a `/`. Populated automatically by `split_s3_args()`.
+    #[arg(skip)]
+    input_s3_bucket_prefix: Vec<String>,
 
     /// Key prefix within the input S3 bucket; acts as the dataset root
     #[arg(long, default_value = "")]
@@ -182,25 +189,40 @@ impl Args {
         }
     }
 
-    /// Split `bucket/path` syntax in bucket arguments into separate bucket +
-    /// prefix. A bucket like `bronze/norway/dt=2026` becomes bucket=`bronze`
-    /// with prefix=`norway/dt=2026`.  The extracted prefix is prepended to any
-    /// existing `--*-prefix` value.
+    /// Split `bucket/path` syntax in bucket arguments. Each input bucket that
+    /// contains a `/` gets its path component stored in `input_s3_bucket_prefix`
+    /// (used per-bucket when listing), leaving the shared `input_s3_prefix`
+    /// unchanged. A single output bucket path is merged into the output prefix.
     fn split_s3_args(&mut self) {
-        let mut merged = self.input_s3_prefix.clone();
+        self.input_s3_bucket_prefix.clear();
         let mut buckets = Vec::with_capacity(self.input_s3_bucket.len());
+        let mut prefixes = Vec::with_capacity(self.input_s3_bucket.len());
         for b in self.input_s3_bucket.drain(..) {
-            let (bucket, pfx) = S3Storage::split_s3_path(&b, &merged);
-            merged = pfx;
+            let (bucket, pfx) = S3Storage::split_s3_path(&b, "");
             buckets.push(bucket);
+            prefixes.push(pfx);
         }
         self.input_s3_bucket = buckets;
-        self.input_s3_prefix = merged;
+        self.input_s3_bucket_prefix = prefixes;
 
         if let Some(b) = self.output_s3_bucket.take() {
             let (bucket, pfx) = S3Storage::split_s3_path(&b, &self.output_s3_prefix);
             self.output_s3_bucket = Some(bucket);
             self.output_s3_prefix = pfx;
+        }
+    }
+
+    /// Combine the per-bucket prefix (extracted from a `bucket/path` arg) with
+    /// the shared `--input-s3-prefix` to get the effective listing prefix for
+    /// the bucket at `index`.
+    fn effective_input_prefix(&self, index: usize) -> String {
+        let pfx = self.input_s3_bucket_prefix[index].trim_matches('/');
+        let shared = self.input_s3_prefix.trim_matches('/');
+        match (pfx.is_empty(), shared.is_empty()) {
+            (true, true) => String::new(),
+            (true, false) => shared.to_string(),
+            (false, true) => pfx.to_string(),
+            (false, false) => format!("{pfx}/{shared}"),
         }
     }
 }
@@ -537,9 +559,10 @@ async fn main() -> Result<()> {
         // land in one group.
         let mut entries: Vec<dataset::S3Entry> = Vec::new();
         for (index, storage) in input_storages.iter().enumerate() {
+            let effective_prefix = args.effective_input_prefix(index);
             let mut bucket_entries = dataset::list_s3_parquet_entries(
                 storage,
-                &args.input_s3_prefix,
+                &effective_prefix,
                 args.partition,
                 args.source.as_deref(),
                 partition_filter,
@@ -558,10 +581,21 @@ async fn main() -> Result<()> {
 
         if entries.is_empty() {
             eprintln!(
-                "No matching Parquet objects found across {} bucket(s) under prefix {:?}.",
+                "No matching Parquet objects found in {} bucket(s).",
                 input_storages.len(),
-                args.input_s3_prefix
             );
+            for (index, storage) in input_storages.iter().enumerate() {
+                let effective = args.effective_input_prefix(index);
+                eprintln!(
+                    "  s3://{}{}",
+                    storage.bucket_name(),
+                    if effective.is_empty() {
+                        String::new()
+                    } else {
+                        format!("/{effective}")
+                    }
+                );
+            }
             return Ok(());
         }
         eprintln!("Found {} matching object(s).", entries.len());
