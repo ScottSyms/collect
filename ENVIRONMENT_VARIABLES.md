@@ -78,6 +78,24 @@ Most command-line parameters can be configured using environment variables, maki
 
 - `S3_BUCKET`: S3 bucket name for remote storage (enables S3 upload)
   - Example: `S3_BUCKET=maritime-data`
+  - Supports `bucket/path` syntax — the path component becomes the key prefix
+
+- `S3_PREFIX`: Optional key prefix for S3 uploads (appended to any path from `S3_BUCKET`)
+  - Example: `S3_PREFIX=norway`
+
+- `INPUT_S3_BUCKET`: Input S3 bucket for batch processing tools (ais-normalize, ais-parse, aisstream-parse)
+  - Example: `INPUT_S3_BUCKET=bronze/norway`
+  - Comma-separated for multiple buckets: `INPUT_S3_BUCKET=bronze/norway,duplicate`
+  - Supports `bucket/path` syntax per entry
+
+- `INPUT_S3_PREFIX`: Key prefix within the input S3 bucket
+  - Example: `INPUT_S3_PREFIX=raw-data`
+
+- `OUTPUT_S3_BUCKET`: Output S3 bucket for batch processing tools
+  - Supports `bucket/path` syntax
+
+- `OUTPUT_S3_PREFIX`: Key prefix within the output S3 bucket
+  - Example: `OUTPUT_S3_PREFIX=silver`
 
 - `S3_ENDPOINT`: S3 endpoint URL (for MinIO or custom S3-compatible storage)
   - Example: `S3_ENDPOINT=https://minio.example.com`
@@ -94,6 +112,20 @@ Most command-line parameters can be configured using environment variables, maki
 - `S3_SECRET_KEY`: S3 secret access key
   - Example: `S3_SECRET_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY`
   - Can also use standard AWS environment variable `AWS_SECRET_ACCESS_KEY`
+
+### Batch Processing Options
+
+- `INCREMENTAL`: Enable watermark-based incremental processing
+  - Example: `INCREMENTAL=true`
+
+- `SINCE_HOURS`: Rolling window for first incremental run (hours)
+  - Example: `SINCE_HOURS=2`
+
+- `DEDUP`: Enable dedup merge on output partitions (ais-normalize)
+  - Example: `DEDUP=false`
+
+- `CONSOLIDATE_AIS`: Enable AIS multi-part message consolidation on ingest (collect-socket, collect-file)
+  - Example: `CONSOLIDATE_AIS=true`
 
 ## Docker Compose Examples
 

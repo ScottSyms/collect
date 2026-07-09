@@ -55,6 +55,8 @@ stays correct and race-free.
 | `high_accuracy` | boolean | position accuracy flag |
 | `raim` | boolean | |
 | `special_manoeuvre` | boolean, nullable | |
+| `station` | utf8, nullable | source/base station from NMEA tag block `s:` field |
+| `payload` | utf8 | the original NMEA sentence that produced this row |
 
 **`statics`** — one row per static/voyage report (AIS types 5 and 24):
 
@@ -71,6 +73,7 @@ stays correct and race-free.
 | `destination` | utf8, nullable | |
 | `eta` | timestamp (ms, UTC), nullable | |
 | `mothership_mmsi` | uint32, nullable | |
+| `payload` | utf8 | the original NMEA sentence that produced this row |
 
 **`meteo`** and **`binary`** — decoded from Type 8 Binary Broadcast messages;
 see [Type 8](#type-8-binary-broadcast) below.
@@ -108,10 +111,11 @@ ais-parse decodes the 6-bit payload itself. Two output datasets result:
   regional DACs, ...): the generic header (`mmsi`, `dac`, `fid`) plus the
   application payload retained as `payload_hex` (+ `payload_bits`), so nothing
   is lost and unrecognized subtypes can be decoded downstream later.
+  Every row also carries a `payload` column with the original NMEA sentence.
 
-Both datasets carry the same `ts`, `source`, `station`, and `msg_type` columns
-as the others (`msg_type` is 8 for every Type 8 row) and are partitioned by
-time only.
+Both datasets carry the same `ts`, `source`, `station`, `msg_type`, and
+`payload` columns as the others (`msg_type` is 8 for every Type 8 row) and are
+partitioned by time only.
 
 ### Tag block / base station
 
@@ -128,18 +132,20 @@ Multi-fragment Type 8 messages (up to 5 sentences) are decoded once
 pipeline order. ais-parse only decodes Type 8 from a combined/single sentence;
 a raw un-combined fragment is left alone.
 
-## Idempotent re-runs (partition replace)
+## Append-only re-runs (no partition replacement)
 
 Decoding never re-partitions: a bronze row's corrected `ts` already places it
-in its output time partition. ais-parse **replaces** each output partition it
-touches — all the sources landing in that partition are decoded together into
-one `positions` and one `statics` file, written first, then the prior run's
-files in that partition are deleted (objects, for S3 output). Because the
-partition is rebuilt as a whole (not per source), and decoding is
-deterministic, a re-run converges to the same result instead of accumulating
-duplicates. No dedup pass needed. In `--incremental` mode a partition is
-rebuilt when *any* of its sources has a new file, re-reading that partition's
-other sources so the replaced partition stays complete.
+in its output time partition. ais-parse **appends** uniquely-named files to each
+output partition it touches (files carry a timestamp + counter suffix). Old
+files from previous runs are left in place; downstream compaction consolidates
+them later. Because each run produces uniquely-named files, concurrent runs
+are safe, and a re-run accumulates new files alongside old ones without
+data loss. Row-level dedup (keyed on `(ts, mmsi, source-kind)`) prevents the
+same AIS message from appearing in multiple files when the watermark lap causes
+a partition to be re-read.
+
+In `--incremental` mode a partition is re-read when *any* of its sources has a
+new file, but dedup ensures no duplicate rows make it to the output.
 
 Don't run two instances against the same output concurrently (use
 `prohibit_overlap` in Nomad, as with the other batch tools).
@@ -153,6 +159,13 @@ part arrives (rows within a partition file are time-ordered, so pairs almost
 always meet). Fragments whose partner never arrives are counted `incomplete`.
 When a partition pools several sources, fragment state is reset at each source
 boundary so multi-part sequence ids can't collide across sources.
+
+When processing raw bronze data with `--consolidate-ais`, the `AisConsolidator`
+explicitly reassembles multi-part fragments into single sentences **before**
+they reach the NMEA parser. This reduces `Incomplete` results and produces
+cleaner output. The consolidator handles `$PGHP` timestamp lines, tag-block
+`c:` carry-forward, and `s:` station preservation, with an 8K-group buffer
+and oldest-first eviction.
 
 ## Usage
 
@@ -178,8 +191,8 @@ for the shared semantics of each group:
 
 | Flag | Default | Purpose |
 |------|---------|---------|
-| `--input-dir` (repeatable) / `--input-s3-bucket` (repeatable) + `--input-s3-prefix` | — | bronze input root(s); exactly one kind required. Env `INPUT_S3_BUCKET` (comma-separated), `INPUT_S3_PREFIX` |
-| `--output-dir` / `--output-s3-bucket` + `--output-s3-prefix` | — | silver output root; exactly one required. Env `OUTPUT_S3_BUCKET`, `OUTPUT_S3_PREFIX` |
+| `--input-dir` (repeatable) / `--input-s3-bucket` (repeatable) + `--input-s3-prefix` | — | bronze input root(s); exactly one kind required. Env `INPUT_S3_BUCKET` (comma-separated, supports `bucket/path` syntax), `INPUT_S3_PREFIX` |
+| `--output-dir` / `--output-s3-bucket` + `--output-s3-prefix` | — | silver output root; exactly one required. Env `OUTPUT_S3_BUCKET` (supports `bucket/path` syntax), `OUTPUT_S3_PREFIX` |
 | `--s3-endpoint`, `--s3-region`, `--s3-access-key`, `--s3-secret-key`, `--s3-disable-tls` | — | shared S3 connection (env equivalents as in ais-normalize) |
 | `--partition` | `day` | input layout granularity; output trees mirror it |
 | `--source`, `--year`…`--minute` | *(all)* | partition slice, same rules as ais-normalize |
@@ -188,6 +201,8 @@ for the shared semantics of each group:
 | `--batch-size` | `8192` | Parquet read batch rows |
 | `--compression-level` | `5` | Zstd level for output |
 | `--concurrency` | cores, clamped `[1, 8]` | partitions decoded in parallel |
+| `--output-prefix` | `ais` | output file name prefix (added before tree suffix) |
+| `--consolidate-ais` | *(off)* | reassemble fragmented NMEA sentences before decoding |
 
 ### Run summary
 
@@ -201,6 +216,7 @@ for the shared semantics of each group:
 | `other decoded` | valid messages of classes not materialized |
 | `incomplete fragments` | multi-part fragments whose partner never arrived |
 | `unparsed` | sentences the parser rejected |
+| `deduped (dropped)` | duplicate rows suppressed by row-level dedup |
 
 A quick way to eyeball decoded output:
 

@@ -58,7 +58,8 @@ cargo run -p collect-socket -- \
 
 | Option | Description | Required | Default |
 |--------|-------------|----------|---------|
-| `--s3-bucket` | S3 bucket name | Yes (to enable S3) | None |
+| `--s3-bucket` | S3 bucket name (supports `bucket/path` syntax — the path component becomes the key prefix) | Yes (to enable S3) | None |
+| `--s3-prefix` | Optional key prefix appended to the bucket path from `--s3-bucket` | No | "" |
 | `--s3-region` | AWS region | No | us-east-1 |
 | `--s3-endpoint` | Custom S3 endpoint URL | No | AWS S3 |
 | `--s3-access-key` | S3 access key ID | No* | From env/credentials |
@@ -85,7 +86,8 @@ The application supports standard AWS environment variables plus custom ones:
 - `AWS_ACCESS_KEY_ID` or `S3_ACCESS_KEY` - AWS access key ID
 - `AWS_SECRET_ACCESS_KEY` or `S3_SECRET_KEY` - AWS secret access key  
 - `S3_REGION` - AWS region (default: us-east-1)
-- `S3_BUCKET` - S3 bucket name
+- `S3_BUCKET` - S3 bucket name (supports `bucket/path` syntax)
+- `S3_PREFIX` - Optional key prefix
 - `S3_ENDPOINT` - Custom S3 endpoint URL
 - `S3_DISABLE_TLS` - Set to `true` or `1` to use HTTP instead of HTTPS
 - `KEEP_LOCAL` - Set to `true` or `1` to keep local files after upload
@@ -196,7 +198,7 @@ On upload failure, detailed error information is provided:
 ### Common Issues
 
 1. **Credentials Error**: Ensure AWS credentials are properly configured
-2. **Bucket Not Found**: Create the S3 bucket before running the application  
+2. **Bucket Not Found**: The application will attempt to create it automatically on startup
 3. **Permission Denied**: Check IAM policies for S3 access
 4. **Endpoint Error**: Verify the S3 endpoint URL for custom services
 5. **Region Mismatch**: Ensure the region matches your bucket's region
