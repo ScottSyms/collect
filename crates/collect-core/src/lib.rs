@@ -1418,11 +1418,45 @@ impl S3Storage {
 
         let client = S3Client::from_conf(s3_config);
 
+        Self::ensure_bucket(&client, &bucket).await?;
+
         Ok(S3Storage {
             client,
             bucket,
             keep_local,
         })
+    }
+
+    /// Create the target bucket if it does not already exist. Safe to call
+    /// concurrently: a `BucketAlreadyOwnedByYou`/`BucketAlreadyExists` race is
+    /// treated as success. Works against both AWS S3 and S3-compatible stores
+    /// (MinIO/rustfs) since it uses a plain `CreateBucket` with no location
+    /// constraint under path-style addressing.
+    async fn ensure_bucket(client: &S3Client, bucket: &str) -> Result<()> {
+        match client.head_bucket().bucket(bucket).send().await {
+            Ok(_) => return Ok(()),
+            Err(err) => {
+                // Any error (NotFound, 403, etc.) falls through to a create
+                // attempt; if the bucket truly exists but we lack HeadBucket
+                // permission, CreateBucket returns AlreadyOwned which we accept.
+                let _ = err;
+            }
+        }
+
+        match client.create_bucket().bucket(bucket).send().await {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                let service_err = err.into_service_error();
+                if service_err.is_bucket_already_owned_by_you()
+                    || service_err.is_bucket_already_exists()
+                {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!(service_err))
+                        .with_context(|| format!("creating S3 bucket {bucket}"))
+                }
+            }
+        }
     }
 
     /// True when uploaded files are kept on local disk after upload.
