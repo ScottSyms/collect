@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use arrow::array::{ArrayBuilder, StringBuilder, TimestampMillisecondArray, TimestampMillisecondBuilder};
 use arrow::compute::{sort_to_indices, take, SortOptions};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -1433,6 +1433,17 @@ impl S3Storage {
     /// (MinIO/rustfs) since it uses a plain `CreateBucket` with no location
     /// constraint under path-style addressing.
     async fn ensure_bucket(client: &S3Client, bucket: &str) -> Result<()> {
+        if bucket.contains('/') {
+            let (parsed_bucket, prefix) = S3Storage::split_s3_path(bucket, "");
+            bail!(
+                "'{bucket}' contains a '/' and is not a valid S3 bucket name. \
+                 The bucket is '{parsed_bucket}' and the remainder is the key \
+                 prefix. You can pass them as a single argument or use the \
+                 dedicated --*-prefix flag, e.g.\n  --input-s3-bucket \
+                 {parsed_bucket} --input-s3-prefix {prefix}",
+            );
+        }
+
         match client.head_bucket().bucket(bucket).send().await {
             Ok(_) => return Ok(()),
             Err(err) => {
@@ -1456,6 +1467,26 @@ impl S3Storage {
                         .with_context(|| format!("creating S3 bucket {bucket}"))
                 }
             }
+        }
+    }
+
+    /// Split a `bucket/key/path` string into (`bucket`, `prefix`). If there is
+    /// no `/`, the prefix is empty. The prefix is returned without a leading
+    /// or trailing `/`. The function is idempotent: if `prefix` is already
+    /// non-empty, the extracted path is prepended.
+    pub fn split_s3_path(bucket: &str, existing_prefix: &str) -> (String, String) {
+        match bucket.find('/') {
+            Some(slash) => {
+                let b = bucket[..slash].to_string();
+                let p = bucket[slash + 1..].trim_matches('/').to_string();
+                let merged = if existing_prefix.is_empty() {
+                    p
+                } else {
+                    format!("{}/{}", p, existing_prefix.trim_matches('/'))
+                };
+                (b, merged)
+            }
+            None => (bucket.to_string(), existing_prefix.to_string()),
         }
     }
 

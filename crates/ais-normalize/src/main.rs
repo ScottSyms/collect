@@ -181,6 +181,28 @@ impl Args {
             }
         }
     }
+
+    /// Split `bucket/path` syntax in bucket arguments into separate bucket +
+    /// prefix. A bucket like `bronze/norway/dt=2026` becomes bucket=`bronze`
+    /// with prefix=`norway/dt=2026`.  The extracted prefix is prepended to any
+    /// existing `--*-prefix` value.
+    fn split_s3_args(&mut self) {
+        let mut merged = self.input_s3_prefix.clone();
+        let mut buckets = Vec::with_capacity(self.input_s3_bucket.len());
+        for b in self.input_s3_bucket.drain(..) {
+            let (bucket, pfx) = S3Storage::split_s3_path(&b, &merged);
+            merged = pfx;
+            buckets.push(bucket);
+        }
+        self.input_s3_bucket = buckets;
+        self.input_s3_prefix = merged;
+
+        if let Some(b) = self.output_s3_bucket.take() {
+            let (bucket, pfx) = S3Storage::split_s3_path(&b, &self.output_s3_prefix);
+            self.output_s3_bucket = Some(bucket);
+            self.output_s3_prefix = pfx;
+        }
+    }
 }
 
 /// Derive the S3 key for a file written under `scratch_root` (`root/rel/dir/file`
@@ -273,6 +295,7 @@ async fn main() -> Result<()> {
 
     let mut args = Args::parse();
     args.apply_env();
+    args.split_s3_args();
     let status_mode = StatusMode::from_tty(!args.noui && std::io::stdout().is_terminal());
 
     match (args.input_dir.is_empty(), args.input_s3_bucket.is_empty()) {
