@@ -152,6 +152,23 @@ struct FragmentGroup {
     tag_block: Option<String>,
 }
 
+/// Configuration for `AisConsolidator`. Each feature can be independently
+/// enabled. When both are disabled the transformer is a no-op.
+pub struct AisConsolidatorConfig {
+    /// Process `$PGHP` timestamp lines and tag-block `c:` carry-forward.
+    /// When on, timestamps from `$PGHP` and `c:` override the arrival timestamp.
+    pub process_timestamps: bool,
+    /// Buffer and reassemble multi-part AIS sentences (fragments with
+    /// fragment_count > 1). When off, each fragment is emitted individually.
+    pub consolidate_multipart: bool,
+}
+
+impl Default for AisConsolidatorConfig {
+    fn default() -> Self {
+        AisConsolidatorConfig { process_timestamps: true, consolidate_multipart: true }
+    }
+}
+
 /// AIS multi-part message consolidator. Implements [`LineTransformer`] for use
 /// in `IngestOptions.line_transformer`.
 ///
@@ -159,13 +176,14 @@ struct FragmentGroup {
 /// when complete, handles `$PGHP` timestamp lines, and carries forward tag-
 /// block `c:` and `s:` fields to the consolidated output.
 pub struct AisConsolidator {
+    config: AisConsolidatorConfig,
     groups: std::collections::HashMap<String, FragmentGroup>,
     pending_timestamp_ms: Option<i64>,
 }
 
 impl AisConsolidator {
-    pub fn new() -> Self {
-        AisConsolidator { groups: std::collections::HashMap::new(), pending_timestamp_ms: None }
+    pub fn new(config: AisConsolidatorConfig) -> Self {
+        AisConsolidator { config, groups: std::collections::HashMap::new(), pending_timestamp_ms: None }
     }
 
     fn emit_group(&mut self, group: FragmentGroup, out: &mut Vec<(i64, String)>) {
@@ -195,10 +213,11 @@ impl LineTransformer for AisConsolidator {
         let mut out = Vec::new();
 
         let (tag_prefix, sentence) = split_tag_block(line);
-        let pghp_ts = parse_pghp_timestamp_ms(sentence);
-        let tag_ts = if tag_prefix.is_empty() { None } else { parse_tag_block_timestamp_ms(tag_prefix) };
+        let pghp_ts = if self.config.process_timestamps { parse_pghp_timestamp_ms(sentence) } else { None };
+        let tag_ts = if self.config.process_timestamps && !tag_prefix.is_empty()
+            { parse_tag_block_timestamp_ms(tag_prefix) } else { None };
 
-        // $PGHP timestamp line
+        // $PGHP timestamp line (only when process_timestamps is on)
         if pghp_ts.is_some() {
             self.pending_timestamp_ms = pghp_ts;
             out.push((pghp_ts.unwrap(), line.to_string()));
@@ -215,20 +234,30 @@ impl LineTransformer for AisConsolidator {
         }
 
         // Resolve output timestamp: tag block c: > pending > arrival
-        let resolved_ts = if let Some(t) = tag_ts {
-            if meta.is_fragmented() { self.pending_timestamp_ms = Some(t); }
-            else { self.pending_timestamp_ms = None; }
-            t
-        } else if let Some(t) = self.pending_timestamp_ms {
-            if meta.is_fragmented() && meta.fragment_number == meta.fragment_count {
-                self.pending_timestamp_ms = None;
-            } else if !meta.is_fragmented() {
-                self.pending_timestamp_ms = None;
+        let resolved_ts = if self.config.process_timestamps {
+            if let Some(t) = tag_ts {
+                if meta.is_fragmented() { self.pending_timestamp_ms = Some(t); }
+                else { self.pending_timestamp_ms = None; }
+                t
+            } else if let Some(t) = self.pending_timestamp_ms {
+                if meta.is_fragmented() && meta.fragment_number == meta.fragment_count {
+                    self.pending_timestamp_ms = None;
+                } else if !meta.is_fragmented() {
+                    self.pending_timestamp_ms = None;
+                }
+                t
+            } else {
+                arrival_ts_ms
             }
-            t
         } else {
             arrival_ts_ms
         };
+
+        // When multipart consolidation is off, emit every sentence directly
+        if !self.config.consolidate_multipart {
+            out.push((resolved_ts, line.to_string()));
+            return out;
+        }
 
         // Single-sentence AIS — emit directly
         if !meta.is_fragmented() {
@@ -263,6 +292,8 @@ impl LineTransformer for AisConsolidator {
             if fn_ >= 1 && fn_ <= fc {
                 slots[fn_] = Some(sentence.to_string());
             }
+            // station is always preserved when consolidating, regardless of
+            // process_timestamps
             let station = parse_tag_block_field(tag_prefix, "s");
             let tb = match (tag_ts, station) {
                 (Some(t), Some(s)) => Some(format!("c:{},s:{}", t / 1000, s)),

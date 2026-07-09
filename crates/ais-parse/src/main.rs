@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use arrow::array::{Array, StringArray, TimestampMillisecondArray};
 use chrono::TimeZone;
 use clap::Parser;
-use collect_core::ais_consolidate::AisConsolidator;
+use collect_core::ais_consolidate::{AisConsolidator, AisConsolidatorConfig};
 use collect_core::dataset::{self, DatasetFile, PartitionKey};
 use collect_core::state;
 use collect_core::LineTransformer;
@@ -145,6 +145,11 @@ struct Args {
     /// fragmented NMEA sentences into single sentences before parsing).
     #[arg(long)]
     consolidate_ais: bool,
+
+    /// Process $PGHP timestamp lines and tag-block c: carry-forward to
+    /// correct row timestamps. Independent of --consolidate-ais.
+    #[arg(long)]
+    process_timestamps: bool,
 }
 
 impl Args {
@@ -645,6 +650,7 @@ async fn main() -> Result<()> {
                 let output_root_for_task = output_root.clone();
                 let output_prefix_for_task = output_prefix.clone();
                 let consolidate_ais = args.consolidate_ais;
+                let process_timestamps = args.process_timestamps;
                 let result = tokio::task::spawn_blocking(move || {
                     process_partition(
                         partition_key,
@@ -654,6 +660,7 @@ async fn main() -> Result<()> {
                         compression_level,
                         &output_prefix_for_task,
                         consolidate_ais,
+                        process_timestamps,
                     )
                 })
                 .await
@@ -818,6 +825,7 @@ fn process_partition(
     compression_level: i32,
     output_prefix: &str,
     consolidate_ais: bool,
+    process_timestamps: bool,
 ) -> Result<(ParseStats, PartitionOutputs)> {
     let rel_dir = partition_key.relative_dir_time_only();
     let dir_for = |tree: &str| output_root.join(tree).join(&rel_dir);
@@ -848,6 +856,7 @@ fn process_partition(
             batch_size,
             &mut seen,
             consolidate_ais,
+            process_timestamps,
         )
         .with_context(|| format!("processing {}", file.path.display()))?;
     }
@@ -905,6 +914,7 @@ fn process_parquet_file(
     batch_size: usize,
     seen: &mut HashSet<DedupKey>,
     consolidate_ais: bool,
+    process_timestamps: bool,
 ) -> Result<()> {
     let file = StdFile::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut reader = ParquetRecordBatchReaderBuilder::try_new(file)
@@ -918,7 +928,10 @@ fn process_parquet_file(
     // column (present in normalized data, per-row after a dedup merge pooled
     // several sources) takes precedence; bronze has none, so we fall back to
     // the source parsed from the file's partition path.
-    let mut consolidator = if consolidate_ais { Some(AisConsolidator::new()) } else { None };
+    let mut consolidator = if consolidate_ais || process_timestamps { Some(AisConsolidator::new(AisConsolidatorConfig {
+        process_timestamps,
+        consolidate_multipart: consolidate_ais,
+    })) } else { None };
 
     while let Some(batch) = reader.next().transpose()? {
         let schema = batch.schema();

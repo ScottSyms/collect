@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use clap::Parser;
+use collect_core::ais_consolidate::{AisConsolidator, AisConsolidatorConfig};
 use collect_core::{
-    ais_consolidate::AisConsolidator, default_source_from_path, health_file_path, run_ingest,
-    update_health_status_async, CommonCliArgs, IngestOptions, S3CliArgs,
+    default_source_from_path, health_file_path, run_ingest, update_health_status_async,
+    CommonCliArgs, IngestOptions, S3CliArgs,
 };
 use std::collections::VecDeque;
 use std::io::IsTerminal;
@@ -50,6 +51,11 @@ struct Args {
     /// NMEA sentences in-line before writing to the Parquet batch).
     #[arg(long)]
     consolidate_ais: bool,
+
+    /// Process $PGHP timestamp lines and tag-block c: carry-forward to
+    /// correct row timestamps. Independent of --consolidate-ais.
+    #[arg(long)]
+    process_timestamps: bool,
 }
 
 #[tokio::main]
@@ -99,6 +105,7 @@ async fn main() -> Result<()> {
         status_mode,
         args.concurrency,
         args.consolidate_ais,
+        args.process_timestamps,
     )
     .await
 }
@@ -111,6 +118,7 @@ async fn run_file_ingest(
     status_mode: status::StatusMode,
     concurrency: Option<usize>,
     consolidate_ais: bool,
+    process_timestamps: bool,
 ) -> Result<()> {
     let manifest_path = completion_manifest::manifest_path(&common.out_dir);
     let completed = match completion_manifest::load_completed(&manifest_path) {
@@ -180,8 +188,11 @@ async fn run_file_ingest(
         // The parallel path sweeps once below; per-worker sweeps would race
         // over the same out_dir.
         sweep_orphans: false,
-        line_transformer: if consolidate_ais {
-            Some(Box::new(AisConsolidator::new()))
+        line_transformer: if consolidate_ais || process_timestamps {
+            Some(Box::new(AisConsolidator::new(AisConsolidatorConfig {
+                process_timestamps,
+                consolidate_multipart: consolidate_ais,
+            })))
         } else {
             None
         },
@@ -230,8 +241,11 @@ async fn run_file_ingest(
                 shutdown: Some(stop.clone()),
                 write_workers: None,
                 sweep_orphans: true,
-                line_transformer: if consolidate_ais {
-                    Some(Box::new(AisConsolidator::new()))
+                line_transformer: if consolidate_ais || process_timestamps {
+                    Some(Box::new(AisConsolidator::new(AisConsolidatorConfig {
+                        process_timestamps,
+                        consolidate_multipart: consolidate_ais,
+                    })))
                 } else {
                     None
                 },
@@ -261,6 +275,7 @@ async fn run_file_ingest(
     }
 
     let use_consolidator = consolidate_ais;
+    let use_timestamps = process_timestamps;
     run_parallel_file_ingest(
         sources,
         options,
@@ -271,6 +286,7 @@ async fn run_file_ingest(
         status_mode,
         stop,
         use_consolidator,
+        use_timestamps,
     )
     .await
 }
@@ -285,6 +301,7 @@ async fn run_parallel_file_ingest(
     status_mode: status::StatusMode,
     stop: Arc<AtomicBool>,
     consolidate_ais: bool,
+    process_timestamps: bool,
 ) -> Result<()> {
     let running = Arc::new(AtomicBool::new(true));
     update_health_status_async(&health_file, true).await?;
@@ -367,8 +384,11 @@ async fn run_parallel_file_ingest(
         let completed_files = completed_files.clone();
         let manifest_path = manifest_path.clone();
         let mut worker_options = options.clone();
-        worker_options.line_transformer = if consolidate_ais {
-            Some(Box::new(AisConsolidator::new()))
+        worker_options.line_transformer = if consolidate_ais || process_timestamps {
+            Some(Box::new(AisConsolidator::new(AisConsolidatorConfig {
+                process_timestamps,
+                consolidate_multipart: consolidate_ais,
+            })))
         } else {
             None
         };

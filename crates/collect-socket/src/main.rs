@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use clap::Parser;
+use collect_core::ais_consolidate::{AisConsolidator, AisConsolidatorConfig};
 use collect_core::{
-    ais_consolidate::AisConsolidator, health_file_path, line_reader_from_async_read, run_ingest,
-    CommonCliArgs, IngestOptions, LineReader, LineSource, ReaderTransition, S3CliArgs,
+    health_file_path, line_reader_from_async_read, run_ingest, CommonCliArgs, IngestOptions,
+    LineReader, LineSource, ReaderTransition, S3CliArgs,
 };
 use std::cmp::min;
 use std::sync::atomic::AtomicBool;
@@ -30,10 +31,15 @@ struct Args {
     #[arg(short, long)]
     source: Option<String>,
 
-    /// Enable AIS multi-part message consolidation (reassembles fragmented
-    /// NMEA sentences in-line before writing to the Parquet batch).
+    /// Enable AIS multi-part message reassembly (combines fragmented NMEA
+    /// sentences into single sentences before writing).
     #[arg(long)]
     consolidate_ais: bool,
+
+    /// Process $PGHP timestamp lines and tag-block c: carry-forward to
+    /// correct row timestamps. Independent of --consolidate-ais.
+    #[arg(long)]
+    process_timestamps: bool,
 
     #[command(flatten)]
     common: CommonCliArgs,
@@ -177,8 +183,11 @@ async fn main() -> Result<()> {
             shutdown: None,
             write_workers: None,
             sweep_orphans: true,
-            line_transformer: if args.consolidate_ais {
-                Some(Box::new(AisConsolidator::new()))
+            line_transformer: if args.consolidate_ais || args.process_timestamps {
+                Some(Box::new(AisConsolidator::new(AisConsolidatorConfig {
+                    process_timestamps: args.process_timestamps,
+                    consolidate_multipart: args.consolidate_ais,
+                })))
             } else {
                 None
             },
