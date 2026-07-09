@@ -16,8 +16,11 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Comparison lap applied when selecting files against the watermark, to
-/// absorb `LastModified` jitter around the previous run's listing.
-pub const WATERMARK_LAP_MS: i64 = 60_000;
+/// absorb `LastModified` jitter around the previous run's listing. S3 is
+/// strongly consistent, so a small lap is enough: a file is at most re-processed
+/// once (when the very next run lands within this window), not for the full
+/// lap duration. Row-level dedup in the parsers handles that single overlap.
+pub const WATERMARK_LAP_MS: i64 = 5_000;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub struct WatermarkState {

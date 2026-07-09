@@ -9,7 +9,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use rayon::prelude::*;
 use simd_json::serde as simd_serde;
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fs::File as StdFile;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -36,6 +36,18 @@ static CANCELLED: AtomicBool = AtomicBool::new(false);
 fn is_cancelled() -> bool {
     CANCELLED.load(Ordering::Relaxed)
 }
+
+/// Unique key for row-level dedup within a single partition run. The leading
+/// discriminator keeps different row kinds from colliding on the same
+/// `(ts_ms, mmsi)` (a position and a static for one MMSI at one instant are
+/// distinct rows that must not suppress each other).
+///
+/// Layout: `(variant, ts_ms, mmsi, dac_fid, msg_type)`
+/// - variant: 0=Position, 1=Static, 2=Meteo, 3=Binary, 4=Aton
+/// - `dac_fid` packs `(dac << 8) | fid` for Meteo/Binary, else 0
+/// - `msg_type` carried for Position/Aton, else 0
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct DedupKey(u8, i64, u32, u32, u8);
 
 #[derive(Parser, Debug)]
 #[command(
@@ -742,6 +754,10 @@ fn process_partition(
     let mut binary = BinaryWriter::new(dir_for(BINARY_TREE), output_prefix, compression_level);
     let mut atons = AtonWriter::new(dir_for(ATONS_TREE), output_prefix, compression_level);
 
+    // Row-level dedup keyed on (ts, mmsi, source-kind) so the same AIS message
+    // seen in more than one input file for this partition is emitted once.
+    let mut seen: HashSet<DedupKey> = HashSet::new();
+
     for file in &files {
         process_parquet_file(
             &file.path,
@@ -755,6 +771,7 @@ fn process_partition(
                 atons: &mut atons,
             },
             batch_size,
+            &mut seen,
         )
         .with_context(|| format!("processing {}", file.path.display()))?;
     }
@@ -809,6 +826,7 @@ fn process_parquet_file(
     stats: &mut ParseStats,
     writers: Writers<'_>,
     batch_size: usize,
+    seen: &mut HashSet<DedupKey>,
 ) -> Result<()> {
     let file = StdFile::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut reader = ParquetRecordBatchReaderBuilder::try_new(file)
@@ -883,24 +901,61 @@ fn process_parquet_file(
         for (_, result) in decoded {
             match result {
                 Decoded::Position(row) => {
-                    stats.positions_out += 1;
-                    writers.positions.write(&row)?;
+                    let key = DedupKey(0, row.ts_ms, row.mmsi, 0, row.msg_type);
+                    if seen.insert(key) {
+                        stats.positions_out += 1;
+                        writers.positions.write(&row)?;
+                    } else {
+                        stats.rows_deduped += 1;
+                    }
                 }
                 Decoded::Static(row) => {
-                    stats.statics_out += 1;
-                    writers.statics.write(&row)?;
+                    let key = DedupKey(1, row.ts_ms, row.mmsi, 0, 0);
+                    if seen.insert(key) {
+                        stats.statics_out += 1;
+                        writers.statics.write(&row)?;
+                    } else {
+                        stats.rows_deduped += 1;
+                    }
                 }
                 Decoded::Meteo(row) => {
-                    stats.meteo_out += 1;
-                    writers.meteo.write(row)?;
+                    let key = DedupKey(
+                        2,
+                        row.ts_ms,
+                        row.mmsi,
+                        ((row.dac as u32) << 8) | row.fid as u32,
+                        0,
+                    );
+                    if seen.insert(key) {
+                        stats.meteo_out += 1;
+                        writers.meteo.write(row)?;
+                    } else {
+                        stats.rows_deduped += 1;
+                    }
                 }
                 Decoded::Binary(row) => {
-                    stats.binary_out += 1;
-                    writers.binary.write(row)?;
+                    let key = DedupKey(
+                        3,
+                        row.ts_ms,
+                        row.mmsi,
+                        ((row.dac as u32) << 8) | row.fid as u32,
+                        0,
+                    );
+                    if seen.insert(key) {
+                        stats.binary_out += 1;
+                        writers.binary.write(row)?;
+                    } else {
+                        stats.rows_deduped += 1;
+                    }
                 }
                 Decoded::Aton(row) => {
-                    stats.atons_out += 1;
-                    writers.atons.write(row)?;
+                    let key = DedupKey(4, row.ts_ms, row.mmsi, 0, row.msg_type);
+                    if seen.insert(key) {
+                        stats.atons_out += 1;
+                        writers.atons.write(row)?;
+                    } else {
+                        stats.rows_deduped += 1;
+                    }
                 }
                 Decoded::Other => stats.other_decoded += 1,
                 Decoded::Failed => stats.failed += 1,

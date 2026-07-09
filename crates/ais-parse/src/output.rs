@@ -19,7 +19,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -33,10 +33,6 @@ fn unique_file_name(prefix: &str) -> String {
     let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%3f");
     let seq = FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{prefix}-{stamp}-{:06}.parquet", seq)
-}
-
-pub fn is_parse_output_file(name: &str, output_prefix: &str) -> bool {
-    name.starts_with(&format!("{output_prefix}-"))
 }
 
 fn writer_props(compression_level: i32) -> Result<WriterProperties> {
@@ -768,28 +764,6 @@ fn u16_aton_col(rows: &[AtonRow], get: impl Fn(&AtonRow) -> Option<u16>) -> Arra
     Arc::new(UInt16Array::from(rows.iter().map(get).collect::<Vec<_>>()))
 }
 
-pub fn existing_parquet_files(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(files),
-        Err(error) => {
-            return Err(error).with_context(|| format!("reading {}", dir.display()));
-        }
-    };
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if name.ends_with(".parquet") && !name.starts_with("tmp-") {
-            files.push(path);
-        }
-    }
-    Ok(files)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -953,20 +927,5 @@ mod tests {
             .downcast_ref::<UInt32Array>()
             .expect("imo col");
         assert!(imo.is_null(0));
-    }
-
-    #[test]
-    fn existing_parquet_files_skips_tmp() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("pos-1.parquet"), b"x").unwrap();
-        std::fs::write(dir.path().join("tmp-pos-2.parquet"), b"x").unwrap();
-        std::fs::write(dir.path().join("notes.txt"), b"x").unwrap();
-        let files = existing_parquet_files(dir.path()).expect("list");
-        assert_eq!(files.len(), 1);
-        assert!(files[0].ends_with("pos-1.parquet"));
-        // Missing dir is fine.
-        assert!(existing_parquet_files(&dir.path().join("nope"))
-            .expect("list")
-            .is_empty());
     }
 }

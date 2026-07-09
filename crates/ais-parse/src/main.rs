@@ -7,7 +7,7 @@ use collect_core::state;
 use collect_core::{PartitionGranularity, S3ConnectionArgs, S3Storage};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use rayon::prelude::*;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fs::File as StdFile;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -19,7 +19,7 @@ mod output;
 mod stats;
 
 use decode::{decode_payload, Decoded};
-use output::{existing_parquet_files, is_parse_output_file, AtonWriter, BinaryWriter, MeteoWriter, PositionsWriter, StaticsWriter};
+use output::{AtonWriter, BinaryWriter, MeteoWriter, PositionsWriter, StaticsWriter};
 use stats::ParseStats;
 
 /// Decoded output lands in sibling hive datasets under the output root.
@@ -28,14 +28,24 @@ const STATICS_TREE: &str = "statics";
 const METEO_TREE: &str = "meteo";
 const BINARY_TREE: &str = "binary";
 const ATONS_TREE: &str = "atons";
-/// Every output dataset tree — used by the partition-replace logic.
-const OUTPUT_TREES: [&str; 5] = [POSITIONS_TREE, STATICS_TREE, METEO_TREE, BINARY_TREE, ATONS_TREE];
 
 static CANCELLED: AtomicBool = AtomicBool::new(false);
 
 fn is_cancelled() -> bool {
     CANCELLED.load(Ordering::Relaxed)
 }
+
+/// Unique key for row-level dedup within a single partition run. The leading
+/// discriminator keeps different row kinds from colliding on the same
+/// `(ts_ms, mmsi)` (a position and a static for one MMSI at one instant are
+/// distinct rows that must not suppress each other).
+///
+/// Layout: `(variant, ts_ms, mmsi, dac_fid, msg_type)`
+/// - variant: 0=Position, 1=Static, 2=Meteo, 3=Binary, 4=Aton
+/// - `dac_fid` packs `(dac << 8) | fid` for Meteo/Binary, else 0
+/// - `msg_type` carried for Position/Aton, else 0
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct DedupKey(u8, i64, u32, u32, u8);
 
 #[derive(Parser, Debug)]
 #[command(
@@ -405,9 +415,6 @@ async fn main() -> Result<()> {
         (None, Some(scratch_path)) => scratch_path.clone(),
         _ => unreachable!("validated exactly one output target above"),
     };
-    // Prior-run files are only deleted when the final output target is local
-    // disk; for S3 output the replace happens against object keys instead.
-    let replace_local = output_storage.is_none();
 
     enum PartitionWork {
         Local(Vec<DatasetFile>),
@@ -603,7 +610,6 @@ async fn main() -> Result<()> {
                     Vec::new()
                 };
 
-                let rel_dir = partition_key.relative_dir_time_only();
                 let output_root_for_task = output_root.clone();
                 let output_prefix_for_task = output_prefix.clone();
                 let result = tokio::task::spawn_blocking(move || {
@@ -613,7 +619,6 @@ async fn main() -> Result<()> {
                         output_root_for_task,
                         batch_size,
                         compression_level,
-                        replace_local,
                         &output_prefix_for_task,
                     )
                 })
@@ -635,47 +640,20 @@ async fn main() -> Result<()> {
                     }
                 };
 
-                // S3 output: replace the partition's prior objects with this
-                // run's file, per tree (positions/statics).
+                // S3 output: append this run's files. Each run writes uniquely
+                // named files per partition; row-level dedup inside the decoder
+                // keeps the union of runs free of duplicate rows. Old files are
+                // left in place and compacted downstream.
                 if let Some(storage) = &output_storage {
-                    for tree in OUTPUT_TREES {
-                        let tree_rel = format!("{tree}/{rel_dir}");
-                        let partition_prefix =
-                            format!("{}/", s3_join(&output_s3_prefix, &tree_rel));
-                        let prior = storage
-                            .list_keys_with_prefix(&partition_prefix)
-                            .await
-                            .with_context(|| format!("listing {partition_prefix}"))?;
-                        let prior_keys: Vec<String> = prior
-                            .into_iter()
-                            .map(|object| object.key)
-                            .filter(|key| {
-                                key.ends_with(".parquet")
-                                    && key.rsplit('/').next()
-                                        .map(|name| is_parse_output_file(name, &output_prefix))
-                                        .unwrap_or(false)
+                    for (out_rel, local_path, _rows) in &outputs {
+                        let key = s3_join(&output_s3_prefix, out_rel);
+                        if let Err(error) =
+                            upload_with_retries(storage, local_path, &key).await.with_context(|| {
+                                format!("uploading {} to S3", local_path.display())
                             })
-                            .collect();
-
-                        for (out_rel, local_path, _rows) in
-                            outputs.iter().filter(|(r, _, _)| r.starts_with(tree))
                         {
-                            let key = s3_join(&output_s3_prefix, out_rel);
-                            if let Err(error) = upload_with_retries(storage, local_path, &key)
-                                .await
-                                .with_context(|| {
-                                    format!("uploading {} to S3", local_path.display())
-                                })
-                            {
-                                CANCELLED.store(true, Ordering::Relaxed);
-                                return Err(error);
-                            }
-                        }
-                        for key in prior_keys {
-                            storage
-                                .delete_key(&key)
-                                .await
-                                .with_context(|| format!("deleting prior object {key}"))?;
+                            CANCELLED.store(true, Ordering::Relaxed);
+                            return Err(error);
                         }
                     }
                 }
@@ -804,32 +782,10 @@ fn process_partition(
     output_root: PathBuf,
     batch_size: usize,
     compression_level: i32,
-    replace_local: bool,
     output_prefix: &str,
 ) -> Result<(ParseStats, PartitionOutputs)> {
     let rel_dir = partition_key.relative_dir_time_only();
     let dir_for = |tree: &str| output_root.join(tree).join(&rel_dir);
-
-    // Collected before writing so the new (uniquely-named) files are never in
-    // the deletion set.
-    let prior_files: Vec<PathBuf> = if replace_local {
-        let mut prior = Vec::new();
-        for tree in OUTPUT_TREES {
-            prior.extend(
-                existing_parquet_files(&dir_for(tree))?
-                    .into_iter()
-                    .filter(|p| {
-                        p.file_name()
-                            .and_then(|n| n.to_str())
-                            .map(|n| is_parse_output_file(n, output_prefix))
-                            .unwrap_or(false)
-                    }),
-            );
-        }
-        prior
-    } else {
-        Vec::new()
-    };
 
     let mut stats = ParseStats::default();
     let mut positions = PositionsWriter::new(dir_for(POSITIONS_TREE), output_prefix, compression_level);
@@ -837,6 +793,10 @@ fn process_partition(
     let mut meteo = MeteoWriter::new(dir_for(METEO_TREE), output_prefix, compression_level);
     let mut binary = BinaryWriter::new(dir_for(BINARY_TREE), output_prefix, compression_level);
     let mut atons = AtonWriter::new(dir_for(ATONS_TREE), output_prefix, compression_level);
+
+    // Row-level dedup keyed on (ts, mmsi, source-kind) so the same AIS message
+    // seen in more than one input file for this partition is emitted once.
+    let mut seen: HashSet<DedupKey> = HashSet::new();
 
     for file in &files {
         process_parquet_file(
@@ -851,6 +811,7 @@ fn process_partition(
                 atons: &mut atons,
             },
             batch_size,
+            &mut seen,
         )
         .with_context(|| format!("processing {}", file.path.display()))?;
     }
@@ -888,13 +849,6 @@ fn process_partition(
         atons.finish().context("closing atons writer")?,
     );
 
-    // New files are durable: the prior run's output for this partition is now
-    // redundant (decoding is deterministic, so this is a replace, not a loss).
-    for prior in prior_files {
-        std::fs::remove_file(&prior)
-            .with_context(|| format!("removing prior output {}", prior.display()))?;
-    }
-
     Ok((stats, outputs))
 }
 
@@ -913,6 +867,7 @@ fn process_parquet_file(
     stats: &mut ParseStats,
     writers: Writers<'_>,
     batch_size: usize,
+    seen: &mut HashSet<DedupKey>,
 ) -> Result<()> {
     let file = StdFile::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut reader = ParquetRecordBatchReaderBuilder::try_new(file)
@@ -979,24 +934,61 @@ fn process_parquet_file(
         for (_, result) in decoded {
             match result {
                 Decoded::Position(row) => {
-                    stats.positions_out += 1;
-                    writers.positions.write(&row)?;
+                    let key = DedupKey(0, row.ts_ms, row.mmsi, 0, row.msg_type);
+                    if seen.insert(key) {
+                        stats.positions_out += 1;
+                        writers.positions.write(&row)?;
+                    } else {
+                        stats.rows_deduped += 1;
+                    }
                 }
                 Decoded::Static(row) => {
-                    stats.statics_out += 1;
-                    writers.statics.write(&row)?;
+                    let key = DedupKey(1, row.ts_ms, row.mmsi, 0, 0);
+                    if seen.insert(key) {
+                        stats.statics_out += 1;
+                        writers.statics.write(&row)?;
+                    } else {
+                        stats.rows_deduped += 1;
+                    }
                 }
                 Decoded::Meteo(row) => {
-                    stats.meteo_out += 1;
-                    writers.meteo.write(*row)?;
+                    let key = DedupKey(
+                        2,
+                        row.ts_ms,
+                        row.mmsi,
+                        ((row.dac as u32) << 8) | row.fid as u32,
+                        0,
+                    );
+                    if seen.insert(key) {
+                        stats.meteo_out += 1;
+                        writers.meteo.write(*row)?;
+                    } else {
+                        stats.rows_deduped += 1;
+                    }
                 }
                 Decoded::Binary(row) => {
-                    stats.binary_out += 1;
-                    writers.binary.write(*row)?;
+                    let key = DedupKey(
+                        3,
+                        row.ts_ms,
+                        row.mmsi,
+                        ((row.dac as u32) << 8) | row.fid as u32,
+                        0,
+                    );
+                    if seen.insert(key) {
+                        stats.binary_out += 1;
+                        writers.binary.write(*row)?;
+                    } else {
+                        stats.rows_deduped += 1;
+                    }
                 }
                 Decoded::Aton(row) => {
-                    stats.atons_out += 1;
-                    writers.atons.write(*row)?;
+                    let key = DedupKey(4, row.ts_ms, row.mmsi, 0, row.msg_type);
+                    if seen.insert(key) {
+                        stats.atons_out += 1;
+                        writers.atons.write(*row)?;
+                    } else {
+                        stats.rows_deduped += 1;
+                    }
                 }
                 Decoded::Other => stats.other_decoded += 1,
                 Decoded::Incomplete => stats.incomplete += 1,

@@ -10,6 +10,9 @@ pub struct ParseStats {
     pub other_decoded: u64,
     pub unknown_type: u64,
     pub failed: u64,
+    /// Rows dropped because an identical (ts, mmsi, source-keyed) row was
+    /// already emitted for this partition in this run.
+    pub rows_deduped: u64,
 }
 
 impl ParseStats {
@@ -24,6 +27,7 @@ impl ParseStats {
         self.other_decoded += other.other_decoded;
         self.unknown_type += other.unknown_type;
         self.failed += other.failed;
+        self.rows_deduped += other.rows_deduped;
     }
 
     pub fn print_summary(&self) {
@@ -38,5 +42,6 @@ impl ParseStats {
         eprintln!("  other decoded        : {}", self.other_decoded);
         eprintln!("  unknown type         : {}", self.unknown_type);
         eprintln!("  unparsed             : {}", self.failed);
+        eprintln!("  deduped (dropped)    : {}", self.rows_deduped);
     }
 }

@@ -20,6 +20,9 @@ pub struct ParseStats {
     /// Sentences the parser rejected (checksum errors, unsupported talkers,
     /// non-NMEA payloads such as `$PGHP` capture wrappers).
     pub failed: u64,
+    /// Rows dropped because an identical (ts, mmsi, source-keyed) row was
+    /// already emitted for this partition in this run.
+    pub rows_deduped: u64,
 }
 
 impl ParseStats {
@@ -34,6 +37,7 @@ impl ParseStats {
         self.other_decoded += other.other_decoded;
         self.incomplete += other.incomplete;
         self.failed += other.failed;
+        self.rows_deduped += other.rows_deduped;
     }
 
     pub fn print_summary(&self) {
@@ -48,5 +52,6 @@ impl ParseStats {
         eprintln!("  other decoded        : {}", self.other_decoded);
         eprintln!("  incomplete fragments : {}", self.incomplete);
         eprintln!("  unparsed             : {}", self.failed);
+        eprintln!("  deduped (dropped)    : {}", self.rows_deduped);
     }
 }
