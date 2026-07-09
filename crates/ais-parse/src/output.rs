@@ -78,6 +78,7 @@ fn positions_schema() -> Arc<Schema> {
         Field::new("raim", DataType::Boolean, false),
         Field::new("special_manoeuvre", DataType::Boolean, true),
         Field::new("station", DataType::Utf8, true),
+        Field::new("payload", DataType::Utf8, false),
     ]))
 }
 
@@ -101,6 +102,7 @@ fn statics_schema() -> Arc<Schema> {
         ts_field("eta", true),
         Field::new("mothership_mmsi", DataType::UInt32, true),
         Field::new("station", DataType::Utf8, true),
+        Field::new("payload", DataType::Utf8, false),
     ]))
 }
 
@@ -165,6 +167,7 @@ fn meteo_schema() -> Arc<Schema> {
         f64n("salinity_pct"),
         u8n("ice"),
         Field::new("station", DataType::Utf8, true),
+        Field::new("payload", DataType::Utf8, false),
     ]))
 }
 
@@ -179,6 +182,7 @@ fn binary_schema() -> Arc<Schema> {
         Field::new("payload_hex", DataType::Utf8, false),
         Field::new("payload_bits", DataType::UInt32, false),
         Field::new("station", DataType::Utf8, true),
+        Field::new("payload", DataType::Utf8, false),
     ]))
 }
 
@@ -267,6 +271,7 @@ pub struct PositionsWriter {
     raim: BooleanBuilder,
     special_manoeuvre: BooleanBuilder,
     station: StringBuilder,
+    payload: StringBuilder,
 }
 
 impl PositionsWriter {
@@ -293,10 +298,11 @@ impl PositionsWriter {
             raim: BooleanBuilder::new(),
             special_manoeuvre: BooleanBuilder::new(),
             station: StringBuilder::new(),
+            payload: StringBuilder::new(),
         }
     }
 
-    pub fn write(&mut self, row: &PositionRow) -> Result<()> {
+    pub fn write(&mut self, row: &PositionRow, payload: &str) -> Result<()> {
         self.ts.append_value(row.ts_ms);
         self.source.append_value(&row.source);
         self.msg_type.append_value(row.msg_type);
@@ -316,6 +322,7 @@ impl PositionsWriter {
         self.raim.append_value(row.raim);
         self.special_manoeuvre.append_option(row.special_manoeuvre);
         self.station.append_option(row.station.as_deref());
+        self.payload.append_value(payload);
         if self.ts.len() >= FLUSH_BATCH_ROWS {
             self.flush()?;
         }
@@ -346,6 +353,7 @@ impl PositionsWriter {
             Arc::new(self.raim.finish()),
             Arc::new(self.special_manoeuvre.finish()),
             Arc::new(self.station.finish()),
+            Arc::new(self.payload.finish()),
         ];
         // The builder was created without a timezone after finish(); rebuild
         // consistency by constructing the batch against the schema.
@@ -380,6 +388,7 @@ pub struct StaticsWriter {
     eta: TimestampMillisecondBuilder,
     mothership_mmsi: UInt32Builder,
     station: StringBuilder,
+    payload: StringBuilder,
 }
 
 impl StaticsWriter {
@@ -405,10 +414,11 @@ impl StaticsWriter {
             eta: TimestampMillisecondBuilder::new().with_timezone("UTC"),
             mothership_mmsi: UInt32Builder::new(),
             station: StringBuilder::new(),
+            payload: StringBuilder::new(),
         }
     }
 
-    pub fn write(&mut self, row: &StaticRow) -> Result<()> {
+    pub fn write(&mut self, row: &StaticRow, payload: &str) -> Result<()> {
         self.ts.append_value(row.ts_ms);
         self.source.append_value(&row.source);
         self.msg_type.append_value(row.msg_type);
@@ -429,6 +439,7 @@ impl StaticsWriter {
         self.eta.append_option(row.eta_ms);
         self.mothership_mmsi.append_option(row.mothership_mmsi);
         self.station.append_option(row.station.as_deref());
+        self.payload.append_value(payload);
         if self.ts.len() >= FLUSH_BATCH_ROWS {
             self.flush()?;
         }
@@ -458,6 +469,7 @@ impl StaticsWriter {
             Arc::new(self.eta.finish()),
             Arc::new(self.mothership_mmsi.finish()),
             Arc::new(self.station.finish()),
+            Arc::new(self.payload.finish()),
         ];
         let batch = RecordBatch::try_new(self.sink.schema.clone(), columns)
             .context("assembling statics batch")?;
@@ -476,6 +488,7 @@ impl StaticsWriter {
 pub struct MeteoWriter {
     sink: FileSink,
     rows: Vec<MeteoRow>,
+    payloads: Vec<String>,
 }
 
 impl MeteoWriter {
@@ -484,11 +497,13 @@ impl MeteoWriter {
         MeteoWriter {
             sink: FileSink::new(dir, &prefix, meteo_schema(), compression_level),
             rows: Vec::new(),
+            payloads: Vec::new(),
         }
     }
 
-    pub fn write(&mut self, row: MeteoRow) -> Result<()> {
+    pub fn write(&mut self, row: MeteoRow, payload: &str) -> Result<()> {
         self.rows.push(row);
+        self.payloads.push(payload.to_string());
         if self.rows.len() >= FLUSH_BATCH_ROWS {
             self.flush()?;
         }
@@ -569,10 +584,14 @@ impl MeteoWriter {
             Arc::new(StringArray::from(
                 r.iter().map(|x| x.station.as_deref()).collect::<Vec<_>>(),
             )),
+            Arc::new(StringArray::from(
+                self.payloads.iter().map(|x| x.as_str()).collect::<Vec<_>>(),
+            )),
         ];
         let batch = RecordBatch::try_new(self.sink.schema.clone(), columns)
             .context("assembling meteo batch")?;
         self.rows.clear();
+        self.payloads.clear();
         self.sink.write_batch(batch)
     }
 
@@ -586,6 +605,7 @@ impl MeteoWriter {
 pub struct BinaryWriter {
     sink: FileSink,
     rows: Vec<BinaryRow>,
+    payloads: Vec<String>,
 }
 
 impl BinaryWriter {
@@ -594,11 +614,13 @@ impl BinaryWriter {
         BinaryWriter {
             sink: FileSink::new(dir, &prefix, binary_schema(), compression_level),
             rows: Vec::new(),
+            payloads: Vec::new(),
         }
     }
 
-    pub fn write(&mut self, row: BinaryRow) -> Result<()> {
+    pub fn write(&mut self, row: BinaryRow, payload: &str) -> Result<()> {
         self.rows.push(row);
+        self.payloads.push(payload.to_string());
         if self.rows.len() >= FLUSH_BATCH_ROWS {
             self.flush()?;
         }
@@ -639,10 +661,14 @@ impl BinaryWriter {
             Arc::new(StringArray::from(
                 r.iter().map(|x| x.station.as_deref()).collect::<Vec<_>>(),
             )),
+            Arc::new(StringArray::from(
+                self.payloads.iter().map(|x| x.as_str()).collect::<Vec<_>>(),
+            )),
         ];
         let batch = RecordBatch::try_new(self.sink.schema.clone(), columns)
             .context("assembling binary batch")?;
         self.rows.clear();
+        self.payloads.clear();
         self.sink.write_batch(batch)
     }
 
@@ -676,12 +702,14 @@ fn atons_schema() -> Arc<Schema> {
         Field::new("high_accuracy", DataType::Boolean, false),
         Field::new("raim", DataType::Boolean, false),
         Field::new("station", DataType::Utf8, true),
+        Field::new("payload", DataType::Utf8, false),
     ]))
 }
 
 pub struct AtonWriter {
     sink: FileSink,
     rows: Vec<AtonRow>,
+    payloads: Vec<String>,
 }
 
 impl AtonWriter {
@@ -690,11 +718,13 @@ impl AtonWriter {
         AtonWriter {
             sink: FileSink::new(dir, &prefix, atons_schema(), compression_level),
             rows: Vec::new(),
+            payloads: Vec::new(),
         }
     }
 
-    pub fn write(&mut self, row: AtonRow) -> Result<()> {
+    pub fn write(&mut self, row: AtonRow, payload: &str) -> Result<()> {
         self.rows.push(row);
+        self.payloads.push(payload.to_string());
         if self.rows.len() >= FLUSH_BATCH_ROWS {
             self.flush()?;
         }
@@ -730,10 +760,14 @@ impl AtonWriter {
             Arc::new(BooleanArray::from(r.iter().map(|x| Some(x.high_accuracy)).collect::<Vec<_>>())),
             Arc::new(BooleanArray::from(r.iter().map(|x| Some(x.raim)).collect::<Vec<_>>())),
             Arc::new(StringArray::from(r.iter().map(|x| x.station.as_deref()).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(
+                self.payloads.iter().map(|x| x.as_str()).collect::<Vec<_>>(),
+            )),
         ];
         let batch = RecordBatch::try_new(self.sink.schema.clone(), columns)
             .context("assembling atons batch")?;
         self.rows.clear();
+        self.payloads.clear();
         self.sink.write_batch(batch)
     }
 
@@ -803,7 +837,7 @@ mod tests {
                 .write(&sample_position(
                     1_700_000_000_000 + i,
                     257_000_000 + i as u32,
-                ))
+                ), "")
                 .expect("write");
         }
         let (path, rows) = writer.finish().expect("finish").expect("file written");
@@ -884,7 +918,7 @@ mod tests {
                 destination: None,
                 eta_ms: None,
                 mothership_mmsi: None,
-            })
+            }, "")
             .expect("write");
         let (path, rows) = writer.finish().expect("finish").expect("file written");
         assert_eq!(rows, 1);

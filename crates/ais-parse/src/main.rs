@@ -2,8 +2,10 @@ use anyhow::{bail, Context, Result};
 use arrow::array::{Array, StringArray, TimestampMillisecondArray};
 use chrono::TimeZone;
 use clap::Parser;
+use collect_core::ais_consolidate::AisConsolidator;
 use collect_core::dataset::{self, DatasetFile, PartitionKey};
 use collect_core::state;
+use collect_core::LineTransformer;
 use collect_core::{PartitionGranularity, S3ConnectionArgs, S3Storage};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use rayon::prelude::*;
@@ -138,6 +140,11 @@ struct Args {
     /// Output file name prefix (added before tree suffix, e.g. `{prefix}-pos-*.parquet`)
     #[arg(long, default_value = "ais")]
     output_prefix: String,
+
+    /// Apply AIS multipart consolidation before decoding (reassembles
+    /// fragmented NMEA sentences into single sentences before parsing).
+    #[arg(long)]
+    consolidate_ais: bool,
 }
 
 impl Args {
@@ -637,6 +644,7 @@ async fn main() -> Result<()> {
 
                 let output_root_for_task = output_root.clone();
                 let output_prefix_for_task = output_prefix.clone();
+                let consolidate_ais = args.consolidate_ais;
                 let result = tokio::task::spawn_blocking(move || {
                     process_partition(
                         partition_key,
@@ -645,6 +653,7 @@ async fn main() -> Result<()> {
                         batch_size,
                         compression_level,
                         &output_prefix_for_task,
+                        consolidate_ais,
                     )
                 })
                 .await
@@ -808,6 +817,7 @@ fn process_partition(
     batch_size: usize,
     compression_level: i32,
     output_prefix: &str,
+    consolidate_ais: bool,
 ) -> Result<(ParseStats, PartitionOutputs)> {
     let rel_dir = partition_key.relative_dir_time_only();
     let dir_for = |tree: &str| output_root.join(tree).join(&rel_dir);
@@ -837,6 +847,7 @@ fn process_partition(
             },
             batch_size,
             &mut seen,
+            consolidate_ais,
         )
         .with_context(|| format!("processing {}", file.path.display()))?;
     }
@@ -893,6 +904,7 @@ fn process_parquet_file(
     writers: Writers<'_>,
     batch_size: usize,
     seen: &mut HashSet<DedupKey>,
+    consolidate_ais: bool,
 ) -> Result<()> {
     let file = StdFile::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut reader = ParquetRecordBatchReaderBuilder::try_new(file)
@@ -906,6 +918,8 @@ fn process_parquet_file(
     // column (present in normalized data, per-row after a dedup merge pooled
     // several sources) takes precedence; bronze has none, so we fall back to
     // the source parsed from the file's partition path.
+    let mut consolidator = if consolidate_ais { Some(AisConsolidator::new()) } else { None };
+
     while let Some(batch) = reader.next().transpose()? {
         let schema = batch.schema();
         let ts_idx = schema.index_of("ts").unwrap_or(0);
@@ -943,26 +957,47 @@ fn process_parquet_file(
             })
             .collect();
 
-        let decoded: Vec<(usize, Decoded)> = (0..n)
-            .into_par_iter()
-            .map(|i| {
-                let result = decode_payload(
-                    ts_col.value(i),
-                    sources[i],
-                    payload_col.value(i),
-                );
-                (i, result)
-            })
-            .collect();
+        let (decoded, payloads): (Vec<(usize, Decoded)>, Vec<String>) = if let Some(c) = &mut consolidator {
+            let mut rows: Vec<(i64, String, String)> = Vec::new();
+            for i in 0..n {
+                let ts = ts_col.value(i);
+                let src = sources[i];
+                let raw = payload_col.value(i);
+                for (new_ts, new_payload) in c.transform(raw, ts) {
+                    rows.push((new_ts, src.to_string(), new_payload));
+                }
+            }
+            let payloads: Vec<String> = rows.iter().map(|(_, _, p)| p.clone()).collect();
+            let decoded: Vec<(usize, Decoded)> = rows.into_par_iter()
+                .enumerate()
+                .map(|(idx, (ts, src, payload))| {
+                    (idx, decode_payload(ts, &src, &payload))
+                })
+                .collect();
+            (decoded, payloads)
+        } else {
+            let payloads: Vec<String> = (0..n).map(|i| payload_col.value(i).to_string()).collect();
+            let decoded: Vec<(usize, Decoded)> = (0..n)
+                .into_par_iter()
+                .map(|i| {
+                    (i, decode_payload(
+                        ts_col.value(i),
+                        sources[i],
+                        payload_col.value(i),
+                    ))
+                })
+                .collect();
+            (decoded, payloads)
+        };
 
         stats.rows_in += n as u64;
-        for (_, result) in decoded {
+        for (i, (_, result)) in decoded.into_iter().enumerate() {
             match result {
                 Decoded::Position(row) => {
                     let key = DedupKey(0, row.ts_ms, row.mmsi, 0, row.msg_type);
                     if seen.insert(key) {
                         stats.positions_out += 1;
-                        writers.positions.write(&row)?;
+                        writers.positions.write(&row, &payloads[i])?;
                     } else {
                         stats.rows_deduped += 1;
                     }
@@ -971,7 +1006,7 @@ fn process_parquet_file(
                     let key = DedupKey(1, row.ts_ms, row.mmsi, 0, 0);
                     if seen.insert(key) {
                         stats.statics_out += 1;
-                        writers.statics.write(&row)?;
+                        writers.statics.write(&row, &payloads[i])?;
                     } else {
                         stats.rows_deduped += 1;
                     }
@@ -986,7 +1021,7 @@ fn process_parquet_file(
                     );
                     if seen.insert(key) {
                         stats.meteo_out += 1;
-                        writers.meteo.write(*row)?;
+                        writers.meteo.write(*row, &payloads[i])?;
                     } else {
                         stats.rows_deduped += 1;
                     }
@@ -1001,7 +1036,7 @@ fn process_parquet_file(
                     );
                     if seen.insert(key) {
                         stats.binary_out += 1;
-                        writers.binary.write(*row)?;
+                        writers.binary.write(*row, &payloads[i])?;
                     } else {
                         stats.rows_deduped += 1;
                     }
@@ -1010,7 +1045,63 @@ fn process_parquet_file(
                     let key = DedupKey(4, row.ts_ms, row.mmsi, 0, row.msg_type);
                     if seen.insert(key) {
                         stats.atons_out += 1;
-                        writers.atons.write(*row)?;
+                        writers.atons.write(*row, &payloads[i])?;
+                    } else {
+                        stats.rows_deduped += 1;
+                    }
+                }
+                Decoded::Other => stats.other_decoded += 1,
+                Decoded::Incomplete => stats.incomplete += 1,
+                Decoded::Failed => stats.failed += 1,
+            }
+        }
+    }
+
+    // Flush any buffered AIS fragments at end-of-file.
+    if let Some(c) = &mut consolidator {
+        for (ts, payload) in c.flush() {
+            match decode_payload(ts, path_source, &payload) {
+                Decoded::Position(row) => {
+                    let key = DedupKey(0, row.ts_ms, row.mmsi, 0, row.msg_type);
+                    if seen.insert(key) {
+                        stats.positions_out += 1;
+                        writers.positions.write(&row, &payload)?;
+                    } else {
+                        stats.rows_deduped += 1;
+                    }
+                }
+                Decoded::Static(row) => {
+                    let key = DedupKey(1, row.ts_ms, row.mmsi, 0, 0);
+                    if seen.insert(key) {
+                        stats.statics_out += 1;
+                        writers.statics.write(&row, &payload)?;
+                    } else {
+                        stats.rows_deduped += 1;
+                    }
+                }
+                Decoded::Meteo(row) => {
+                    let key = DedupKey(2, row.ts_ms, row.mmsi, ((row.dac as u32) << 8) | row.fid as u32, 0);
+                    if seen.insert(key) {
+                        stats.meteo_out += 1;
+                        writers.meteo.write(*row, &payload)?;
+                    } else {
+                        stats.rows_deduped += 1;
+                    }
+                }
+                Decoded::Binary(row) => {
+                    let key = DedupKey(3, row.ts_ms, row.mmsi, ((row.dac as u32) << 8) | row.fid as u32, 0);
+                    if seen.insert(key) {
+                        stats.binary_out += 1;
+                        writers.binary.write(*row, &payload)?;
+                    } else {
+                        stats.rows_deduped += 1;
+                    }
+                }
+                Decoded::Aton(row) => {
+                    let key = DedupKey(4, row.ts_ms, row.mmsi, 0, row.msg_type);
+                    if seen.insert(key) {
+                        stats.atons_out += 1;
+                        writers.atons.write(*row, &payload)?;
                     } else {
                         stats.rows_deduped += 1;
                     }
