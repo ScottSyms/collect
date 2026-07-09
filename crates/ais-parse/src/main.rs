@@ -335,6 +335,7 @@ async fn main() -> Result<()> {
         input_storages.push(
             S3Storage::new(
                 bucket.clone(),
+                String::new(),
                 args.s3_connection.s3_region.clone(),
                 args.s3_connection.s3_endpoint.clone(),
                 args.s3_connection.s3_access_key.clone(),
@@ -352,6 +353,7 @@ async fn main() -> Result<()> {
         Some(bucket) => Some(
             S3Storage::new(
                 bucket.clone(),
+                String::new(),
                 args.s3_connection.s3_region.clone(),
                 args.s3_connection.s3_endpoint.clone(),
                 args.s3_connection.s3_access_key.clone(),

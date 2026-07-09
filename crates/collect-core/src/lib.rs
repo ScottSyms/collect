@@ -200,9 +200,16 @@ pub struct CommonCliArgs {
 
 #[derive(Clone, Debug, Args)]
 pub struct S3CliArgs {
-    /// S3 bucket name for remote storage (enables S3 upload)
+    /// S3 bucket name for remote storage (enables S3 upload).  You may include
+    /// a key prefix, e.g. `bronze/norway` — the first path segment becomes the
+    /// bucket and the remainder is used as `s3_prefix`.
     #[arg(long)]
     pub s3_bucket: Option<String>,
+
+    /// Optional S3 key prefix prepended to every upload key (used alongside
+    /// `--s3-bucket`, or contributed by `bucket/path` syntax).
+    #[arg(long)]
+    pub s3_prefix: Option<String>,
 
     /// S3 endpoint URL (for MinIO or custom S3-compatible storage)
     #[arg(long)]
@@ -268,6 +275,7 @@ pub struct CommonOptions {
 #[derive(Clone, Debug)]
 pub struct S3Options {
     pub bucket: String,
+    pub s3_prefix: String,
     pub endpoint: Option<String>,
     pub region: String,
     pub access_key: Option<String>,
@@ -453,6 +461,15 @@ impl S3CliArgs {
             }
         }
 
+        if self.s3_prefix.is_none() {
+            if let Ok(value) = std::env::var("S3_PREFIX") {
+                let trimmed = value.trim().to_string();
+                if !trimmed.is_empty() {
+                    self.s3_prefix = Some(trimmed);
+                }
+            }
+        }
+
         if self.s3_endpoint.is_none() {
             if let Ok(value) = std::env::var("S3_ENDPOINT") {
                 self.s3_endpoint = Some(value);
@@ -491,10 +508,18 @@ impl S3CliArgs {
     }
 
     pub fn to_options(&self) -> Option<S3Options> {
-        let bucket = self.s3_bucket.clone()?;
+        let bucket_raw = self.s3_bucket.clone()?;
+        let (bucket, path_prefix) = S3Storage::split_s3_path(&bucket_raw, "");
+        let s3_prefix = match (&self.s3_prefix, path_prefix.is_empty()) {
+            (Some(explicit), false) => format!("{}/{}", path_prefix, explicit.trim_matches('/')),
+            (Some(explicit), true) => explicit.clone(),
+            (None, false) => path_prefix,
+            (None, true) => String::new(),
+        };
 
         Some(S3Options {
             bucket,
+            s3_prefix,
             endpoint: self.s3_endpoint.clone(),
             region: self.s3_region.clone(),
             access_key: self.s3_access_key.clone(),
@@ -543,6 +568,7 @@ impl S3Options {
     pub async fn into_storage(self) -> Result<S3Storage> {
         S3Storage::new(
             self.bucket,
+            self.s3_prefix,
             self.region,
             self.endpoint,
             self.access_key,
@@ -1370,6 +1396,7 @@ impl PartKey {
 pub struct S3Storage {
     client: S3Client,
     bucket: String,
+    s3_prefix: String,
     keep_local: bool,
 }
 
@@ -1377,6 +1404,7 @@ impl std::fmt::Debug for S3Storage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("S3Storage")
             .field("bucket", &self.bucket)
+            .field("s3_prefix", &self.s3_prefix)
             .field("keep_local", &self.keep_local)
             .finish_non_exhaustive()
     }
@@ -1385,6 +1413,7 @@ impl std::fmt::Debug for S3Storage {
 impl S3Storage {
     pub async fn new(
         bucket: String,
+        s3_prefix: String,
         region: String,
         endpoint: Option<String>,
         access_key: Option<String>,
@@ -1423,6 +1452,7 @@ impl S3Storage {
         Ok(S3Storage {
             client,
             bucket,
+            s3_prefix,
             keep_local,
         })
     }
@@ -1434,13 +1464,14 @@ impl S3Storage {
     /// constraint under path-style addressing.
     async fn ensure_bucket(client: &S3Client, bucket: &str) -> Result<()> {
         if bucket.contains('/') {
-            let (parsed_bucket, prefix) = S3Storage::split_s3_path(bucket, "");
+            let (parsed_bucket, path_part) = S3Storage::split_s3_path(bucket, "");
             bail!(
-                "'{bucket}' contains a '/' and is not a valid S3 bucket name. \
-                 The bucket is '{parsed_bucket}' and the remainder is the key \
-                 prefix. You can pass them as a single argument or use the \
-                 dedicated --*-prefix flag, e.g.\n  --input-s3-bucket \
-                 {parsed_bucket} --input-s3-prefix {prefix}",
+                "'{bucket}' is not a valid S3 bucket name because it contains \
+                 a '/' (the bucket would be '{parsed_bucket}' and the key \
+                 prefix would be '{path_part}'). Use --s3-bucket \
+                 {parsed_bucket} --s3-prefix {path_part} or pass the bucket \
+                 and prefix together as --s3-bucket {parsed_bucket}/{path_part} \
+                 and the tool will split it automatically."
             );
         }
 
@@ -1496,6 +1527,12 @@ impl S3Storage {
     }
 
     pub async fn upload_file(&self, local_path: &Path, s3_key: &str) -> Result<()> {
+        let full_key = if self.s3_prefix.is_empty() {
+            s3_key.to_string()
+        } else {
+            format!("{}/{}", self.s3_prefix.trim_matches('/'), s3_key)
+        };
+
         let file_metadata = tokio::fs::metadata(local_path)
             .await
             .with_context(|| format!("Failed to read file metadata: {}", local_path.display()))?;
@@ -1512,7 +1549,7 @@ impl S3Storage {
         self.client
             .put_object()
             .bucket(&self.bucket)
-            .key(s3_key)
+            .key(&full_key)
             .body(body)
             .send()
             .await
@@ -1525,7 +1562,7 @@ impl S3Storage {
                     file_size as f64 / 1_048_576.0
                 );
                 eprintln!("   Bucket: s3://{}", self.bucket);
-                eprintln!("   Key: {}", s3_key);
+                eprintln!("   Key: {}", full_key);
                 eprintln!("   Error Type: {}", e);
                 if let Some(source) = e.source() {
                     eprintln!("   Underlying Cause: {}", source);
@@ -1537,7 +1574,7 @@ impl S3Storage {
             "✅ Uploaded {} to S3: s3://{}/{} ({:.2} MB)",
             local_path.display(),
             self.bucket,
-            s3_key,
+            full_key,
             file_size as f64 / 1_048_576.0
         );
 
