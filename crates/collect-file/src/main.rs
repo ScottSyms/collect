@@ -173,6 +173,7 @@ async fn run_file_ingest(
         // The parallel path sweeps once below; per-worker sweeps would race
         // over the same out_dir.
         sweep_orphans: false,
+        line_transformer: None,
     };
     if parallel {
         if let Some(storage) = options.s3_storage.clone().filter(|s| !s.keeps_local()) {
@@ -218,6 +219,7 @@ async fn run_file_ingest(
                 shutdown: Some(stop.clone()),
                 write_workers: None,
                 sweep_orphans: true,
+                line_transformer: None,
             },
         )
         .await;

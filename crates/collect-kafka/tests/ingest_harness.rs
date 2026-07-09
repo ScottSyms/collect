@@ -150,8 +150,9 @@ async fn kafka_ingest_harness_writes_expected_parquet() -> Result<()> {
         report_progress: false,
         log_writes: false,
         shutdown: Some(shutdown),
-        write_workers: None,
-        sweep_orphans: false,
+                write_workers: None,
+                sweep_orphans: false,
+                line_transformer: None,
     };
 
     run_ingest(&mut mock, opts).await?;

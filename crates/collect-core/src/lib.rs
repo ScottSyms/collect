@@ -32,6 +32,7 @@ use tokio_util::codec::{FramedRead, LinesCodec};
 pub mod dataset;
 mod metrics;
 pub mod state;
+pub mod ais_consolidate;
 
 pub use async_trait::async_trait;
 pub use metrics::IngestMetrics;
@@ -284,7 +285,6 @@ pub struct S3Options {
     pub disable_tls: bool,
 }
 
-#[derive(Clone, Debug)]
 pub struct IngestOptions {
     pub common: CommonOptions,
     pub s3: Option<S3Options>,
@@ -304,6 +304,50 @@ pub struct IngestOptions {
     /// over one out_dir (collect-file's parallel mode) should sweep once
     /// themselves and set this to false.
     pub sweep_orphans: bool,
+
+    /// Optional line transformer applied to every line before it enters the
+    /// batch buffer. The transformer can buffer, combine, or rewrite lines
+    /// (e.g. for AIS multipart message reassembly with `AisConsolidator`).
+    /// Cloned instances lose the transformer (stateful, not shared).
+    pub line_transformer: Option<Box<dyn LineTransformer>>,
+}
+
+// Manual Clone + Debug: skip line_transformer (stateful — not shareable or
+// introspectable).
+impl Clone for IngestOptions {
+    fn clone(&self) -> Self {
+        IngestOptions {
+            line_transformer: None,
+            common: self.common.clone(),
+            s3: self.s3.clone(),
+            s3_storage: self.s3_storage.clone(),
+            health_file: self.health_file.clone(),
+            manage_health: self.manage_health,
+            report_progress: self.report_progress,
+            log_writes: self.log_writes,
+            shutdown: self.shutdown.clone(),
+            write_workers: self.write_workers,
+            sweep_orphans: self.sweep_orphans,
+        }
+    }
+}
+
+impl std::fmt::Debug for IngestOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IngestOptions")
+            .field("common", &self.common)
+            .field("s3", &self.s3)
+            .field("s3_storage", &self.s3_storage)
+            .field("health_file", &self.health_file)
+            .field("manage_health", &self.manage_health)
+            .field("report_progress", &self.report_progress)
+            .field("log_writes", &self.log_writes)
+            .field("shutdown", &self.shutdown)
+            .field("write_workers", &self.write_workers)
+            .field("sweep_orphans", &self.sweep_orphans)
+            .field("line_transformer", &self.line_transformer.as_ref().map(|_| "(set)"))
+            .finish()
+    }
 }
 
 pub type LineReader = FramedRead<Box<dyn AsyncRead + Unpin + Send>, LinesCodec>;
@@ -351,6 +395,8 @@ pub trait LineSource {
         None
     }
 
+
+
     async fn open(&mut self, max_line_length: usize) -> Result<LineReader>;
 
     async fn on_stream_end(
@@ -370,6 +416,18 @@ pub trait LineSource {
     ) -> Result<ReaderTransition> {
         let _ = (shutdown, max_line_length);
         Err(anyhow::anyhow!(error.to_string()))
+    }
+}
+
+/// Transforms raw input lines before they are written to the Parquet batch.
+/// Useful for AIS multipart message reassembly, payload filtering, etc.
+/// Each call to `transform` receives the raw line and its arrival timestamp;
+/// returns zero or more (timestamp, payload) pairs to write. `flush` is
+/// called on partition rollover and shutdown to emit buffered state.
+pub trait LineTransformer: Send {
+    fn transform(&mut self, line: &str, arrival_ts_ms: i64) -> Vec<(i64, String)>;
+    fn flush(&mut self) -> Vec<(i64, String)> {
+        Vec::new()
     }
 }
 
@@ -771,6 +829,7 @@ mod tests {
                 shutdown: Some(shutdown),
                 write_workers: None,
                 sweep_orphans: false,
+                line_transformer: None,
             },
         )
         .await?;
@@ -873,6 +932,7 @@ mod tests {
                 shutdown: None,
                 write_workers: None,
                 sweep_orphans: false,
+                line_transformer: None,
             },
         )
         .await?;
@@ -912,6 +972,7 @@ where
         shutdown: external_shutdown,
         write_workers,
         sweep_orphans,
+        mut line_transformer,
     } = options;
 
     if common.health_check {
@@ -1080,16 +1141,54 @@ where
             maybe_line = reader.next() => {
                 match maybe_line {
                     Some(Ok(payload)) => {
-                        let row_ts_ms = match source.timestamp_for_payload(&payload) {
+                        let arrival_ts_ms = match source.timestamp_for_payload(&payload) {
                             Some(timestamp_ms) => timestamp_ms,
                             None => now_unix_duration().as_millis() as i64,
                         };
-                        let payload = source.normalize_payload(payload, row_ts_ms);
-                        let payload_len = payload.len();
+                        let payload = source.normalize_payload(payload, arrival_ts_ms);
 
-                        let row_ts_clamped = row_ts_ms.max(0);
-                        if row_ts_clamped < key_start_ms || row_ts_clamped >= key_end_ms {
-                            if !buf.is_empty() {
+                        // Resolve lines to write. An active transformer owns
+                        // timestamp resolution and may buffer/combine multiple
+                        // input lines (e.g. AIS fragment reassembly).
+                        let lines: Vec<(i64, String)> = if let Some(t) = &mut line_transformer {
+                            t.transform(&payload, arrival_ts_ms)
+                        } else {
+                            vec![(arrival_ts_ms, payload)]
+                        };
+
+                        for (row_ts_ms, payload) in lines {
+                            let payload_len = payload.len();
+                            let row_ts_clamped = row_ts_ms.max(0);
+
+                            if row_ts_clamped < key_start_ms || row_ts_clamped >= key_end_ms {
+                                if !buf.is_empty() {
+                                    flush_batch(
+                                        &common.out_dir,
+                                        &current_key,
+                                        &mut buf,
+                                        write_queue.as_ref(),
+                                        common.compression_level,
+                                        batches_sealed + 1,
+                                    )
+                                    .await?;
+                                    batches_sealed += 1;
+                                    source.on_batch_sealed(batches_sealed);
+                                    metrics.batches_sealed.store(batches_sealed, Ordering::Relaxed);
+                                    rows_in_file = 0;
+                                    files_flushed += 1;
+                                }
+                            current_key = PartKey::from_timestamp(
+                                source.source_name(),
+                                row_ts_ms,
+                                common.partition,
+                            );
+                            let bounds = common.partition.period_bounds_ms(row_ts_ms);
+                            key_start_ms = bounds.0;
+                            key_end_ms = bounds.1;
+                            }
+
+                            // Keep each batch well below Arrow's string offset limit.
+                            if buf.would_exceed_batch_bytes(payload_len, common.max_batch_bytes) {
                                 flush_batch(
                                     &common.out_dir,
                                     &current_key,
@@ -1105,62 +1204,17 @@ where
                                 rows_in_file = 0;
                                 files_flushed += 1;
                             }
-                            current_key = PartKey::from_timestamp(
-                                source.source_name(),
-                                row_ts_ms,
-                                common.partition,
-                            );
-                            let bounds = common.partition.period_bounds_ms(row_ts_ms);
-                            key_start_ms = bounds.0;
-                            key_end_ms = bounds.1;
-                        }
 
-                        // Keep each batch well below Arrow's string offset limit.
-                        if buf.would_exceed_batch_bytes(payload_len, common.max_batch_bytes) {
-                            flush_batch(
-                                &common.out_dir,
-                                &current_key,
-                                &mut buf,
-                                write_queue.as_ref(),
-                                common.compression_level,
-                                batches_sealed + 1,
-                            )
-                            .await?;
-                            batches_sealed += 1;
-                            source.on_batch_sealed(batches_sealed);
-                            metrics.batches_sealed.store(batches_sealed, Ordering::Relaxed);
-                            rows_in_file = 0;
-                            files_flushed += 1;
-                        }
+                            buf.push(row_ts_ms, &payload);
+                            rows_in_file += 1;
+                            rows_processed += 1;
+                            metrics.rows_processed.fetch_add(1, Ordering::Relaxed);
+                            metrics
+                                .buffered_bytes
+                                .store(buf.payload_bytes() as u64, Ordering::Relaxed);
+                            metrics.touch_last_row();
 
-                        buf.push(row_ts_ms, &payload);
-                        rows_in_file += 1;
-                        rows_processed += 1;
-                        metrics.rows_processed.fetch_add(1, Ordering::Relaxed);
-                        metrics
-                            .buffered_bytes
-                            .store(buf.payload_bytes() as u64, Ordering::Relaxed);
-                        metrics.touch_last_row();
-
-                        if buf.payload_bytes() >= common.max_batch_bytes {
-                            flush_batch(
-                                &common.out_dir,
-                                &current_key,
-                                &mut buf,
-                                write_queue.as_ref(),
-                                common.compression_level,
-                                batches_sealed + 1,
-                            )
-                            .await?;
-                            batches_sealed += 1;
-                            source.on_batch_sealed(batches_sealed);
-                            metrics.batches_sealed.store(batches_sealed, Ordering::Relaxed);
-                            rows_in_file = 0;
-                            files_flushed += 1;
-                        }
-
-                        if let Some(max_rows) = common.max_rows {
-                            if rows_in_file >= max_rows {
+                            if buf.payload_bytes() >= common.max_batch_bytes {
                                 flush_batch(
                                     &common.out_dir,
                                     &current_key,
@@ -1175,6 +1229,25 @@ where
                                 metrics.batches_sealed.store(batches_sealed, Ordering::Relaxed);
                                 rows_in_file = 0;
                                 files_flushed += 1;
+                            }
+
+                            if let Some(max_rows) = common.max_rows {
+                                if rows_in_file >= max_rows {
+                                    flush_batch(
+                                        &common.out_dir,
+                                        &current_key,
+                                        &mut buf,
+                                        write_queue.as_ref(),
+                                        common.compression_level,
+                                        batches_sealed + 1,
+                                    )
+                                    .await?;
+                                    batches_sealed += 1;
+                                    source.on_batch_sealed(batches_sealed);
+                                    metrics.batches_sealed.store(batches_sealed, Ordering::Relaxed);
+                                    rows_in_file = 0;
+                                    files_flushed += 1;
+                                }
                             }
                         }
                     }
@@ -1209,6 +1282,33 @@ where
                     }
                 }
             }
+        }
+    }
+
+    // Flush any buffered transformer state (e.g. incomplete AIS fragments).
+    if let Some(t) = &mut line_transformer {
+        for (flush_ts, flush_payload) in t.flush() {
+            let flush_key = PartKey::from_timestamp(
+                source.source_name(),
+                flush_ts,
+                common.partition,
+            );
+            if flush_key != current_key && !buf.is_empty() {
+                flush_batch(
+                    &common.out_dir,
+                    &current_key,
+                    &mut buf,
+                    write_queue.as_ref(),
+                    common.compression_level,
+                    batches_sealed + 1,
+                )
+                .await?;
+                batches_sealed += 1;
+                source.on_batch_sealed(batches_sealed);
+                metrics.batches_sealed.store(batches_sealed, Ordering::Relaxed);
+            }
+            current_key = flush_key;
+            buf.push(flush_ts, &flush_payload);
         }
     }
 

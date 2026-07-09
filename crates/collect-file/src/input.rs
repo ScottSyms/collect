@@ -763,6 +763,7 @@ mod tests {
                 shutdown: None,
                 write_workers: None,
                 sweep_orphans: false,
+                line_transformer: None,
             },
         )
         .await?;

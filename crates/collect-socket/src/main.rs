@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use collect_core::{
-    health_file_path, line_reader_from_async_read, run_ingest, CommonCliArgs, IngestOptions,
-    LineReader, LineSource, ReaderTransition, S3CliArgs,
+    ais_consolidate::AisConsolidator, health_file_path, line_reader_from_async_read, run_ingest,
+    CommonCliArgs, IngestOptions, LineReader, LineSource, ReaderTransition, S3CliArgs,
 };
 use std::cmp::min;
 use std::sync::atomic::AtomicBool;
@@ -29,6 +29,11 @@ struct Args {
     /// Logical source label; defaults to "tcp"
     #[arg(short, long)]
     source: Option<String>,
+
+    /// Enable AIS multi-part message consolidation (reassembles fragmented
+    /// NMEA sentences in-line before writing to the Parquet batch).
+    #[arg(long)]
+    consolidate_ais: bool,
 
     #[command(flatten)]
     common: CommonCliArgs,
@@ -172,6 +177,11 @@ async fn main() -> Result<()> {
             shutdown: None,
             write_workers: None,
             sweep_orphans: true,
+            line_transformer: if args.consolidate_ais {
+                Some(Box::new(AisConsolidator::new()))
+            } else {
+                None
+            },
         },
     )
     .await

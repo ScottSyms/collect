@@ -318,8 +318,9 @@ async fn main() -> Result<()> {
             report_progress: true,
             log_writes: true,
             shutdown: Some(shutdown.clone()),
-            write_workers: None,
-            sweep_orphans: true,
+                write_workers: None,
+                sweep_orphans: true,
+                line_transformer: None,
         },
     )
     .await
