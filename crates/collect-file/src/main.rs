@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use collect_core::{
-    default_source_from_path, health_file_path, run_ingest, update_health_status_async,
-    CommonCliArgs, IngestOptions, S3CliArgs,
+    ais_consolidate::AisConsolidator, default_source_from_path, health_file_path, run_ingest,
+    update_health_status_async, CommonCliArgs, IngestOptions, S3CliArgs,
 };
 use std::collections::VecDeque;
 use std::io::IsTerminal;
@@ -45,6 +45,11 @@ struct Args {
     /// Disable the runtime status UI and print aggregate updates every 10 files
     #[arg(long)]
     noui: bool,
+
+    /// Enable AIS multi-part message consolidation (reassembles fragmented
+    /// NMEA sentences in-line before writing to the Parquet batch).
+    #[arg(long)]
+    consolidate_ais: bool,
 }
 
 #[tokio::main]
@@ -93,6 +98,7 @@ async fn main() -> Result<()> {
         health_file,
         status_mode,
         args.concurrency,
+        args.consolidate_ais,
     )
     .await
 }
@@ -104,6 +110,7 @@ async fn run_file_ingest(
     health_file: PathBuf,
     status_mode: status::StatusMode,
     concurrency: Option<usize>,
+    consolidate_ais: bool,
 ) -> Result<()> {
     let manifest_path = completion_manifest::manifest_path(&common.out_dir);
     let completed = match completion_manifest::load_completed(&manifest_path) {
@@ -173,7 +180,11 @@ async fn run_file_ingest(
         // The parallel path sweeps once below; per-worker sweeps would race
         // over the same out_dir.
         sweep_orphans: false,
-        line_transformer: None,
+        line_transformer: if consolidate_ais {
+            Some(Box::new(AisConsolidator::new()))
+        } else {
+            None
+        },
     };
     if parallel {
         if let Some(storage) = options.s3_storage.clone().filter(|s| !s.keeps_local()) {
@@ -219,7 +230,11 @@ async fn run_file_ingest(
                 shutdown: Some(stop.clone()),
                 write_workers: None,
                 sweep_orphans: true,
-                line_transformer: None,
+                line_transformer: if consolidate_ais {
+                    Some(Box::new(AisConsolidator::new()))
+                } else {
+                    None
+                },
             },
         )
         .await;
@@ -245,6 +260,7 @@ async fn run_file_ingest(
         return result;
     }
 
+    let use_consolidator = consolidate_ais;
     run_parallel_file_ingest(
         sources,
         options,
@@ -254,6 +270,7 @@ async fn run_file_ingest(
         manifest_path,
         status_mode,
         stop,
+        use_consolidator,
     )
     .await
 }
@@ -267,6 +284,7 @@ async fn run_parallel_file_ingest(
     manifest_path: PathBuf,
     status_mode: status::StatusMode,
     stop: Arc<AtomicBool>,
+    consolidate_ais: bool,
 ) -> Result<()> {
     let running = Arc::new(AtomicBool::new(true));
     update_health_status_async(&health_file, true).await?;
@@ -348,7 +366,12 @@ async fn run_parallel_file_ingest(
         let stop = stop.clone();
         let completed_files = completed_files.clone();
         let manifest_path = manifest_path.clone();
-        let worker_options = options.clone();
+        let mut worker_options = options.clone();
+        worker_options.line_transformer = if consolidate_ais {
+            Some(Box::new(AisConsolidator::new()))
+        } else {
+            None
+        };
         workers.push(tokio::spawn(async move {
             loop {
                 if stop.load(Ordering::SeqCst) || status::is_cancelled() {
