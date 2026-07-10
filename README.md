@@ -6,16 +6,15 @@ A Rust workspace for ingesting positional data into Hive-partitioned Parquet fil
 - **`collect-socket`** — TCP line-stream ingestion
 - **`collect-kafka`** — Kafka topic ingestion with at-least-once offset commits
 - **`collect-aisstream`** — aisstream.io WebSocket ingestion
-- **`ais-normalize`** — post-processing: re-timestamp, re-partition, and combine multi-part AIS sentences (input and output can each be local or S3)
-- **`ais-parse`** — silver layer: decode AIS sentences into typed Parquet (vessel positions and statics), via [ScottSyms/nmea-parser](https://github.com/ScottSyms/nmea-parser); local or S3 on both sides
+- **`ais-parse`** — silver layer: decode AIS sentences into typed Parquet (vessel positions, statics, meteo, binary, aids to navigation), via [ScottSyms/nmea-parser](https://github.com/ScottSyms/nmea-parser); local or S3 on both sides
 
 All collectors support optional remote storage (S3/MinIO).
 
 ## Features
 - **Multiple Input Sources**: Files, TCP streams, Kafka topics, and aisstream.io WebSocket
 - **Compressed Inputs**: Plain text, gzip, bzip2, and zip files
-- **AIS Normalization**: Fragment reassembly, tag-block/`$PGHP` re-timestamping, parallel partition processing, S3-to-S3, multi-source merge into one time-partitioned dataset (source retained as a column), idempotent re-runs (exact `(ts, source, payload)` dedup-merge), and watermark-based incremental scheduling (`--incremental`)
-- **AIS Decoding**: Typed Parquet output decoded from AIVDM sentences — positions (MMSI, lat/lon, SOG/COG), vessel statics (name, destination, dimensions), and Type 8 Binary Broadcast including full meteorological/hydrological data (wind, temperature, pressure, waves, currents, tides); unrecognized Type 8 subtypes retained as hex — with idempotent partition-replace re-runs
+- **AIS Consolidation**: On-ingest fragment reassembly via `--consolidate-ais`, tag-block/`$PGHP` timestamp processing via `--process-timestamps`, parallel partition processing, S3-to-S3, and watermark-based incremental scheduling (`--incremental`)
+- **AIS Decoding**: Typed Parquet output decoded from AIVDM sentences and AISStream JSON — positions (MMSI, lat/lon, SOG/COG), vessel statics (name, destination, dimensions), and Type 8 Binary Broadcast including full meteorological/hydrological data (wind, temperature, pressure, waves, currents, tides); unrecognized Type 8 subtypes retained as hex
 - **Hive Partitioning**: Automatic partitioning by source and selected time granularity
 - **Parquet Format**: Efficient columnar storage with Zstd compression, sorted by timestamp
 - **S3 Integration**: Upload to AWS S3 or S3-compatible storage (MinIO) with optional TLS
@@ -61,17 +60,18 @@ cargo run -p collect-aisstream -- --api-key $AISSTREAM_API_KEY --bounding-boxes 
 # File input with S3
 cargo run -p collect-file -- --input-dir data.txt --source mydata --compression-level 1 --s3-bucket maritime-data
 
-# Normalize collected AIS data (combine fragments, re-timestamp/re-partition)
-cargo run -p ais-normalize -- --input-dir data --output-dir normalized --partition day
+# Consolidate AIS and decode in one step
+cargo run -p ais-parse -- --input-dir data --output-dir silver --partition day --consolidate-ais --process-timestamps
 
-# Normalize straight from one S3 bucket to another (same endpoint/region/credentials)
-cargo run -p ais-normalize -- --input-s3-bucket raw-ais --output-s3-bucket normalized-ais --s3-endpoint http://minio:9000 --partition day
-
-# Decode normalized AIS into typed Parquet (positions + vessel statics)
-cargo run -p ais-parse -- --input-dir normalized --output-dir silver --partition day
+# Decode into typed Parquet (positions, statics, meteo, binary, atons)
+cargo run -p ais-parse -- --input-dir data --output-dir silver --partition day
 ```
 
-See [AIS_NORMALIZE.md](AIS_NORMALIZE.md) for how fragment reassembly and re-timestamping work, the full CLI reference, and deployment as a scheduled batch job. See [AIS_PARSE.md](AIS_PARSE.md) for the decoded (silver) schemas and the bronze → silver pipeline.
+See [COLLECT_SOCKET.md](COLLECT_SOCKET.md), [COLLECT_FILE.md](COLLECT_FILE.md),
+[COLLECT_KAFKA.md](COLLECT_KAFKA.md), and [COLLECT_AISSTREAM.md](COLLECT_AISSTREAM.md)
+for the ingest binaries. See [AIS_PARSE.md](AIS_PARSE.md) for the decoded
+(silver) schemas and [AISSTREAM_PARSE.md](AISSTREAM_PARSE.md) for the
+AISStream JSON decoder.
 
 `collect-file` auto-detects plain text, gzip, bzip2, and zip inputs. Zip archives are read entry-by-entry in archive order. Hidden dotfiles are skipped silently. `--concurrency` overrides the auto-selected file worker count.
 
@@ -296,7 +296,7 @@ cargo build --release --workspace
 - **MAX_BATCH_BYTES**: Cap buffered payload size per Parquet file (default: 64 MiB). The write pipeline holds at most ~4× this in flight, so worst-case ingest memory is roughly `5 × MAX_BATCH_BYTES` plus a small base.
 - **Compression**: Zstd level 5 by default; level 3 is ~40% faster for a few percent more size — a good trade for CPU-constrained live collectors
 - **collect-file `--concurrency`**: overrides the auto-selected worker count (defaults to ~1–2× cores; per-worker buffers scale down automatically)
-- **ais-normalize `--concurrency`**: partitions are processed in parallel (defaults to up to 8 workers)
+- **ais-parse / aisstream-parse `--concurrency`**: partitions are decoded in parallel (defaults to number of CPUs)
 - **Async Processing**: Leverages Tokio for high-performance async I/O
 - **Resource Limits**: Set appropriate memory limits in Docker for large datasets
 

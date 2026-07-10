@@ -83,7 +83,7 @@ Most command-line parameters can be configured using environment variables, maki
 - `S3_PREFIX`: Optional key prefix for S3 uploads (appended to any path from `S3_BUCKET`)
   - Example: `S3_PREFIX=norway`
 
-- `INPUT_S3_BUCKET`: Input S3 bucket for batch processing tools (ais-normalize, ais-parse, aisstream-parse)
+- `INPUT_S3_BUCKET`: Input S3 bucket for batch processing tools (ais-parse, aisstream-parse)
   - Example: `INPUT_S3_BUCKET=bronze/norway`
   - Comma-separated for multiple buckets: `INPUT_S3_BUCKET=bronze/norway,duplicate`
   - Supports `bucket/path` syntax per entry
@@ -121,7 +121,7 @@ Most command-line parameters can be configured using environment variables, maki
 - `SINCE_HOURS`: Rolling window for first incremental run (hours)
   - Example: `SINCE_HOURS=2`
 
-- `DEDUP`: Enable dedup merge on output partitions (ais-normalize)
+- `DEDUP`: Enable dedup merge on output partitions (ais-parse, aisstream-parse)
   - Example: `DEDUP=false`
 
 - `CONSOLIDATE_AIS`: Enable AIS multi-part message consolidation on ingest (collect-socket, collect-file)

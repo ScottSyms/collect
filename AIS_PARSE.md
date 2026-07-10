@@ -1,19 +1,19 @@
 # ais-parse — decode AIS sentences into typed Parquet
 
 `ais-parse` is the silver-layer step of the pipeline: it reads the bronze
-(ts, payload) Parquet datasets the collectors and [ais-normalize](AIS_NORMALIZE.md)
-produce, decodes each AIS sentence with the
+(ts, payload) Parquet datasets the collectors produce, decodes each AIS
+sentence with the
 [ScottSyms/nmea-parser](https://github.com/ScottSyms/nmea-parser) library, and
 writes **typed, queryable Parquet** — no more NMEA strings between you and the
 data.
 
 ```
-collect-* (ingest)  →  ais-normalize (re-timestamp/combine)  →  ais-parse (decode)
-      bronze                      bronze, clean                     silver
+collect-* (ingest)  →  ais-parse (decode)
+   bronze                      silver
 ```
 
 Input and output can each independently be a local directory or an S3/MinIO
-bucket, exactly like ais-normalize.
+bucket.
 
 ## What it produces
 
@@ -30,11 +30,9 @@ unified dataset — but each row keeps its origin in a `source` column:
 <output>/binary/year=YYYY/month=MM/day=DD/bin-....parquet
 ```
 
-`source` is read from the input's `source` column when present (ais-normalize
-output), and otherwise from the input's `source=` partition segment (raw
-bronze). Either input layout works. Each output time partition is rebuilt as a
-whole from all the sources that land in it, so the partition-replace re-run
-stays correct and race-free.
+`source` is read from the input's `source` column when present, and otherwise
+from the input's `source=` partition segment (raw bronze). Either input layout
+works.
 
 **`positions`** — one row per position report (AIS types 1–3, 18, 19, 27):
 
@@ -122,15 +120,16 @@ partitioned by time only.
 Every dataset includes a **`station`** column carrying the NMEA 4.10 tag-block
 `s:` field — the source/base station (receiver) that reported the message —
 when the feed provides it. It is read from the tag block on single sentences,
-and ais-normalize preserves it into the rebuilt tag block when it combines
+and the consolidator preserves it into the rebuilt tag block when it combines
 multi-fragment messages, so combined statics keep their station too. Other tag
 fields (`d:`, `n:`, `r:`, `g:`, `t:`) are not currently extracted; only
 `c:` (used as `ts`) and `s:` are.
 
-Multi-fragment Type 8 messages (up to 5 sentences) are decoded once
-**ais-normalize has combined them** into a single sentence — the normal
-pipeline order. ais-parse only decodes Type 8 from a combined/single sentence;
-a raw un-combined fragment is left alone.
+Multi-fragment Type 8 messages (up to 5 sentences) are decoded once the
+on-ingest consolidator or the `--consolidate-ais` pass has combined them into
+a single sentence. ais-parse also decodes Type 8 from a combined/single
+sentence via the peeked-type fast path; a raw un-combined fragment falls
+through to the NMEA parser.
 
 ## Append-only re-runs (no partition replacement)
 
@@ -152,20 +151,21 @@ Don't run two instances against the same output concurrently (use
 
 ## Multi-part messages
 
-ais-normalize has usually already recombined multi-part messages into single
-sentences, which decode directly. Raw, un-normalized bronze data works too:
-the parser buffers `Incomplete` fragments and completes them when the matching
-part arrives (rows within a partition file are time-ordered, so pairs almost
-always meet). Fragments whose partner never arrives are counted `incomplete`.
+When processing raw bronze data via `--consolidate-ais` on the collector or on
+ais-parse itself, the `AisConsolidator` explicitly reassembles multi-part
+fragments into single sentences **before** they reach the NMEA parser. This
+reduces `Incomplete` results and produces cleaner output. The consolidator
+handles `$PGHP` timestamp lines, tag-block `c:` carry-forward, and `s:`
+station preservation, with an 8K-group buffer and oldest-first eviction.
+
+Without `--consolidate-ais`, raw un-normalized bronze data also works: the
+parser buffers `Incomplete` fragments internally and completes them when the
+matching part arrives (rows within a partition file are time-ordered, so pairs
+almost always meet). Fragments whose partner never arrives are counted
+`incomplete`.
+
 When a partition pools several sources, fragment state is reset at each source
 boundary so multi-part sequence ids can't collide across sources.
-
-When processing raw bronze data with `--consolidate-ais`, the `AisConsolidator`
-explicitly reassembles multi-part fragments into single sentences **before**
-they reach the NMEA parser. This reduces `Incomplete` results and produces
-cleaner output. The consolidator handles `$PGHP` timestamp lines, tag-block
-`c:` carry-forward, and `s:` station preservation, with an 8K-group buffer
-and oldest-first eviction.
 
 ## Usage
 
@@ -186,18 +186,15 @@ cargo run -p ais-parse -- --input-s3-bucket normalized-ais --output-s3-bucket si
 
 ### CLI reference
 
-The flag set mirrors ais-normalize; see [AIS_NORMALIZE.md](AIS_NORMALIZE.md)
-for the shared semantics of each group:
-
 | Flag | Default | Purpose |
 |------|---------|---------|
 | `--input-dir` (repeatable) / `--input-s3-bucket` (repeatable) + `--input-s3-prefix` | — | bronze input root(s); exactly one kind required. Env `INPUT_S3_BUCKET` (comma-separated, supports `bucket/path` syntax), `INPUT_S3_PREFIX` |
 | `--output-dir` / `--output-s3-bucket` + `--output-s3-prefix` | — | silver output root; exactly one required. Env `OUTPUT_S3_BUCKET` (supports `bucket/path` syntax), `OUTPUT_S3_PREFIX` |
-| `--s3-endpoint`, `--s3-region`, `--s3-access-key`, `--s3-secret-key`, `--s3-disable-tls` | — | shared S3 connection (env equivalents as in ais-normalize) |
+| `--s3-endpoint`, `--s3-region`, `--s3-access-key`, `--s3-secret-key`, `--s3-disable-tls` | — | shared S3 connection (env equivalents as in other tools) |
 | `--partition` | `day` | input layout granularity; output trees mirror it |
-| `--source`, `--year`…`--minute` | *(all)* | partition slice, same rules as ais-normalize |
+| `--source`, `--year`…`--minute` | *(all)* | partition slice filters |
 | `--since <HOURS>` | *(off)* | rolling window (env `SINCE_HOURS`); with `--incremental`, first-run seed only |
-| `--incremental` | *(off)* | watermark at the output (`_ais-parse/watermark.json`), env `INCREMENTAL=true`. Independent of ais-normalize's watermark, so both tools can share an output tree |
+| `--incremental` | *(off)* | watermark at the output (`_ais-parse/watermark.json`), env `INCREMENTAL=true` |
 | `--batch-size` | `8192` | Parquet read batch rows |
 | `--compression-level` | `5` | Zstd level for output |
 | `--concurrency` | cores, clamped `[1, 8]` | partitions decoded in parallel |
@@ -226,8 +223,7 @@ cargo run -p ais-parse --example dump -- silver/positions/year=2026/month=07/day
 
 ## Deployment
 
-A batch job, like ais-normalize — run it on a schedule after the normalize
-step. Nomad periodic example:
+A batch job — run it on a schedule. Nomad periodic example:
 
 ```hcl
 job "ais-parse" {
@@ -235,7 +231,7 @@ job "ais-parse" {
   type        = "batch"
 
   periodic {
-    cron             = "0 * * * * *"   # hourly, after ais-normalize
+    cron             = "0 * * * * *"   # hourly
     prohibit_overlap = true
   }
 
