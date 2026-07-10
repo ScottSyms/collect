@@ -1,6 +1,8 @@
 # collect
 
-A Rust workspace for ingesting positional data into Hive-partitioned Parquet files with Zstd compression — the bronze layer of a medallion pipeline for maritime (AIS) data. It provides:
+![screenshot](screenshot.png)
+
+A Rust project to collect positional data into Hive-partitioned Parquet files with Zstd compression — the bronze layer of a medallion pipeline for maritime (AIS) data. It provides:
 
 - **`collect-file`** — recursive file ingestion (plain, gzip, bzip2, zip)
 - **`collect-socket`** — TCP line-stream ingestion
