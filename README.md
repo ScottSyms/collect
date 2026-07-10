@@ -9,6 +9,7 @@ A Rust project to collect positional data into Hive-partitioned Parquet files wi
 - **`collect-kafka`** — Kafka topic ingestion with at-least-once offset commits
 - **`collect-aisstream`** — aisstream.io WebSocket ingestion
 - **`ais-parse`** — silver layer: decode AIS sentences into typed Parquet (vessel positions, statics, meteo, binary, aids to navigation), via [ScottSyms/nmea-parser](https://github.com/ScottSyms/nmea-parser); local or S3 on both sides
+- **`aisstream-parse`** — silver layer: decode aisstream.io JSON from bronze Parquet into typed Parquet (vessel positions, statics, meteo, binary, aids to navigation); local or S3 on both sides
 
 All collectors support optional remote storage (S3/MinIO).
 
@@ -73,7 +74,7 @@ See [COLLECT_SOCKET.md](COLLECT_SOCKET.md), [COLLECT_FILE.md](COLLECT_FILE.md),
 [COLLECT_KAFKA.md](COLLECT_KAFKA.md), and [COLLECT_AISSTREAM.md](COLLECT_AISSTREAM.md)
 for the ingest binaries. See [AIS_PARSE.md](AIS_PARSE.md) for the decoded
 (silver) schemas and [AISSTREAM_PARSE.md](AISSTREAM_PARSE.md) for the
-AISStream JSON decoder.
+AISStream JSON decoder. See [specifications.md](specifications.md) for detailed design documentation.
 
 `collect-file` auto-detects plain text, gzip, bzip2, and zip inputs. Zip archives are read entry-by-entry in archive order. Hidden dotfiles are skipped silently. `--concurrency` overrides the auto-selected file worker count.
 
@@ -156,7 +157,7 @@ docker run -d \
   collect:latest
 ```
 
-The image defaults to `collect-socket`; use `--entrypoint /usr/local/bin/collect-file` for file ingestion or `--entrypoint /usr/local/bin/collect-maint` for maintenance commands.
+The image defaults to `collect-socket`; use `--entrypoint /usr/local/bin/collect-file` for file ingestion or `--entrypoint /usr/local/bin/collect-maint` for maintenance commands. See [NOMAD.md](NOMAD.md) for Nomad orchestration job definitions.
 
 ## Configuration Precedence
 
@@ -167,17 +168,6 @@ Configuration values are applied in the following order (highest to lowest prece
 3. **Default values** (lowest precedence)
 
 This allows you to set base configuration via environment variables and override specific values with command-line arguments when needed.
-
-## TUI
-
-Both binaries include an interactive console setup flow:
-
-```bash
-cargo run -p collect-file -- --tui
-cargo run -p collect-socket -- --tui
-```
-
-The file binary saves to `collect-file-config.json` by default. The socket binary saves to `collect-socket-config.json` by default.
 
 ## Output Structure
 
@@ -213,7 +203,7 @@ HEALTH_CHECK=true ./target/release/collect-socket
 
 Health status is tracked in `/tmp/collect-socket.health` for the socket binary and `/tmp/collect-file.health` for the file binary.
 
-When `--metrics-addr` is set (see below), an HTTP `GET /healthz` endpoint is also available — it returns `200` while the ingest loop's heartbeat is fresh and `503` once it goes stale (60-second window), so it detects hung loops rather than just live processes. Prefer it for Nomad/Kubernetes HTTP checks.
+When `--metrics-addr` is set (see below), an HTTP `GET /healthz` endpoint is also available — it returns `200` while the ingest loop's heartbeat is fresh and `503` once it goes stale (60-second window), so it detects hung loops rather than just live processes. Prefer it for Nomad/Kubernetes HTTP checks. See [DOCKER_HEALTH_CHECK.md](DOCKER_HEALTH_CHECK.md) for Docker-specific health check setup.
 
 ## Observability
 
