@@ -1,0 +1,909 @@
+use crate::decode::{AtonRow, BinaryRow, MeteoRow, PositionRow, StaticRow};
+use anyhow::{Context, Result};
+use arrow::array::{
+    ArrayBuilder, ArrayRef, BooleanArray, BooleanBuilder, Float64Array, Float64Builder,
+    Int64Array, Int64Builder, StringArray, StringBuilder, TimestampMillisecondArray,
+    TimestampMillisecondBuilder, UInt16Array, UInt16Builder, UInt32Array, UInt32Builder,
+    UInt8Array, UInt8Builder,
+};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow::record_batch::RecordBatch;
+use iceberg::spec::{DataFile, DataFileFormat};
+use iceberg::table::Table;
+use iceberg::transaction::{Transaction, ApplyTransactionAction};
+use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+use iceberg::writer::file_writer::location_generator::{
+    DefaultFileNameGenerator, DefaultLocationGenerator,
+};
+use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+use iceberg::writer::file_writer::ParquetWriterBuilder;
+use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
+use iceberg::Catalog;
+use parquet::basic::{Compression, ZstdLevel};
+use parquet::file::properties::WriterProperties;
+use std::sync::Arc;
+
+const FLUSH_BATCH_ROWS: usize = 8192;
+
+fn ts_field(name: &str, nullable: bool) -> Field {
+    Field::new(
+        name,
+        DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+        nullable,
+    )
+}
+
+fn writer_props(compression_level: i32) -> Result<WriterProperties> {
+    use parquet::schema::types::ColumnPath;
+    let level = ZstdLevel::try_new(compression_level).context("invalid zstd level")?;
+    Ok(WriterProperties::builder()
+        .set_compression(Compression::ZSTD(level))
+        .set_column_bloom_filter_enabled(ColumnPath::from("mmsi"), true)
+        .set_column_bloom_filter_enabled(ColumnPath::from("station"), true)
+        .set_column_bloom_filter_enabled(ColumnPath::from("source"), true)
+        .set_column_bloom_filter_enabled(ColumnPath::from("imo_number"), true)
+        .set_column_bloom_filter_enabled(ColumnPath::from("call_sign"), true)
+        .set_column_bloom_filter_enabled(ColumnPath::from("name"), true)
+        .build())
+}
+
+fn positions_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        ts_field("ts", false),
+        Field::new("source", DataType::Utf8, false),
+        Field::new("msg_type", DataType::UInt8, false),
+        Field::new("mmsi", DataType::UInt32, false),
+        Field::new("ais_class", DataType::Utf8, false),
+        Field::new("latitude", DataType::Float64, true),
+        Field::new("longitude", DataType::Float64, true),
+        Field::new("sog_knots", DataType::Float64, true),
+        Field::new("cog", DataType::Float64, true),
+        Field::new("heading_true", DataType::Float64, true),
+        Field::new("rot", DataType::Float64, true),
+        Field::new("altitude_m", DataType::Float64, true),
+        Field::new("h3", DataType::Int64, true),
+        Field::new("hilbert", DataType::Int64, true),
+        Field::new("nav_status", DataType::Utf8, false),
+        Field::new("high_accuracy", DataType::Boolean, false),
+        Field::new("raim", DataType::Boolean, false),
+        Field::new("special_manoeuvre", DataType::Boolean, true),
+        Field::new("station", DataType::Utf8, true),
+        Field::new("payload", DataType::Utf8, false),
+    ]))
+}
+
+fn statics_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        ts_field("ts", false),
+        Field::new("source", DataType::Utf8, false),
+        Field::new("msg_type", DataType::UInt8, false),
+        Field::new("mmsi", DataType::UInt32, false),
+        Field::new("ais_class", DataType::Utf8, false),
+        Field::new("imo_number", DataType::UInt32, true),
+        Field::new("call_sign", DataType::Utf8, true),
+        Field::new("name", DataType::Utf8, true),
+        Field::new("ship_type", DataType::Utf8, false),
+        Field::new("dimension_to_bow", DataType::UInt16, true),
+        Field::new("dimension_to_stern", DataType::UInt16, true),
+        Field::new("dimension_to_port", DataType::UInt16, true),
+        Field::new("dimension_to_starboard", DataType::UInt16, true),
+        Field::new("draught_m", DataType::Float64, true),
+        Field::new("destination", DataType::Utf8, true),
+        ts_field("eta", true),
+        Field::new("mothership_mmsi", DataType::UInt32, true),
+        Field::new("station", DataType::Utf8, true),
+        Field::new("payload", DataType::Utf8, false),
+    ]))
+}
+
+fn f64n(name: &str) -> Field {
+    Field::new(name, DataType::Float64, true)
+}
+fn u16n(name: &str) -> Field {
+    Field::new(name, DataType::UInt16, true)
+}
+fn u8n(name: &str) -> Field {
+    Field::new(name, DataType::UInt8, true)
+}
+fn booln(name: &str) -> Field {
+    Field::new(name, DataType::Boolean, true)
+}
+
+fn meteo_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        ts_field("ts", false),
+        Field::new("source", DataType::Utf8, false),
+        Field::new("msg_type", DataType::UInt8, false),
+        Field::new("mmsi", DataType::UInt32, false),
+        Field::new("dac", DataType::UInt16, false),
+        Field::new("fid", DataType::UInt8, false),
+        f64n("latitude"),
+        f64n("longitude"),
+        Field::new("hilbert", DataType::Int64, true),
+        booln("position_accuracy"),
+        u8n("day"),
+        u8n("hour"),
+        u8n("minute"),
+        u16n("wind_speed_kn"),
+        u16n("wind_gust_kn"),
+        u16n("wind_dir_deg"),
+        u16n("wind_gust_dir_deg"),
+        f64n("air_temp_c"),
+        u8n("humidity_pct"),
+        f64n("dew_point_c"),
+        u16n("pressure_hpa"),
+        u8n("pressure_tendency"),
+        f64n("visibility_nm"),
+        booln("visibility_greater"),
+        f64n("water_level_m"),
+        u8n("water_level_trend"),
+        f64n("surface_current_speed_kn"),
+        u16n("surface_current_dir_deg"),
+        f64n("current2_speed_kn"),
+        u16n("current2_dir_deg"),
+        f64n("current2_depth_m"),
+        f64n("current3_speed_kn"),
+        u16n("current3_dir_deg"),
+        f64n("current3_depth_m"),
+        f64n("wave_height_m"),
+        u16n("wave_period_s"),
+        u16n("wave_dir_deg"),
+        f64n("swell_height_m"),
+        u16n("swell_period_s"),
+        u16n("swell_dir_deg"),
+        u8n("sea_state"),
+        f64n("water_temp_c"),
+        u8n("precipitation_type"),
+        f64n("salinity_pct"),
+        u8n("ice"),
+        Field::new("station", DataType::Utf8, true),
+        Field::new("payload", DataType::Utf8, false),
+    ]))
+}
+
+fn binary_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        ts_field("ts", false),
+        Field::new("source", DataType::Utf8, false),
+        Field::new("msg_type", DataType::UInt8, false),
+        Field::new("mmsi", DataType::UInt32, false),
+        Field::new("dac", DataType::UInt16, false),
+        Field::new("fid", DataType::UInt8, false),
+        Field::new("payload_hex", DataType::Utf8, false),
+        Field::new("payload_bits", DataType::UInt32, false),
+        Field::new("station", DataType::Utf8, true),
+        Field::new("payload", DataType::Utf8, false),
+    ]))
+}
+
+fn atons_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        ts_field("ts", false),
+        Field::new("source", DataType::Utf8, false),
+        Field::new("msg_type", DataType::UInt8, false),
+        Field::new("mmsi", DataType::UInt32, false),
+        Field::new("ais_class", DataType::Utf8, false),
+        Field::new("aid_type", DataType::Utf8, false),
+        Field::new("name", DataType::Utf8, true),
+        Field::new("name_extension", DataType::Utf8, true),
+        Field::new("latitude", DataType::Float64, true),
+        Field::new("longitude", DataType::Float64, true),
+        Field::new("h3", DataType::Int64, true),
+        Field::new("hilbert", DataType::Int64, true),
+        Field::new("dimension_to_bow", DataType::UInt16, true),
+        Field::new("dimension_to_stern", DataType::UInt16, true),
+        Field::new("dimension_to_port", DataType::UInt16, true),
+        Field::new("dimension_to_starboard", DataType::UInt16, true),
+        booln("off_position"),
+        booln("virtual_aid"),
+        booln("assigned_mode"),
+        Field::new("high_accuracy", DataType::Boolean, false),
+        Field::new("raim", DataType::Boolean, false),
+        Field::new("station", DataType::Utf8, true),
+        Field::new("payload", DataType::Utf8, false),
+    ]))
+}
+
+// ── Positions ─────────────────────────────────────────────────────────────────
+
+pub struct IcebergPositionsWriter {
+    schema: Arc<Schema>,
+    ts: TimestampMillisecondBuilder,
+    source: StringBuilder,
+    msg_type: UInt8Builder,
+    mmsi: UInt32Builder,
+    ais_class: StringBuilder,
+    latitude: Float64Builder,
+    longitude: Float64Builder,
+    sog_knots: Float64Builder,
+    cog: Float64Builder,
+    heading_true: Float64Builder,
+    rot: Float64Builder,
+    altitude_m: Float64Builder,
+    h3: Int64Builder,
+    hilbert: Int64Builder,
+    nav_status: StringBuilder,
+    high_accuracy: BooleanBuilder,
+    raim: BooleanBuilder,
+    special_manoeuvre: BooleanBuilder,
+    station: StringBuilder,
+    payload: StringBuilder,
+    batches: Vec<RecordBatch>,
+}
+
+impl IcebergPositionsWriter {
+    pub fn new() -> Self {
+        IcebergPositionsWriter {
+            schema: positions_schema(),
+            ts: TimestampMillisecondBuilder::new().with_timezone("UTC"),
+            source: StringBuilder::new(),
+            msg_type: UInt8Builder::new(),
+            mmsi: UInt32Builder::new(),
+            ais_class: StringBuilder::new(),
+            latitude: Float64Builder::new(),
+            longitude: Float64Builder::new(),
+            sog_knots: Float64Builder::new(),
+            cog: Float64Builder::new(),
+            heading_true: Float64Builder::new(),
+            rot: Float64Builder::new(),
+            altitude_m: Float64Builder::new(),
+            h3: Int64Builder::new(),
+            hilbert: Int64Builder::new(),
+            nav_status: StringBuilder::new(),
+            high_accuracy: BooleanBuilder::new(),
+            raim: BooleanBuilder::new(),
+            special_manoeuvre: BooleanBuilder::new(),
+            station: StringBuilder::new(),
+            payload: StringBuilder::new(),
+            batches: Vec::new(),
+        }
+    }
+
+    pub fn write(&mut self, row: &PositionRow, payload: &str) -> Result<()> {
+        self.ts.append_value(row.ts_ms);
+        self.source.append_value(&row.source);
+        self.msg_type.append_value(row.msg_type);
+        self.mmsi.append_value(row.mmsi);
+        self.ais_class.append_value(&row.ais_class);
+        self.latitude.append_option(row.latitude);
+        self.longitude.append_option(row.longitude);
+        self.sog_knots.append_option(row.sog_knots);
+        self.cog.append_option(row.cog);
+        self.heading_true.append_option(row.heading_true);
+        self.rot.append_option(row.rot);
+        self.altitude_m.append_option(row.altitude_m);
+        self.h3.append_option(row.h3.and_then(|v| i64::try_from(v).ok()));
+        self.hilbert.append_option(row.hilbert.and_then(|v| i64::try_from(v).ok()));
+        self.nav_status.append_value(&row.nav_status);
+        self.high_accuracy.append_value(row.high_accuracy);
+        self.raim.append_value(row.raim);
+        self.special_manoeuvre.append_option(row.special_manoeuvre);
+        self.station.append_option(row.station.as_deref());
+        self.payload.append_value(payload);
+        if self.ts.len() >= FLUSH_BATCH_ROWS {
+            self.flush_batch()?;
+        }
+        Ok(())
+    }
+
+    pub fn flush_batch(&mut self) -> Result<()> {
+        if self.ts.len() == 0 {
+            return Ok(());
+        }
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(self.ts.finish()),
+            Arc::new(self.source.finish()),
+            Arc::new(self.msg_type.finish()),
+            Arc::new(self.mmsi.finish()),
+            Arc::new(self.ais_class.finish()),
+            Arc::new(self.latitude.finish()),
+            Arc::new(self.longitude.finish()),
+            Arc::new(self.sog_knots.finish()),
+            Arc::new(self.cog.finish()),
+            Arc::new(self.heading_true.finish()),
+            Arc::new(self.rot.finish()),
+            Arc::new(self.altitude_m.finish()),
+            Arc::new(self.h3.finish()),
+            Arc::new(self.hilbert.finish()),
+            Arc::new(self.nav_status.finish()),
+            Arc::new(self.high_accuracy.finish()),
+            Arc::new(self.raim.finish()),
+            Arc::new(self.special_manoeuvre.finish()),
+            Arc::new(self.station.finish()),
+            Arc::new(self.payload.finish()),
+        ];
+        let batch = RecordBatch::try_new(self.schema.clone(), columns)
+            .context("assembling positions batch")?;
+        self.batches.push(batch);
+        // Rebuild the finished builders for the next round
+        self.ts = TimestampMillisecondBuilder::new().with_timezone("UTC");
+        self.source = StringBuilder::new();
+        self.msg_type = UInt8Builder::new();
+        self.mmsi = UInt32Builder::new();
+        self.ais_class = StringBuilder::new();
+        self.latitude = Float64Builder::new();
+        self.longitude = Float64Builder::new();
+        self.sog_knots = Float64Builder::new();
+        self.cog = Float64Builder::new();
+        self.heading_true = Float64Builder::new();
+        self.rot = Float64Builder::new();
+        self.altitude_m = Float64Builder::new();
+        self.h3 = Int64Builder::new();
+        self.hilbert = Int64Builder::new();
+        self.nav_status = StringBuilder::new();
+        self.high_accuracy = BooleanBuilder::new();
+        self.raim = BooleanBuilder::new();
+        self.special_manoeuvre = BooleanBuilder::new();
+        self.station = StringBuilder::new();
+        self.payload = StringBuilder::new();
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<Vec<RecordBatch>> {
+        self.flush_batch()?;
+        Ok(self.batches)
+    }
+}
+
+// ── Statics ───────────────────────────────────────────────────────────────────
+
+pub struct IcebergStaticsWriter {
+    schema: Arc<Schema>,
+    ts: TimestampMillisecondBuilder,
+    source: StringBuilder,
+    msg_type: UInt8Builder,
+    mmsi: UInt32Builder,
+    ais_class: StringBuilder,
+    imo_number: UInt32Builder,
+    call_sign: StringBuilder,
+    name: StringBuilder,
+    ship_type: StringBuilder,
+    dimension_to_bow: UInt16Builder,
+    dimension_to_stern: UInt16Builder,
+    dimension_to_port: UInt16Builder,
+    dimension_to_starboard: UInt16Builder,
+    draught_m: Float64Builder,
+    destination: StringBuilder,
+    eta: TimestampMillisecondBuilder,
+    mothership_mmsi: UInt32Builder,
+    station: StringBuilder,
+    payload: StringBuilder,
+    batches: Vec<RecordBatch>,
+}
+
+impl IcebergStaticsWriter {
+    pub fn new() -> Self {
+        IcebergStaticsWriter {
+            schema: statics_schema(),
+            ts: TimestampMillisecondBuilder::new().with_timezone("UTC"),
+            source: StringBuilder::new(),
+            msg_type: UInt8Builder::new(),
+            mmsi: UInt32Builder::new(),
+            ais_class: StringBuilder::new(),
+            imo_number: UInt32Builder::new(),
+            call_sign: StringBuilder::new(),
+            name: StringBuilder::new(),
+            ship_type: StringBuilder::new(),
+            dimension_to_bow: UInt16Builder::new(),
+            dimension_to_stern: UInt16Builder::new(),
+            dimension_to_port: UInt16Builder::new(),
+            dimension_to_starboard: UInt16Builder::new(),
+            draught_m: Float64Builder::new(),
+            destination: StringBuilder::new(),
+            eta: TimestampMillisecondBuilder::new().with_timezone("UTC"),
+            mothership_mmsi: UInt32Builder::new(),
+            station: StringBuilder::new(),
+            payload: StringBuilder::new(),
+            batches: Vec::new(),
+        }
+    }
+
+    pub fn write(&mut self, row: &StaticRow, payload: &str) -> Result<()> {
+        self.ts.append_value(row.ts_ms);
+        self.source.append_value(&row.source);
+        self.msg_type.append_value(row.msg_type);
+        self.mmsi.append_value(row.mmsi);
+        self.ais_class.append_value(&row.ais_class);
+        self.imo_number.append_option(row.imo_number);
+        self.call_sign.append_option(row.call_sign.as_deref());
+        self.name.append_option(row.name.as_deref());
+        self.ship_type.append_value(&row.ship_type);
+        self.dimension_to_bow.append_option(row.dimension_to_bow);
+        self.dimension_to_stern
+            .append_option(row.dimension_to_stern);
+        self.dimension_to_port.append_option(row.dimension_to_port);
+        self.dimension_to_starboard
+            .append_option(row.dimension_to_starboard);
+        self.draught_m.append_option(row.draught_m);
+        self.destination.append_option(row.destination.as_deref());
+        self.eta.append_option(row.eta_ms);
+        self.mothership_mmsi.append_option(row.mothership_mmsi);
+        self.station.append_option(row.station.as_deref());
+        self.payload.append_value(payload);
+        if self.ts.len() >= FLUSH_BATCH_ROWS {
+            self.flush_batch()?;
+        }
+        Ok(())
+    }
+
+    pub fn flush_batch(&mut self) -> Result<()> {
+        if self.ts.len() == 0 {
+            return Ok(());
+        }
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(self.ts.finish()),
+            Arc::new(self.source.finish()),
+            Arc::new(self.msg_type.finish()),
+            Arc::new(self.mmsi.finish()),
+            Arc::new(self.ais_class.finish()),
+            Arc::new(self.imo_number.finish()),
+            Arc::new(self.call_sign.finish()),
+            Arc::new(self.name.finish()),
+            Arc::new(self.ship_type.finish()),
+            Arc::new(self.dimension_to_bow.finish()),
+            Arc::new(self.dimension_to_stern.finish()),
+            Arc::new(self.dimension_to_port.finish()),
+            Arc::new(self.dimension_to_starboard.finish()),
+            Arc::new(self.draught_m.finish()),
+            Arc::new(self.destination.finish()),
+            Arc::new(self.eta.finish()),
+            Arc::new(self.mothership_mmsi.finish()),
+            Arc::new(self.station.finish()),
+            Arc::new(self.payload.finish()),
+        ];
+        let batch = RecordBatch::try_new(self.schema.clone(), columns)
+            .context("assembling statics batch")?;
+        self.batches.push(batch);
+        self.ts = TimestampMillisecondBuilder::new().with_timezone("UTC");
+        self.source = StringBuilder::new();
+        self.msg_type = UInt8Builder::new();
+        self.mmsi = UInt32Builder::new();
+        self.ais_class = StringBuilder::new();
+        self.imo_number = UInt32Builder::new();
+        self.call_sign = StringBuilder::new();
+        self.name = StringBuilder::new();
+        self.ship_type = StringBuilder::new();
+        self.dimension_to_bow = UInt16Builder::new();
+        self.dimension_to_stern = UInt16Builder::new();
+        self.dimension_to_port = UInt16Builder::new();
+        self.dimension_to_starboard = UInt16Builder::new();
+        self.draught_m = Float64Builder::new();
+        self.destination = StringBuilder::new();
+        self.eta = TimestampMillisecondBuilder::new().with_timezone("UTC");
+        self.mothership_mmsi = UInt32Builder::new();
+        self.station = StringBuilder::new();
+        self.payload = StringBuilder::new();
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<Vec<RecordBatch>> {
+        self.flush_batch()?;
+        Ok(self.batches)
+    }
+}
+
+// ── Meteo ─────────────────────────────────────────────────────────────────────
+
+pub struct IcebergMeteoWriter {
+    schema: Arc<Schema>,
+    rows: Vec<MeteoRow>,
+    payloads: Vec<String>,
+    batches: Vec<RecordBatch>,
+}
+
+impl IcebergMeteoWriter {
+    pub fn new() -> Self {
+        IcebergMeteoWriter {
+            schema: meteo_schema(),
+            rows: Vec::new(),
+            payloads: Vec::new(),
+            batches: Vec::new(),
+        }
+    }
+
+    pub fn write(&mut self, row: MeteoRow, payload: &str) -> Result<()> {
+        self.rows.push(row);
+        self.payloads.push(payload.to_string());
+        if self.rows.len() >= FLUSH_BATCH_ROWS {
+            self.flush_batch()?;
+        }
+        Ok(())
+    }
+
+    pub fn flush_batch(&mut self) -> Result<()> {
+        if self.rows.is_empty() {
+            return Ok(());
+        }
+        self.rows.sort_by_key(|r| r.hilbert.unwrap_or(0));
+        let r = &self.rows;
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(
+                TimestampMillisecondArray::from(r.iter().map(|x| x.ts_ms).collect::<Vec<_>>())
+                    .with_timezone("UTC"),
+            ),
+            Arc::new(StringArray::from(
+                r.iter().map(|x| x.source.as_ref()).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt8Array::from(
+                r.iter().map(|x| x.msg_type).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt32Array::from(
+                r.iter().map(|x| x.mmsi).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt16Array::from(
+                r.iter().map(|x| x.dac).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt8Array::from(
+                r.iter().map(|x| x.fid).collect::<Vec<_>>(),
+            )),
+            f64_col(r, |x| x.latitude),
+            f64_col(r, |x| x.longitude),
+            Arc::new(Int64Array::from(
+                r.iter().map(|x| x.hilbert.and_then(|v| i64::try_from(v).ok())).collect::<Vec<_>>(),
+            )),
+            Arc::new(BooleanArray::from(
+                r.iter().map(|x| x.position_accuracy).collect::<Vec<_>>(),
+            )),
+            u8_col(r, |x| x.day),
+            u8_col(r, |x| x.hour),
+            u8_col(r, |x| x.minute),
+            u16_col(r, |x| x.wind_speed_kn),
+            u16_col(r, |x| x.wind_gust_kn),
+            u16_col(r, |x| x.wind_dir_deg),
+            u16_col(r, |x| x.wind_gust_dir_deg),
+            f64_col(r, |x| x.air_temp_c),
+            u8_col(r, |x| x.humidity_pct),
+            f64_col(r, |x| x.dew_point_c),
+            u16_col(r, |x| x.pressure_hpa),
+            u8_col(r, |x| x.pressure_tendency),
+            f64_col(r, |x| x.visibility_nm),
+            Arc::new(BooleanArray::from(
+                r.iter().map(|x| x.visibility_greater).collect::<Vec<_>>(),
+            )),
+            f64_col(r, |x| x.water_level_m),
+            u8_col(r, |x| x.water_level_trend),
+            f64_col(r, |x| x.surface_current_speed_kn),
+            u16_col(r, |x| x.surface_current_dir_deg),
+            f64_col(r, |x| x.current2_speed_kn),
+            u16_col(r, |x| x.current2_dir_deg),
+            f64_col(r, |x| x.current2_depth_m),
+            f64_col(r, |x| x.current3_speed_kn),
+            u16_col(r, |x| x.current3_dir_deg),
+            f64_col(r, |x| x.current3_depth_m),
+            f64_col(r, |x| x.wave_height_m),
+            u16_col(r, |x| x.wave_period_s),
+            u16_col(r, |x| x.wave_dir_deg),
+            f64_col(r, |x| x.swell_height_m),
+            u16_col(r, |x| x.swell_period_s),
+            u16_col(r, |x| x.swell_dir_deg),
+            u8_col(r, |x| x.sea_state),
+            f64_col(r, |x| x.water_temp_c),
+            u8_col(r, |x| x.precipitation_type),
+            f64_col(r, |x| x.salinity_pct),
+            u8_col(r, |x| x.ice),
+            Arc::new(StringArray::from(
+                r.iter().map(|x| x.station.as_deref()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                self.payloads.iter().map(|x| x.as_str()).collect::<Vec<_>>(),
+            )),
+        ];
+        let batch = RecordBatch::try_new(self.schema.clone(), columns)
+            .context("assembling meteo batch")?;
+        self.batches.push(batch);
+        self.rows.clear();
+        self.payloads.clear();
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<Vec<RecordBatch>> {
+        self.flush_batch()?;
+        Ok(self.batches)
+    }
+}
+
+// ── Binary ────────────────────────────────────────────────────────────────────
+
+pub struct IcebergBinaryWriter {
+    schema: Arc<Schema>,
+    rows: Vec<BinaryRow>,
+    payloads: Vec<String>,
+    batches: Vec<RecordBatch>,
+}
+
+impl IcebergBinaryWriter {
+    pub fn new() -> Self {
+        IcebergBinaryWriter {
+            schema: binary_schema(),
+            rows: Vec::new(),
+            payloads: Vec::new(),
+            batches: Vec::new(),
+        }
+    }
+
+    pub fn write(&mut self, row: BinaryRow, payload: &str) -> Result<()> {
+        self.rows.push(row);
+        self.payloads.push(payload.to_string());
+        if self.rows.len() >= FLUSH_BATCH_ROWS {
+            self.flush_batch()?;
+        }
+        Ok(())
+    }
+
+    pub fn flush_batch(&mut self) -> Result<()> {
+        if self.rows.is_empty() {
+            return Ok(());
+        }
+        let r = &self.rows;
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(
+                TimestampMillisecondArray::from(r.iter().map(|x| x.ts_ms).collect::<Vec<_>>())
+                    .with_timezone("UTC"),
+            ),
+            Arc::new(StringArray::from(
+                r.iter().map(|x| x.source.as_ref()).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt8Array::from(
+                r.iter().map(|x| x.msg_type).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt32Array::from(
+                r.iter().map(|x| x.mmsi).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt16Array::from(
+                r.iter().map(|x| x.dac).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt8Array::from(
+                r.iter().map(|x| x.fid).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                r.iter().map(|x| x.payload_hex.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt32Array::from(
+                r.iter().map(|x| x.payload_bits).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                r.iter().map(|x| x.station.as_deref()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                self.payloads.iter().map(|x| x.as_str()).collect::<Vec<_>>(),
+            )),
+        ];
+        let batch = RecordBatch::try_new(self.schema.clone(), columns)
+            .context("assembling binary batch")?;
+        self.batches.push(batch);
+        self.rows.clear();
+        self.payloads.clear();
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<Vec<RecordBatch>> {
+        self.flush_batch()?;
+        Ok(self.batches)
+    }
+}
+
+// ── AtoN ──────────────────────────────────────────────────────────────────────
+
+pub struct IcebergAtonWriter {
+    schema: Arc<Schema>,
+    rows: Vec<AtonRow>,
+    payloads: Vec<String>,
+    batches: Vec<RecordBatch>,
+}
+
+impl IcebergAtonWriter {
+    pub fn new() -> Self {
+        IcebergAtonWriter {
+            schema: atons_schema(),
+            rows: Vec::new(),
+            payloads: Vec::new(),
+            batches: Vec::new(),
+        }
+    }
+
+    pub fn write(&mut self, row: AtonRow, payload: &str) -> Result<()> {
+        self.rows.push(row);
+        self.payloads.push(payload.to_string());
+        if self.rows.len() >= FLUSH_BATCH_ROWS {
+            self.flush_batch()?;
+        }
+        Ok(())
+    }
+
+    pub fn flush_batch(&mut self) -> Result<()> {
+        if self.rows.is_empty() {
+            return Ok(());
+        }
+        self.rows.sort_by_key(|r| r.hilbert.unwrap_or(0));
+        let r = &self.rows;
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(
+                TimestampMillisecondArray::from(r.iter().map(|x| x.ts_ms).collect::<Vec<_>>())
+                    .with_timezone("UTC"),
+            ),
+            Arc::new(StringArray::from(
+                r.iter().map(|x| x.source.as_ref()).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt8Array::from(
+                r.iter().map(|x| x.msg_type).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt32Array::from(
+                r.iter().map(|x| x.mmsi).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                r.iter().map(|x| x.ais_class.as_ref()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                r.iter().map(|x| x.aid_type.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                r.iter().map(|x| x.name.as_deref()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                r.iter().map(|x| x.name_extension.as_deref()).collect::<Vec<_>>(),
+            )),
+            f64_aton_col(r, |x| x.latitude),
+            f64_aton_col(r, |x| x.longitude),
+            Arc::new(Int64Array::from(
+                r.iter().map(|x| x.h3.and_then(|v| i64::try_from(v).ok())).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                r.iter().map(|x| x.hilbert.and_then(|v| i64::try_from(v).ok())).collect::<Vec<_>>(),
+            )),
+            u16_aton_col(r, |x| x.dimension_to_bow),
+            u16_aton_col(r, |x| x.dimension_to_stern),
+            u16_aton_col(r, |x| x.dimension_to_port),
+            u16_aton_col(r, |x| x.dimension_to_starboard),
+            Arc::new(BooleanArray::from(
+                r.iter()
+                    .map(|x| Some(x.off_position))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(BooleanArray::from(
+                r.iter()
+                    .map(|x| Some(x.virtual_aid))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(BooleanArray::from(
+                r.iter()
+                    .map(|x| Some(x.assigned_mode))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(BooleanArray::from(
+                r.iter()
+                    .map(|x| Some(x.high_accuracy))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(BooleanArray::from(
+                r.iter().map(|x| Some(x.raim)).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                r.iter()
+                    .map(|x| x.station.as_deref())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                self.payloads.iter().map(|x| x.as_str()).collect::<Vec<_>>(),
+            )),
+        ];
+        let batch = RecordBatch::try_new(self.schema.clone(), columns)
+            .context("assembling atons batch")?;
+        self.batches.push(batch);
+        self.rows.clear();
+        self.payloads.clear();
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<Vec<RecordBatch>> {
+        self.flush_batch()?;
+        Ok(self.batches)
+    }
+}
+
+// ── Column helpers ────────────────────────────────────────────────────────────
+
+fn f64_col(rows: &[MeteoRow], get: impl Fn(&MeteoRow) -> Option<f64>) -> ArrayRef {
+    Arc::new(Float64Array::from(
+        rows.iter().map(get).collect::<Vec<_>>(),
+    ))
+}
+
+fn u16_col(rows: &[MeteoRow], get: impl Fn(&MeteoRow) -> Option<u16>) -> ArrayRef {
+    Arc::new(UInt16Array::from(
+        rows.iter().map(get).collect::<Vec<_>>(),
+    ))
+}
+
+fn u8_col(rows: &[MeteoRow], get: impl Fn(&MeteoRow) -> Option<u8>) -> ArrayRef {
+    Arc::new(UInt8Array::from(
+        rows.iter().map(get).collect::<Vec<_>>(),
+    ))
+}
+
+fn f64_aton_col(rows: &[AtonRow], get: impl Fn(&AtonRow) -> Option<f64>) -> ArrayRef {
+    Arc::new(Float64Array::from(
+        rows.iter().map(get).collect::<Vec<_>>(),
+    ))
+}
+
+fn u16_aton_col(rows: &[AtonRow], get: impl Fn(&AtonRow) -> Option<u16>) -> ArrayRef {
+    Arc::new(UInt16Array::from(
+        rows.iter().map(get).collect::<Vec<_>>(),
+    ))
+}
+
+// ── Iceberg commit ────────────────────────────────────────────────────────────
+
+async fn write_batches_to_table(
+    table: &Table,
+    batches: Vec<RecordBatch>,
+    compression_level: i32,
+) -> Result<Vec<DataFile>> {
+    let metadata = table.metadata();
+    let schema = metadata.current_schema().clone();
+    let location_gen = DefaultLocationGenerator::new(metadata.clone())?;
+    let file_name_gen = DefaultFileNameGenerator::new(
+        "part".to_string(),
+        Some("iceberg".to_string()),
+        DataFileFormat::Parquet,
+    );
+
+    let writer_builder = ParquetWriterBuilder::new(writer_props(compression_level)?, schema);
+    let rolling_builder = RollingFileWriterBuilder::new_with_default_file_size(
+        writer_builder,
+        table.file_io().clone(),
+        location_gen,
+        file_name_gen,
+    );
+    let builder = DataFileWriterBuilder::new(rolling_builder);
+    let mut writer = builder.build(None).await.context("building Iceberg DataFileWriter")?;
+
+    for batch in &batches {
+        writer.write(batch.clone()).await.context("writing batch to Iceberg")?;
+    }
+
+    let data_files = writer.close().await.context("closing Iceberg writer")?;
+    Ok(data_files)
+}
+
+pub(crate) async fn commit_batches_to_iceberg(
+    catalog: &dyn Catalog,
+    positions_table: &Table,
+    statics_table: &Table,
+    meteo_table: &Table,
+    binary_table: &Table,
+    atons_table: &Table,
+    positions_batches: Vec<RecordBatch>,
+    statics_batches: Vec<RecordBatch>,
+    meteo_batches: Vec<RecordBatch>,
+    binary_batches: Vec<RecordBatch>,
+    atons_batches: Vec<RecordBatch>,
+    compression_level: i32,
+) -> Result<()> {
+    commit_table_batches(catalog, positions_table, positions_batches, compression_level).await?;
+    commit_table_batches(catalog, statics_table, statics_batches, compression_level).await?;
+    commit_table_batches(catalog, meteo_table, meteo_batches, compression_level).await?;
+    commit_table_batches(catalog, binary_table, binary_batches, compression_level).await?;
+    commit_table_batches(catalog, atons_table, atons_batches, compression_level).await?;
+    Ok(())
+}
+
+async fn commit_table_batches(
+    catalog: &dyn Catalog,
+    table: &Table,
+    batches: Vec<RecordBatch>,
+    compression_level: i32,
+) -> Result<()> {
+    if batches.is_empty() {
+        return Ok(());
+    }
+
+    let data_files = write_batches_to_table(table, batches, compression_level).await?;
+
+    let txn = Transaction::new(table);
+    let action = txn.fast_append().add_data_files(data_files);
+    let txn = action.apply(txn)?;
+    txn.commit(catalog).await?;
+
+    Ok(())
+}

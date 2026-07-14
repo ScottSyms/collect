@@ -20,6 +20,7 @@ tempfile.workspace = true
 tokio.workspace = true
 walkdir.workspace = true
 collect-core = { path = "../collect-core" }
+iceberg.workspace = true
 rayon = "1"
 
 [[bin]]

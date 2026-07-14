@@ -15,12 +15,25 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use arrow::record_batch::RecordBatch;
+use collect_core::iceberg::{
+    ensure_namespace, ensure_table, open_catalog, partition_spec_for,
+    IcebergConfig, TABLE_ATONS, TABLE_BINARY, TABLE_METEO, TABLE_POSITIONS, TABLE_STATICS,
+};
+use collect_core::iceberg::table_schemas;
+use output_iceberg::{
+    commit_batches_to_iceberg, AtonWriter as IcebergAtonWriter, BinaryWriter as IcebergBinaryWriter,
+    MeteoWriter as IcebergMeteoWriter, PositionsWriter as IcebergPositionsWriter,
+    StaticsWriter as IcebergStaticsWriter,
+};
+
 mod ais_stream;
 mod convert;
 mod output;
+mod output_iceberg;
 mod stats;
 
-use convert::{decode_row, Decoded};
+use convert::{decode_row, AtonRow, BinaryRow, Decoded, MeteoRow, PositionRow, StaticRow};
 use output::{AtonWriter, BinaryWriter, MeteoWriter, PositionsWriter, StaticsWriter};
 use stats::ParseStats;
 
@@ -136,6 +149,9 @@ struct Args {
     /// Output file name prefix (added before tree suffix, e.g. `{prefix}-pos-*.parquet`)
     #[arg(long, default_value = "aisstream")]
     output_prefix: String,
+
+    #[command(flatten)]
+    iceberg: collect_core::iceberg::IcebergCliArgs,
 }
 
 impl Args {
@@ -263,8 +279,12 @@ async fn main() -> Result<()> {
     }
     match (&args.output_dir, &args.output_s3_bucket) {
         (Some(_), Some(_)) => bail!("use either --output-dir or --output-s3-bucket, not both"),
-        (None, None) => bail!("one of --output-dir or --output-s3-bucket is required"),
+        (None, None) if !args.iceberg.is_iceberg_mode() => bail!("one of --output-dir, --output-s3-bucket, or --iceberg-catalog-uri is required"),
         _ => {}
+    }
+    args.iceberg.validate()?;
+    if args.incremental && args.iceberg.is_iceberg_mode() {
+        bail!("--incremental is not supported with Iceberg output");
     }
     if args.incremental
         && (args.year.is_some()
@@ -425,7 +445,8 @@ async fn main() -> Result<()> {
     let output_root: PathBuf = match (&args.output_dir, &output_scratch_path) {
         (Some(dir), None) => dir.clone(),
         (None, Some(scratch_path)) => scratch_path.clone(),
-        _ => unreachable!("validated exactly one output target above"),
+        (None, None) if args.iceberg.is_iceberg_mode() => PathBuf::new(),
+        _ => unreachable!("validated above"),
     };
     enum PartitionWork {
         Local(Vec<DatasetFile>),
@@ -553,137 +574,317 @@ async fn main() -> Result<()> {
 
     const PARTITION_DOWNLOAD_CONCURRENCY: usize = 4;
 
-    let mut workers = Vec::with_capacity(concurrency);
-    for _ in 0..concurrency {
-        let queue = queue.clone();
-        let processed = processed.clone();
-        let output_root = output_root.clone();
-        let output_storage = output_storage.clone();
-        let output_s3_prefix = args.output_s3_prefix.clone();
-        let output_prefix = args.output_prefix.clone();
-        let input_storages = input_storages.clone();
-        let input_scratch_root = input_scratch_root.clone();
-        let batch_size = args.batch_size;
-        let compression_level = args.compression_level;
-
-        workers.push(tokio::spawn(async move {
-            let mut stats = ParseStats::default();
-
-            loop {
-                if is_cancelled() {
-                    break;
-                }
-                let next = queue.lock().expect("partition queue lock").pop_front();
-                let Some((partition_key, work)) = next else {
-                    break;
-                };
-
-                let is_remote = matches!(work, PartitionWork::Remote(_));
-                let partition_files = match work {
-                    PartitionWork::Local(files) => files,
-                    PartitionWork::Remote(entries) => {
-                        let scratch_root = input_scratch_root
-                            .as_ref()
-                            .expect("remote work implies input scratch dir");
-                        match dataset::download_s3_entries(
-                            &input_storages,
-                            entries,
-                            scratch_root,
-                            PARTITION_DOWNLOAD_CONCURRENCY,
-                        )
-                        .await
-                        .context("downloading input partition from S3")
-                        {
-                            Ok(files) => files,
-                            Err(error) => {
-                                CANCELLED.store(true, Ordering::Relaxed);
-                                return Err(error);
-                            }
-                        }
-                    }
-                };
-
-                let scratch_files: Vec<PathBuf> = if is_remote {
-                    partition_files.iter().map(|f| f.path.clone()).collect()
-                } else {
-                    Vec::new()
-                };
-
-                let output_root_for_task = output_root.clone();
-                let output_prefix_for_task = output_prefix.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    process_partition(
-                        partition_key,
-                        partition_files,
-                        output_root_for_task,
-                        batch_size,
-                        compression_level,
-                        &output_prefix_for_task,
-                    )
-                })
-                .await
-                .context("partition worker panicked")?;
-
-                for scratch_file in &scratch_files {
-                    let _ = tokio::fs::remove_file(scratch_file).await;
-                }
-
-                let outputs = match result {
-                    Ok((partition_stats, outputs)) => {
-                        stats.merge(&partition_stats);
-                        outputs
-                    }
-                    Err(error) => {
-                        CANCELLED.store(true, Ordering::Relaxed);
-                        return Err(error);
-                    }
-                };
-
-                if let Some(storage) = &output_storage {
-                    for tree in OUTPUT_TREES {
-                        for (out_rel, local_path, _rows) in
-                            outputs.iter().filter(|(r, _, _)| r.starts_with(tree))
-                        {
-                            let key = s3_join(&output_s3_prefix, out_rel);
-                            if let Err(error) =
-                                upload_with_retries(storage, local_path, &key)
-                                    .await
-                                    .with_context(|| {
-                                        format!("uploading {} to S3", local_path.display())
-                                    })
-                            {
-                                CANCELLED.store(true, Ordering::Relaxed);
-                                return Err(error);
-                            }
-                        }
-                    }
-                }
-
-                let done = processed.fetch_add(1, Ordering::SeqCst) + 1;
-                if done == 1 || done.is_multiple_of(10) || done == total_partitions {
-                    eprintln!("Processed {done}/{total_partitions} partition(s).");
-                }
-            }
-
-            Ok::<_, anyhow::Error>(stats)
-        }));
-    }
-
     let mut total_stats = ParseStats::default();
     let mut first_error = None;
-    for worker in workers {
-        match worker.await {
-            Ok(Ok(stats)) => total_stats.merge(&stats),
-            Ok(Err(error)) => {
-                if first_error.is_none() {
-                    first_error = Some(error);
+
+    if !args.iceberg.is_iceberg_mode() {
+        let mut workers = Vec::with_capacity(concurrency);
+        for _ in 0..concurrency {
+            let queue = queue.clone();
+            let processed = processed.clone();
+            let output_root = output_root.clone();
+            let output_storage = output_storage.clone();
+            let output_s3_prefix = args.output_s3_prefix.clone();
+            let output_prefix = args.output_prefix.clone();
+            let input_storages = input_storages.clone();
+            let input_scratch_root = input_scratch_root.clone();
+            let batch_size = args.batch_size;
+            let compression_level = args.compression_level;
+
+            workers.push(tokio::spawn(async move {
+                let mut stats = ParseStats::default();
+
+                loop {
+                    if is_cancelled() {
+                        break;
+                    }
+                    let next = queue.lock().expect("partition queue lock").pop_front();
+                    let Some((partition_key, work)) = next else {
+                        break;
+                    };
+
+                    let is_remote = matches!(work, PartitionWork::Remote(_));
+                    let partition_files = match work {
+                        PartitionWork::Local(files) => files,
+                        PartitionWork::Remote(entries) => {
+                            let scratch_root = input_scratch_root
+                                .as_ref()
+                                .expect("remote work implies input scratch dir");
+                            match dataset::download_s3_entries(
+                                &input_storages,
+                                entries,
+                                scratch_root,
+                                PARTITION_DOWNLOAD_CONCURRENCY,
+                            )
+                            .await
+                            .context("downloading input partition from S3")
+                            {
+                                Ok(files) => files,
+                                Err(error) => {
+                                    CANCELLED.store(true, Ordering::Relaxed);
+                                    return Err(error);
+                                }
+                            }
+                        }
+                    };
+
+                    let scratch_files: Vec<PathBuf> = if is_remote {
+                        partition_files.iter().map(|f| f.path.clone()).collect()
+                    } else {
+                        Vec::new()
+                    };
+
+                    let output_root_for_task = output_root.clone();
+                    let output_prefix_for_task = output_prefix.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        process_partition(
+                            partition_key,
+                            partition_files,
+                            output_root_for_task,
+                            batch_size,
+                            compression_level,
+                            &output_prefix_for_task,
+                        )
+                    })
+                    .await
+                    .context("partition worker panicked")?;
+
+                    for scratch_file in &scratch_files {
+                        let _ = tokio::fs::remove_file(scratch_file).await;
+                    }
+
+                    let outputs = match result {
+                        Ok((partition_stats, outputs)) => {
+                            stats.merge(&partition_stats);
+                            outputs
+                        }
+                        Err(error) => {
+                            CANCELLED.store(true, Ordering::Relaxed);
+                            return Err(error);
+                        }
+                    };
+
+                    if let Some(storage) = &output_storage {
+                        for tree in OUTPUT_TREES {
+                            for (out_rel, local_path, _rows) in
+                                outputs.iter().filter(|(r, _, _)| r.starts_with(tree))
+                            {
+                                let key = s3_join(&output_s3_prefix, out_rel);
+                                if let Err(error) =
+                                    upload_with_retries(storage, local_path, &key)
+                                        .await
+                                        .with_context(|| {
+                                            format!("uploading {} to S3", local_path.display())
+                                        })
+                                {
+                                    CANCELLED.store(true, Ordering::Relaxed);
+                                    return Err(error);
+                                }
+                            }
+                        }
+                    }
+
+                    let done = processed.fetch_add(1, Ordering::SeqCst) + 1;
+                    if done == 1 || done.is_multiple_of(10) || done == total_partitions {
+                        eprintln!("Processed {done}/{total_partitions} partition(s).");
+                    }
+                }
+
+                Ok::<_, anyhow::Error>(stats)
+            }));
+        }
+
+        for worker in workers {
+            match worker.await {
+                Ok(Ok(stats)) => total_stats.merge(&stats),
+                Ok(Err(error)) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error.into());
+                    }
                 }
             }
-            Err(error) => {
-                if first_error.is_none() {
-                    first_error = Some(error.into());
+        }
+    } else {
+        let mut workers = Vec::with_capacity(concurrency);
+        for _ in 0..concurrency {
+            let queue = queue.clone();
+            let processed = processed.clone();
+            let input_storages = input_storages.clone();
+            let input_scratch_root = input_scratch_root.clone();
+            let batch_size = args.batch_size;
+
+            workers.push(tokio::spawn(async move {
+                let mut stats = ParseStats::default();
+                let mut partition_batches: Vec<IcebergPartitionOutput> = Vec::new();
+
+                loop {
+                    if is_cancelled() {
+                        break;
+                    }
+                    let next = queue.lock().expect("partition queue lock").pop_front();
+                    let Some((partition_key, work)) = next else {
+                        break;
+                    };
+
+                    let is_remote = matches!(work, PartitionWork::Remote(_));
+                    let partition_files = match work {
+                        PartitionWork::Local(files) => files,
+                        PartitionWork::Remote(entries) => {
+                            let scratch_root = input_scratch_root
+                                .as_ref()
+                                .expect("remote work implies input scratch dir");
+                            match dataset::download_s3_entries(
+                                &input_storages,
+                                entries,
+                                scratch_root,
+                                PARTITION_DOWNLOAD_CONCURRENCY,
+                            )
+                            .await
+                            .context("downloading input partition from S3")
+                            {
+                                Ok(files) => files,
+                                Err(error) => {
+                                    CANCELLED.store(true, Ordering::Relaxed);
+                                    return Err(error);
+                                }
+                            }
+                        }
+                    };
+
+                    let scratch_files: Vec<PathBuf> = if is_remote {
+                        partition_files.iter().map(|f| f.path.clone()).collect()
+                    } else {
+                        Vec::new()
+                    };
+
+                    let result = tokio::task::spawn_blocking(move || {
+                        process_partition_iceberg(
+                            partition_key,
+                            partition_files,
+                            batch_size,
+                        )
+                    })
+                    .await
+                    .context("partition worker panicked")?;
+
+                    for scratch_file in &scratch_files {
+                        let _ = tokio::fs::remove_file(scratch_file).await;
+                    }
+
+                    match result {
+                        Ok((partition_stats, batches)) => {
+                            stats.merge(&partition_stats);
+                            partition_batches.push(batches);
+                        }
+                        Err(error) => {
+                            CANCELLED.store(true, Ordering::Relaxed);
+                            return Err(error);
+                        }
+                    }
+
+                    let done = processed.fetch_add(1, Ordering::SeqCst) + 1;
+                    if done == 1 || done.is_multiple_of(10) || done == total_partitions {
+                        eprintln!("Processed {done}/{total_partitions} partition(s).");
+                    }
+                }
+
+                Ok::<_, anyhow::Error>((stats, partition_batches))
+            }));
+        }
+
+        let mut all_batches = IcebergPartitionOutput {
+            positions: Vec::new(),
+            statics: Vec::new(),
+            meteo: Vec::new(),
+            binary: Vec::new(),
+            atons: Vec::new(),
+        };
+
+        for worker in workers {
+            match worker.await {
+                Ok(Ok((stats, batches))) => {
+                    total_stats.merge(&stats);
+                    for b in batches {
+                        all_batches.positions.extend(b.positions);
+                        all_batches.statics.extend(b.statics);
+                        all_batches.meteo.extend(b.meteo);
+                        all_batches.binary.extend(b.binary);
+                        all_batches.atons.extend(b.atons);
+                    }
+                }
+                Ok(Err(error)) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error.into());
+                    }
                 }
             }
+        }
+
+        if first_error.is_none() {
+            let config: IcebergConfig = (&args.iceberg).into();
+            let catalog = open_catalog(&config)
+                .await
+                .context("connecting to Iceberg catalog")?;
+            ensure_namespace(&catalog, &config).await?;
+
+            let partition_granularity = args.partition.as_str();
+            let positions_table = ensure_table(
+                &catalog,
+                &config,
+                TABLE_POSITIONS,
+                table_schemas::positions_schema(),
+                partition_spec_for(&table_schemas::positions_schema(), partition_granularity)?,
+            )
+            .await?;
+            let statics_table = ensure_table(
+                &catalog,
+                &config,
+                TABLE_STATICS,
+                table_schemas::statics_schema(),
+                partition_spec_for(&table_schemas::statics_schema(), partition_granularity)?,
+            )
+            .await?;
+            let meteo_table = ensure_table(
+                &catalog,
+                &config,
+                TABLE_METEO,
+                table_schemas::meteo_schema(),
+                partition_spec_for(&table_schemas::meteo_schema(), partition_granularity)?,
+            )
+            .await?;
+            let binary_table = ensure_table(
+                &catalog,
+                &config,
+                TABLE_BINARY,
+                table_schemas::binary_schema(),
+                partition_spec_for(&table_schemas::binary_schema(), partition_granularity)?,
+            )
+            .await?;
+            let atons_table = ensure_table(
+                &catalog,
+                &config,
+                TABLE_ATONS,
+                table_schemas::atons_schema(),
+                partition_spec_for(&table_schemas::atons_schema(), partition_granularity)?,
+            )
+            .await?;
+
+            let sc = &catalog;
+            commit_batches_to_iceberg(all_batches.positions, &positions_table, sc).await?;
+            commit_batches_to_iceberg(all_batches.statics, &statics_table, sc).await?;
+            commit_batches_to_iceberg(all_batches.meteo, &meteo_table, sc).await?;
+            commit_batches_to_iceberg(all_batches.binary, &binary_table, sc).await?;
+            commit_batches_to_iceberg(all_batches.atons, &atons_table, sc).await?;
         }
     }
 
@@ -783,18 +984,19 @@ fn process_partition(
     // seen in more than one input file for this partition is emitted once.
     let mut seen: HashSet<DedupKey> = HashSet::new();
 
+    let mut writers = Writers {
+        positions: &mut positions,
+        statics: &mut statics,
+        meteo: &mut meteo,
+        binary: &mut binary,
+        atons: &mut atons,
+    };
     for file in &files {
         process_parquet_file(
             &file.path,
             &file.partition.source,
             &mut stats,
-            Writers {
-                positions: &mut positions,
-                statics: &mut statics,
-                meteo: &mut meteo,
-                binary: &mut binary,
-                atons: &mut atons,
-            },
+            &mut writers,
             batch_size,
             &mut seen,
         )
@@ -837,6 +1039,14 @@ fn process_partition(
     Ok((stats, outputs))
 }
 
+trait WriterSet {
+    fn write_position(&mut self, row: &PositionRow, payload: Option<&str>) -> Result<()>;
+    fn write_static(&mut self, row: &StaticRow, payload: Option<&str>) -> Result<()>;
+    fn write_meteo(&mut self, row: MeteoRow, payload: Option<&str>) -> Result<()>;
+    fn write_binary(&mut self, row: BinaryRow, payload: Option<&str>) -> Result<()>;
+    fn write_aton(&mut self, row: AtonRow, payload: Option<&str>) -> Result<()>;
+}
+
 struct Writers<'a> {
     positions: &'a mut PositionsWriter,
     statics: &'a mut StaticsWriter,
@@ -845,11 +1055,29 @@ struct Writers<'a> {
     atons: &'a mut AtonWriter,
 }
 
+impl<'a> WriterSet for Writers<'a> {
+    fn write_position(&mut self, row: &PositionRow, _payload: Option<&str>) -> Result<()> {
+        self.positions.write(row)
+    }
+    fn write_static(&mut self, row: &StaticRow, _payload: Option<&str>) -> Result<()> {
+        self.statics.write(row)
+    }
+    fn write_meteo(&mut self, row: MeteoRow, _payload: Option<&str>) -> Result<()> {
+        self.meteo.write(row)
+    }
+    fn write_binary(&mut self, row: BinaryRow, _payload: Option<&str>) -> Result<()> {
+        self.binary.write(row)
+    }
+    fn write_aton(&mut self, row: AtonRow, _payload: Option<&str>) -> Result<()> {
+        self.atons.write(row)
+    }
+}
+
 fn process_parquet_file(
     path: &Path,
     path_source: &str,
     stats: &mut ParseStats,
-    writers: Writers<'_>,
+    writers: &mut impl WriterSet,
     batch_size: usize,
     seen: &mut HashSet<DedupKey>,
 ) -> Result<()> {
@@ -901,14 +1129,14 @@ fn process_parquet_file(
             static JSON_BUF: RefCell<String> = const { RefCell::new(String::new()) };
         }
 
-        let decoded: Vec<(usize, Decoded)> = (0..n)
+        let decoded: Vec<(usize, String, Decoded)> = (0..n)
             .into_par_iter()
             .map(|i| {
-                let payload_str = payload_col.value(i);
+                let payload_str = payload_col.value(i).to_string();
                 let result = JSON_BUF.with(|buf_cell| {
                     let mut buf = buf_cell.borrow_mut();
                     buf.clear();
-                    buf.push_str(payload_str);
+                    buf.push_str(&payload_str);
                     let mut ais_msg: crate::ais_stream::AisStreamMessage = match unsafe {
                         simd_serde::from_str(&mut buf)
                     } {
@@ -918,18 +1146,19 @@ fn process_parquet_file(
                     let msg_type = ais_msg.MessageType.as_str();
                     decode_row(ts_col.value(i), sources[i], msg_type, &mut ais_msg.Message)
                 });
-                (i, result)
+                (i, payload_str, result)
             })
             .collect();
 
         stats.rows_in += n as u64;
-        for (_, result) in decoded {
+        for (_, payload_str, result) in decoded {
+            let payload = Some(payload_str.as_str());
             match result {
                 Decoded::Position(row) => {
                     let key = DedupKey(0, row.ts_ms, row.mmsi, 0, row.msg_type);
                     if seen.insert(key) {
                         stats.positions_out += 1;
-                        writers.positions.write(&row)?;
+                        writers.write_position(&row, payload)?;
                     } else {
                         stats.rows_deduped += 1;
                     }
@@ -938,7 +1167,7 @@ fn process_parquet_file(
                     let key = DedupKey(1, row.ts_ms, row.mmsi, 0, 0);
                     if seen.insert(key) {
                         stats.statics_out += 1;
-                        writers.statics.write(&row)?;
+                        writers.write_static(&row, payload)?;
                     } else {
                         stats.rows_deduped += 1;
                     }
@@ -953,7 +1182,7 @@ fn process_parquet_file(
                     );
                     if seen.insert(key) {
                         stats.meteo_out += 1;
-                        writers.meteo.write(row)?;
+                        writers.write_meteo(row, payload)?;
                     } else {
                         stats.rows_deduped += 1;
                     }
@@ -968,7 +1197,7 @@ fn process_parquet_file(
                     );
                     if seen.insert(key) {
                         stats.binary_out += 1;
-                        writers.binary.write(row)?;
+                        writers.write_binary(row, payload)?;
                     } else {
                         stats.rows_deduped += 1;
                     }
@@ -977,7 +1206,7 @@ fn process_parquet_file(
                     let key = DedupKey(4, row.ts_ms, row.mmsi, 0, row.msg_type);
                     if seen.insert(key) {
                         stats.atons_out += 1;
-                        writers.atons.write(row)?;
+                        writers.write_aton(row, payload)?;
                     } else {
                         stats.rows_deduped += 1;
                     }
@@ -989,6 +1218,83 @@ fn process_parquet_file(
     }
 
     Ok(())
+}
+
+// ── Iceberg support ──────────────────────────────────────────────────────────
+
+struct IcebergWriters {
+    positions: IcebergPositionsWriter,
+    statics: IcebergStaticsWriter,
+    meteo: IcebergMeteoWriter,
+    binary: IcebergBinaryWriter,
+    atons: IcebergAtonWriter,
+}
+
+impl WriterSet for IcebergWriters {
+    fn write_position(&mut self, row: &PositionRow, payload: Option<&str>) -> Result<()> {
+        self.positions.write(row, payload)
+    }
+    fn write_static(&mut self, row: &StaticRow, payload: Option<&str>) -> Result<()> {
+        self.statics.write(row, payload)
+    }
+    fn write_meteo(&mut self, row: MeteoRow, payload: Option<&str>) -> Result<()> {
+        self.meteo.write(row, payload)
+    }
+    fn write_binary(&mut self, row: BinaryRow, payload: Option<&str>) -> Result<()> {
+        self.binary.write(row, payload)
+    }
+    fn write_aton(&mut self, row: AtonRow, payload: Option<&str>) -> Result<()> {
+        self.atons.write(row, payload)
+    }
+}
+
+struct IcebergPartitionOutput {
+    positions: Vec<RecordBatch>,
+    statics: Vec<RecordBatch>,
+    meteo: Vec<RecordBatch>,
+    binary: Vec<RecordBatch>,
+    atons: Vec<RecordBatch>,
+}
+
+fn process_partition_iceberg(
+    _partition_key: PartitionKey,
+    files: Vec<DatasetFile>,
+    batch_size: usize,
+) -> Result<(ParseStats, IcebergPartitionOutput)> {
+    let mut stats = ParseStats::default();
+    let mut writers = IcebergWriters {
+        positions: IcebergPositionsWriter::new(),
+        statics: IcebergStaticsWriter::new(),
+        meteo: IcebergMeteoWriter::new(),
+        binary: IcebergBinaryWriter::new(),
+        atons: IcebergAtonWriter::new(),
+    };
+
+    let mut seen: HashSet<DedupKey> = HashSet::new();
+
+    for file in &files {
+        process_parquet_file(
+            &file.path,
+            &file.partition.source,
+            &mut stats,
+            &mut writers,
+            batch_size,
+            &mut seen,
+        )
+        .with_context(|| format!("processing {}", file.path.display()))?;
+    }
+    stats.partitions_processed += 1;
+
+    Ok((
+        stats,
+        IcebergPartitionOutput {
+            positions: writers.positions.finish()?,
+            statics: writers.statics.finish()?,
+            meteo: writers.meteo.finish()?,
+            binary: writers.binary.finish()?,
+            atons: writers.atons.finish()?,
+        },
+    ))
 }
 
 #[cfg(test)]

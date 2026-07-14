@@ -49,6 +49,9 @@ works.
 | `cog` | float64, nullable | course over ground, degrees |
 | `heading_true` | float64, nullable | |
 | `rot` | float64, nullable | rate of turn |
+| `altitude_m` | float64, nullable | SAR aircraft altitude |
+| `h3` | uint64 (local) / bigint (Iceberg) | H3 cell at resolution 10 (signed long in Iceberg; no unsigned integer types) |
+| `hilbert` | uint64 (local) / bigint (Iceberg) | Hilbert curve S2 cell id (signed long in Iceberg) |
 | `nav_status` | utf8 | e.g. `under way using engine` |
 | `high_accuracy` | boolean | position accuracy flag |
 | `raim` | boolean | |
@@ -194,12 +197,28 @@ cargo run -p ais-parse -- --input-s3-bucket normalized-ais --output-s3-bucket si
 | `--partition` | `day` | input layout granularity; output trees mirror it |
 | `--source`, `--year`…`--minute` | *(all)* | partition slice filters |
 | `--since <HOURS>` | *(off)* | rolling window (env `SINCE_HOURS`); with `--incremental`, first-run seed only |
-| `--incremental` | *(off)* | watermark at the output (`_ais-parse/watermark.json`), env `INCREMENTAL=true` |
+| `--incremental` | *(off)* | watermark at the output (`_ais-parse/watermark.json`), env `INCREMENTAL=true`; not supported in Iceberg mode |
 | `--batch-size` | `8192` | Parquet read batch rows |
 | `--compression-level` | `5` | Zstd level for output |
 | `--concurrency` | cores, clamped `[1, 8]` | partitions decoded in parallel |
 | `--output-prefix` | `ais` | output file name prefix (added before tree suffix) |
 | `--consolidate-ais` | *(off)* | reassemble fragmented NMEA sentences before decoding |
+
+### Iceberg output (REST catalog)
+
+Instead of `--output-dir` / `--output-s3-bucket`, pass `--iceberg-catalog-uri` to write directly into Iceberg tables via a REST catalog (Lakekeeper, Polaris, etc.). Both `ais-parse` and `aisstream-parse` share the same set of tables when writing to the same namespace.
+
+| Flag | Env | Default | Description |
+|------|-----|---------|-------------|
+| `--iceberg-catalog-uri` | `ICEBERG_CATALOG_URI` | — | REST catalog URI |
+| `--iceberg-warehouse` | `ICEBERG_WAREHOUSE` | — | Warehouse location |
+| `--iceberg-namespace` | `ICEBERG_NAMESPACE` | `ais` | Catalog namespace (database) |
+| `--iceberg-table-prefix` | `ICEBERG_TABLE_PREFIX` | — | Prefix for table names |
+| `--iceberg-token` | `ICEBERG_TOKEN` | — | Bearer token for auth |
+
+Tables are automatically created if missing with schemas matching the shared Iceberg specification (field IDs stable across tools). All five table types are written: `positions`, `statics`, `meteo`, `binary`, `atons`.
+
+**Type difference — unsigned → signed:** Iceberg has no unsigned integer types. Columns that are `uint64` in the local Parquet output (`h3`, `hilbert`) are stored as Iceberg `long` (signed 64-bit bigint). The H3 cell ID and Hilbert curve values both fit within signed `i64` range, so no precision is lost. The conversion is handled transparently in the Iceberg writer.
 
 ### Run summary
 

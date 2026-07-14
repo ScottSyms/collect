@@ -61,8 +61,8 @@ partitioned by time only (not by source).
 | `heading_true` | float64, nullable | |
 | `rot` | float64, nullable | rate of turn |
 | `altitude_m` | float64, nullable | (SAR aircraft) |
-| `h3` | uint64, nullable | H3 cell at resolution 10 |
-| `hilbert` | uint64, nullable | Hilbert curve S2 cell id |
+| `h3` | uint64 (local) / bigint (Iceberg) | H3 cell at resolution 10 (signed long in Iceberg) |
+| `hilbert` | uint64 (local) / bigint (Iceberg) | Hilbert curve S2 cell id (signed long in Iceberg) |
 | `nav_status` | utf8 | navigation status |
 | `high_accuracy` | boolean | position accuracy flag |
 | `raim` | boolean | |
@@ -123,8 +123,8 @@ Other Type 8 messages retained as generic header + hex payload:
 | `aid_type` | utf8 | aid type description |
 | `name` / `name_extension` | utf8, nullable | |
 | `latitude` / `longitude` | float64, nullable | |
-| `h3` | uint64, nullable | |
-| `hilbert` | uint64, nullable | |
+| `h3` | uint64 (local) / bigint (Iceberg) | signed long in Iceberg |
+| `hilbert` | uint64 (local) / bigint (Iceberg) | signed long in Iceberg |
 | `dimension_to_bow/stern/port/starboard` | uint16, nullable | |
 | `off_position` | boolean | |
 | `virtual_aid` | boolean | |
@@ -155,6 +155,20 @@ Other Type 8 messages retained as generic header + hex payload:
 
 S3 connection args: `--s3-endpoint`, `--s3-region`, `--s3-access-key`,
 `--s3-secret-key`, `--s3-disable-tls` (env vars: `S3_ENDPOINT`, etc.)
+
+### Iceberg output (REST catalog)
+
+Instead of `--output-dir` / `--output-s3-bucket`, pass `--iceberg-catalog-uri` to write directly into Iceberg tables via a REST catalog. Both aisstream-parse and ais-parse share the same set of tables when writing to the same namespace.
+
+| Flag | Env | Default | Description |
+|------|-----|---------|-------------|
+| `--iceberg-catalog-uri` | `ICEBERG_CATALOG_URI` | — | REST catalog URI |
+| `--iceberg-warehouse` | `ICEBERG_WAREHOUSE` | — | Warehouse location |
+| `--iceberg-namespace` | `ICEBERG_NAMESPACE` | `ais` | Catalog namespace (database) |
+| `--iceberg-table-prefix` | `ICEBERG_TABLE_PREFIX` | — | Prefix for table names |
+| `--iceberg-token` | `ICEBERG_TOKEN` | — | Bearer token for auth |
+
+**Type difference — unsigned → signed:** Iceberg has no unsigned integer types. Columns that are `uint64` in the local Parquet output (`h3`, `hilbert`) are stored as Iceberg `long` (signed 64-bit bigint). The H3 cell ID and Hilbert curve values both fit within signed `i64` range, so no precision is lost.
 
 ## Watermark / Incremental
 

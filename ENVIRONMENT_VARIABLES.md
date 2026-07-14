@@ -113,6 +113,24 @@ Most command-line parameters can be configured using environment variables, maki
   - Example: `S3_SECRET_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY`
   - Can also use standard AWS environment variable `AWS_SECRET_ACCESS_KEY`
 
+### Iceberg Output Options
+
+- `ICEBERG_CATALOG_URI`: Iceberg REST catalog URI
+  - Example: `ICEBERG_CATALOG_URI=http://lakekeeper:8181/catalog`
+
+- `ICEBERG_WAREHOUSE`: Iceberg warehouse location
+  - Example: `ICEBERG_WAREHOUSE=s3://my-bucket/warehouse`
+
+- `ICEBERG_NAMESPACE`: Iceberg namespace (database)
+  - Example: `ICEBERG_NAMESPACE=ais`
+  - Default: `ais`
+
+- `ICEBERG_TABLE_PREFIX`: Optional prefix for Iceberg table names
+  - Example: `ICEBERG_TABLE_PREFIX=prod`
+
+- `ICEBERG_TOKEN`: Bearer token for Lakekeeper / REST catalog authentication
+  - Example: `ICEBERG_TOKEN=lk_demo_xxx`
+
 ### Batch Processing Options
 
 - `INCREMENTAL`: Enable watermark-based incremental processing
