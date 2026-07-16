@@ -203,6 +203,26 @@ cargo run -p ais-parse -- --input-s3-bucket normalized-ais --output-s3-bucket si
 | `--concurrency` | cores, clamped `[1, 8]` | partitions decoded in parallel (env `CONCURRENCY`) |
 | `--output-prefix` | `ais` | output file name prefix (added before tree suffix, env `OUTPUT_PREFIX`) |
 | `--consolidate-ais` | *(off)* | reassemble fragmented NMEA sentences before decoding |
+| `--dry-run` | *(off)* | list the partitions that would be processed and exit; never connects to the output (env `DRY_RUN`) — see [below](#dry-run) |
+| `--quiet` / `-q` | *(off)* | suppress routine progress lines; warnings/errors/summary still print (env `QUIET`) |
+| `--completions <shell>` | — | print shell completions to stdout and exit |
+| `--version` | — | prints `<crate version> (<git commit hash>)` |
+
+### Dry run
+
+`--dry-run` lists the partitions a real run would touch and exits without decoding, writing, or connecting to the output target at all — including skipping the S3 connection that would otherwise auto-create a missing output bucket. Output:
+
+```
+$ ais-parse --input-dir normalized --output-dir silver --dry-run
+Scanning 1 input dir(s)...
+Found 3 partition(s).
+year=2026/month=07/day=14  (2 local files)
+year=2026/month=07/day=15  (4 local files)
+year=2026/month=07/day=16  (1 local file)
+Dry run: 3 partition(s) would be processed. No output was written.
+```
+
+Combined with `--incremental`, the dry run can't see the real watermark (it lives at the output, which `--dry-run` deliberately doesn't connect to), so it falls back to `--since` or the full dataset — a printed note calls this out.
 
 ### Iceberg output (REST catalog)
 
@@ -232,6 +252,14 @@ Tables are automatically created if missing with schemas matching the shared Ice
 | `other decoded` | valid messages of classes not materialized |
 | `incomplete fragments` | multi-part fragments whose partner never arrived |
 | `unparsed` | sentences the parser rejected |
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | processed successfully (or `--dry-run` completed, even with 0 partitions found) |
+| `1` | error |
+| `2` | nothing to process — no matching input files, or (with `--incremental`) nothing new since the watermark |
 | `deduped (dropped)` | duplicate rows suppressed by row-level dedup |
 
 A quick way to eyeball decoded output:

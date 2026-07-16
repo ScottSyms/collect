@@ -39,6 +39,7 @@ dependencies = [
  "arrow",
  "chrono",
  "clap",
+ "clap_complete",
  "collect-core",
  "fast_hilbert",
  "futures-util",
@@ -63,6 +64,7 @@ dependencies = [
  "arrow",
  "chrono",
  "clap",
+ "clap_complete",
  "collect-core",
  "fast_hilbert",
  "futures-util",
@@ -1187,6 +1189,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "clap_complete"
+version = "4.6.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "db8b397918185f0161ff3d6fcaa9e4bfc09b8367caf6e1d4a2848e5477ed027b"
+dependencies = [
+ "clap",
+]
+
+[[package]]
 name = "clap_derive"
 version = "4.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1219,6 +1230,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "clap_complete",
  "collect-core",
  "futures-util",
  "serde",
@@ -1239,6 +1251,7 @@ dependencies = [
  "aws-sdk-s3",
  "chrono",
  "clap",
+ "clap_complete",
  "futures",
  "futures-util",
  "iceberg",
@@ -1262,6 +1275,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "clap_complete",
  "collect-core",
  "crossterm",
  "futures-util",
@@ -1283,6 +1297,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "clap",
+ "clap_complete",
  "collect-core",
  "futures-util",
  "parquet",
@@ -1301,6 +1316,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "clap_complete",
  "collect-core",
  "serde",
  "tokio",
@@ -4177,7 +4193,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",

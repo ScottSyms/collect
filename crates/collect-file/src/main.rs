@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use collect_core::ais_consolidate::{AisConsolidator, AisConsolidatorConfig};
 use collect_core::{
-    default_source_from_path, health_file_path, run_ingest, update_health_status_async,
-    CommonCliArgs, IngestOptions, S3CliArgs,
+    default_source_from_path, health_file_path, print_completions, run_ingest,
+    update_health_status_async, CommonCliArgs, IngestOptions, S3CliArgs,
 };
 use std::collections::VecDeque;
 use std::io::IsTerminal;
@@ -19,9 +19,13 @@ mod completion_manifest;
 mod input;
 mod status;
 
+/// Exit code used when there was nothing to ingest (distinct from success
+/// with rows written, and from a hard error).
+const EXIT_NOTHING_TO_DO: i32 = 2;
+
 #[derive(Parser, Debug)]
 #[command(
-    version,
+    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_COMMIT_HASH"), ")"),
     about = "Recursively ingest plain, gzip, bzip2, and zip files into Hive-partitioned Parquet with Zstd compression"
 )]
 struct Args {
@@ -47,6 +51,10 @@ struct Args {
     #[arg(long)]
     noui: bool,
 
+    /// Suppress informational progress lines; warnings and errors still print
+    #[arg(short, long, env = "QUIET")]
+    quiet: bool,
+
     /// Enable AIS multi-part message consolidation (reassembles fragmented
     /// NMEA sentences in-line before writing to the Parquet batch).
     #[arg(long)]
@@ -56,12 +64,22 @@ struct Args {
     /// correct row timestamps. Independent of --consolidate-ais.
     #[arg(long)]
     process_timestamps: bool,
+
+    /// Print shell completions for the given shell to stdout and exit
+    #[arg(long, exclusive = true)]
+    completions: Option<clap_complete::Shell>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
 
+    if let Some(shell) = args.completions {
+        print_completions::<Args>(shell, "collect-file");
+        return Ok(());
+    }
+
+    let quiet = args.quiet;
     let status_mode = status::StatusMode::from_tty(!args.noui && std::io::stdout().is_terminal());
 
     let input = args
@@ -72,9 +90,11 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| default_source_from_path(&input));
 
     let health_file = health_file_path("collect-file");
-    eprintln!("🔎 Scanning input files...");
+    if !quiet {
+        eprintln!("🔎 Scanning input files...");
+    }
     let source = input::FileInputSource::new_parallel(input, source_name).await?;
-    if status_mode.is_plain() {
+    if !quiet && status_mode.is_plain() {
         eprintln!("📦 Discovered {} input job(s)", source.job_count());
     }
     run_file_ingest(
@@ -86,10 +106,12 @@ async fn main() -> Result<()> {
         args.concurrency,
         args.consolidate_ais,
         args.process_timestamps,
+        quiet,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_file_ingest(
     source: input::FileInputSource,
     common: collect_core::CommonOptions,
@@ -99,6 +121,7 @@ async fn run_file_ingest(
     concurrency: Option<usize>,
     consolidate_ais: bool,
     process_timestamps: bool,
+    quiet: bool,
 ) -> Result<()> {
     let manifest_path = completion_manifest::manifest_path(&common.out_dir);
     let completed = match completion_manifest::load_completed(&manifest_path) {
@@ -122,8 +145,10 @@ async fn run_file_ingest(
         .collect();
 
     if sources.is_empty() {
-        eprintln!("✅ No unfinished input files found");
-        return Ok(());
+        if !quiet {
+            eprintln!("✅ No unfinished input files found");
+        }
+        std::process::exit(EXIT_NOTHING_TO_DO);
     }
 
     let total_files = sources.len();
@@ -183,17 +208,21 @@ async fn run_file_ingest(
             tokio::spawn(async move {
                 match collect_core::sweep_orphaned_uploads(out_dir, storage).await {
                     Ok(0) => {}
-                    Ok(count) => eprintln!(
-                        "♻️  Uploaded {} orphaned parquet file(s) from a previous run",
-                        count
-                    ),
+                    Ok(count) => {
+                        if !quiet {
+                            eprintln!(
+                                "♻️  Uploaded {} orphaned parquet file(s) from a previous run",
+                                count
+                            );
+                        }
+                    }
                     Err(error) => eprintln!("⚠️  Orphan upload sweep failed: {}", error),
                 }
             });
         }
     }
     if sources.len() == 1 {
-        if status_mode.is_plain() {
+        if !quiet && status_mode.is_plain() {
             eprintln!("▶️  Starting single-worker ingest");
         }
         let mut source = sources.pop().expect("single source");
@@ -270,10 +299,12 @@ async fn run_file_ingest(
         stop,
         use_consolidator,
         use_timestamps,
+        quiet,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_parallel_file_ingest(
     sources: Vec<input::FileInputSource>,
     options: IngestOptions,
@@ -285,6 +316,7 @@ async fn run_parallel_file_ingest(
     stop: Arc<AtomicBool>,
     consolidate_ais: bool,
     process_timestamps: bool,
+    quiet: bool,
 ) -> Result<()> {
     let running = Arc::new(AtomicBool::new(true));
     update_health_status_async(&health_file, true).await?;
@@ -352,7 +384,7 @@ async fn run_parallel_file_ingest(
         eprintln!("🛑 Shutdown signal received. Stopping file workers...");
     });
 
-    if status_mode.is_plain() {
+    if !quiet && status_mode.is_plain() {
         eprintln!(
             "🧵 Starting parallel ingest with {} worker(s)",
             worker_limit

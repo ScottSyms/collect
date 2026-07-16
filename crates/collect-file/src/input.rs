@@ -820,7 +820,7 @@ mod tests {
         write_text_file(&root.join("a_readable.txt"), "good-1\n")?;
         let unreadable = root.join("b_unreadable.txt");
         write_text_file(&unreadable, "bad-1\n")?;
-        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0))?;
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000))?;
 
         let mut source = FileInputSource::new(root.to_path_buf(), "source".to_string())?;
         let lines = collect_all_lines(&mut source, 1024).await?;

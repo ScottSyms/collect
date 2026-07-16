@@ -160,6 +160,15 @@ Each variable is the SCREAMING_SNAKE name of its flag unless noted.
 - `OUTPUT_PREFIX`: Output file name prefix
   - Default: `ais` (ais-parse) / `aisstream` (aisstream-parse)
 
+- `DRY_RUN`: List the partitions that would be processed and exit, without decoding, writing, or connecting to the output target
+  - Example: `DRY_RUN=true`
+
+### Common to Every Binary
+
+- `QUIET`: Suppress routine progress lines (scanning/listing/per-batch chatter); warnings, errors, and the final summary still print
+  - Example: `QUIET=true`
+  - Every binary also accepts `-q` / `--quiet` and `--completions <shell>` (bash/zsh/fish/elvish/powershell) as CLI-only flags (no env equivalent for completions, since it's a one-shot action, not a runtime mode)
+
 ### Source-Specific Options
 
 - Kafka (collect-kafka): `KAFKA_BROKERS`, `KAFKA_TOPIC`, `KAFKA_GROUP_ID`, `KAFKA_AUTO_OFFSET_RESET`

@@ -48,6 +48,9 @@ cargo run -p collect-socket -- \
 | Flag | Env | Default | Description |
 |------|-----|---------|-------------|
 | `--source` / `-s` | `SOURCE` | `"tcp"` | Logical source label |
+| `--quiet` / `-q` | `QUIET` | off | Suppress routine progress lines; warnings/errors still print |
+| `--completions <shell>` | — | — | Print shell completions to stdout and exit |
+| `--version` | — | — | Prints `<crate version> (<git commit hash>)` |
 
 ### AIS Processing
 

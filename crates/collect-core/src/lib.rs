@@ -495,6 +495,13 @@ pub fn health_file_path(app_name: &str) -> PathBuf {
     PathBuf::from(format!("/tmp/{}.health", app_name))
 }
 
+/// Write shell completions for `command` to stdout and return. Call this
+/// right after parsing `--completions <shell>` and exit before doing any
+/// other work.
+pub fn print_completions<C: clap::CommandFactory>(shell: clap_complete::Shell, bin_name: &str) {
+    clap_complete::generate(shell, &mut C::command(), bin_name, &mut std::io::stdout());
+}
+
 pub fn default_source_from_path(path: &Path) -> String {
     path.file_stem()
         .or_else(|| path.file_name())

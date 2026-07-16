@@ -43,6 +43,10 @@ const METEO_TREE: &str = "meteo";
 const BINARY_TREE: &str = "binary";
 const ATONS_TREE: &str = "atons";
 
+/// Exit code used when there was nothing to process (distinct from success
+/// with rows written, and from a hard error).
+const EXIT_NOTHING_TO_DO: i32 = 2;
+
 static CANCELLED: AtomicBool = AtomicBool::new(false);
 
 fn is_cancelled() -> bool {
@@ -63,7 +67,7 @@ struct DedupKey(u8, i64, u32, u32, u8);
 
 #[derive(Parser, Debug)]
 #[command(
-    version,
+    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_COMMIT_HASH"), ")"),
     about = "Decode normalized AIS sentences into typed Parquet (positions and vessel statics)"
 )]
 struct Args {
@@ -167,8 +171,21 @@ struct Args {
     #[arg(long)]
     process_timestamps: bool,
 
+    /// List the partitions that would be processed and exit without
+    /// decoding, writing, or touching the output target
+    #[arg(long, env = "DRY_RUN")]
+    dry_run: bool,
+
+    /// Suppress informational progress lines; warnings and errors still print
+    #[arg(short, long, env = "QUIET")]
+    quiet: bool,
+
     #[command(flatten)]
     iceberg: collect_core::iceberg::IcebergCliArgs,
+
+    /// Print shell completions for the given shell to stdout and exit
+    #[arg(long, exclusive = true)]
+    completions: Option<clap_complete::Shell>,
 }
 
 impl Args {
@@ -259,8 +276,15 @@ async fn main() -> Result<()> {
     }
 
     let mut args = Args::parse();
+
+    if let Some(shell) = args.completions {
+        collect_core::print_completions::<Args>(shell, "ais-parse");
+        return Ok(());
+    }
+
     args.normalize();
     args.split_s3_args();
+    let quiet = args.quiet;
 
     match (args.input_dir.is_empty(), args.input_s3_bucket.is_empty()) {
         (false, false) => bail!("use either --input-dir or --input-s3-bucket, not both"),
@@ -353,26 +377,35 @@ async fn main() -> Result<()> {
     }
     let input_storages = Arc::new(input_storages);
     let input_is_s3 = !input_storages.is_empty();
-    let output_storage = match &args.output_s3_bucket {
-        Some(bucket) => Some(
-            S3Storage::new(
-                bucket.clone(),
-                String::new(),
-                args.s3_connection.s3_region.clone(),
-                args.s3_connection.s3_endpoint.clone(),
-                args.s3_connection.s3_access_key.clone(),
-                args.s3_connection.s3_secret_key.clone(),
-                false,
-                args.s3_connection.s3_disable_tls,
-            )
-            .await
-            .context("connecting to output S3 bucket")?,
-        ),
-        None => None,
+    // --dry-run never touches the output target: connecting can create a
+    // missing bucket as a side effect (see S3Storage::ensure_bucket), and a
+    // preview should be side-effect-free. Incremental selection therefore
+    // falls back to --since (or the full dataset) under --dry-run, since the
+    // real watermark lives at the output.
+    let output_storage = if args.dry_run {
+        None
+    } else {
+        match &args.output_s3_bucket {
+            Some(bucket) => Some(
+                S3Storage::new(
+                    bucket.clone(),
+                    String::new(),
+                    args.s3_connection.s3_region.clone(),
+                    args.s3_connection.s3_endpoint.clone(),
+                    args.s3_connection.s3_access_key.clone(),
+                    args.s3_connection.s3_secret_key.clone(),
+                    false,
+                    args.s3_connection.s3_disable_tls,
+                )
+                .await
+                .context("connecting to output S3 bucket")?,
+            ),
+            None => None,
+        }
     };
 
     // Incremental watermark, stored per tool at the output target.
-    let state_store = if args.incremental {
+    let state_store = if args.incremental && !args.dry_run {
         Some(match (&output_storage, &args.output_dir) {
             (Some(storage), _) => {
                 state::StateStore::s3(storage, &args.output_s3_prefix, "ais-parse")
@@ -385,6 +418,13 @@ async fn main() -> Result<()> {
     };
     let mut prev_watermark_ms: Option<i64> = None;
     let mut incremental_cutoff: Option<i64> = None;
+    if args.incremental && args.dry_run {
+        eprintln!(
+            "Note: --dry-run does not connect to the output, so incremental selection here \
+             uses --since (or the full dataset) instead of the real watermark."
+        );
+        incremental_cutoff = since_ms;
+    }
     if let Some(store) = &state_store {
         match store.load().await? {
             Some(prev) => {
@@ -452,7 +492,9 @@ async fn main() -> Result<()> {
     }
 
     let mut partitions: Vec<(PartitionKey, PartitionWork)> = if input_is_s3 {
-        eprintln!("Listing {} input S3 bucket(s)...", input_storages.len());
+        if !quiet {
+            eprintln!("Listing {} input S3 bucket(s)...", input_storages.len());
+        }
         if !partition_filter.is_empty() && args.source.is_none() {
             eprintln!(
                 "Note: without --source the partition filter is applied after listing; \
@@ -481,9 +523,14 @@ async fn main() -> Result<()> {
                 input_storages.len(),
                 args.input_s3_prefix
             );
-            return Ok(());
+            if args.dry_run {
+                return Ok(());
+            }
+            std::process::exit(EXIT_NOTHING_TO_DO);
         }
-        eprintln!("Found {} matching object(s).", entries.len());
+        if !quiet {
+            eprintln!("Found {} matching object(s).", entries.len());
+        }
         entries.sort_by(|a, b| {
             a.partition
                 .sort_key()
@@ -500,7 +547,9 @@ async fn main() -> Result<()> {
             .map(|(key, list)| (key, PartitionWork::Remote(list)))
             .collect()
     } else {
-        eprintln!("Scanning {} input dir(s)...", args.input_dir.len());
+        if !quiet {
+            eprintln!("Scanning {} input dir(s)...", args.input_dir.len());
+        }
         let mut files: Vec<DatasetFile> = Vec::new();
         for dir in &args.input_dir {
             let dir_files = dataset::list_parquet_files(
@@ -515,7 +564,10 @@ async fn main() -> Result<()> {
         }
         if files.is_empty() {
             eprintln!("No matching Parquet files found in the input dir(s).");
-            return Ok(());
+            if args.dry_run {
+                return Ok(());
+            }
+            std::process::exit(EXIT_NOTHING_TO_DO);
         }
         files.sort_by(|a, b| {
             a.partition
@@ -555,18 +607,47 @@ async fn main() -> Result<()> {
                 let _ = tokio::fs::remove_dir_all(scratch_path).await;
             }
             eprintln!("Nothing new since the watermark; done.");
-            return Ok(());
+            if args.dry_run {
+                return Ok(());
+            }
+            std::process::exit(EXIT_NOTHING_TO_DO);
         }
     }
 
     let total_partitions = partitions.len();
-    eprintln!("Found {} partition(s).", total_partitions);
+    if !quiet {
+        eprintln!("Found {} partition(s).", total_partitions);
+    }
+
+    if args.dry_run {
+        if let Some(scratch_path) = &output_scratch_path {
+            let _ = tokio::fs::remove_dir_all(scratch_path).await;
+        }
+        for (key, work) in &partitions {
+            let (file_count, kind) = match work {
+                PartitionWork::Local(files) => (files.len(), "local"),
+                PartitionWork::Remote(entries) => (entries.len(), "S3"),
+            };
+            println!(
+                "{}  ({} {} file{})",
+                key.relative_dir_time_only(),
+                file_count,
+                kind,
+                if file_count == 1 { "" } else { "s" }
+            );
+        }
+        eprintln!(
+            "Dry run: {} partition(s) would be processed. No output was written.",
+            total_partitions
+        );
+        return Ok(());
+    }
 
     let concurrency = args
         .concurrency
         .unwrap_or_else(default_concurrency)
         .clamp(1, total_partitions.max(1));
-    if concurrency > 1 {
+    if !quiet && concurrency > 1 {
         eprintln!("Processing partitions with {} worker(s).", concurrency);
     }
 
@@ -697,7 +778,9 @@ async fn main() -> Result<()> {
                     }
 
                     let done = processed.fetch_add(1, Ordering::SeqCst) + 1;
-                    if done == 1 || done.is_multiple_of(10) || done == total_partitions {
+                    if !quiet
+                        && (done == 1 || done.is_multiple_of(10) || done == total_partitions)
+                    {
                         eprintln!("Processed {done}/{total_partitions} partition(s).");
                     }
                 }
@@ -802,7 +885,9 @@ async fn main() -> Result<()> {
                     }
 
                     let done = processed.fetch_add(1, Ordering::SeqCst) + 1;
-                    if done == 1 || done.is_multiple_of(10) || done == total_partitions {
+                    if !quiet
+                        && (done == 1 || done.is_multiple_of(10) || done == total_partitions)
+                    {
                         eprintln!("Processed {done}/{total_partitions} partition(s).");
                     }
                 }

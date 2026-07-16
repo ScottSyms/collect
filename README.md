@@ -169,6 +169,19 @@ Configuration values are applied in the following order (highest to lowest prece
 
 This allows you to set base configuration via environment variables and override specific values with command-line arguments when needed.
 
+## Common CLI Features
+
+Every binary in this workspace supports:
+
+- **`--version`** — prints the crate version plus the short git commit hash it was built from, e.g. `ais-parse 0.1.0 (baf9f52)`, so you can tell exactly which build is running in a container.
+- **`--completions <shell>`** — prints shell completions (bash, zsh, fish, elvish, powershell) to stdout and exits; wire it into your shell's completion directory, e.g. `collect-file --completions zsh > ~/.zfunc/_collect-file`.
+- **`--quiet` / `-q`** (env `QUIET`) — suppresses routine progress lines (scanning/listing/per-batch "processed N" chatter). Warnings, errors, and the final run summary still print.
+
+`ais-parse` and `aisstream-parse` additionally support:
+
+- **`--dry-run`** (env `DRY_RUN`) — lists the partitions that would be processed and exits without decoding, writing, or connecting to the output target at all (so it can't trigger the S3 auto-create-bucket path). With `--incremental`, the dry run can't see the real watermark (that lives at the output it's intentionally not touching) and falls back to `--since`/full-dataset selection — a printed note says so.
+- **Exit code `2`** when there was nothing to process (no matching input files, or nothing new since the watermark) — distinct from `0` (processed successfully) and `1` (error). `collect-file` uses the same convention when it finds no unfinished input files. `--dry-run` always exits `0`, since successfully reporting "nothing to do" is a successful dry run.
+
 ## Output Structure
 
 Data is organized in Hive-partitioned directories:

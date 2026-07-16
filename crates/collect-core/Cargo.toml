@@ -12,6 +12,7 @@ aws-credential-types.workspace = true
 aws-sdk-s3.workspace = true
 chrono.workspace = true
 clap.workspace = true
+clap_complete.workspace = true
 futures-util.workspace = true
 parquet.workspace = true
 serde.workspace = true

@@ -58,6 +58,9 @@ cargo run -p collect-aisstream -- \
 | Flag | Env | Default | Description |
 |------|-----|---------|-------------|
 | `--source` / `-s` | `SOURCE` | `"aisstream"` | Logical source label |
+| `--quiet` / `-q` | `QUIET` | off | Suppress routine progress lines; warnings/errors still print |
+| `--completions <shell>` | — | — | Print shell completions to stdout and exit |
+| `--version` | — | — | Prints `<crate version> (<git commit hash>)` |
 
 ### Common + S3
 

@@ -1,8 +1,8 @@
 use anyhow::{Context as _, Result};
 use clap::Parser;
 use collect_core::{
-    health_file_path, line_reader_from_async_read, run_ingest, CommonCliArgs, IngestOptions,
-    LineReader, LineSource, ReaderTransition, S3CliArgs,
+    health_file_path, line_reader_from_async_read, print_completions, run_ingest, CommonCliArgs,
+    IngestOptions, LineReader, LineSource, ReaderTransition, S3CliArgs,
 };
 use futures_util::{SinkExt, StreamExt};
 use std::cmp::min;
@@ -22,7 +22,7 @@ const WS_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(5);
 
 #[derive(Parser, Debug)]
 #[command(
-    version,
+    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_COMMIT_HASH"), ")"),
     about = "Consume AIS data from aisstream.io WebSocket API into Hive-partitioned Parquet with Zstd compression"
 )]
 struct Args {
@@ -47,11 +47,19 @@ struct Args {
     #[arg(short, long, env = "SOURCE")]
     source: Option<String>,
 
+    /// Suppress informational progress lines; warnings and errors still print
+    #[arg(short, long, env = "QUIET")]
+    quiet: bool,
+
     #[command(flatten)]
     common: CommonCliArgs,
 
     #[command(flatten)]
     s3: S3CliArgs,
+
+    /// Print shell completions for the given shell to stdout and exit
+    #[arg(long, exclusive = true)]
+    completions: Option<clap_complete::Shell>,
 }
 
 struct WebSocketReadAdapter {
@@ -282,6 +290,11 @@ impl LineSource for AisStreamSource {
 async fn main() -> Result<()> {
     let mut args = Args::parse();
 
+    if let Some(shell) = args.completions {
+        print_completions::<Args>(shell, "collect-aisstream");
+        return Ok(());
+    }
+
     // Tidy delimiter-split lists: drop empties, trim whitespace.
     for list in [&mut args.filter_mmsi, &mut args.filter_message_types] {
         *list = list
@@ -316,8 +329,8 @@ async fn main() -> Result<()> {
             s3_storage: None,
             health_file,
             manage_health: true,
-            report_progress: true,
-            log_writes: true,
+            report_progress: !args.quiet,
+            log_writes: !args.quiet,
             shutdown: None,
             write_workers: None,
             sweep_orphans: true,
