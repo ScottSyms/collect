@@ -56,6 +56,7 @@ cargo run -p collect-file -- \
 | `--quiet` / `-q` (env `QUIET`) | off | Suppress routine progress lines; warnings/errors still print |
 | `--completions <shell>` | — | Print shell completions to stdout and exit |
 | `--version` | — | Prints `<crate version> (<git commit hash>)` |
+| `--config <file>` (env `CONFIG_FILE`) | — | Load flag defaults from a flat TOML file; CLI flags and pre-set env vars still win — see [README.md](README.md#common-cli-features) |
 
 Exits `2` (instead of `0`) when there were no unfinished input files to ingest — distinct from a hard error (`1`).
 

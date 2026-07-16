@@ -156,6 +156,7 @@ Other Type 8 messages retained as generic header + hex payload:
 | `--quiet` / `-q` | `QUIET` | off | Suppress routine progress lines; warnings/errors/summary still print |
 | `--completions <shell>` | — | — | Print shell completions to stdout and exit |
 | `--version` | — | — | Prints `<crate version> (<git commit hash>)` |
+| `--config <file>` | `CONFIG_FILE` | — | Load flag defaults from a flat TOML file; CLI flags and pre-set env vars still win — see [README.md](README.md#common-cli-features) |
 
 S3 connection args: `--s3-endpoint`, `--s3-region`, `--s3-access-key`,
 `--s3-secret-key`, `--s3-disable-tls` (env vars: `S3_ENDPOINT`, etc.)

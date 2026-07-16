@@ -502,6 +502,65 @@ pub fn print_completions<C: clap::CommandFactory>(shell: clap_complete::Shell, b
     clap_complete::generate(shell, &mut C::command(), bin_name, &mut std::io::stdout());
 }
 
+/// Load a flat TOML config file and set each key as a process environment
+/// variable, for any key not already present in the environment — so an
+/// explicit CLI flag or a pre-set env var always wins over the file.
+///
+/// Keys are expected to be the same SCREAMING_SNAKE names used by `--flag
+/// env = "..."` throughout this workspace (e.g. `S3_BUCKET`, `OUTPUT_DIR`).
+/// String, integer, float, and boolean values are converted with their
+/// natural `Display`; a string array is joined with `,` to match the
+/// comma-separated convention used by repeatable flags like
+/// `INPUT_S3_BUCKET`. Nested tables are rejected (config files here are
+/// intentionally flat, one file per binary invocation).
+///
+/// Call this once, immediately after parsing just enough to know the
+/// `--config` path was given, and then re-parse `Args` so clap picks up the
+/// newly-set environment variables with correct precedence.
+pub fn apply_config_file(path: &Path) -> Result<()> {
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("reading config file {}", path.display()))?;
+    let table: toml::Table = contents
+        .parse()
+        .with_context(|| format!("parsing config file {} as TOML", path.display()))?;
+
+    for (key, value) in &table {
+        if std::env::var(key).is_ok() {
+            continue;
+        }
+        let rendered = match value {
+            toml::Value::String(s) => s.clone(),
+            toml::Value::Integer(i) => i.to_string(),
+            toml::Value::Float(f) => f.to_string(),
+            toml::Value::Boolean(b) => b.to_string(),
+            toml::Value::Array(items) => {
+                let mut parts = Vec::with_capacity(items.len());
+                for item in items {
+                    match item {
+                        toml::Value::String(s) => parts.push(s.clone()),
+                        toml::Value::Integer(i) => parts.push(i.to_string()),
+                        other => bail!(
+                            "config file {}: key '{key}' has an array element of unsupported \
+                             type {other:?}; use strings or integers",
+                            path.display()
+                        ),
+                    }
+                }
+                parts.join(",")
+            }
+            toml::Value::Datetime(dt) => dt.to_string(),
+            toml::Value::Table(_) => bail!(
+                "config file {}: key '{key}' is a nested table; config files here must be a \
+                 flat list of KEY = value pairs matching the env var names shown in --help",
+                path.display()
+            ),
+        };
+        std::env::set_var(key, rendered);
+    }
+
+    Ok(())
+}
+
 pub fn default_source_from_path(path: &Path) -> String {
     path.file_stem()
         .or_else(|| path.file_name())

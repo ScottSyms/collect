@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use collect_core::ais_consolidate::{AisConsolidator, AisConsolidatorConfig};
 use collect_core::{
-    default_source_from_path, health_file_path, print_completions, run_ingest,
+    apply_config_file, default_source_from_path, health_file_path, print_completions, run_ingest,
     update_health_status_async, CommonCliArgs, IngestOptions, S3CliArgs,
 };
 use std::collections::VecDeque;
@@ -68,15 +68,26 @@ struct Args {
     /// Print shell completions for the given shell to stdout and exit
     #[arg(long, exclusive = true)]
     completions: Option<clap_complete::Shell>,
+
+    /// Load flag defaults from a flat TOML config file (KEY = value, using
+    /// the same env var names shown in --help); explicit flags and
+    /// already-set env vars still take precedence over the file
+    #[arg(long, env = "CONFIG_FILE")]
+    config: Option<PathBuf>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
 
     if let Some(shell) = args.completions {
         print_completions::<Args>(shell, "collect-file");
         return Ok(());
+    }
+
+    if let Some(config_path) = &args.config {
+        apply_config_file(config_path)?;
+        args = Args::parse();
     }
 
     let quiet = args.quiet;

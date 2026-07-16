@@ -51,6 +51,7 @@ cargo run -p collect-socket -- \
 | `--quiet` / `-q` | `QUIET` | off | Suppress routine progress lines; warnings/errors still print |
 | `--completions <shell>` | — | — | Print shell completions to stdout and exit |
 | `--version` | — | — | Prints `<crate version> (<git commit hash>)` |
+| `--config <file>` | `CONFIG_FILE` | — | Load flag defaults from a flat TOML file; CLI flags and pre-set env vars still win — see [README.md](README.md#common-cli-features) |
 
 ### AIS Processing
 

@@ -207,6 +207,7 @@ cargo run -p ais-parse -- --input-s3-bucket normalized-ais --output-s3-bucket si
 | `--quiet` / `-q` | *(off)* | suppress routine progress lines; warnings/errors/summary still print (env `QUIET`) |
 | `--completions <shell>` | — | print shell completions to stdout and exit |
 | `--version` | — | prints `<crate version> (<git commit hash>)` |
+| `--config <file>` | — | load flag defaults from a flat TOML file (env `CONFIG_FILE`); CLI flags and pre-set env vars still win — see [README.md](README.md#common-cli-features) |
 
 ### Dry run
 

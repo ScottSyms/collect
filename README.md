@@ -176,6 +176,19 @@ Every binary in this workspace supports:
 - **`--version`** — prints the crate version plus the short git commit hash it was built from, e.g. `ais-parse 0.1.0 (baf9f52)`, so you can tell exactly which build is running in a container.
 - **`--completions <shell>`** — prints shell completions (bash, zsh, fish, elvish, powershell) to stdout and exits; wire it into your shell's completion directory, e.g. `collect-file --completions zsh > ~/.zfunc/_collect-file`.
 - **`--quiet` / `-q`** (env `QUIET`) — suppresses routine progress lines (scanning/listing/per-batch "processed N" chatter). Warnings, errors, and the final run summary still print.
+- **`--config <file>`** (env `CONFIG_FILE`) — loads flag defaults from a flat TOML file. Keys are the same `SCREAMING_SNAKE` names shown as `[env: ...]` in `--help` (e.g. `OUTPUT_DIR`, `S3_BUCKET`). A repeatable flag like `--input-s3-bucket` takes a TOML array (`INPUT_S3_BUCKET = ["a", "b"]`), which is joined the same way the comma-separated env var is. Precedence is **CLI flag > pre-set environment variable > config file > built-in default** — a config file only fills in values nothing else already provided. Nested tables aren't supported; keep the file flat. Example:
+
+  ```toml
+  # collect-file.toml
+  OUTPUT_DIR = "/data"
+  S3_BUCKET = "bronze"
+  S3_ENDPOINT = "http://minio:9000"
+  S3_DISABLE_TLS = true
+  ```
+
+  ```bash
+  collect-file --config collect-file.toml --input /path/to/data
+  ```
 
 `ais-parse` and `aisstream-parse` additionally support:
 

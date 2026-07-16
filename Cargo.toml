@@ -25,6 +25,7 @@ aws-sdk-s3 = "1.0"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
+toml = { version = "0.8", default-features = false, features = ["parse"] }
 futures-util = "0.3"
 parquet = { version = "57", features = ["arrow", "zstd"] }
 ratatui = "0.28"

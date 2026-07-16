@@ -169,6 +169,12 @@ Each variable is the SCREAMING_SNAKE name of its flag unless noted.
   - Example: `QUIET=true`
   - Every binary also accepts `-q` / `--quiet` and `--completions <shell>` (bash/zsh/fish/elvish/powershell) as CLI-only flags (no env equivalent for completions, since it's a one-shot action, not a runtime mode)
 
+- `CONFIG_FILE`: Path to a flat TOML file supplying defaults for any of the env vars on this page (by the same key names)
+  - Example: `CONFIG_FILE=/etc/collect/collect-file.toml`
+  - Precedence: CLI flag > pre-set env var > config file > built-in default. A value already present in the environment is never overwritten by the file.
+  - Repeatable flags (e.g. `INPUT_S3_BUCKET`) take a TOML array in the file, joined into the same comma-separated form the env var expects: `INPUT_S3_BUCKET = ["bronze/norway", "bronze/finland"]`
+  - Nested TOML tables are rejected — keep the file to flat `KEY = value` pairs
+
 ### Source-Specific Options
 
 - Kafka (collect-kafka): `KAFKA_BROKERS`, `KAFKA_TOPIC`, `KAFKA_GROUP_ID`, `KAFKA_AUTO_OFFSET_RESET`

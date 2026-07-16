@@ -6,7 +6,7 @@ use collect_core::ais_consolidate::{AisConsolidator, AisConsolidatorConfig};
 use collect_core::dataset::{self, DatasetFile, PartitionKey};
 use collect_core::state;
 use collect_core::LineTransformer;
-use collect_core::{PartitionGranularity, S3ConnectionArgs, S3Storage};
+use collect_core::{apply_config_file, PartitionGranularity, S3ConnectionArgs, S3Storage};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use rayon::prelude::*;
 use std::collections::{HashSet, VecDeque};
@@ -186,6 +186,12 @@ struct Args {
     /// Print shell completions for the given shell to stdout and exit
     #[arg(long, exclusive = true)]
     completions: Option<clap_complete::Shell>,
+
+    /// Load flag defaults from a flat TOML config file (KEY = value, using
+    /// the same env var names shown in --help); explicit flags and
+    /// already-set env vars still take precedence over the file
+    #[arg(long, env = "CONFIG_FILE")]
+    config: Option<PathBuf>,
 }
 
 impl Args {
@@ -280,6 +286,11 @@ async fn main() -> Result<()> {
     if let Some(shell) = args.completions {
         collect_core::print_completions::<Args>(shell, "ais-parse");
         return Ok(());
+    }
+
+    if let Some(config_path) = &args.config {
+        apply_config_file(config_path)?;
+        args = Args::parse();
     }
 
     args.normalize();
@@ -778,8 +789,7 @@ async fn main() -> Result<()> {
                     }
 
                     let done = processed.fetch_add(1, Ordering::SeqCst) + 1;
-                    if !quiet
-                        && (done == 1 || done.is_multiple_of(10) || done == total_partitions)
+                    if !quiet && (done == 1 || done.is_multiple_of(10) || done == total_partitions)
                     {
                         eprintln!("Processed {done}/{total_partitions} partition(s).");
                     }
@@ -885,8 +895,7 @@ async fn main() -> Result<()> {
                     }
 
                     let done = processed.fetch_add(1, Ordering::SeqCst) + 1;
-                    if !quiet
-                        && (done == 1 || done.is_multiple_of(10) || done == total_partitions)
+                    if !quiet && (done == 1 || done.is_multiple_of(10) || done == total_partitions)
                     {
                         eprintln!("Processed {done}/{total_partitions} partition(s).");
                     }

@@ -1,12 +1,13 @@
 use anyhow::{Context as _, Result};
 use clap::Parser;
 use collect_core::{
-    health_file_path, line_reader_from_async_read, print_completions, run_ingest, CommonCliArgs,
-    IngestOptions, LineReader, LineSource, ReaderTransition, S3CliArgs,
+    apply_config_file, health_file_path, line_reader_from_async_read, print_completions,
+    run_ingest, CommonCliArgs, IngestOptions, LineReader, LineSource, ReaderTransition, S3CliArgs,
 };
 use futures_util::{SinkExt, StreamExt};
 use std::cmp::min;
 use std::io;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::AtomicBool;
 use std::task::Context;
@@ -60,6 +61,12 @@ struct Args {
     /// Print shell completions for the given shell to stdout and exit
     #[arg(long, exclusive = true)]
     completions: Option<clap_complete::Shell>,
+
+    /// Load flag defaults from a flat TOML config file (KEY = value, using
+    /// the same env var names shown in --help); explicit flags and
+    /// already-set env vars still take precedence over the file
+    #[arg(long, env = "CONFIG_FILE")]
+    config: Option<PathBuf>,
 }
 
 struct WebSocketReadAdapter {
@@ -293,6 +300,11 @@ async fn main() -> Result<()> {
     if let Some(shell) = args.completions {
         print_completions::<Args>(shell, "collect-aisstream");
         return Ok(());
+    }
+
+    if let Some(config_path) = &args.config {
+        apply_config_file(config_path)?;
+        args = Args::parse();
     }
 
     // Tidy delimiter-split lists: drop empties, trim whitespace.
