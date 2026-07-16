@@ -106,7 +106,7 @@ Precedence order:
 2. environment variables
 3. defaults
 
-If `--input-dir` is omitted, `INPUT_PATH` or `INPUT_FILE` is used.
+If `--input` is omitted, `INPUT_PATH` is used.
 If `--source` is omitted, `SOURCE` is used.
 
 ### Runtime Status
@@ -232,7 +232,6 @@ Common ingest variables:
 File ingestion:
 
 - `INPUT_PATH`
-- `INPUT_FILE`
 - `SOURCE`
 
 Socket ingestion:

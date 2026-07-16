@@ -27,24 +27,24 @@ const WS_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(5);
 )]
 struct Args {
     /// AISStream API key
-    #[arg(long)]
+    #[arg(long, env = "AISSTREAM_API_KEY", hide_env_values = true)]
     api_key: Option<String>,
 
     /// Bounding boxes as JSON matching the AISStream API format, e.g.
     /// '[[[-90,-180],[90,180]]]' for the entire world
-    #[arg(long)]
+    #[arg(long, env = "BOUNDING_BOXES")]
     bounding_boxes: Option<String>,
 
-    /// Only receive messages from these MMSI values (repeatable, max 50)
-    #[arg(long)]
+    /// Only receive messages from these MMSI values (repeatable or comma-separated, max 50)
+    #[arg(long, env = "FILTER_MMSI", value_delimiter = ',')]
     filter_mmsi: Vec<String>,
 
-    /// Only receive these message types (repeatable), e.g. "PositionReport"
-    #[arg(long)]
+    /// Only receive these message types (repeatable or comma-separated), e.g. "PositionReport"
+    #[arg(long, env = "FILTER_MESSAGE_TYPES", value_delimiter = ',')]
     filter_message_types: Vec<String>,
 
     /// Logical source label; defaults to "aisstream"
-    #[arg(short, long)]
+    #[arg(short, long, env = "SOURCE")]
     source: Option<String>,
 
     #[command(flatten)]
@@ -55,16 +55,27 @@ struct Args {
 }
 
 struct WebSocketReadAdapter {
-    stream: Pin<Box<dyn futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Send>>,
+    stream: Pin<
+        Box<
+            dyn futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+                + Send,
+        >,
+    >,
     buffer: Vec<u8>,
     pos: usize,
-    _write: Pin<Box<dyn futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Send>>,
+    _write: Pin<
+        Box<dyn futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Send>,
+    >,
 }
 
 impl WebSocketReadAdapter {
     fn new(
-        stream: impl futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Send + 'static,
-        write: impl futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Send + 'static,
+        stream: impl futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+            + Send
+            + 'static,
+        write: impl futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
+            + Send
+            + 'static,
     ) -> Self {
         Self {
             stream: Box::pin(stream),
@@ -166,11 +177,13 @@ impl AisStreamSource {
             .context("WebSocket connection to aisstream.io")?;
 
         let mut subscribe = serde_json::Map::new();
-        subscribe.insert("APIKey".into(), serde_json::Value::String(self.api_key.clone()));
+        subscribe.insert(
+            "APIKey".into(),
+            serde_json::Value::String(self.api_key.clone()),
+        );
 
-        let bboxes: serde_json::Value =
-            serde_json::from_str(&self.bounding_boxes)
-                .context("Failed to parse --bounding-boxes as JSON")?;
+        let bboxes: serde_json::Value = serde_json::from_str(&self.bounding_boxes)
+            .context("Failed to parse --bounding-boxes as JSON")?;
         subscribe.insert("BoundingBoxes".into(), bboxes);
 
         if !self.filter_mmsi.is_empty() {
@@ -269,45 +282,13 @@ impl LineSource for AisStreamSource {
 async fn main() -> Result<()> {
     let mut args = Args::parse();
 
-    args.common.apply_env();
-    args.s3.apply_env();
-
-    if args.api_key.is_none() {
-        if let Ok(value) = std::env::var("AISSTREAM_API_KEY") {
-            args.api_key = Some(value);
-        }
-    }
-
-    if args.bounding_boxes.is_none() {
-        if let Ok(value) = std::env::var("BOUNDING_BOXES") {
-            args.bounding_boxes = Some(value);
-        }
-    }
-
-    if args.source.is_none() {
-        if let Ok(value) = std::env::var("SOURCE") {
-            args.source = Some(value);
-        }
-    }
-
-    if args.filter_mmsi.is_empty() {
-        if let Ok(value) = std::env::var("FILTER_MMSI") {
-            args.filter_mmsi = value
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-        }
-    }
-
-    if args.filter_message_types.is_empty() {
-        if let Ok(value) = std::env::var("FILTER_MESSAGE_TYPES") {
-            args.filter_message_types = value
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-        }
+    // Tidy delimiter-split lists: drop empties, trim whitespace.
+    for list in [&mut args.filter_mmsi, &mut args.filter_message_types] {
+        *list = list
+            .drain(..)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
     }
 
     let api_key = args
@@ -338,9 +319,9 @@ async fn main() -> Result<()> {
             report_progress: true,
             log_writes: true,
             shutdown: None,
-                write_workers: None,
-                sweep_orphans: true,
-                line_transformer: None,
+            write_workers: None,
+            sweep_orphans: true,
+            line_transformer: None,
         },
     )
     .await

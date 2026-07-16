@@ -7,16 +7,16 @@
 ### Required
 
 - `--kafka-brokers host1:9092,host2:9092`
-- `--topic <topic>`
-- `--group-id <consumer-group>`
+- `--kafka-topic <topic>`
+- `--kafka-group-id <consumer-group>`
 
 ### Example
 
 ```bash
 cargo run -p collect-kafka -- \
   --kafka-brokers localhost:9092 \
-  --topic telemetry \
-  --group-id collect-kafka \
+  --kafka-topic telemetry \
+  --kafka-group-id collect-kafka \
   --source kafka-telemetry
 ```
 

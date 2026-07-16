@@ -16,11 +16,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arrow::record_batch::RecordBatch;
-use collect_core::iceberg::{
-    ensure_namespace, ensure_table, open_catalog, partition_spec_for, IcebergConfig,
-    TABLE_ATONS, TABLE_BINARY, TABLE_METEO, TABLE_POSITIONS, TABLE_STATICS,
-};
 use collect_core::iceberg::table_schemas;
+use collect_core::iceberg::{
+    ensure_namespace, ensure_table, open_catalog, partition_spec_for, IcebergConfig, TABLE_ATONS,
+    TABLE_BINARY, TABLE_METEO, TABLE_POSITIONS, TABLE_STATICS,
+};
 use output_iceberg::{
     commit_batches_to_iceberg, IcebergAtonWriter, IcebergBinaryWriter, IcebergMeteoWriter,
     IcebergPositionsWriter, IcebergStaticsWriter,
@@ -69,29 +69,29 @@ struct DedupKey(u8, i64, u32, u32, u8);
 struct Args {
     /// Normalized Hive-partitioned Parquet root directory. Repeatable to
     /// merge several sources in one run (mutually exclusive with --input-s3-bucket)
-    #[arg(long)]
+    #[arg(long, env = "INPUT_DIR", value_delimiter = ',')]
     input_dir: Vec<PathBuf>,
 
     /// Output root; decoded data is written under <root>/positions and
     /// <root>/statics (mutually exclusive with --output-s3-bucket)
-    #[arg(long)]
+    #[arg(long, env = "OUTPUT_DIR")]
     output_dir: Option<PathBuf>,
 
     /// S3 bucket to read the input dataset from, instead of --input-dir.
     /// Repeatable to merge several buckets (all on the shared endpoint)
-    #[arg(long)]
+    #[arg(long, env = "INPUT_S3_BUCKET", value_delimiter = ',')]
     input_s3_bucket: Vec<String>,
 
     /// Key prefix within the input S3 bucket; acts as the dataset root
-    #[arg(long, default_value = "")]
+    #[arg(long, env = "INPUT_S3_PREFIX", default_value = "")]
     input_s3_prefix: String,
 
     /// S3 bucket to write decoded output to, instead of --output-dir
-    #[arg(long)]
+    #[arg(long, env = "OUTPUT_S3_BUCKET")]
     output_s3_bucket: Option<String>,
 
     /// Key prefix within the output S3 bucket; acts as the dataset root
-    #[arg(long, default_value = "")]
+    #[arg(long, env = "OUTPUT_S3_PREFIX", default_value = "")]
     output_s3_prefix: String,
 
     #[command(flatten)]
@@ -99,11 +99,15 @@ struct Args {
 
     /// Partition granularity; must match the input dataset layout (the
     /// output trees mirror it)
-    #[arg(long, default_value_t = PartitionGranularity::Day)]
+    #[arg(long, env = "PARTITION", default_value_t = PartitionGranularity::Day)]
     partition: PartitionGranularity,
 
     /// Filter to a specific source label (processes all sources if omitted)
-    #[arg(long)]
+    #[arg(
+        long = "filter-source",
+        visible_alias = "source",
+        env = "FILTER_SOURCE"
+    )]
     source: Option<String>,
 
     /// Process only this year's partitions (narrow further with --month, --day, ...)
@@ -129,28 +133,28 @@ struct Args {
     /// Process only partitions holding data from the last N hours (rolling
     /// window from now, UTC); mutually exclusive with the fixed filters.
     /// With --incremental, acts only as the first run's starting bound
-    #[arg(long, value_name = "HOURS")]
+    #[arg(long, env = "SINCE", value_name = "HOURS")]
     since: Option<u64>,
 
     /// Track a watermark at the output target and process only partitions
     /// holding files that arrived since the last successful run
-    #[arg(long)]
+    #[arg(long, env = "INCREMENTAL", value_parser = clap::builder::FalseyValueParser::new())]
     incremental: bool,
 
     /// Number of rows per Parquet read batch
-    #[arg(long, default_value_t = 8192)]
+    #[arg(long, env = "BATCH_SIZE", default_value_t = 8192)]
     batch_size: usize,
 
     /// Zstd compression level for output files
-    #[arg(long, default_value_t = 5)]
+    #[arg(long, env = "COMPRESSION_LEVEL", default_value_t = 5)]
     compression_level: i32,
 
     /// Number of partitions to process concurrently; auto-selected when omitted
-    #[arg(long)]
+    #[arg(long, env = "CONCURRENCY")]
     concurrency: Option<usize>,
 
     /// Output file name prefix (added before tree suffix, e.g. `{prefix}-pos-*.parquet`)
-    #[arg(long, default_value = "ais")]
+    #[arg(long, env = "OUTPUT_PREFIX", default_value = "ais")]
     output_prefix: String,
 
     /// Apply AIS multipart consolidation before decoding (reassembles
@@ -168,46 +172,13 @@ struct Args {
 }
 
 impl Args {
-    fn apply_env(&mut self) {
-        if self.input_dir.is_empty() && self.input_s3_bucket.is_empty() {
-            if let Ok(value) = std::env::var("INPUT_S3_BUCKET") {
-                self.input_s3_bucket = value
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|b| !b.is_empty())
-                    .map(str::to_string)
-                    .collect();
-            }
-        }
-        if self.input_s3_prefix.is_empty() {
-            if let Ok(value) = std::env::var("INPUT_S3_PREFIX") {
-                self.input_s3_prefix = value;
-            }
-        }
-        if self.output_dir.is_none() && self.output_s3_bucket.is_none() {
-            if let Ok(value) = std::env::var("OUTPUT_S3_BUCKET") {
-                if !value.trim().is_empty() {
-                    self.output_s3_bucket = Some(value);
-                }
-            }
-        }
-        if self.output_s3_prefix.is_empty() {
-            if let Ok(value) = std::env::var("OUTPUT_S3_PREFIX") {
-                self.output_s3_prefix = value;
-            }
-        }
-        self.s3_connection.apply_env();
-        if self.since.is_none() {
-            if let Ok(value) = std::env::var("SINCE_HOURS") {
-                if let Ok(hours) = value.trim().parse::<u64>() {
-                    self.since = Some(hours);
-                }
-            }
-        }
-        if !self.incremental {
-            if let Ok(value) = std::env::var("INCREMENTAL") {
-                self.incremental = value.eq_ignore_ascii_case("true") || value == "1";
-            }
+    /// Drop empty-string values that reach us via empty env vars (e.g. an
+    /// empty `OUTPUT_S3_BUCKET=` in a job spec means "not set").
+    fn normalize(&mut self) {
+        self.input_s3_bucket.retain(|b| !b.trim().is_empty());
+        self.input_dir.retain(|d| !d.as_os_str().is_empty());
+        if matches!(&self.output_s3_bucket, Some(b) if b.trim().is_empty()) {
+            self.output_s3_bucket = None;
         }
     }
 
@@ -288,7 +259,7 @@ async fn main() -> Result<()> {
     }
 
     let mut args = Args::parse();
-    args.apply_env();
+    args.normalize();
     args.split_s3_args();
 
     match (args.input_dir.is_empty(), args.input_s3_bucket.is_empty()) {
@@ -298,7 +269,9 @@ async fn main() -> Result<()> {
     }
     match (&args.output_dir, &args.output_s3_bucket) {
         (Some(_), Some(_)) => bail!("use either --output-dir or --output-s3-bucket, not both"),
-        (None, None) if !args.iceberg.is_iceberg_mode() => bail!("one of --output-dir, --output-s3-bucket, or --iceberg-catalog-uri is required"),
+        (None, None) if !args.iceberg.is_iceberg_mode() => {
+            bail!("one of --output-dir, --output-s3-bucket, or --iceberg-catalog-uri is required")
+        }
         _ => {}
     }
     args.iceberg.validate()?;
@@ -711,8 +684,9 @@ async fn main() -> Result<()> {
                     if let Some(storage) = &output_storage {
                         for (out_rel, local_path, _rows) in &outputs {
                             let key = s3_join(&output_s3_prefix, out_rel);
-                            if let Err(error) =
-                                upload_with_retries(storage, local_path, &key).await.with_context(|| {
+                            if let Err(error) = upload_with_retries(storage, local_path, &key)
+                                .await
+                                .with_context(|| {
                                     format!("uploading {} to S3", local_path.display())
                                 })
                             {
@@ -872,10 +846,9 @@ async fn main() -> Result<()> {
 
         if first_error.is_none() {
             let config: IcebergConfig = (&args.iceberg).into();
-            let catalog =
-                open_catalog(&config)
-                    .await
-                    .context("connecting to Iceberg catalog")?;
+            let catalog = open_catalog(&config)
+                .await
+                .context("connecting to Iceberg catalog")?;
             ensure_namespace(&catalog, &config).await?;
 
             let partition_granularity = args.partition.as_str();
@@ -1042,7 +1015,8 @@ fn process_partition(
     let dir_for = |tree: &str| output_root.join(tree).join(&rel_dir);
 
     let mut stats = ParseStats::default();
-    let mut positions = PositionsWriter::new(dir_for(POSITIONS_TREE), output_prefix, compression_level);
+    let mut positions =
+        PositionsWriter::new(dir_for(POSITIONS_TREE), output_prefix, compression_level);
     let mut statics = StaticsWriter::new(dir_for(STATICS_TREE), output_prefix, compression_level);
     let mut meteo = MeteoWriter::new(dir_for(METEO_TREE), output_prefix, compression_level);
     let mut binary = BinaryWriter::new(dir_for(BINARY_TREE), output_prefix, compression_level);
@@ -1245,10 +1219,14 @@ fn process_parquet_file<W: WriterSet>(
     // column (present in normalized data, per-row after a dedup merge pooled
     // several sources) takes precedence; bronze has none, so we fall back to
     // the source parsed from the file's partition path.
-    let mut consolidator = if consolidate_ais || process_timestamps { Some(AisConsolidator::new(AisConsolidatorConfig {
-        process_timestamps,
-        consolidate_multipart: consolidate_ais,
-    })) } else { None };
+    let mut consolidator = if consolidate_ais || process_timestamps {
+        Some(AisConsolidator::new(AisConsolidatorConfig {
+            process_timestamps,
+            consolidate_multipart: consolidate_ais,
+        }))
+    } else {
+        None
+    };
 
     while let Some(batch) = reader.next().transpose()? {
         let schema = batch.schema();
@@ -1287,7 +1265,9 @@ fn process_parquet_file<W: WriterSet>(
             })
             .collect();
 
-        let (decoded, payloads): (Vec<(usize, Decoded)>, Vec<String>) = if let Some(c) = &mut consolidator {
+        let (decoded, payloads): (Vec<(usize, Decoded)>, Vec<String>) = if let Some(c) =
+            &mut consolidator
+        {
             let mut rows: Vec<(i64, String, String)> = Vec::new();
             for i in 0..n {
                 let ts = ts_col.value(i);
@@ -1298,11 +1278,10 @@ fn process_parquet_file<W: WriterSet>(
                 }
             }
             let payloads: Vec<String> = rows.iter().map(|(_, _, p)| p.clone()).collect();
-            let decoded: Vec<(usize, Decoded)> = rows.into_par_iter()
+            let decoded: Vec<(usize, Decoded)> = rows
+                .into_par_iter()
                 .enumerate()
-                .map(|(idx, (ts, src, payload))| {
-                    (idx, decode_payload(ts, &src, &payload))
-                })
+                .map(|(idx, (ts, src, payload))| (idx, decode_payload(ts, &src, &payload)))
                 .collect();
             (decoded, payloads)
         } else {
@@ -1310,11 +1289,10 @@ fn process_parquet_file<W: WriterSet>(
             let decoded: Vec<(usize, Decoded)> = (0..n)
                 .into_par_iter()
                 .map(|i| {
-                    (i, decode_payload(
-                        ts_col.value(i),
-                        sources[i],
-                        payload_col.value(i),
-                    ))
+                    (
+                        i,
+                        decode_payload(ts_col.value(i), sources[i], payload_col.value(i)),
+                    )
                 })
                 .collect();
             (decoded, payloads)
@@ -1410,7 +1388,13 @@ fn process_parquet_file<W: WriterSet>(
                     }
                 }
                 Decoded::Meteo(row) => {
-                    let key = DedupKey(2, row.ts_ms, row.mmsi, ((row.dac as u32) << 8) | row.fid as u32, 0);
+                    let key = DedupKey(
+                        2,
+                        row.ts_ms,
+                        row.mmsi,
+                        ((row.dac as u32) << 8) | row.fid as u32,
+                        0,
+                    );
                     if seen.insert(key) {
                         stats.meteo_out += 1;
                         writers.write_meteo(*row, &payload)?;
@@ -1419,7 +1403,13 @@ fn process_parquet_file<W: WriterSet>(
                     }
                 }
                 Decoded::Binary(row) => {
-                    let key = DedupKey(3, row.ts_ms, row.mmsi, ((row.dac as u32) << 8) | row.fid as u32, 0);
+                    let key = DedupKey(
+                        3,
+                        row.ts_ms,
+                        row.mmsi,
+                        ((row.dac as u32) << 8) | row.fid as u32,
+                        0,
+                    );
                     if seen.insert(key) {
                         stats.binary_out += 1;
                         writers.write_binary(*row, &payload)?;

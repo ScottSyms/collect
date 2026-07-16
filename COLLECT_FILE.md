@@ -44,14 +44,14 @@ cargo run -p collect-file -- \
 
 | Flag | Env | Default | Description |
 |------|-----|---------|-------------|
-| `--input-dir` | `INPUT_PATH` / `INPUT_FILE` | — | Input file or directory (recursive) |
+| `--input` (alias `--input-dir`) | `INPUT_PATH` | — | Input file or directory (recursive) |
 | `--source` / `-s` | `SOURCE` | file stem/dir name | Logical source label |
 
 ### Processing
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--concurrency` | auto (2..32) | Max concurrent file workers |
+| `--concurrency` (env `CONCURRENCY`) | auto (2..32) | Max concurrent file workers |
 | `--noui` | off | Disable TUI status display |
 
 ### AIS Processing

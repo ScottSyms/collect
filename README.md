@@ -55,7 +55,7 @@ cargo run -p collect-file -- --input-dir data.txt --source mydata
 cargo run -p collect-socket -- --tcp-host 153.44.253.27 --tcp-port 5631 --source norway-tcp
 
 # Kafka topic
-cargo run -p collect-kafka -- --kafka-brokers broker:9092 --topic ais-raw --group-id collect
+cargo run -p collect-kafka -- --kafka-brokers broker:9092 --kafka-topic ais-raw --kafka-group-id collect
 
 # aisstream.io WebSocket (worldwide bounding box)
 cargo run -p collect-aisstream -- --api-key $AISSTREAM_API_KEY --bounding-boxes '[[[-90,-180],[90,180]]]'
@@ -84,7 +84,7 @@ Most command-line parameters can be configured using environment variables.
 
 | Environment Variable | CLI Argument | Description |
 |---------------------|--------------|-------------|
-| `INPUT_PATH` / `INPUT_FILE` | `--input-dir` | Input file or directory path |
+| `INPUT_PATH` | `--input` | Input file or directory path |
 | `TCP_HOST` | `--tcp-host` | TCP host address |
 | `TCP_PORT` | `--tcp-port` | TCP port number |
 | `SOURCE` | `--source` | Logical source label |

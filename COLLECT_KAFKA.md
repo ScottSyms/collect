@@ -17,14 +17,14 @@ Kafka topic → collect-kafka → Bronze Parquet
 # Basic Kafka ingest
 cargo run -p collect-kafka -- \
   --kafka-brokers broker1:9092,broker2:9092 \
-  --topic ais-data \
-  --group-id ingest-group-1
+  --kafka-topic ais-data \
+  --kafka-group-id ingest-group-1
 
 # With source label and S3 output
 cargo run -p collect-kafka -- \
   --kafka-brokers localhost:9092 \
-  --topic ais-data \
-  --group-id ingest-group-1 \
+  --kafka-topic ais-data \
+  --kafka-group-id ingest-group-1 \
   --source kafka-ais \
   --s3-bucket bronze --s3-prefix kafka \
   --s3-endpoint http://minio:9000 --s3-disable-tls \
@@ -38,8 +38,8 @@ cargo run -p collect-kafka -- \
 | Flag | Env | Default | Description |
 |------|-----|---------|-------------|
 | `--kafka-brokers` | `KAFKA_BROKERS` | — | Kafka bootstrap servers |
-| `--topic` | `KAFKA_TOPIC` | — | Kafka topic to consume |
-| `--group-id` | `KAFKA_GROUP_ID` | — | Consumer group ID |
+| `--kafka-topic` (alias `--topic`) | `KAFKA_TOPIC` | — | Kafka topic to consume |
+| `--kafka-group-id` (alias `--group-id`) | `KAFKA_GROUP_ID` | — | Consumer group ID |
 | `--kafka-auto-offset-reset` | `KAFKA_AUTO_OFFSET_RESET` | `latest` | Start strategy (`earliest` / `latest`) |
 
 ### Source

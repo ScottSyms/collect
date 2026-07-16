@@ -2,14 +2,23 @@
 
 Most command-line parameters can be configured using environment variables, making Docker deployments much easier to manage. This document lists the supported environment variables and their usage.
 
+Every environment variable is also shown in each binary's `--help` output as
+`[env: NAME=]` next to its flag — `--help` is the authoritative reference.
+Each variable is the SCREAMING_SNAKE name of its flag unless noted.
+
 ## Environment Variable Reference
 
 ### Input Source Configuration (Choose One)
 
 #### File Input
-- `INPUT_PATH` / `INPUT_FILE`: Path to input file or directory
+- `INPUT_PATH`: Path to input file or directory (collect-file)
   - Example: `INPUT_PATH=/input/data.txt`
   - Conflicts with TCP options
+
+#### Parquet Input (batch tools)
+- `INPUT_DIR`: Local Hive-partitioned Parquet root(s) for ais-parse / aisstream-parse
+  - Comma-separated for multiple roots
+  - Mutually exclusive with `INPUT_S3_BUCKET`
 
 #### TCP Input  
 - `TCP_HOST`: TCP host address to receive data from
@@ -32,13 +41,13 @@ Most command-line parameters can be configured using environment variables, maki
   - Example: `PARTITION=hour`
   - Default: `day`
 
-- `AIS`: Use NMEA `c:<epoch>` tag blocks or `$PGHP` capture timestamps when present; grouped `\g:` fragments reuse the first sentence timestamp for the whole AIS message, otherwise fall back to ingest time. File ingestion only.
-  - Example: `AIS=true`
-  - Default: `false`
-
 - `OUTPUT_DIR`: Output root directory for Parquet files
   - Example: `OUTPUT_DIR=/data`
-  - Default: `data`
+  - Default: `data` (collectors); no default for the batch tools
+
+- `CONCURRENCY`: Max concurrent workers (collect-file) / partitions processed in parallel (ais-parse, aisstream-parse)
+  - Example: `CONCURRENCY=4`
+  - Default: auto-selected
 
 - `MAX_ROWS`: Maximum rows to buffer per Parquet file before flush
   - Example: `MAX_ROWS=10000`
@@ -131,19 +140,30 @@ Most command-line parameters can be configured using environment variables, maki
 - `ICEBERG_TOKEN`: Bearer token for Lakekeeper / REST catalog authentication
   - Example: `ICEBERG_TOKEN=lk_demo_xxx`
 
-### Batch Processing Options
+### Batch Processing Options (ais-parse, aisstream-parse)
 
 - `INCREMENTAL`: Enable watermark-based incremental processing
   - Example: `INCREMENTAL=true`
 
-- `SINCE_HOURS`: Rolling window for first incremental run (hours)
-  - Example: `SINCE_HOURS=2`
+- `SINCE`: Rolling window in hours (with `INCREMENTAL`, first-run seed only)
+  - Example: `SINCE=2`
 
-- `DEDUP`: Enable dedup merge on output partitions (ais-parse, aisstream-parse)
-  - Example: `DEDUP=false`
+- `PARTITION`: Partition granularity of the input dataset layout
+  - Example: `PARTITION=day`
 
-- `CONSOLIDATE_AIS`: Enable AIS multi-part message consolidation on ingest (collect-socket, collect-file)
-  - Example: `CONSOLIDATE_AIS=true`
+- `BATCH_SIZE`: Rows per Parquet read batch
+  - Default: `8192`
+
+- `FILTER_SOURCE`: Process only this source label
+  - Example: `FILTER_SOURCE=norway`
+
+- `OUTPUT_PREFIX`: Output file name prefix
+  - Default: `ais` (ais-parse) / `aisstream` (aisstream-parse)
+
+### Source-Specific Options
+
+- Kafka (collect-kafka): `KAFKA_BROKERS`, `KAFKA_TOPIC`, `KAFKA_GROUP_ID`, `KAFKA_AUTO_OFFSET_RESET`
+- AISStream (collect-aisstream): `AISSTREAM_API_KEY`, `BOUNDING_BOXES`, `FILTER_MMSI`, `FILTER_MESSAGE_TYPES` (comma-separated lists)
 
 ## Docker Compose Examples
 
@@ -210,9 +230,15 @@ services:
 
 ## Environment Variable Precedence
 
-1. **Command-line arguments** take highest precedence
+1. **Command-line arguments** take highest precedence (an explicit flag always
+   wins, even when its value equals the default)
 2. **Environment variables** are used if no command-line argument is provided
 3. **Default values** are used if neither is specified
+
+Note: for mutually exclusive pairs (`--input-dir` vs `--input-s3-bucket`,
+`--output-dir` vs `--output-s3-bucket`), a value supplied via environment
+variable counts as "set" — unset the variable rather than relying on a flag to
+switch modes.
 
 This allows for flexible configuration where you can:
 - Set base configuration via environment variables

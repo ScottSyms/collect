@@ -26,15 +26,15 @@ mod status;
 )]
 struct Args {
     /// Input file or directory to ingest
-    #[arg(long = "input-dir")]
+    #[arg(long = "input", visible_alias = "input-dir", env = "INPUT_PATH")]
     input: Option<PathBuf>,
 
     /// Logical source label; defaults to input file stem or directory name
-    #[arg(short, long)]
+    #[arg(short, long, env = "SOURCE")]
     source: Option<String>,
 
     /// Maximum number of concurrent file ingest workers; auto-selected when omitted
-    #[arg(long)]
+    #[arg(long, env = "CONCURRENCY")]
     concurrency: Option<usize>,
 
     #[command(flatten)]
@@ -60,33 +60,13 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let mut args = Args::parse();
-    let noui = args.noui;
-
-    if args.input.is_none() {
-        if let Ok(value) = std::env::var("INPUT_PATH") {
-            args.input = Some(PathBuf::from(value));
-        } else if let Ok(value) = std::env::var("INPUT_FILE") {
-            args.input = Some(PathBuf::from(value));
-        }
-    }
-
-    if args.source.is_none() {
-        if let Ok(value) = std::env::var("SOURCE") {
-            args.source = Some(value);
-        }
-    }
-
-    args.noui = noui;
-
-    args.common.apply_env();
-    args.s3.apply_env();
+    let args = Args::parse();
 
     let status_mode = status::StatusMode::from_tty(!args.noui && std::io::stdout().is_terminal());
 
     let input = args
         .input
-        .context("missing input path; set --input or INPUT_FILE")?;
+        .context("missing input path; set --input or INPUT_PATH")?;
     let source_name = args
         .source
         .unwrap_or_else(|| default_source_from_path(&input));
@@ -203,7 +183,10 @@ async fn run_file_ingest(
             tokio::spawn(async move {
                 match collect_core::sweep_orphaned_uploads(out_dir, storage).await {
                     Ok(0) => {}
-                    Ok(count) => eprintln!("♻️  Uploaded {} orphaned parquet file(s) from a previous run", count),
+                    Ok(count) => eprintln!(
+                        "♻️  Uploaded {} orphaned parquet file(s) from a previous run",
+                        count
+                    ),
                     Err(error) => eprintln!("⚠️  Orphan upload sweep failed: {}", error),
                 }
             });

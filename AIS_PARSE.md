@@ -191,17 +191,17 @@ cargo run -p ais-parse -- --input-s3-bucket normalized-ais --output-s3-bucket si
 
 | Flag | Default | Purpose |
 |------|---------|---------|
-| `--input-dir` (repeatable) / `--input-s3-bucket` (repeatable) + `--input-s3-prefix` | — | bronze input root(s); exactly one kind required. Env `INPUT_S3_BUCKET` (comma-separated, supports `bucket/path` syntax), `INPUT_S3_PREFIX` |
-| `--output-dir` / `--output-s3-bucket` + `--output-s3-prefix` | — | silver output root; exactly one required. Env `OUTPUT_S3_BUCKET` (supports `bucket/path` syntax), `OUTPUT_S3_PREFIX` |
-| `--s3-endpoint`, `--s3-region`, `--s3-access-key`, `--s3-secret-key`, `--s3-disable-tls` | — | shared S3 connection (env equivalents as in other tools) |
-| `--partition` | `day` | input layout granularity; output trees mirror it |
-| `--source`, `--year`…`--minute` | *(all)* | partition slice filters |
-| `--since <HOURS>` | *(off)* | rolling window (env `SINCE_HOURS`); with `--incremental`, first-run seed only |
+| `--input-dir` (repeatable) / `--input-s3-bucket` (repeatable) + `--input-s3-prefix` | — | bronze input root(s); exactly one kind required. Env `INPUT_DIR`, `INPUT_S3_BUCKET` (both comma-separated; buckets support `bucket/path` syntax), `INPUT_S3_PREFIX` |
+| `--output-dir` / `--output-s3-bucket` + `--output-s3-prefix` | — | silver output root; exactly one required. Env `OUTPUT_DIR`, `OUTPUT_S3_BUCKET` (supports `bucket/path` syntax), `OUTPUT_S3_PREFIX` |
+| `--s3-endpoint`, `--s3-region`, `--s3-access-key`, `--s3-secret-key`, `--s3-disable-tls` | — | shared S3 connection (env `S3_ENDPOINT`, `S3_REGION`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_DISABLE_TLS`) |
+| `--partition` | `day` | input layout granularity; output trees mirror it (env `PARTITION`) |
+| `--filter-source` (alias `--source`), `--year`…`--minute` | *(all)* | partition slice filters (env `FILTER_SOURCE`) |
+| `--since <HOURS>` | *(off)* | rolling window (env `SINCE`); with `--incremental`, first-run seed only |
 | `--incremental` | *(off)* | watermark at the output (`_ais-parse/watermark.json`), env `INCREMENTAL=true`; not supported in Iceberg mode |
-| `--batch-size` | `8192` | Parquet read batch rows |
-| `--compression-level` | `5` | Zstd level for output |
-| `--concurrency` | cores, clamped `[1, 8]` | partitions decoded in parallel |
-| `--output-prefix` | `ais` | output file name prefix (added before tree suffix) |
+| `--batch-size` | `8192` | Parquet read batch rows (env `BATCH_SIZE`) |
+| `--compression-level` | `5` | Zstd level for output (env `COMPRESSION_LEVEL`) |
+| `--concurrency` | cores, clamped `[1, 8]` | partitions decoded in parallel (env `CONCURRENCY`) |
+| `--output-prefix` | `ais` | output file name prefix (added before tree suffix, env `OUTPUT_PREFIX`) |
 | `--consolidate-ais` | *(off)* | reassemble fragmented NMEA sentences before decoding |
 
 ### Iceberg output (REST catalog)

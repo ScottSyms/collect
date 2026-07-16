@@ -137,21 +137,21 @@ Other Type 8 messages retained as generic header + hex payload:
 
 | Flag | Env | Default | Description |
 |------|-----|---------|-------------|
-| `--input-dir` (repeatable) | — | — | Local input directory |
-| `--input-s3-bucket` (repeatable) | `INPUT_S3_BUCKET` | — | Input S3 bucket (supports `bucket/path`) |
+| `--input-dir` (repeatable) | `INPUT_DIR` (comma-separated) | — | Local input directory |
+| `--input-s3-bucket` (repeatable) | `INPUT_S3_BUCKET` (comma-separated) | — | Input S3 bucket (supports `bucket/path`) |
 | `--input-s3-prefix` | `INPUT_S3_PREFIX` | `""` | Input key prefix |
-| `--output-dir` | — | — | Local output directory |
+| `--output-dir` | `OUTPUT_DIR` | — | Local output directory |
 | `--output-s3-bucket` | `OUTPUT_S3_BUCKET` | — | Output S3 bucket (supports `bucket/path`) |
 | `--output-s3-prefix` | `OUTPUT_S3_PREFIX` | `""` | Output key prefix |
-| `--partition` | — | `day` | Partition granularity |
-| `--source` | — | — | Source filter |
+| `--partition` | `PARTITION` | `day` | Partition granularity |
+| `--filter-source` (alias `--source`) | `FILTER_SOURCE` | — | Source filter |
 | `--year` / `--month` / `--day` / `--hour` / `--minute` | — | — | Partition time filter chain |
-| `--since <HOURS>` | `SINCE_HOURS` | — | Rolling window |
+| `--since <HOURS>` | `SINCE` | — | Rolling window |
 | `--incremental` | `INCREMENTAL` | off | Watermark-based incremental |
-| `--batch-size` | — | `8192` | Parquet read batch rows |
-| `--compression-level` | — | `5` | Zstd level |
-| `--concurrency` | — | auto | Partition concurrency |
-| `--output-prefix` | — | `aisstream` | Output file name prefix |
+| `--batch-size` | `BATCH_SIZE` | `8192` | Parquet read batch rows |
+| `--compression-level` | `COMPRESSION_LEVEL` | `5` | Zstd level |
+| `--concurrency` | `CONCURRENCY` | auto | Partition concurrency |
+| `--output-prefix` | `OUTPUT_PREFIX` | `aisstream` | Output file name prefix |
 
 S3 connection args: `--s3-endpoint`, `--s3-region`, `--s3-access-key`,
 `--s3-secret-key`, `--s3-disable-tls` (env vars: `S3_ENDPOINT`, etc.)

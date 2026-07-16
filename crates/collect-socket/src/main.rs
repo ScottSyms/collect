@@ -20,15 +20,15 @@ const TCP_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(5);
 )]
 struct Args {
     /// TCP host address to receive data from
-    #[arg(long, requires = "tcp_port")]
+    #[arg(long, env = "TCP_HOST", requires = "tcp_port")]
     tcp_host: Option<String>,
 
     /// TCP port to receive data from
-    #[arg(long, requires = "tcp_host")]
+    #[arg(long, env = "TCP_PORT", requires = "tcp_host")]
     tcp_port: Option<u16>,
 
     /// Logical source label; defaults to "tcp"
-    #[arg(short, long)]
+    #[arg(short, long, env = "SOURCE")]
     source: Option<String>,
 
     /// Enable AIS multi-part message reassembly (combines fragmented NMEA
@@ -136,28 +136,7 @@ impl LineSource for TcpInputSource {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let mut args = Args::parse();
-
-    if args.tcp_host.is_none() {
-        if let Ok(value) = std::env::var("TCP_HOST") {
-            args.tcp_host = Some(value);
-        }
-    }
-
-    if args.tcp_port.is_none() {
-        if let Ok(value) = std::env::var("TCP_PORT") {
-            args.tcp_port = value.parse().ok();
-        }
-    }
-
-    if args.source.is_none() {
-        if let Ok(value) = std::env::var("SOURCE") {
-            args.source = Some(value);
-        }
-    }
-
-    args.common.apply_env();
-    args.s3.apply_env();
+    let args = Args::parse();
 
     let host = args
         .tcp_host

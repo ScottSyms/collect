@@ -32,23 +32,27 @@ const KAFKA_FORWARDER_CHANNEL_CAPACITY: usize = 1024;
 )]
 struct Args {
     /// Kafka bootstrap servers, e.g. host1:9092,host2:9092
-    #[arg(long)]
+    #[arg(long, env = "KAFKA_BROKERS")]
     kafka_brokers: Option<String>,
 
     /// Kafka topic to consume from
-    #[arg(long)]
+    #[arg(long = "kafka-topic", visible_alias = "topic", env = "KAFKA_TOPIC")]
     topic: Option<String>,
 
     /// Kafka consumer group id
-    #[arg(long)]
+    #[arg(
+        long = "kafka-group-id",
+        visible_alias = "group-id",
+        env = "KAFKA_GROUP_ID"
+    )]
     group_id: Option<String>,
 
     /// Where to start when no offset is committed: earliest | latest
-    #[arg(long, default_value = DEFAULT_KAFKA_AUTO_OFFSET_RESET)]
+    #[arg(long, env = "KAFKA_AUTO_OFFSET_RESET", default_value = DEFAULT_KAFKA_AUTO_OFFSET_RESET)]
     kafka_auto_offset_reset: String,
 
     /// Logical source label (defaults to kafka topic)
-    #[arg(short, long)]
+    #[arg(short, long, env = "SOURCE")]
     source: Option<String>,
 
     #[command(flatten)]
@@ -168,9 +172,7 @@ impl LineSource for KafkaInputSource {
         self.tracker.reset_stream(pending.clone());
 
         let shutdown = self.shutdown.clone();
-        let (tx, rx) = mpsc::channel::<io::Result<bytes::Bytes>>(
-            KAFKA_FORWARDER_CHANNEL_CAPACITY,
-        );
+        let (tx, rx) = mpsc::channel::<io::Result<bytes::Bytes>>(KAFKA_FORWARDER_CHANNEL_CAPACITY);
 
         // Forward Kafka messages as newline-delimited payloads into a byte stream.
         tokio::spawn(async move {
@@ -253,45 +255,17 @@ impl LineSource for KafkaInputSource {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let mut args = Args::parse();
-
-    // Apply env fallbacks (consistent with other binaries)
-    if args.kafka_brokers.is_none() {
-        if let Ok(v) = std::env::var("KAFKA_BROKERS") {
-            args.kafka_brokers = Some(v);
-        }
-    }
-    if args.topic.is_none() {
-        if let Ok(v) = std::env::var("KAFKA_TOPIC") {
-            args.topic = Some(v);
-        }
-    }
-    if args.group_id.is_none() {
-        if let Ok(v) = std::env::var("KAFKA_GROUP_ID") {
-            args.group_id = Some(v);
-        }
-    }
-    if args.source.is_none() {
-        if let Ok(v) = std::env::var("SOURCE") {
-            args.source = Some(v);
-        }
-    }
-    if let Ok(v) = std::env::var("KAFKA_AUTO_OFFSET_RESET") {
-        args.kafka_auto_offset_reset = v;
-    }
-
-    args.common.apply_env();
-    args.s3.apply_env();
+    let args = Args::parse();
 
     let brokers = args
         .kafka_brokers
         .context("missing Kafka brokers; set --kafka-brokers or KAFKA_BROKERS")?;
     let topic = args
         .topic
-        .context("missing Kafka topic; set --topic or KAFKA_TOPIC")?;
+        .context("missing Kafka topic; set --kafka-topic or KAFKA_TOPIC")?;
     let group_id = args
         .group_id
-        .context("missing Kafka group id; set --group-id or KAFKA_GROUP_ID")?;
+        .context("missing Kafka group id; set --kafka-group-id or KAFKA_GROUP_ID")?;
 
     let source_name = args.source.unwrap_or_else(|| topic.clone());
 
@@ -318,9 +292,9 @@ async fn main() -> Result<()> {
             report_progress: true,
             log_writes: true,
             shutdown: Some(shutdown.clone()),
-                write_workers: None,
-                sweep_orphans: true,
-                line_transformer: None,
+            write_workers: None,
+            sweep_orphans: true,
+            line_transformer: None,
         },
     )
     .await

@@ -1,5 +1,7 @@
 use anyhow::{bail, Context, Result};
-use arrow::array::{ArrayBuilder, StringBuilder, TimestampMillisecondArray, TimestampMillisecondBuilder};
+use arrow::array::{
+    ArrayBuilder, StringBuilder, TimestampMillisecondArray, TimestampMillisecondBuilder,
+};
 use arrow::compute::{sort_to_indices, take, SortOptions};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
@@ -29,11 +31,11 @@ use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::codec::{FramedRead, LinesCodec};
 
+pub mod ais_consolidate;
 pub mod dataset;
 pub mod iceberg;
 mod metrics;
 pub mod state;
-pub mod ais_consolidate;
 
 pub use async_trait::async_trait;
 pub use metrics::IngestMetrics;
@@ -164,39 +166,39 @@ impl FromStr for PartitionGranularity {
 #[derive(Clone, Debug, Args)]
 pub struct CommonCliArgs {
     /// Output root directory
-    #[arg(long = "output-dir", default_value = "data")]
+    #[arg(long = "output-dir", env = "OUTPUT_DIR", default_value = DEFAULT_OUT_DIR)]
     pub out_dir: PathBuf,
 
     /// Partition granularity for dataset layout
-    #[arg(long, default_value_t = PartitionGranularity::Day)]
+    #[arg(long, env = "PARTITION", default_value_t = PartitionGranularity::Day)]
     pub partition: PartitionGranularity,
 
     /// Max rows to buffer per Parquet file before flush (default: flush on the selected partition boundary)
-    #[arg(long)]
+    #[arg(long, env = "MAX_ROWS")]
     pub max_rows: Option<usize>,
 
     /// Max payload bytes to buffer per Parquet file before flush
-    #[arg(long)]
+    #[arg(long, env = "MAX_BATCH_BYTES")]
     pub max_batch_bytes: Option<usize>,
 
     /// Zstd compression level for Parquet output (default: 5)
-    #[arg(long)]
+    #[arg(long, env = "COMPRESSION_LEVEL")]
     pub compression_level: Option<i32>,
 
     /// Seconds to wait for background uploads on shutdown
-    #[arg(long, default_value_t = DEFAULT_UPLOAD_DRAIN_TIMEOUT_SECONDS)]
+    #[arg(long, env = "UPLOAD_DRAIN_TIMEOUT_SECONDS", default_value_t = DEFAULT_UPLOAD_DRAIN_TIMEOUT_SECONDS)]
     pub upload_drain_timeout_seconds: u64,
 
     /// Maximum bytes allowed per input line before dropping it
-    #[arg(long, default_value_t = DEFAULT_MAX_LINE_LENGTH)]
+    #[arg(long, env = "MAX_LINE_LENGTH", default_value_t = DEFAULT_MAX_LINE_LENGTH)]
     pub max_line_length: usize,
 
     /// Run health check and exit
-    #[arg(long)]
+    #[arg(long, env = "HEALTH_CHECK", value_parser = clap::builder::FalseyValueParser::new())]
     pub health_check: bool,
 
     /// Serve Prometheus metrics and /healthz on this address, e.g. 0.0.0.0:9184
-    #[arg(long)]
+    #[arg(long, env = "METRICS_ADDR")]
     pub metrics_addr: Option<String>,
 }
 
@@ -205,59 +207,59 @@ pub struct S3CliArgs {
     /// S3 bucket name for remote storage (enables S3 upload).  You may include
     /// a key prefix, e.g. `bronze/norway` — the first path segment becomes the
     /// bucket and the remainder is used as `s3_prefix`.
-    #[arg(long)]
+    #[arg(long, env = "S3_BUCKET")]
     pub s3_bucket: Option<String>,
 
     /// Optional S3 key prefix prepended to every upload key (used alongside
     /// `--s3-bucket`, or contributed by `bucket/path` syntax).
-    #[arg(long)]
+    #[arg(long, env = "S3_PREFIX")]
     pub s3_prefix: Option<String>,
 
     /// S3 endpoint URL (for MinIO or custom S3-compatible storage)
-    #[arg(long)]
+    #[arg(long, env = "S3_ENDPOINT")]
     pub s3_endpoint: Option<String>,
 
     /// S3 region (default: us-east-1)
-    #[arg(long, default_value = "us-east-1")]
+    #[arg(long, env = "S3_REGION", default_value = DEFAULT_S3_REGION)]
     pub s3_region: String,
 
     /// S3 access key ID (can also use AWS_ACCESS_KEY_ID env var)
-    #[arg(long)]
+    #[arg(long, env = "S3_ACCESS_KEY")]
     pub s3_access_key: Option<String>,
 
     /// S3 secret access key (can also use AWS_SECRET_ACCESS_KEY env var)
-    #[arg(long)]
+    #[arg(long, env = "S3_SECRET_KEY", hide_env_values = true)]
     pub s3_secret_key: Option<String>,
 
     /// Keep local files after S3 upload (default: delete after successful upload)
-    #[arg(long)]
+    #[arg(long, env = "KEEP_LOCAL", value_parser = clap::builder::FalseyValueParser::new())]
     pub keep_local: bool,
 
     /// Disable TLS/HTTPS for S3 endpoint (use plain HTTP instead)
-    #[arg(long)]
+    #[arg(long, env = "S3_DISABLE_TLS", value_parser = clap::builder::FalseyValueParser::new())]
     pub s3_disable_tls: bool,
 }
 
 #[derive(Clone, Debug, Args)]
 pub struct S3ConnectionArgs {
     /// S3 endpoint URL (for MinIO or custom S3-compatible storage)
-    #[arg(long)]
+    #[arg(long, env = "S3_ENDPOINT")]
     pub s3_endpoint: Option<String>,
 
     /// S3 region (default: us-east-1)
-    #[arg(long, default_value = "us-east-1")]
+    #[arg(long, env = "S3_REGION", default_value = DEFAULT_S3_REGION)]
     pub s3_region: String,
 
     /// S3 access key ID (can also use AWS_ACCESS_KEY_ID env var)
-    #[arg(long)]
+    #[arg(long, env = "S3_ACCESS_KEY")]
     pub s3_access_key: Option<String>,
 
     /// S3 secret access key (can also use AWS_SECRET_ACCESS_KEY env var)
-    #[arg(long)]
+    #[arg(long, env = "S3_SECRET_KEY", hide_env_values = true)]
     pub s3_secret_key: Option<String>,
 
     /// Disable TLS/HTTPS for S3 endpoint (use plain HTTP instead)
-    #[arg(long)]
+    #[arg(long, env = "S3_DISABLE_TLS", value_parser = clap::builder::FalseyValueParser::new())]
     pub s3_disable_tls: bool,
 }
 
@@ -346,7 +348,10 @@ impl std::fmt::Debug for IngestOptions {
             .field("shutdown", &self.shutdown)
             .field("write_workers", &self.write_workers)
             .field("sweep_orphans", &self.sweep_orphans)
-            .field("line_transformer", &self.line_transformer.as_ref().map(|_| "(set)"))
+            .field(
+                "line_transformer",
+                &self.line_transformer.as_ref().map(|_| "(set)"),
+            )
             .finish()
     }
 }
@@ -396,8 +401,6 @@ pub trait LineSource {
         None
     }
 
-
-
     async fn open(&mut self, max_line_length: usize) -> Result<LineReader>;
 
     async fn on_stream_end(
@@ -433,70 +436,6 @@ pub trait LineTransformer: Send {
 }
 
 impl CommonCliArgs {
-    pub fn apply_env(&mut self) {
-        if self.out_dir == PathBuf::from(DEFAULT_OUT_DIR) {
-            if let Ok(value) = std::env::var("OUTPUT_DIR") {
-                self.out_dir = PathBuf::from(value);
-            }
-        }
-
-        if self.partition == PartitionGranularity::Day {
-            if let Ok(value) = std::env::var("PARTITION") {
-                if let Ok(parsed) = value.parse::<PartitionGranularity>() {
-                    self.partition = parsed;
-                }
-            }
-        }
-
-        if self.max_rows.is_none() {
-            if let Ok(value) = std::env::var("MAX_ROWS") {
-                self.max_rows = value.parse().ok();
-            }
-        }
-
-        if self.max_batch_bytes.is_none() {
-            if let Ok(value) = std::env::var("MAX_BATCH_BYTES") {
-                self.max_batch_bytes = value.parse().ok();
-            }
-        }
-
-        if self.compression_level.is_none() {
-            if let Ok(value) = std::env::var("COMPRESSION_LEVEL") {
-                self.compression_level = value.parse().ok();
-            }
-        }
-
-        if self.upload_drain_timeout_seconds == DEFAULT_UPLOAD_DRAIN_TIMEOUT_SECONDS {
-            if let Ok(value) = std::env::var("UPLOAD_DRAIN_TIMEOUT_SECONDS") {
-                if let Ok(parsed) = value.parse::<u64>() {
-                    self.upload_drain_timeout_seconds = parsed;
-                }
-            }
-        }
-
-        if self.max_line_length == DEFAULT_MAX_LINE_LENGTH {
-            if let Ok(value) = std::env::var("MAX_LINE_LENGTH") {
-                if let Ok(parsed) = value.parse::<usize>() {
-                    self.max_line_length = parsed;
-                }
-            }
-        }
-
-        if !self.health_check {
-            if let Some(value) = parse_bool_env("HEALTH_CHECK") {
-                self.health_check = value;
-            }
-        }
-
-        if self.metrics_addr.is_none() {
-            if let Ok(value) = std::env::var("METRICS_ADDR") {
-                if !value.trim().is_empty() {
-                    self.metrics_addr = Some(value);
-                }
-            }
-        }
-    }
-
     pub fn to_options(&self) -> CommonOptions {
         CommonOptions {
             out_dir: self.out_dir.clone(),
@@ -513,59 +452,6 @@ impl CommonCliArgs {
 }
 
 impl S3CliArgs {
-    pub fn apply_env(&mut self) {
-        if self.s3_bucket.is_none() {
-            if let Ok(value) = std::env::var("S3_BUCKET") {
-                self.s3_bucket = Some(value);
-            }
-        }
-
-        if self.s3_prefix.is_none() {
-            if let Ok(value) = std::env::var("S3_PREFIX") {
-                let trimmed = value.trim().to_string();
-                if !trimmed.is_empty() {
-                    self.s3_prefix = Some(trimmed);
-                }
-            }
-        }
-
-        if self.s3_endpoint.is_none() {
-            if let Ok(value) = std::env::var("S3_ENDPOINT") {
-                self.s3_endpoint = Some(value);
-            }
-        }
-
-        if self.s3_region == DEFAULT_S3_REGION {
-            if let Ok(value) = std::env::var("S3_REGION") {
-                self.s3_region = value;
-            }
-        }
-
-        if self.s3_access_key.is_none() {
-            if let Ok(value) = std::env::var("S3_ACCESS_KEY") {
-                self.s3_access_key = Some(value);
-            }
-        }
-
-        if self.s3_secret_key.is_none() {
-            if let Ok(value) = std::env::var("S3_SECRET_KEY") {
-                self.s3_secret_key = Some(value);
-            }
-        }
-
-        if !self.keep_local {
-            if let Some(value) = parse_bool_env("KEEP_LOCAL") {
-                self.keep_local = value;
-            }
-        }
-
-        if !self.s3_disable_tls {
-            if let Some(value) = parse_bool_env("S3_DISABLE_TLS") {
-                self.s3_disable_tls = value;
-            }
-        }
-    }
-
     pub fn to_options(&self) -> Option<S3Options> {
         let bucket_raw = self.s3_bucket.clone()?;
         let (bucket, path_prefix) = S3Storage::split_s3_path(&bucket_raw, "");
@@ -586,40 +472,6 @@ impl S3CliArgs {
             keep_local: self.keep_local,
             disable_tls: self.s3_disable_tls,
         })
-    }
-}
-
-impl S3ConnectionArgs {
-    pub fn apply_env(&mut self) {
-        if self.s3_endpoint.is_none() {
-            if let Ok(value) = std::env::var("S3_ENDPOINT") {
-                self.s3_endpoint = Some(value);
-            }
-        }
-
-        if self.s3_region == "us-east-1" {
-            if let Ok(value) = std::env::var("S3_REGION") {
-                self.s3_region = value;
-            }
-        }
-
-        if self.s3_access_key.is_none() {
-            if let Ok(value) = std::env::var("S3_ACCESS_KEY") {
-                self.s3_access_key = Some(value);
-            }
-        }
-
-        if self.s3_secret_key.is_none() {
-            if let Ok(value) = std::env::var("S3_SECRET_KEY") {
-                self.s3_secret_key = Some(value);
-            }
-        }
-
-        if !self.s3_disable_tls {
-            if let Some(value) = parse_bool_env("S3_DISABLE_TLS") {
-                self.s3_disable_tls = value;
-            }
-        }
     }
 }
 
@@ -730,7 +582,10 @@ mod tests {
             PartitionGranularity::Year,
         ] {
             let (start, end) = granularity.period_bounds_ms(ts);
-            assert!(start <= ts && ts < end, "{granularity}: {start}..{end} vs {ts}");
+            assert!(
+                start <= ts && ts < end,
+                "{granularity}: {start}..{end} vs {ts}"
+            );
             // A timestamp just past the end must map to a different partition.
             let next = PartKey::from_timestamp("s", end, granularity);
             let current = PartKey::from_timestamp("s", ts, granularity);
@@ -1289,11 +1144,8 @@ where
     // Flush any buffered transformer state (e.g. incomplete AIS fragments).
     if let Some(t) = &mut line_transformer {
         for (flush_ts, flush_payload) in t.flush() {
-            let flush_key = PartKey::from_timestamp(
-                source.source_name(),
-                flush_ts,
-                common.partition,
-            );
+            let flush_key =
+                PartKey::from_timestamp(source.source_name(), flush_ts, common.partition);
             if flush_key != current_key && !buf.is_empty() {
                 flush_batch(
                     &common.out_dir,
@@ -1306,7 +1158,9 @@ where
                 .await?;
                 batches_sealed += 1;
                 source.on_batch_sealed(batches_sealed);
-                metrics.batches_sealed.store(batches_sealed, Ordering::Relaxed);
+                metrics
+                    .batches_sealed
+                    .store(batches_sealed, Ordering::Relaxed);
             }
             current_key = flush_key;
             buf.push(flush_ts, &flush_payload);
@@ -1325,7 +1179,9 @@ where
         .await?;
         batches_sealed += 1;
         source.on_batch_sealed(batches_sealed);
-        metrics.batches_sealed.store(batches_sealed, Ordering::Relaxed);
+        metrics
+            .batches_sealed
+            .store(batches_sealed, Ordering::Relaxed);
     }
 
     if let Some(write_queue) = write_queue {
@@ -1754,14 +1610,16 @@ impl S3Storage {
             .await
             .with_context(|| format!("create {}", local_path.display()))?;
         let mut reader = response.body.into_async_read();
-        tokio::io::copy(&mut reader, &mut file).await.with_context(|| {
-            format!(
-                "copy s3://{}/{} to {}",
-                self.bucket,
-                key,
-                local_path.display()
-            )
-        })?;
+        tokio::io::copy(&mut reader, &mut file)
+            .await
+            .with_context(|| {
+                format!(
+                    "copy s3://{}/{} to {}",
+                    self.bucket,
+                    key,
+                    local_path.display()
+                )
+            })?;
         file.flush().await?;
         Ok(())
     }
@@ -1818,8 +1676,7 @@ impl S3Storage {
                 {
                     return Ok(None);
                 }
-                return Err(error)
-                    .with_context(|| format!("reading s3://{}/{}", self.bucket, key));
+                return Err(error).with_context(|| format!("reading s3://{}/{}", self.bucket, key));
             }
         };
         let bytes = response
@@ -1928,8 +1785,7 @@ pub fn sort_record_batch_by_ts(batch: &RecordBatch) -> Result<RecordBatch> {
         descending: false,
         nulls_first: false,
     };
-    let indices = sort_to_indices(ts_column, Some(sort_options), None)
-        .context("sort indices")?;
+    let indices = sort_to_indices(ts_column, Some(sort_options), None).context("sort indices")?;
 
     let sorted_columns: Vec<_> = (0..batch.num_columns())
         .map(|i| take(batch.column(i), &indices, None).context("reorder column"))
@@ -2058,7 +1914,11 @@ fn find_orphaned_uploads(out_dir: &Path) -> Result<Vec<(PathBuf, String)>> {
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(error) => {
-                eprintln!("⚠️  Skipping unreadable directory {}: {}", dir.display(), error);
+                eprintln!(
+                    "⚠️  Skipping unreadable directory {}: {}",
+                    dir.display(),
+                    error
+                );
                 continue;
             }
         };
@@ -2380,9 +2240,7 @@ async fn flush_batch(
     // Byte-budget backpressure: memory in the write pipeline is bounded by
     // the semaphore budget rather than the queue's job count. Oversized
     // batches clamp to the full budget so they can still proceed alone.
-    let permits = payload_bytes
-        .min(queue.budget_bytes)
-        .min(u32::MAX as usize) as u32;
+    let permits = payload_bytes.min(queue.budget_bytes).min(u32::MAX as usize) as u32;
     let byte_permit = queue
         .byte_budget
         .clone()
@@ -2430,12 +2288,6 @@ fn emit_ingest_progress<S: LineSource>(
         format_count(buffered_bytes),
         format_count(files_flushed),
     );
-}
-
-fn parse_bool_env(name: &str) -> Option<bool> {
-    std::env::var(name)
-        .ok()
-        .map(|value| matches!(value.to_ascii_lowercase().as_str(), "true" | "1"))
 }
 
 fn now_unix_duration() -> Duration {
