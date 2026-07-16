@@ -157,7 +157,7 @@ docker run -d \
   collect:latest
 ```
 
-The image defaults to `collect-socket`; use `--entrypoint /usr/local/bin/collect-file` for file ingestion or `--entrypoint /usr/local/bin/collect-maint` for maintenance commands. See [NOMAD.md](NOMAD.md) for Nomad orchestration job definitions.
+The image defaults to `collect-socket`; use `--entrypoint /usr/local/bin/<binary>` (e.g. `collect-file`, `collect-kafka`, `collect-aisstream`, `ais-parse`, `aisstream-parse`) to run any other binary the image ships. See [NOMAD.md](NOMAD.md) for Nomad orchestration job definitions.
 
 ## Configuration Precedence
 

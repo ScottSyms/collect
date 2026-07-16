@@ -236,7 +236,7 @@ impl AisStreamSource {
 
             match self.connect(max_line_length).await {
                 Ok(reader) => {
-                    println!("Reconnected to AISStream");
+                    eprintln!("Reconnected to AISStream");
                     return Ok(ReaderTransition::Continue(reader));
                 }
                 Err(error) => {

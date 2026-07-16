@@ -1207,7 +1207,7 @@ where
         drop(upload_tx);
         if let Some(upload_worker) = upload_worker {
             if log_writes {
-                println!("Waiting for background uploads to complete...");
+                eprintln!("Waiting for background uploads to complete...");
             }
             let drain_timeout = Duration::from_secs(common.upload_drain_timeout_seconds);
             match tokio::time::timeout(drain_timeout, upload_worker).await {
@@ -1216,7 +1216,7 @@ where
                         eprintln!("Upload worker failed: {}", error);
                     } else {
                         if log_writes {
-                            println!("All uploads completed");
+                            eprintln!("All uploads completed");
                         }
                     }
                 }
@@ -1435,13 +1435,29 @@ impl S3Storage {
         match client.head_bucket().bucket(bucket).send().await {
             Ok(_) => return Ok(()),
             Err(err) => {
-                // Any error (NotFound, 403, etc.) falls through to a create
-                // attempt; if the bucket truly exists but we lack HeadBucket
-                // permission, CreateBucket returns AlreadyOwned which we accept.
-                let _ = err;
+                // Only a confirmed "no such bucket" falls through to create.
+                // Anything else (403 permission denied, network failure, bad
+                // credentials, ...) is a real problem and must not be masked
+                // by a CreateBucket attempt against a bucket that already
+                // exists but we simply can't see.
+                let is_not_found = err.as_service_error().is_some_and(|e| e.is_not_found());
+                if !is_not_found {
+                    let status = err.raw_response().map(|r| r.status().as_u16());
+                    if status == Some(403) {
+                        bail!(
+                            "access denied checking whether S3 bucket '{bucket}' exists \
+                             (HeadBucket returned 403 Forbidden). Check --s3-access-key/\
+                             --s3-secret-key (or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY) and \
+                             that the credentials have permission on this bucket."
+                        );
+                    }
+                    return Err(anyhow::Error::new(err))
+                        .with_context(|| format!("checking whether S3 bucket '{bucket}' exists"));
+                }
             }
         }
 
+        eprintln!("S3 bucket '{bucket}' does not exist; creating it...");
         match client.create_bucket().bucket(bucket).send().await {
             Ok(_) => Ok(()),
             Err(err) => {
@@ -1527,7 +1543,7 @@ impl S3Storage {
                 anyhow::anyhow!("S3 upload failed: {}", e)
             })?;
 
-        println!(
+        eprintln!(
             "✅ Uploaded {} to S3: s3://{}/{} ({:.2} MB)",
             local_path.display(),
             self.bucket,
@@ -1539,7 +1555,7 @@ impl S3Storage {
             tokio::fs::remove_file(local_path).await.with_context(|| {
                 format!("Failed to remove local file: {}", local_path.display())
             })?;
-            println!("🗑️  Removed local file: {}", local_path.display());
+            eprintln!("🗑️  Removed local file: {}", local_path.display());
         }
 
         Ok(())
@@ -2194,7 +2210,7 @@ async fn write_batch_job(
     let _ = durable_tx.send(seq);
 
     if log_writes {
-        println!(
+        eprintln!(
             "✅ Wrote {} rows to {} (queued for upload)",
             format_count(batch_rows),
             path.display()

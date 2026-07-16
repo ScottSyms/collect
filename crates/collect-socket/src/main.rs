@@ -89,7 +89,7 @@ impl TcpInputSource {
 
             match self.connect(max_line_length).await {
                 Ok(reader) => {
-                    println!("Reconnected to TCP {}:{}", self.host, self.port);
+                    eprintln!("Reconnected to TCP {}:{}", self.host, self.port);
                     return Ok(ReaderTransition::Continue(reader));
                 }
                 Err(error) => {
