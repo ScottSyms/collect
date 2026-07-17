@@ -193,6 +193,19 @@ pub struct AtonRow {
     pub raim: bool,
 }
 
+/// An unparsed message retained as-is in the other/ tree.
+#[derive(Debug, Clone)]
+pub struct OtherRow {
+    pub ts_ms: i64,
+    pub source: Arc<str>,
+    /// Station from the NMEA tag block, if present.
+    pub station: Option<String>,
+    /// AIS message type number (peeked from the first 6 bits), or 0 if unknown.
+    pub msg_type: u8,
+    /// The original AIVDM payload string.
+    pub payload_raw: String,
+}
+
 pub enum Decoded {
     Position(Box<PositionRow>),
     Static(Box<StaticRow>),
@@ -203,7 +216,7 @@ pub enum Decoded {
     /// AIS type 21 Aids to Navigation.
     Aton(Box<AtonRow>),
     /// Decoded fine, but not a message class we materialize.
-    Other,
+    Other(Box<OtherRow>),
     /// Part of a multi-sentence message; the parser buffered it.
     Incomplete,
     /// The parser rejected the sentence.
@@ -291,7 +304,13 @@ pub fn decode_payload(ts_ms: i64, source: &str, payload: &str) -> Decoded {
                 )))
             }
             Ok(ParsedMessage::Incomplete) => Decoded::Incomplete,
-            Ok(_) => Decoded::Other,
+            Ok(_) => Decoded::Other(Box::new(OtherRow {
+                ts_ms,
+                source: src.clone(),
+                station,
+                msg_type: peeked_type.unwrap_or(0),
+                payload_raw: payload.to_string(),
+            })),
             Err(_) => Decoded::Failed,
         }
     })
@@ -746,7 +765,7 @@ mod tests {
     fn garbage_is_failed_not_panic() {
         assert!(matches!(
             decode_payload(0, "s", "$PGHP,1,2013,1,9,4,37,45,298,,110,,1,26*19"),
-            Decoded::Failed | Decoded::Other
+            Decoded::Failed | Decoded::Other(_)
         ));
         assert!(matches!(
             decode_payload(0, "s", "not a sentence at all"),

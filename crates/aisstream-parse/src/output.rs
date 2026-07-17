@@ -707,3 +707,65 @@ fn u16_aton_col(rows: &[AtonRow], get: impl Fn(&AtonRow) -> Option<u16>) -> Arra
 fn u64_aton_col(rows: &[AtonRow], get: impl Fn(&AtonRow) -> Option<u64>) -> ArrayRef {
     Arc::new(UInt64Array::from(rows.iter().map(get).collect::<Vec<_>>()))
 }
+
+#[derive(Debug, Clone)]
+pub struct OtherRow {
+    pub ts_ms: i64,
+    pub source: String,
+    pub msg_type: String,
+    pub payload: String,
+}
+
+fn other_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        ts_field("ts", false),
+        Field::new("source", DataType::Utf8, false),
+        Field::new("msg_type", DataType::Utf8, false),
+        Field::new("payload", DataType::Utf8, false),
+    ]))
+}
+
+pub struct OtherWriter {
+    sink: FileSink,
+    rows: Vec<OtherRow>,
+}
+
+impl OtherWriter {
+    pub fn new(dir: PathBuf, output_prefix: &str, compression_level: i32) -> Self {
+        let prefix = format!("{output_prefix}-oth");
+        OtherWriter {
+            sink: FileSink::new(dir, &prefix, other_schema(), compression_level),
+            rows: Vec::new(),
+        }
+    }
+
+    pub fn write(&mut self, row: OtherRow) -> Result<()> {
+        self.rows.push(row);
+        if self.rows.len() >= FLUSH_BATCH_ROWS {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        if self.rows.is_empty() {
+            return Ok(());
+        }
+        let r = &self.rows;
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(TimestampMillisecondArray::from(r.iter().map(|x| x.ts_ms).collect::<Vec<_>>()).with_timezone("UTC")),
+            Arc::new(StringArray::from(r.iter().map(|x| x.source.as_str()).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(r.iter().map(|x| x.msg_type.as_str()).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(r.iter().map(|x| x.payload.as_str()).collect::<Vec<_>>())),
+        ];
+        let batch = RecordBatch::try_new(self.sink.schema.clone(), columns)
+            .context("assembling other batch")?;
+        self.rows.clear();
+        self.sink.write_batch(batch)
+    }
+
+    pub fn finish(mut self) -> Result<Option<(PathBuf, u64)>> {
+        self.flush()?;
+        self.sink.finish()
+    }
+}

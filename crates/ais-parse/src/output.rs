@@ -6,7 +6,7 @@
 //! under a `tmp-` name and renamed into place on close, matching the
 //! convention the rest of the workspace uses for in-flight Parquet output.
 
-use crate::decode::{AtonRow, BinaryRow, MeteoRow, PositionRow, StaticRow};
+use crate::decode::{AtonRow, BinaryRow, MeteoRow, OtherRow, PositionRow, StaticRow};
 use anyhow::{Context, Result};
 use arrow::array::{
     ArrayBuilder, ArrayRef, BooleanArray, BooleanBuilder, Float64Array, Float64Builder,
@@ -678,6 +678,74 @@ impl BinaryWriter {
     }
 }
 
+/// Catch-all writer for message types that don't fit any specialised schema.
+/// Rows are buffered and columns built at flush time (like MeteoWriter /
+/// BinaryWriter).
+pub struct OtherWriter {
+    sink: FileSink,
+    rows: Vec<OtherRow>,
+}
+
+impl OtherWriter {
+    pub fn new(dir: PathBuf, output_prefix: &str, compression_level: i32) -> Self {
+        let prefix = format!("{output_prefix}-oth");
+        OtherWriter {
+            sink: FileSink::new(dir, &prefix, other_schema(), compression_level),
+            rows: Vec::new(),
+        }
+    }
+
+    pub fn write(&mut self, row: OtherRow) -> Result<()> {
+        self.rows.push(row);
+        if self.rows.len() >= FLUSH_BATCH_ROWS {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        if self.rows.is_empty() {
+            return Ok(());
+        }
+        let r = &self.rows;
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(
+                TimestampMillisecondArray::from(r.iter().map(|x| x.ts_ms).collect::<Vec<_>>())
+                    .with_timezone("UTC"),
+            ),
+            Arc::new(StringArray::from(
+                r.iter().map(|x| x.source.as_ref()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                r.iter().map(|x| x.station.as_deref()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                r.iter()
+                    .map(|x| {
+                        if x.msg_type == 0 {
+                            "Unknown".to_string()
+                        } else {
+                            format!("Type{}", x.msg_type)
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                r.iter().map(|x| x.payload_raw.as_str()).collect::<Vec<_>>(),
+            )),
+        ];
+        let batch = RecordBatch::try_new(self.sink.schema.clone(), columns)
+            .context("assembling other batch")?;
+        self.rows.clear();
+        self.sink.write_batch(batch)
+    }
+
+    pub fn finish(mut self) -> Result<Option<(PathBuf, u64)>> {
+        self.flush()?;
+        self.sink.finish()
+    }
+}
+
 fn atons_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         ts_field("ts", false),
@@ -775,6 +843,16 @@ impl AtonWriter {
         self.flush()?;
         self.sink.finish()
     }
+}
+
+fn other_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        ts_field("ts", false),
+        Field::new("source", DataType::Utf8, false),
+        Field::new("station", DataType::Utf8, true),
+        Field::new("msg_type", DataType::Utf8, false),
+        Field::new("payload", DataType::Utf8, false),
+    ]))
 }
 
 fn f64_col(rows: &[MeteoRow], get: impl Fn(&MeteoRow) -> Option<f64>) -> ArrayRef {

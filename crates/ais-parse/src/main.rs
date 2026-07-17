@@ -32,8 +32,8 @@ mod output;
 mod output_iceberg;
 mod stats;
 
-use decode::{decode_payload, AtonRow, BinaryRow, Decoded, MeteoRow, PositionRow, StaticRow};
-use output::{AtonWriter, BinaryWriter, MeteoWriter, PositionsWriter, StaticsWriter};
+use decode::{decode_payload, AtonRow, BinaryRow, Decoded, MeteoRow, OtherRow, PositionRow, StaticRow};
+use output::{AtonWriter, BinaryWriter, MeteoWriter, OtherWriter, PositionsWriter, StaticsWriter};
 use stats::ParseStats;
 
 /// Decoded output lands in sibling hive datasets under the output root.
@@ -42,6 +42,7 @@ const STATICS_TREE: &str = "statics";
 const METEO_TREE: &str = "meteo";
 const BINARY_TREE: &str = "binary";
 const ATONS_TREE: &str = "atons";
+const OTHER_TREE: &str = "other";
 
 /// Exit code used when there was nothing to process (distinct from success
 /// with rows written, and from a hard error).
@@ -1115,6 +1116,7 @@ fn process_partition(
     let mut meteo = MeteoWriter::new(dir_for(METEO_TREE), output_prefix, compression_level);
     let mut binary = BinaryWriter::new(dir_for(BINARY_TREE), output_prefix, compression_level);
     let mut atons = AtonWriter::new(dir_for(ATONS_TREE), output_prefix, compression_level);
+    let mut other = OtherWriter::new(dir_for(OTHER_TREE), output_prefix, compression_level);
 
     // Row-level dedup keyed on (ts, mmsi, source-kind) so the same AIS message
     // seen in more than one input file for this partition is emitted once.
@@ -1131,6 +1133,7 @@ fn process_partition(
                 meteo: &mut meteo,
                 binary: &mut binary,
                 atons: &mut atons,
+                other: &mut other,
             },
             batch_size,
             &mut seen,
@@ -1172,6 +1175,12 @@ fn process_partition(
         &rel_dir,
         atons.finish().context("closing atons writer")?,
     );
+    push_output(
+        &mut outputs,
+        OTHER_TREE,
+        &rel_dir,
+        other.finish().context("closing other writer")?,
+    );
 
     Ok((stats, outputs))
 }
@@ -1183,6 +1192,7 @@ struct Writers<'a> {
     meteo: &'a mut MeteoWriter,
     binary: &'a mut BinaryWriter,
     atons: &'a mut AtonWriter,
+    other: &'a mut OtherWriter,
 }
 
 trait WriterSet {
@@ -1191,6 +1201,7 @@ trait WriterSet {
     fn write_meteo(&mut self, row: MeteoRow, payload: &str) -> Result<()>;
     fn write_binary(&mut self, row: BinaryRow, payload: &str) -> Result<()>;
     fn write_aton(&mut self, row: AtonRow, payload: &str) -> Result<()>;
+    fn write_other(&mut self, row: OtherRow) -> Result<()>;
 }
 
 impl<'a> WriterSet for Writers<'a> {
@@ -1208,6 +1219,9 @@ impl<'a> WriterSet for Writers<'a> {
     }
     fn write_aton(&mut self, row: AtonRow, payload: &str) -> Result<()> {
         self.atons.write(row, payload)
+    }
+    fn write_other(&mut self, row: OtherRow) -> Result<()> {
+        self.other.write(row)
     }
 }
 
@@ -1234,6 +1248,9 @@ impl WriterSet for IcebergWriters {
     }
     fn write_aton(&mut self, row: AtonRow, payload: &str) -> Result<()> {
         self.atons.write(row, payload)
+    }
+    fn write_other(&mut self, _row: OtherRow) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -1452,7 +1469,10 @@ fn process_parquet_file<W: WriterSet>(
                         stats.rows_deduped += 1;
                     }
                 }
-                Decoded::Other => stats.other_decoded += 1,
+                Decoded::Other(row) => {
+                    stats.others_out += 1;
+                    writers.write_other(*row)?;
+                }
                 Decoded::Incomplete => stats.incomplete += 1,
                 Decoded::Failed => stats.failed += 1,
             }
@@ -1520,7 +1540,10 @@ fn process_parquet_file<W: WriterSet>(
                         stats.rows_deduped += 1;
                     }
                 }
-                Decoded::Other => stats.other_decoded += 1,
+                Decoded::Other(row) => {
+                    stats.others_out += 1;
+                    writers.write_other(*row)?;
+                }
                 Decoded::Incomplete => stats.incomplete += 1,
                 Decoded::Failed => stats.failed += 1,
             }

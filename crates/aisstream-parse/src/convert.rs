@@ -9,6 +9,7 @@ use crate::ais_stream::{
     ShipStaticData, StandardClassBPositionReport, StandardSearchAndRescueAircraftReport,
     StaticDataReport,
 };
+use crate::output::OtherRow;
 
 fn lat_lon_to_h3(lat: f64, lon: f64) -> Option<u64> {
     let ll = LatLng::new(lat.to_radians(), lon.to_radians()).ok()?;
@@ -164,7 +165,7 @@ pub enum Decoded {
     Meteo(MeteoRow),
     Binary(BinaryRow),
     Aton(AtonRow),
-    Other,
+    Other(OtherRow),
     Failed,
 }
 
@@ -172,6 +173,7 @@ pub fn decode_row(
     ts_ms: i64,
     source: &str,
     msg_type: &str,
+    raw_payload: &str,
     message: &mut serde_json::Value,
 ) -> Decoded {
     let src: Arc<str> = Arc::from(source);
@@ -235,8 +237,18 @@ pub fn decode_row(
         | "DataLinkManagementMessage"
         | "Interrogation" | "BinaryAcknowledge" | "ChannelManagement"
         | "AssignedModeCommand" | "CoordinatedUTCInquiry" | "GnssBroadcastBinaryMessage"
-        | "GroupAssignmentCommand" => Decoded::Other,
-        _ => Decoded::Other,
+        | "GroupAssignmentCommand" => Decoded::Other(OtherRow {
+            ts_ms,
+            source: source.to_string(),
+            msg_type: msg_type.to_string(),
+            payload: raw_payload.to_string(),
+        }),
+        _ => Decoded::Other(OtherRow {
+            ts_ms,
+            source: source.to_string(),
+            msg_type: msg_type.to_string(),
+            payload: raw_payload.to_string(),
+        }),
     }
 }
 

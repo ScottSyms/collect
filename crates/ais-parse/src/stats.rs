@@ -11,9 +11,8 @@ pub struct ParseStats {
     pub binary_out: u64,
     /// AIS type 21 Aids to Navigation rows.
     pub atons_out: u64,
-    /// Sentences that decoded fine but aren't materialized (base station
-    /// reports, safety messages, GNSS sentences, ...).
-    pub other_decoded: u64,
+    /// Unparsed message types preserved in the other/ tree.
+    pub others_out: u64,
     /// Fragments of a multi-part message whose remaining parts never arrived
     /// within the partition.
     pub incomplete: u64,
@@ -34,7 +33,7 @@ impl ParseStats {
         self.meteo_out += other.meteo_out;
         self.binary_out += other.binary_out;
         self.atons_out += other.atons_out;
-        self.other_decoded += other.other_decoded;
+        self.others_out += other.others_out;
         self.incomplete += other.incomplete;
         self.failed += other.failed;
         self.rows_deduped += other.rows_deduped;
@@ -49,7 +48,7 @@ impl ParseStats {
         eprintln!("  meteo rows           : {}", self.meteo_out);
         eprintln!("  binary rows          : {}", self.binary_out);
         eprintln!("  aton rows            : {}", self.atons_out);
-        eprintln!("  other decoded        : {}", self.other_decoded);
+        eprintln!("  other rows           : {}", self.others_out);
         eprintln!("  incomplete fragments : {}", self.incomplete);
         eprintln!("  unparsed             : {}", self.failed);
         eprintln!("  deduped (dropped)    : {}", self.rows_deduped);

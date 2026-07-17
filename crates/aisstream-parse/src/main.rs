@@ -34,7 +34,8 @@ mod output_iceberg;
 mod stats;
 
 use convert::{decode_row, AtonRow, BinaryRow, Decoded, MeteoRow, PositionRow, StaticRow};
-use output::{AtonWriter, BinaryWriter, MeteoWriter, PositionsWriter, StaticsWriter};
+use output::OtherRow;
+use output::{AtonWriter, BinaryWriter, MeteoWriter, OtherWriter, PositionsWriter, StaticsWriter};
 use stats::ParseStats;
 
 const POSITIONS_TREE: &str = "positions";
@@ -42,12 +43,14 @@ const STATICS_TREE: &str = "statics";
 const METEO_TREE: &str = "meteo";
 const BINARY_TREE: &str = "binary";
 const ATONS_TREE: &str = "atons";
-const OUTPUT_TREES: [&str; 5] = [
+const OTHER_TREE: &str = "other";
+const OUTPUT_TREES: [&str; 6] = [
     POSITIONS_TREE,
     STATICS_TREE,
     METEO_TREE,
     BINARY_TREE,
     ATONS_TREE,
+    OTHER_TREE,
 ];
 
 /// Exit code used when there was nothing to process (distinct from success
@@ -1051,6 +1054,7 @@ fn process_partition(
     let mut meteo = MeteoWriter::new(dir_for(METEO_TREE), output_prefix, compression_level);
     let mut binary = BinaryWriter::new(dir_for(BINARY_TREE), output_prefix, compression_level);
     let mut atons = AtonWriter::new(dir_for(ATONS_TREE), output_prefix, compression_level);
+    let mut other = OtherWriter::new(dir_for(OTHER_TREE), output_prefix, compression_level);
 
     // Row-level dedup keyed on (ts, mmsi, source-kind) so the same AIS message
     // seen in more than one input file for this partition is emitted once.
@@ -1062,6 +1066,7 @@ fn process_partition(
         meteo: &mut meteo,
         binary: &mut binary,
         atons: &mut atons,
+        other: &mut other,
     };
     for file in &files {
         process_parquet_file(
@@ -1107,6 +1112,12 @@ fn process_partition(
         &rel_dir,
         atons.finish().context("closing atons writer")?,
     );
+    push_output(
+        &mut outputs,
+        OTHER_TREE,
+        &rel_dir,
+        other.finish().context("closing other writer")?,
+    );
 
     Ok((stats, outputs))
 }
@@ -1117,6 +1128,7 @@ trait WriterSet {
     fn write_meteo(&mut self, row: MeteoRow, payload: Option<&str>) -> Result<()>;
     fn write_binary(&mut self, row: BinaryRow, payload: Option<&str>) -> Result<()>;
     fn write_aton(&mut self, row: AtonRow, payload: Option<&str>) -> Result<()>;
+    fn write_other(&mut self, row: OtherRow) -> Result<()>;
 }
 
 struct Writers<'a> {
@@ -1125,6 +1137,7 @@ struct Writers<'a> {
     meteo: &'a mut MeteoWriter,
     binary: &'a mut BinaryWriter,
     atons: &'a mut AtonWriter,
+    other: &'a mut OtherWriter,
 }
 
 impl<'a> WriterSet for Writers<'a> {
@@ -1142,6 +1155,9 @@ impl<'a> WriterSet for Writers<'a> {
     }
     fn write_aton(&mut self, row: AtonRow, _payload: Option<&str>) -> Result<()> {
         self.atons.write(row)
+    }
+    fn write_other(&mut self, row: OtherRow) -> Result<()> {
+        self.other.write(row)
     }
 }
 
@@ -1215,7 +1231,7 @@ fn process_parquet_file(
                             Err(_) => return Decoded::Failed,
                         };
                     let msg_type = ais_msg.MessageType.as_str();
-                    decode_row(ts_col.value(i), sources[i], msg_type, &mut ais_msg.Message)
+                    decode_row(ts_col.value(i), sources[i], msg_type, &payload_str, &mut ais_msg.Message)
                 });
                 (i, payload_str, result)
             })
@@ -1282,7 +1298,10 @@ fn process_parquet_file(
                         stats.rows_deduped += 1;
                     }
                 }
-                Decoded::Other => stats.other_decoded += 1,
+                Decoded::Other(row) => {
+                    stats.others_out += 1;
+                    writers.write_other(row)?;
+                }
                 Decoded::Failed => stats.failed += 1,
             }
         }
@@ -1316,6 +1335,9 @@ impl WriterSet for IcebergWriters {
     }
     fn write_aton(&mut self, row: AtonRow, payload: Option<&str>) -> Result<()> {
         self.atons.write(row, payload)
+    }
+    fn write_other(&mut self, _row: OtherRow) -> Result<()> {
+        Ok(())
     }
 }
 
