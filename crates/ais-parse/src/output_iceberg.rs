@@ -8,7 +8,8 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
-use iceberg::spec::{DataFile, DataFileFormat};
+use chrono::{Datelike, TimeZone, Timelike, Utc};
+use iceberg::spec::{DataFile, DataFileFormat, PartitionKey};
 use iceberg::table::Table;
 use iceberg::transaction::{Transaction, ApplyTransactionAction};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
@@ -834,13 +835,89 @@ fn u16_aton_col(rows: &[AtonRow], get: impl Fn(&AtonRow) -> Option<u16>) -> Arra
 
 // ── Iceberg commit ────────────────────────────────────────────────────────────
 
+fn batch_for_writer(
+    batch: &RecordBatch,
+    iceberg_schema: &iceberg::spec::Schema,
+) -> Result<RecordBatch> {
+    let target_schema = Arc::new(
+        iceberg::arrow::schema_to_arrow_schema(iceberg_schema)
+            .context("converting Iceberg schema to Arrow schema")?,
+    );
+    let columns: Result<Vec<ArrayRef>> = target_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, target_field)| {
+            let source_col = batch.column(i);
+            if source_col.data_type() == target_field.data_type() {
+                Ok(source_col.clone())
+            } else {
+                arrow::compute::cast(source_col, target_field.data_type())
+                    .context(format!(
+                        "casting column '{}' from {:?} to {:?}",
+                        target_field.name(),
+                        source_col.data_type(),
+                        target_field.data_type()
+                    ))
+            }
+        })
+        .collect();
+    Ok(RecordBatch::try_new(target_schema, columns?)?)
+}
+
+fn compute_partition_key(
+    table: &Table,
+    batches: &[RecordBatch],
+) -> Result<Option<PartitionKey>> {
+    let spec = table.metadata().default_partition_spec();
+    if spec.fields().is_empty() {
+        return Ok(None);
+    }
+
+    let metadata = table.metadata();
+    let ts_col = &batches[0].column(0);
+    let ts_array = ts_col
+        .as_any()
+        .downcast_ref::<TimestampMillisecondArray>()
+        .context("expected timestamp column at index 0")?;
+    let first_ts = ts_array.value(0);
+    let dt = Utc
+        .timestamp_millis_opt(first_ts)
+        .single()
+        .context("invalid timestamp in partition computation")?;
+
+    let mut partition_values: Vec<i32> = Vec::new();
+    for field in spec.fields() {
+        match field.transform {
+            iceberg::spec::Transform::Year => partition_values.push(dt.year()),
+            iceberg::spec::Transform::Month => partition_values.push(dt.month() as i32),
+            iceberg::spec::Transform::Day => partition_values.push(dt.day() as i32),
+            iceberg::spec::Transform::Hour => partition_values.push(dt.hour() as i32),
+            _ => {}
+        }
+    }
+
+    let partition_data = iceberg::spec::Struct::from_iter(
+        partition_values.into_iter().map(|v| Some(iceberg::spec::Literal::int(v))),
+    );
+
+    let pk = PartitionKey::new(
+        spec.as_ref().clone(),
+        metadata.current_schema().clone(),
+        partition_data,
+    );
+
+    Ok(Some(pk))
+}
+
 async fn write_batches_to_table(
     table: &Table,
     batches: Vec<RecordBatch>,
     compression_level: i32,
 ) -> Result<Vec<DataFile>> {
     let metadata = table.metadata();
-    let schema = metadata.current_schema().clone();
+    let iceberg_schema = metadata.current_schema();
+    let schema = iceberg_schema.clone();
     let location_gen = DefaultLocationGenerator::new(metadata.clone())?;
     let file_name_gen = DefaultFileNameGenerator::new(
         "part".to_string(),
@@ -856,10 +933,16 @@ async fn write_batches_to_table(
         file_name_gen,
     );
     let builder = DataFileWriterBuilder::new(rolling_builder);
-    let mut writer = builder.build(None).await.context("building Iceberg DataFileWriter")?;
+
+    let partition_key = compute_partition_key(table, &batches)
+        .context("computing partition key")?;
+    let mut writer = builder.build(partition_key).await
+        .context("building Iceberg DataFileWriter")?;
 
     for batch in &batches {
-        writer.write(batch.clone()).await.context("writing batch to Iceberg")?;
+        let projected = batch_for_writer(batch, &iceberg_schema)
+            .context("converting batch to Iceberg-compatible schema")?;
+        writer.write(projected).await.context("writing batch to Iceberg")?;
     }
 
     let data_files = writer.close().await.context("closing Iceberg writer")?;

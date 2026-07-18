@@ -84,15 +84,22 @@ pub async fn open_catalog(config: &IcebergConfig) -> Result<impl Catalog> {
         props.insert("token".to_string(), token.clone());
     }
 
-    // Pass S3 configuration from env vars to the storage factory
-    for (key, var) in [
-        ("s3.endpoint", "S3_ENDPOINT"),
-        ("s3.access-key-id", "S3_ACCESS_KEY"),
-        ("s3.secret-access-key", "S3_SECRET_KEY"),
-        ("s3.region", "S3_REGION"),
+    // Pass S3 configuration from env vars to the storage factory.
+    // Checks both project-specific and AWS-standard env var names.
+    for (key, vars) in [
+        ("s3.endpoint", &["S3_ENDPOINT"] as &[_]),
+        ("s3.access-key-id", &["S3_ACCESS_KEY", "AWS_ACCESS_KEY_ID"]),
+        ("s3.secret-access-key", &["S3_SECRET_KEY", "AWS_SECRET_ACCESS_KEY"]),
+        ("s3.region", &["S3_REGION"]),
+        ("s3.path-style-access", &["S3_PATH_STYLE"]),
+        ("s3.disable-ec2-metadata", &["S3_DISABLE_EC2_METADATA"]),
+        ("s3.disable-config-load", &["S3_DISABLE_CONFIG_LOAD"]),
     ] {
-        if let Ok(val) = std::env::var(var) {
-            props.insert(key.to_string(), val);
+        for var in vars {
+            if let Ok(val) = std::env::var(var) {
+                props.insert(key.to_string(), val);
+                break;
+            }
         }
     }
 
@@ -152,16 +159,16 @@ pub fn partition_spec_for(schema: &Schema, granularity: &str) -> Result<Partitio
 
     match granularity {
         "year" => {
-            builder = builder.add_partition_field("ts", "year", Transform::Year)?;
+            builder = builder.add_partition_field("ts", "ts_year", Transform::Year)?;
         }
         "month" => {
-            builder = builder.add_partition_field("ts", "month", Transform::Month)?;
+            builder = builder.add_partition_field("ts", "ts_month", Transform::Month)?;
         }
         "day" => {
-            builder = builder.add_partition_field("ts", "day", Transform::Day)?;
+            builder = builder.add_partition_field("ts", "ts_day", Transform::Day)?;
         }
         "hour" | "minute" => {
-            builder = builder.add_partition_field("ts", "hour", Transform::Hour)?;
+            builder = builder.add_partition_field("ts", "ts_hour", Transform::Hour)?;
         }
         _ => anyhow::bail!("unsupported partition granularity: {granularity}"),
     }

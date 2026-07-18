@@ -8,6 +8,7 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
+use chrono::{Datelike, TimeZone, Timelike};
 use iceberg::io::FileIO;
 use iceberg::spec::{DataFileFormat, PartitionKey};
 use iceberg::table::Table;
@@ -22,7 +23,6 @@ use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::Catalog;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
-use chrono::{Datelike, TimeZone, Timelike};
 use std::sync::Arc;
 
 const FLUSH_BATCH_ROWS: usize = 8192;
@@ -793,6 +793,36 @@ fn i64_aton_col(rows: &[AtonRow], get: impl Fn(&AtonRow) -> Option<u64>) -> Arra
     ))
 }
 
+fn batch_for_writer(
+    batch: &RecordBatch,
+    iceberg_schema: &iceberg::spec::Schema,
+) -> Result<RecordBatch> {
+    let target_schema = Arc::new(
+        iceberg::arrow::schema_to_arrow_schema(iceberg_schema)
+            .context("converting Iceberg schema to Arrow schema")?,
+    );
+    let columns: Result<Vec<ArrayRef>> = target_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, target_field)| {
+            let source_col = batch.column(i);
+            if source_col.data_type() == target_field.data_type() {
+                Ok(source_col.clone())
+            } else {
+                arrow::compute::cast(source_col, target_field.data_type())
+                    .context(format!(
+                        "casting column '{}' from {:?} to {:?}",
+                        target_field.name(),
+                        source_col.data_type(),
+                        target_field.data_type()
+                    ))
+            }
+        })
+        .collect();
+    Ok(RecordBatch::try_new(target_schema, columns?)?)
+}
+
 pub(crate) async fn commit_batches_to_iceberg(
     batches: Vec<RecordBatch>,
     table: &Table,
@@ -804,6 +834,7 @@ pub(crate) async fn commit_batches_to_iceberg(
 
     let file_io: FileIO = table.file_io().clone();
     let metadata = table.metadata();
+    let iceberg_schema = metadata.current_schema();
     let location_gen = DefaultLocationGenerator::new(metadata.clone())
         .context("creating location generator")?;
     let file_name_gen =
@@ -815,7 +846,7 @@ pub(crate) async fn commit_batches_to_iceberg(
         .build();
 
     let parquet_writer_builder =
-        ParquetWriterBuilder::new(props, metadata.current_schema().clone());
+        ParquetWriterBuilder::new(props, iceberg_schema.clone());
     let rolling_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
         parquet_writer_builder,
         file_io,
@@ -831,8 +862,10 @@ pub(crate) async fn commit_batches_to_iceberg(
         .context("building data file writer")?;
 
     for batch in &batches {
+        let projected = batch_for_writer(batch, &iceberg_schema)
+            .context("converting batch to Iceberg-compatible schema")?;
         data_file_writer
-            .write(batch.clone())
+            .write(projected)
             .await
             .context("writing batch to iceberg")?;
     }
