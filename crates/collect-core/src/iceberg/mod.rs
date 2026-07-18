@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Args;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use iceberg::spec::{PartitionSpecBuilder, Schema, Transform};
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
@@ -83,7 +84,27 @@ pub async fn open_catalog(config: &IcebergConfig) -> Result<impl Catalog> {
         props.insert("token".to_string(), token.clone());
     }
 
+    // Pass S3 configuration from env vars to the storage factory
+    for (key, var) in [
+        ("s3.endpoint", "S3_ENDPOINT"),
+        ("s3.access-key-id", "S3_ACCESS_KEY"),
+        ("s3.secret-access-key", "S3_SECRET_KEY"),
+        ("s3.region", "S3_REGION"),
+    ] {
+        if let Ok(val) = std::env::var(var) {
+            props.insert(key.to_string(), val);
+        }
+    }
+
+    let factory = Arc::new(
+        iceberg_storage_opendal::OpenDalStorageFactory::S3 {
+            configured_scheme: "s3".to_string(),
+            customized_credential_load: None,
+        },
+    );
+
     let catalog = iceberg_catalog_rest::RestCatalogBuilder::default()
+        .with_storage_factory(factory)
         .load("rest", props)
         .await
         .context("Failed to connect to Iceberg REST catalog")?;
@@ -131,26 +152,16 @@ pub fn partition_spec_for(schema: &Schema, granularity: &str) -> Result<Partitio
 
     match granularity {
         "year" => {
-            builder = builder
-                .add_partition_field("ts", "year", Transform::Year)?;
+            builder = builder.add_partition_field("ts", "year", Transform::Year)?;
         }
         "month" => {
-            builder = builder
-                .add_partition_field("ts", "year", Transform::Year)?
-                .add_partition_field("ts", "month", Transform::Month)?;
+            builder = builder.add_partition_field("ts", "month", Transform::Month)?;
         }
         "day" => {
-            builder = builder
-                .add_partition_field("ts", "year", Transform::Year)?
-                .add_partition_field("ts", "month", Transform::Month)?
-                .add_partition_field("ts", "day", Transform::Day)?;
+            builder = builder.add_partition_field("ts", "day", Transform::Day)?;
         }
         "hour" | "minute" => {
-            builder = builder
-                .add_partition_field("ts", "year", Transform::Year)?
-                .add_partition_field("ts", "month", Transform::Month)?
-                .add_partition_field("ts", "day", Transform::Day)?
-                .add_partition_field("ts", "hour", Transform::Hour)?;
+            builder = builder.add_partition_field("ts", "hour", Transform::Hour)?;
         }
         _ => anyhow::bail!("unsupported partition granularity: {granularity}"),
     }

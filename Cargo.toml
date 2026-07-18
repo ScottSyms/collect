@@ -48,4 +48,5 @@ rlimit = "0.10"
 nmea-parser = { git = "https://github.com/ScottSyms/nmea-parser", rev = "a4ddb297c1ce654d329f158c2a709d410d016849" }
 iceberg = "0.9.1"
 iceberg-catalog-rest = "0.9.1"
+iceberg-storage-opendal = "0.9.1"
 reqwest = { version = "0.12", features = ["json"] }
