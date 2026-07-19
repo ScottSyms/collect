@@ -706,6 +706,14 @@ async fn main() -> Result<()> {
                     };
 
                     let is_remote = matches!(work, PartitionWork::Remote(_));
+                    let partition_label = partition_key.relative_dir_time_only();
+                    if !quiet {
+                        let file_count = match &work {
+                            PartitionWork::Local(files) => files.len(),
+                            PartitionWork::Remote(entries) => entries.len(),
+                        };
+                        eprintln!("  starting {} ({} files) ...", partition_label, file_count);
+                    }
                     let partition_files = match work {
                         PartitionWork::Local(files) => files,
                         PartitionWork::Remote(entries) => {
@@ -741,7 +749,6 @@ async fn main() -> Result<()> {
 
                     let output_root_for_task = output_root.clone();
                     let output_prefix_for_task = output_prefix.clone();
-                    let partition_label = partition_key.relative_dir_time_only();
                     let result = tokio::task::spawn_blocking(move || {
                         process_partition(
                             partition_key,
@@ -854,6 +861,14 @@ async fn main() -> Result<()> {
                     };
 
                     let is_remote = matches!(work, PartitionWork::Remote(_));
+                    let partition_label = partition_key.relative_dir_time_only();
+                    if !quiet {
+                        let file_count = match &work {
+                            PartitionWork::Local(files) => files.len(),
+                            PartitionWork::Remote(entries) => entries.len(),
+                        };
+                        eprintln!("  starting {} ({} files) ...", partition_label, file_count);
+                    }
                     let partition_files = match work {
                         PartitionWork::Local(files) => files,
                         PartitionWork::Remote(entries) => {
@@ -884,7 +899,6 @@ async fn main() -> Result<()> {
                         Vec::new()
                     };
 
-                    let partition_label = partition_key.relative_dir_time_only();
                     let result = tokio::task::spawn_blocking(move || {
                         process_partition_iceberg(
                             partition_key,
