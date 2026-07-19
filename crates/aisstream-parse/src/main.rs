@@ -294,15 +294,15 @@ async fn main() -> Result<()> {
     }
     match (&args.output_dir, &args.output_s3_bucket) {
         (Some(_), Some(_)) => bail!("use either --output-dir or --output-s3-bucket, not both"),
+        (None, None) if args.incremental && args.iceberg.is_iceberg_mode() => {
+            bail!("--output-s3-bucket is required for the incremental watermark with Iceberg output")
+        }
         (None, None) if !args.iceberg.is_iceberg_mode() => {
             bail!("one of --output-dir, --output-s3-bucket, or --iceberg-catalog-uri is required")
         }
         _ => {}
     }
     args.iceberg.validate()?;
-    if args.incremental && args.iceberg.is_iceberg_mode() {
-        bail!("--incremental is not supported with Iceberg output");
-    }
     if args.incremental
         && (args.year.is_some()
             || args.month.is_some()
