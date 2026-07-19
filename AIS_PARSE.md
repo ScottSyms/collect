@@ -197,7 +197,7 @@ cargo run -p ais-parse -- --input-s3-bucket normalized-ais --output-s3-bucket si
 | `--partition` | `day` | input layout granularity; output trees mirror it (env `PARTITION`) |
 | `--filter-source` (alias `--source`), `--year`…`--minute` | *(all)* | partition slice filters (env `FILTER_SOURCE`) |
 | `--since <HOURS>` | *(off)* | rolling window (env `SINCE`); with `--incremental`, first-run seed only |
-| `--incremental` | *(off)* | watermark at the output (`_ais-parse/watermark.json`), env `INCREMENTAL=true`; not supported in Iceberg mode |
+| `--incremental` | *(off)* | watermark at the output (`_ais-parse/watermark.json`), env `INCREMENTAL=true`; requires `--output-s3-bucket` when combined with Iceberg output |
 | `--batch-size` | `8192` | Parquet read batch rows (env `BATCH_SIZE`) |
 | `--compression-level` | `5` | Zstd level for output (env `COMPRESSION_LEVEL`) |
 | `--concurrency` | cores, clamped `[1, 8]` | partitions decoded in parallel (env `CONCURRENCY`) |
@@ -240,6 +240,28 @@ Instead of `--output-dir` / `--output-s3-bucket`, pass `--iceberg-catalog-uri` t
 Tables are automatically created if missing with schemas matching the shared Iceberg specification (field IDs stable across tools). All five table types are written: `positions`, `statics`, `meteo`, `binary`, `atons`.
 
 **Type difference — unsigned → signed:** Iceberg has no unsigned integer types. Columns that are `uint64` in the local Parquet output (`h3`, `hilbert`) are stored as Iceberg `long` (signed 64-bit bigint). The H3 cell ID and Hilbert curve values both fit within signed `i64` range, so no precision is lost. The conversion is handled transparently in the Iceberg writer.
+
+#### Incremental mode with Iceberg
+
+`--incremental` is supported with Iceberg output. The watermark is stored in an S3 bucket (specified via `--output-s3-bucket`) so it persists across runs independently of the Iceberg catalog — pass a bucket on your S3/MinIO endpoint:
+
+```bash
+S3_ENDPOINT=http://fishbake:9000 \
+S3_ACCESS_KEY=qz5mjYcOvTgRIw6aJKgm \
+S3_SECRET_KEY=uIDVBTY5eux1xgmiWqnLU6LfnjI1wYgCyrJuYggl \
+S3_PATH_STYLE=true \
+S3_DISABLE_EC2_METADATA=true \
+~/code/projects/collect/target/release/ais-parse \
+  --input-dir ./extract/ \
+  --output-s3-bucket warehouse-bucket \
+  --incremental \
+  --since 48 \
+  --iceberg-catalog-uri http://fishbake:8181/catalog \
+  --iceberg-warehouse test \
+  --iceberg-namespace melongoober
+```
+
+The watermark is stored at `s3://<bucket>/<prefix>/_ais-parse/watermark.json`. On the first run `--since` provides the initial cutoff; subsequent runs load the persisted watermark and skip partitions whose files haven't changed. The `--output-s3-bucket` is used only for watermark storage — no Parquet data is written to it.
 
 ### Run summary
 

@@ -147,7 +147,7 @@ Other Type 8 messages retained as generic header + hex payload:
 | `--filter-source` (alias `--source`) | `FILTER_SOURCE` | — | Source filter |
 | `--year` / `--month` / `--day` / `--hour` / `--minute` | — | — | Partition time filter chain |
 | `--since <HOURS>` | `SINCE` | — | Rolling window |
-| `--incremental` | `INCREMENTAL` | off | Watermark-based incremental |
+| `--incremental` | `INCREMENTAL` | off | Watermark-based incremental; requires `--output-s3-bucket` when combined with Iceberg output |
 | `--batch-size` | `BATCH_SIZE` | `8192` | Parquet read batch rows |
 | `--compression-level` | `COMPRESSION_LEVEL` | `5` | Zstd level |
 | `--concurrency` | `CONCURRENCY` | auto | Partition concurrency |
@@ -182,6 +182,28 @@ Instead of `--output-dir` / `--output-s3-bucket`, pass `--iceberg-catalog-uri` t
 | `--iceberg-token` | `ICEBERG_TOKEN` | — | Bearer token for auth |
 
 **Type difference — unsigned → signed:** Iceberg has no unsigned integer types. Columns that are `uint64` in the local Parquet output (`h3`, `hilbert`) are stored as Iceberg `long` (signed 64-bit bigint). The H3 cell ID and Hilbert curve values both fit within signed `i64` range, so no precision is lost.
+
+#### Incremental mode with Iceberg
+
+`--incremental` is supported with Iceberg output. Pass `--output-s3-bucket` to store the watermark in S3 (the same endpoint as your Iceberg warehouse's storage backend):
+
+```bash
+S3_ENDPOINT=http://fishbake:9000 \
+S3_ACCESS_KEY=qz5mjYcOvTgRIw6aJKgm \
+S3_SECRET_KEY=uIDVBTY5eux1xgmiWqnLU6LfnjI1wYgCyrJuYggl \
+S3_PATH_STYLE=true \
+S3_DISABLE_EC2_METADATA=true \
+~/code/projects/collect/target/release/aisstream-parse \
+  --input-dir ./aisstream-data/ \
+  --output-s3-bucket warehouse-bucket \
+  --incremental \
+  --since 48 \
+  --iceberg-catalog-uri http://fishbake:8181/catalog \
+  --iceberg-warehouse test \
+  --iceberg-namespace melongoober
+```
+
+The watermark lives at `s3://<bucket>/<prefix>/_aisstream-parse/watermark.json`. No Parquet data is written to the S3 bucket — it is used only for watermark persistence.
 
 ## Watermark / Incremental
 
