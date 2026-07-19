@@ -713,6 +713,7 @@ async fn main() -> Result<()> {
 
                     let output_root_for_task = output_root.clone();
                     let output_prefix_for_task = output_prefix.clone();
+                    let partition_label = partition_key.relative_dir_time_only();
                     let result = tokio::task::spawn_blocking(move || {
                         process_partition(
                             partition_key,
@@ -732,6 +733,20 @@ async fn main() -> Result<()> {
 
                     let outputs = match result {
                         Ok((partition_stats, outputs)) => {
+                            if !quiet {
+                                eprintln!(
+                                    "  {}: +{} rows (pos={}, stat={}, met={}, bin={}, aton={}, other={}, unparsed={})",
+                                    partition_label,
+                                    partition_stats.rows_in,
+                                    partition_stats.positions_out,
+                                    partition_stats.statics_out,
+                                    partition_stats.meteo_out,
+                                    partition_stats.binary_out,
+                                    partition_stats.atons_out,
+                                    partition_stats.others_out,
+                                    partition_stats.failed,
+                                );
+                            }
                             stats.merge(&partition_stats);
                             outputs
                         }
@@ -839,6 +854,7 @@ async fn main() -> Result<()> {
                         Vec::new()
                     };
 
+                    let partition_label = partition_key.relative_dir_time_only();
                     let result = tokio::task::spawn_blocking(move || {
                         process_partition_iceberg(partition_key, partition_files, batch_size)
                     })
@@ -851,6 +867,20 @@ async fn main() -> Result<()> {
 
                     match result {
                         Ok((partition_stats, batches)) => {
+                            if !quiet {
+                                eprintln!(
+                                    "  {}: +{} rows (pos={}, stat={}, met={}, bin={}, aton={}, other={}, unparsed={})",
+                                    partition_label,
+                                    partition_stats.rows_in,
+                                    partition_stats.positions_out,
+                                    partition_stats.statics_out,
+                                    partition_stats.meteo_out,
+                                    partition_stats.binary_out,
+                                    partition_stats.atons_out,
+                                    partition_stats.others_out,
+                                    partition_stats.failed,
+                                );
+                            }
                             stats.merge(&partition_stats);
                             partition_batches.push(batches);
                         }
