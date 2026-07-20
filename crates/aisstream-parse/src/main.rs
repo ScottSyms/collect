@@ -167,6 +167,11 @@ struct Args {
     #[arg(long, env = "OUTPUT_PREFIX", default_value = "aisstream")]
     output_prefix: String,
 
+    /// Directory for temporary scratch files (S3 downloads, intermediate Parquet).
+    /// Defaults to the system temp dir. Set to /dev/shm or a ramdisk for faster I/O.
+    #[arg(long, env = "SCRATCH_DIR")]
+    scratch_dir: Option<PathBuf>,
+
     /// List the partitions that would be processed and exit without
     /// decoding, writing, or touching the output target
     #[arg(long, env = "DRY_RUN")]
@@ -461,17 +466,28 @@ async fn main() -> Result<()> {
 
     let input_scratch = input_is_s3
         .then(|| {
-            tempfile::Builder::new()
-                .prefix("aisstream-parse-input-")
-                .tempdir()
+            match &args.scratch_dir {
+                Some(dir) => tempfile::Builder::new()
+                    .prefix("aisstream-parse-input-")
+                    .tempdir_in(dir),
+                None => tempfile::Builder::new()
+                    .prefix("aisstream-parse-input-")
+                    .tempdir(),
+            }
         })
         .transpose()
         .context("creating input scratch directory")?;
     let output_scratch_path: Option<PathBuf> = if output_storage.is_some() {
-        let dir = tempfile::Builder::new()
-            .prefix("aisstream-parse-output-")
-            .tempdir()
-            .context("creating output scratch directory")?;
+        let dir = match &args.scratch_dir {
+            Some(scratch) => tempfile::Builder::new()
+                .prefix("aisstream-parse-output-")
+                .tempdir_in(scratch)
+                .context("creating output scratch directory")?,
+            None => tempfile::Builder::new()
+                .prefix("aisstream-parse-output-")
+                .tempdir()
+                .context("creating output scratch directory")?,
+        };
         Some(dir.keep())
     } else {
         None
@@ -500,22 +516,33 @@ async fn main() -> Result<()> {
                  add --source to push it into the S3 LIST prefix."
             );
         }
-        let mut entries: Vec<dataset::S3Entry> = Vec::new();
-        for (index, storage) in input_storages.iter().enumerate() {
-            let mut bucket_entries = dataset::list_s3_parquet_entries(
-                storage,
-                &args.input_s3_prefix,
-                args.partition,
-                args.source.as_deref(),
-                partition_filter,
-            )
-            .await
-            .with_context(|| format!("listing input S3 bucket {}", args.input_s3_bucket[index]))?;
-            for entry in &mut bucket_entries {
-                entry.storage_index = index;
-            }
-            entries.extend(bucket_entries);
-        }
+        let listing_futures: Vec<_> = input_storages
+            .iter()
+            .enumerate()
+            .map(|(index, storage)| {
+                let bucket = args.input_s3_bucket[index].clone();
+                let prefix = args.input_s3_prefix.clone();
+                let source = args.source.clone();
+                let pf = partition_filter;
+                async move {
+                    let mut bucket_entries = dataset::list_s3_parquet_entries(
+                        storage,
+                        &prefix,
+                        args.partition,
+                        source.as_deref(),
+                        pf,
+                    )
+                    .await
+                    .with_context(|| format!("listing input S3 bucket {bucket}"))?;
+                    for entry in &mut bucket_entries {
+                        entry.storage_index = index;
+                    }
+                    Ok::<_, anyhow::Error>(bucket_entries)
+                }
+            })
+            .collect();
+        let results = futures_util::future::try_join_all(listing_futures).await?;
+        let mut entries: Vec<dataset::S3Entry> = results.into_iter().flatten().collect();
         if entries.is_empty() {
             eprintln!(
                 "No matching Parquet objects found across {} bucket(s) under prefix {:?}.",

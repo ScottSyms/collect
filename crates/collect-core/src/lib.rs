@@ -185,6 +185,10 @@ pub struct CommonCliArgs {
     #[arg(long, env = "COMPRESSION_LEVEL")]
     pub compression_level: Option<i32>,
 
+    /// Max concurrent S3 uploads
+    #[arg(long, env = "UPLOAD_CONCURRENCY")]
+    pub upload_concurrency: Option<usize>,
+
     /// Seconds to wait for background uploads on shutdown
     #[arg(long, env = "UPLOAD_DRAIN_TIMEOUT_SECONDS", default_value_t = DEFAULT_UPLOAD_DRAIN_TIMEOUT_SECONDS)]
     pub upload_drain_timeout_seconds: u64,
@@ -270,6 +274,7 @@ pub struct CommonOptions {
     pub max_rows: Option<usize>,
     pub max_batch_bytes: usize,
     pub compression_level: i32,
+    pub upload_concurrency: usize,
     pub upload_drain_timeout_seconds: u64,
     pub max_line_length: usize,
     pub health_check: bool,
@@ -443,6 +448,7 @@ impl CommonCliArgs {
             max_rows: self.max_rows,
             max_batch_bytes: self.max_batch_bytes.unwrap_or(DEFAULT_MAX_BATCH_BYTES),
             compression_level: self.compression_level.unwrap_or(DEFAULT_COMPRESSION_LEVEL),
+            upload_concurrency: self.upload_concurrency.unwrap_or(DEFAULT_UPLOAD_CONCURRENCY),
             upload_drain_timeout_seconds: self.upload_drain_timeout_seconds,
             max_line_length: self.max_line_length,
             health_check: self.health_check,
@@ -737,6 +743,7 @@ mod tests {
                     max_rows: None,
                     max_batch_bytes: 64 * 1024 * 1024,
                     compression_level: 3,
+                    upload_concurrency: 4,
                     upload_drain_timeout_seconds: 1,
                     max_line_length: 1024,
                     health_check: false,
@@ -840,6 +847,7 @@ mod tests {
                     max_rows: Some(2), // 6 lines -> 3 sealed batches
                     max_batch_bytes: 64 * 1024 * 1024,
                     compression_level: 3,
+                    upload_concurrency: 4,
                     upload_drain_timeout_seconds: 1,
                     max_line_length: 1024,
                     health_check: false,
@@ -949,8 +957,9 @@ where
                         .orphan_files_swept
                         .fetch_add(orphans.len() as u64, Ordering::Relaxed);
                     let sweep_metrics = metrics.clone();
+                    let upload_concurrency = common.upload_concurrency;
                     tokio::spawn(async move {
-                        upload_orphaned_files(storage, orphans, sweep_metrics).await;
+                        upload_orphaned_files(storage, orphans, sweep_metrics, upload_concurrency).await;
                     });
                 }
                 Ok(Ok(_)) => {}
@@ -1003,7 +1012,11 @@ where
     let mut files_flushed = 0usize;
     let mut batches_sealed = 0u64;
 
-    let (upload_tx, upload_worker) = spawn_upload_worker(s3_storage.clone(), metrics.clone());
+    let (upload_tx, upload_worker) = spawn_upload_worker(
+        s3_storage.clone(),
+        metrics.clone(),
+        common.upload_concurrency,
+    );
     let (durable_tx, mut durable_rx) = mpsc::unbounded_channel::<u64>();
     // Bound queued batches by payload bytes, not job count, so memory stays
     // predictable regardless of batch size.
@@ -2039,8 +2052,9 @@ async fn upload_orphaned_files(
     storage: S3Storage,
     files: Vec<(PathBuf, String)>,
     metrics: Arc<IngestMetrics>,
+    upload_concurrency: usize,
 ) {
-    let semaphore = Arc::new(Semaphore::new(DEFAULT_UPLOAD_CONCURRENCY));
+    let semaphore = Arc::new(Semaphore::new(upload_concurrency));
     let mut uploads = JoinSet::new();
 
     for (path, s3_key) in files {
@@ -2077,7 +2091,7 @@ pub async fn sweep_orphaned_uploads(out_dir: PathBuf, storage: S3Storage) -> Res
         .context("orphan upload scan task")??;
     let count = files.len();
     if count > 0 {
-        upload_orphaned_files(storage, files, Arc::new(IngestMetrics::default())).await;
+        upload_orphaned_files(storage, files, Arc::new(IngestMetrics::default()), DEFAULT_UPLOAD_CONCURRENCY).await;
     }
     Ok(count)
 }
@@ -2085,6 +2099,7 @@ pub async fn sweep_orphaned_uploads(out_dir: PathBuf, storage: S3Storage) -> Res
 fn spawn_upload_worker(
     s3_storage: Option<S3Storage>,
     metrics: Arc<IngestMetrics>,
+    upload_concurrency: usize,
 ) -> (
     Option<mpsc::Sender<(PathBuf, String)>>,
     Option<tokio::task::JoinHandle<()>>,
@@ -2095,7 +2110,7 @@ fn spawn_upload_worker(
 
     let (tx, mut rx) = mpsc::channel::<(PathBuf, String)>(DEFAULT_UPLOAD_QUEUE_CAPACITY);
     let worker = tokio::spawn(async move {
-        let semaphore = Arc::new(Semaphore::new(DEFAULT_UPLOAD_CONCURRENCY));
+        let semaphore = Arc::new(Semaphore::new(upload_concurrency));
         let mut uploads = JoinSet::new();
 
         while let Some((path, s3_key)) = rx.recv().await {
