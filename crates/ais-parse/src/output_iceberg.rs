@@ -914,6 +914,7 @@ async fn write_batches_to_table(
     table: &Table,
     batches: Vec<RecordBatch>,
     compression_level: i32,
+    table_name: &str,
 ) -> Result<Vec<DataFile>> {
     let metadata = table.metadata();
     let iceberg_schema = metadata.current_schema();
@@ -939,50 +940,32 @@ async fn write_batches_to_table(
     let mut writer = builder.build(partition_key).await
         .context("building Iceberg DataFileWriter")?;
 
+    eprintln!("    writing {} rows to '{}' ...", batches.iter().map(|b| b.num_rows()).sum::<usize>(), table_name);
     for batch in &batches {
         let projected = batch_for_writer(batch, &iceberg_schema)
             .context("converting batch to Iceberg-compatible schema")?;
         writer.write(projected).await.context("writing batch to Iceberg")?;
     }
 
+    eprintln!("    closing writer for '{}' ...", table_name);
     let data_files = writer.close().await.context("closing Iceberg writer")?;
     Ok(data_files)
 }
 
-pub(crate) async fn commit_batches_to_iceberg(
-    catalog: &dyn Catalog,
-    positions_table: &Table,
-    statics_table: &Table,
-    meteo_table: &Table,
-    binary_table: &Table,
-    atons_table: &Table,
-    positions_batches: Vec<RecordBatch>,
-    statics_batches: Vec<RecordBatch>,
-    meteo_batches: Vec<RecordBatch>,
-    binary_batches: Vec<RecordBatch>,
-    atons_batches: Vec<RecordBatch>,
-    compression_level: i32,
-) -> Result<()> {
-    commit_table_batches(catalog, positions_table, positions_batches, compression_level).await?;
-    commit_table_batches(catalog, statics_table, statics_batches, compression_level).await?;
-    commit_table_batches(catalog, meteo_table, meteo_batches, compression_level).await?;
-    commit_table_batches(catalog, binary_table, binary_batches, compression_level).await?;
-    commit_table_batches(catalog, atons_table, atons_batches, compression_level).await?;
-    Ok(())
-}
-
-async fn commit_table_batches(
+pub(crate) async fn commit_table_batches(
     catalog: &dyn Catalog,
     table: &Table,
     batches: Vec<RecordBatch>,
     compression_level: i32,
+    table_name: &str,
 ) -> Result<()> {
     if batches.is_empty() {
         return Ok(());
     }
 
-    let data_files = write_batches_to_table(table, batches, compression_level).await?;
+    let data_files = write_batches_to_table(table, batches, compression_level, table_name).await?;
 
+    eprintln!("    committing '{}' ...", table_name);
     let txn = Transaction::new(table);
     let action = txn.fast_append().add_data_files(data_files);
     let txn = action.apply(txn)?;

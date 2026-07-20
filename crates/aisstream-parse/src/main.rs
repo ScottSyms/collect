@@ -946,25 +946,13 @@ async fn main() -> Result<()> {
             }));
         }
 
-        let mut all_batches = IcebergPartitionOutput {
-            positions: Vec::new(),
-            statics: Vec::new(),
-            meteo: Vec::new(),
-            binary: Vec::new(),
-            atons: Vec::new(),
-        };
+        let mut partition_outputs: Vec<IcebergPartitionOutput> = Vec::new();
 
         for worker in workers {
             match worker.await {
                 Ok(Ok((stats, batches))) => {
                     total_stats.merge(&stats);
-                    for b in batches {
-                        all_batches.positions.extend(b.positions);
-                        all_batches.statics.extend(b.statics);
-                        all_batches.meteo.extend(b.meteo);
-                        all_batches.binary.extend(b.binary);
-                        all_batches.atons.extend(b.atons);
-                    }
+                    partition_outputs.extend(batches);
                 }
                 Ok(Err(error)) => {
                     if first_error.is_none() {
@@ -1028,12 +1016,16 @@ async fn main() -> Result<()> {
             )
             .await?;
 
-            let sc = &catalog;
-            commit_batches_to_iceberg(all_batches.positions, &positions_table, sc).await?;
-            commit_batches_to_iceberg(all_batches.statics, &statics_table, sc).await?;
-            commit_batches_to_iceberg(all_batches.meteo, &meteo_table, sc).await?;
-            commit_batches_to_iceberg(all_batches.binary, &binary_table, sc).await?;
-            commit_batches_to_iceberg(all_batches.atons, &atons_table, sc).await?;
+            let total_partitions = partition_outputs.len();
+            for (i, output) in partition_outputs.into_iter().enumerate() {
+                eprintln!("  Committing partition {}/{} to Iceberg ...", i + 1, total_partitions);
+                commit_batches_to_iceberg(output.positions, &positions_table, &catalog, TABLE_POSITIONS).await?;
+                commit_batches_to_iceberg(output.statics, &statics_table, &catalog, TABLE_STATICS).await?;
+                commit_batches_to_iceberg(output.meteo, &meteo_table, &catalog, TABLE_METEO).await?;
+                commit_batches_to_iceberg(output.binary, &binary_table, &catalog, TABLE_BINARY).await?;
+                commit_batches_to_iceberg(output.atons, &atons_table, &catalog, TABLE_ATONS).await?;
+                eprintln!("  Committed partition {}/{} to Iceberg.", i + 1, total_partitions);
+            }
         }
     }
 

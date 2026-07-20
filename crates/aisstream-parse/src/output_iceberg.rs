@@ -827,6 +827,7 @@ pub(crate) async fn commit_batches_to_iceberg(
     batches: Vec<RecordBatch>,
     table: &Table,
     catalog: &dyn Catalog,
+    table_name: &str,
 ) -> Result<()> {
     if batches.is_empty() {
         return Ok(());
@@ -861,6 +862,7 @@ pub(crate) async fn commit_batches_to_iceberg(
         .await
         .context("building data file writer")?;
 
+    eprintln!("    writing {} rows to '{}' ...", batches.iter().map(|b| b.num_rows()).sum::<usize>(), table_name);
     for batch in &batches {
         let projected = batch_for_writer(batch, &iceberg_schema)
             .context("converting batch to Iceberg-compatible schema")?;
@@ -870,6 +872,7 @@ pub(crate) async fn commit_batches_to_iceberg(
             .context("writing batch to iceberg")?;
     }
 
+    eprintln!("    closing writer for '{}' ...", table_name);
     let data_files = data_file_writer
         .close()
         .await
@@ -879,6 +882,7 @@ pub(crate) async fn commit_batches_to_iceberg(
         return Ok(());
     }
 
+    eprintln!("    committing '{}' ...", table_name);
     let tx = Transaction::new(table);
     let action = tx.fast_append().add_data_files(data_files);
     let tx = action.apply(tx).context("applying fast append")?;

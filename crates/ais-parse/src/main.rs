@@ -22,7 +22,7 @@ use collect_core::iceberg::{
     TABLE_BINARY, TABLE_METEO, TABLE_POSITIONS, TABLE_STATICS,
 };
 use output_iceberg::{
-    commit_batches_to_iceberg, IcebergAtonWriter, IcebergBinaryWriter, IcebergMeteoWriter,
+    commit_table_batches, IcebergAtonWriter, IcebergBinaryWriter, IcebergMeteoWriter,
     IcebergPositionsWriter, IcebergStaticsWriter,
 };
 
@@ -979,25 +979,13 @@ async fn main() -> Result<()> {
             }));
         }
 
-        let mut all_batches = IcebergPartitionOutput {
-            positions: Vec::new(),
-            statics: Vec::new(),
-            meteo: Vec::new(),
-            binary: Vec::new(),
-            atons: Vec::new(),
-        };
+        let mut partition_outputs: Vec<IcebergPartitionOutput> = Vec::new();
 
         for worker in workers {
             match worker.await {
                 Ok(Ok((stats, batches))) => {
                     total_stats.merge(&stats);
-                    for b in batches {
-                        all_batches.positions.extend(b.positions);
-                        all_batches.statics.extend(b.statics);
-                        all_batches.meteo.extend(b.meteo);
-                        all_batches.binary.extend(b.binary);
-                        all_batches.atons.extend(b.atons);
-                    }
+                    partition_outputs.extend(batches);
                 }
                 Ok(Err(error)) => {
                     if first_error.is_none() {
@@ -1061,21 +1049,16 @@ async fn main() -> Result<()> {
             )
             .await?;
 
-            commit_batches_to_iceberg(
-                &catalog,
-                &positions_table,
-                &statics_table,
-                &meteo_table,
-                &binary_table,
-                &atons_table,
-                all_batches.positions,
-                all_batches.statics,
-                all_batches.meteo,
-                all_batches.binary,
-                all_batches.atons,
-                compression_level,
-            )
-            .await?;
+            let total_partitions = partition_outputs.len();
+            for (i, output) in partition_outputs.into_iter().enumerate() {
+                eprintln!("  Committing partition {}/{} to Iceberg ...", i + 1, total_partitions);
+                commit_table_batches(&catalog, &positions_table, output.positions, compression_level, TABLE_POSITIONS).await?;
+                commit_table_batches(&catalog, &statics_table, output.statics, compression_level, TABLE_STATICS).await?;
+                commit_table_batches(&catalog, &meteo_table, output.meteo, compression_level, TABLE_METEO).await?;
+                commit_table_batches(&catalog, &binary_table, output.binary, compression_level, TABLE_BINARY).await?;
+                commit_table_batches(&catalog, &atons_table, output.atons, compression_level, TABLE_ATONS).await?;
+                eprintln!("  Committed partition {}/{} to Iceberg.", i + 1, total_partitions);
+            }
         }
     }
 
