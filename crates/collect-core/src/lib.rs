@@ -1667,8 +1667,10 @@ impl S3Storage {
     async fn list_keys_with_prefix_inner(&self, prefix: &str) -> Result<Vec<S3ObjectInfo>> {
         let mut keys = Vec::new();
         let mut continuation_token = None;
+        let mut page: u32 = 0;
 
         loop {
+            page += 1;
             let mut request = self.client.list_objects_v2().bucket(&self.bucket);
             if !prefix.is_empty() {
                 request = request.prefix(prefix);
@@ -1681,6 +1683,8 @@ impl S3Storage {
                 .send()
                 .await
                 .with_context(|| format!("listing s3://{}/{}", self.bucket, prefix))?;
+
+            let page_count = response.contents().len();
             for object in response.contents() {
                 let Some(key) = object.key() else {
                     continue;
@@ -1693,6 +1697,11 @@ impl S3Storage {
                     modified_ms: modified_ms.flatten(),
                 });
             }
+
+            eprintln!(
+                "  listed page {page} (+{page_count} objects, {} total) ...",
+                keys.len()
+            );
 
             if response.is_truncated().unwrap_or(false) {
                 continuation_token = response
