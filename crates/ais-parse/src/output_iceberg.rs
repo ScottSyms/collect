@@ -957,13 +957,23 @@ fn compute_partition_key(
         .single()
         .context("invalid timestamp in partition computation")?;
 
+    // Iceberg partition transforms return epoch-based values:
+    //   year  = calendar year (e.g. 2026)
+    //   month = months since 1970-01-01
+    //   day   = days since 1970-01-01
+    //   hour  = hours since 1970-01-01 00:00:00
+    let epoch_days = (first_ts / (1000 * 86400)) as i32;
     let mut partition_values: Vec<i32> = Vec::new();
     for field in spec.fields() {
         match field.transform {
             iceberg::spec::Transform::Year => partition_values.push(dt.year()),
-            iceberg::spec::Transform::Month => partition_values.push(dt.month() as i32),
-            iceberg::spec::Transform::Day => partition_values.push(dt.day() as i32),
-            iceberg::spec::Transform::Hour => partition_values.push(dt.hour() as i32),
+            iceberg::spec::Transform::Month => {
+                partition_values.push((dt.year() - 1970) * 12 + dt.month() as i32 - 1);
+            }
+            iceberg::spec::Transform::Day => partition_values.push(epoch_days),
+            iceberg::spec::Transform::Hour => {
+                partition_values.push(epoch_days * 24 + dt.hour() as i32);
+            }
             _ => {}
         }
     }
