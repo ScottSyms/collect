@@ -23,6 +23,7 @@ use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::Catalog;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
+use parquet::schema::types::ColumnPath;
 use std::sync::Arc;
 
 const FLUSH_BATCH_ROWS: usize = 8192;
@@ -844,6 +845,12 @@ pub(crate) async fn commit_batches_to_iceberg(
     let level = ZstdLevel::try_new(3).context("invalid zstd level")?;
     let props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(level))
+        .set_column_bloom_filter_enabled(ColumnPath::from("mmsi"), true)
+        .set_column_bloom_filter_enabled(ColumnPath::from("station"), true)
+        .set_column_bloom_filter_enabled(ColumnPath::from("source"), true)
+        .set_column_bloom_filter_enabled(ColumnPath::from("imo_number"), true)
+        .set_column_bloom_filter_enabled(ColumnPath::from("call_sign"), true)
+        .set_column_bloom_filter_enabled(ColumnPath::from("name"), true)
         .build();
 
     let parquet_writer_builder =
