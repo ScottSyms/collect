@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arrow::record_batch::RecordBatch;
+use iceberg::Catalog;
 use collect_core::iceberg::table_schemas;
 use collect_core::iceberg::{
     ensure_namespace, ensure_table, open_catalog, partition_spec_for, IcebergConfig, TABLE_ATONS,
@@ -981,13 +982,65 @@ async fn main() -> Result<()> {
             }));
         }
 
-        let mut partition_outputs: Vec<IcebergPartitionOutput> = Vec::new();
+        // Open catalog and ensure tables before joining workers so each
+        // partition commits immediately as its worker finishes.
+        let (catalog, positions_table, statics_table, meteo_table, binary_table, atons_table) =
+            if first_error.is_none() {
+                let config: IcebergConfig = (&args.iceberg).into();
+                let catalog = open_catalog(&config)
+                    .await
+                    .context("connecting to Iceberg catalog")?;
+                ensure_namespace(&catalog, &config).await?;
+
+                let partition_granularity = args.partition.as_str();
+                let positions_table = ensure_table(
+                    &catalog, &config, TABLE_POSITIONS,
+                    table_schemas::positions_schema(),
+                    partition_spec_for(&table_schemas::positions_schema(), partition_granularity)?,
+                ).await?;
+                let statics_table = ensure_table(
+                    &catalog, &config, TABLE_STATICS,
+                    table_schemas::statics_schema(),
+                    partition_spec_for(&table_schemas::statics_schema(), partition_granularity)?,
+                ).await?;
+                let meteo_table = ensure_table(
+                    &catalog, &config, TABLE_METEO,
+                    table_schemas::meteo_schema(),
+                    partition_spec_for(&table_schemas::meteo_schema(), partition_granularity)?,
+                ).await?;
+                let binary_table = ensure_table(
+                    &catalog, &config, TABLE_BINARY,
+                    table_schemas::binary_schema(),
+                    partition_spec_for(&table_schemas::binary_schema(), partition_granularity)?,
+                ).await?;
+                let atons_table = ensure_table(
+                    &catalog, &config, TABLE_ATONS,
+                    table_schemas::atons_schema(),
+                    partition_spec_for(&table_schemas::atons_schema(), partition_granularity)?,
+                ).await?;
+                (Some(catalog), Some(positions_table), Some(statics_table), Some(meteo_table), Some(binary_table), Some(atons_table))
+            } else {
+                (None, None, None, None, None, None)
+            };
+
+        let compression_level = args.compression_level;
 
         for worker in workers {
             match worker.await {
                 Ok(Ok((stats, batches))) => {
                     total_stats.merge(&stats);
-                    partition_outputs.extend(batches);
+                    if let (Some(ref cat), Some(ref pos), Some(ref stat), Some(ref met), Some(ref bin), Some(ref atn)) = (catalog.as_ref(), positions_table.as_ref(), statics_table.as_ref(), meteo_table.as_ref(), binary_table.as_ref(), atons_table.as_ref()) {
+                        let cat: &dyn Catalog = &**cat;
+                        for (i, output) in batches.into_iter().enumerate() {
+                            eprintln!("  Committing partition {} to Iceberg ...", i + 1);
+                            commit_batches_to_iceberg(output.positions, pos, cat, TABLE_POSITIONS, compression_level).await?;
+                            commit_batches_to_iceberg(output.statics, stat, cat, TABLE_STATICS, compression_level).await?;
+                            commit_batches_to_iceberg(output.meteo, met, cat, TABLE_METEO, compression_level).await?;
+                            commit_batches_to_iceberg(output.binary, bin, cat, TABLE_BINARY, compression_level).await?;
+                            commit_batches_to_iceberg(output.atons, atn, cat, TABLE_ATONS, compression_level).await?;
+                            eprintln!("  Committed partition {} to Iceberg.", i + 1);
+                        }
+                    }
                 }
                 Ok(Err(error)) => {
                     if first_error.is_none() {
@@ -999,68 +1052,6 @@ async fn main() -> Result<()> {
                         first_error = Some(error.into());
                     }
                 }
-            }
-        }
-
-        if first_error.is_none() {
-            let config: IcebergConfig = (&args.iceberg).into();
-            let catalog = open_catalog(&config)
-                .await
-                .context("connecting to Iceberg catalog")?;
-            ensure_namespace(&catalog, &config).await?;
-
-            let partition_granularity = args.partition.as_str();
-            let positions_table = ensure_table(
-                &catalog,
-                &config,
-                TABLE_POSITIONS,
-                table_schemas::positions_schema(),
-                partition_spec_for(&table_schemas::positions_schema(), partition_granularity)?,
-            )
-            .await?;
-            let statics_table = ensure_table(
-                &catalog,
-                &config,
-                TABLE_STATICS,
-                table_schemas::statics_schema(),
-                partition_spec_for(&table_schemas::statics_schema(), partition_granularity)?,
-            )
-            .await?;
-            let meteo_table = ensure_table(
-                &catalog,
-                &config,
-                TABLE_METEO,
-                table_schemas::meteo_schema(),
-                partition_spec_for(&table_schemas::meteo_schema(), partition_granularity)?,
-            )
-            .await?;
-            let binary_table = ensure_table(
-                &catalog,
-                &config,
-                TABLE_BINARY,
-                table_schemas::binary_schema(),
-                partition_spec_for(&table_schemas::binary_schema(), partition_granularity)?,
-            )
-            .await?;
-            let atons_table = ensure_table(
-                &catalog,
-                &config,
-                TABLE_ATONS,
-                table_schemas::atons_schema(),
-                partition_spec_for(&table_schemas::atons_schema(), partition_granularity)?,
-            )
-            .await?;
-
-            let compression_level = args.compression_level;
-            let total_partitions = partition_outputs.len();
-            for (i, output) in partition_outputs.into_iter().enumerate() {
-                eprintln!("  Committing partition {}/{} to Iceberg ...", i + 1, total_partitions);
-                commit_batches_to_iceberg(output.positions, &positions_table, &catalog, TABLE_POSITIONS, compression_level).await?;
-                commit_batches_to_iceberg(output.statics, &statics_table, &catalog, TABLE_STATICS, compression_level).await?;
-                commit_batches_to_iceberg(output.meteo, &meteo_table, &catalog, TABLE_METEO, compression_level).await?;
-                commit_batches_to_iceberg(output.binary, &binary_table, &catalog, TABLE_BINARY, compression_level).await?;
-                commit_batches_to_iceberg(output.atons, &atons_table, &catalog, TABLE_ATONS, compression_level).await?;
-                eprintln!("  Committed partition {}/{} to Iceberg.", i + 1, total_partitions);
             }
         }
     }
