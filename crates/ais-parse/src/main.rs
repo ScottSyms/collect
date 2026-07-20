@@ -1060,6 +1060,7 @@ async fn main() -> Result<()> {
             match worker.await {
                 Ok(Ok((stats, batches))) => {
                     total_stats.merge(&stats);
+                    eprintln!("  [DEBUG] worker finished with {} partition(s) in this batch", batches.len());
                     if let (Some(ref cat), Some(ref pos), Some(ref stat), Some(ref met), Some(ref bin), Some(ref atn)) = (catalog.as_ref(), positions_table.as_ref(), statics_table.as_ref(), meteo_table.as_ref(), binary_table.as_ref(), atons_table.as_ref()) {
                         let cat: &dyn Catalog = &**cat;
                         for (i, output) in batches.into_iter().enumerate() {
@@ -1071,6 +1072,8 @@ async fn main() -> Result<()> {
                             commit_table_batches(cat, atn, output.atons, compression_level, TABLE_ATONS).await?;
                             eprintln!("  Committed partition {} to Iceberg.", i + 1);
                         }
+                    } else {
+                        eprintln!("  [DEBUG] WARNING: catalog or table reference is None — skipping commit for partition");
                     }
                 }
                 Ok(Err(error)) => {
