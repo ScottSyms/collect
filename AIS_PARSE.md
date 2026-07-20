@@ -201,6 +201,7 @@ cargo run -p ais-parse -- --input-s3-bucket normalized-ais --output-s3-bucket si
 | `--batch-size` | `8192` | Parquet read batch rows (env `BATCH_SIZE`) |
 | `--compression-level` | `5` | Zstd level for output (env `COMPRESSION_LEVEL`) |
 | `--concurrency` | cores, clamped `[1, 8]` | partitions decoded in parallel (env `CONCURRENCY`) |
+| `--download-concurrency` | `4` | concurrent S3 downloads per partition; lower if MinIO is overloaded (env `DOWNLOAD_CONCURRENCY`) |
 | `--output-prefix` | `ais` | output file name prefix (added before tree suffix, env `OUTPUT_PREFIX`) |
 | `--consolidate-ais` | *(off)* | reassemble fragmented NMEA sentences before decoding |
 | `--dry-run` | *(off)* | list the partitions that would be processed and exit; never connects to the output (env `DRY_RUN`) — see [below](#dry-run) |

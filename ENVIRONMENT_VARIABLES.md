@@ -158,6 +158,11 @@ Each variable is the SCREAMING_SNAKE name of its flag unless noted.
 - `BATCH_SIZE`: Rows per Parquet read batch
   - Default: `8192`
 
+- `DOWNLOAD_CONCURRENCY`: Concurrent S3 downloads per partition during S3 input
+  - Example: `DOWNLOAD_CONCURRENCY=2`
+  - Default: `4`
+  - Lower this if MinIO connection errors occur; also consider lowering `--concurrency`
+
 - `FILTER_SOURCE`: Process only this source label
   - Example: `FILTER_SOURCE=norway`
 

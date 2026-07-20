@@ -151,6 +151,7 @@ Other Type 8 messages retained as generic header + hex payload:
 | `--batch-size` | `BATCH_SIZE` | `8192` | Parquet read batch rows |
 | `--compression-level` | `COMPRESSION_LEVEL` | `5` | Zstd level |
 | `--concurrency` | `CONCURRENCY` | auto | Partition concurrency |
+| `--download-concurrency` | `DOWNLOAD_CONCURRENCY` | `4` | Concurrent S3 downloads per partition; lower if MinIO is overloaded |
 | `--output-prefix` | `OUTPUT_PREFIX` | `aisstream` | Output file name prefix |
 | `--dry-run` | `DRY_RUN` | off | List the partitions that would be processed and exit; never connects to the output (see [ais-parse's dry-run docs](AIS_PARSE.md#dry-run) — identical behavior) |
 | `--scratch-dir` | `SCRATCH_DIR` | system tmpdir | Directory for S3 download scratch and intermediate Parquet; use a tmpfs/ramdisk like `/dev/shm` for faster I/O |
