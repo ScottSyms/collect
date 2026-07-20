@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use arrow::array::{Array, StringArray, TimestampMillisecondArray};
 use chrono::TimeZone;
+use rand::Rng;
 use clap::Parser;
 use collect_core::ais_consolidate::{AisConsolidator, AisConsolidatorConfig};
 use collect_core::dataset::{self, DatasetFile, PartitionKey};
@@ -157,6 +158,10 @@ struct Args {
     /// Number of partitions to process concurrently; auto-selected when omitted
     #[arg(long, env = "CONCURRENCY")]
     concurrency: Option<usize>,
+
+    /// Concurrent S3 downloads per partition (default: 4)
+    #[arg(long, env = "DOWNLOAD_CONCURRENCY", default_value_t = 4)]
+    download_concurrency: usize,
 
     /// Output file name prefix (added before tree suffix, e.g. `{prefix}-pos-*.parquet`)
     #[arg(long, env = "OUTPUT_PREFIX", default_value = "ais")]
@@ -699,8 +704,7 @@ async fn main() -> Result<()> {
         .as_ref()
         .map(|scratch| scratch.path().to_path_buf());
 
-    const PARTITION_DOWNLOAD_CONCURRENCY: usize = 4;
-
+    let download_concurrency = args.download_concurrency;
     let output_prefix = args.output_prefix.clone();
     let consolidate_ais = args.consolidate_ais;
     let process_timestamps = args.process_timestamps;
@@ -754,7 +758,7 @@ async fn main() -> Result<()> {
                                     &input_storages,
                                     entries.clone(),
                                     scratch_root,
-                                    PARTITION_DOWNLOAD_CONCURRENCY,
+                                    download_concurrency,
                                 )
                                 .await
                                 {
@@ -764,10 +768,12 @@ async fn main() -> Result<()> {
                                     }
                                     Err(error) => {
                                         if attempt < DOWNLOAD_MAX_ATTEMPTS {
-                                            let backoff = std::time::Duration::from_secs(1 << (attempt - 1));
+                                            let base_secs = 5u64 * (1 << (attempt - 1));
+                                            let jitter = rand::thread_rng().gen_range(0..base_secs);
+                                            let backoff = std::time::Duration::from_secs(base_secs + jitter);
                                             eprintln!(
-                                                "Download attempt {attempt}/{DOWNLOAD_MAX_ATTEMPTS} failed for partition, retrying in {}s...",
-                                                backoff.as_secs()
+                                                "Download attempt {attempt}/{DOWNLOAD_MAX_ATTEMPTS} failed for partition, retrying in ~{}s...",
+                                                base_secs + jitter / 2
                                             );
                                             tokio::time::sleep(backoff).await;
                                         } else {
@@ -921,7 +927,7 @@ async fn main() -> Result<()> {
                                     &input_storages,
                                     entries.clone(),
                                     scratch_root,
-                                    PARTITION_DOWNLOAD_CONCURRENCY,
+                                    download_concurrency,
                                 )
                                 .await
                                 {
@@ -931,10 +937,12 @@ async fn main() -> Result<()> {
                                     }
                                     Err(error) => {
                                         if attempt < DOWNLOAD_MAX_ATTEMPTS {
-                                            let backoff = std::time::Duration::from_secs(1 << (attempt - 1));
+                                            let base_secs = 5u64 * (1 << (attempt - 1));
+                                            let jitter = rand::thread_rng().gen_range(0..base_secs);
+                                            let backoff = std::time::Duration::from_secs(base_secs + jitter);
                                             eprintln!(
-                                                "Download attempt {attempt}/{DOWNLOAD_MAX_ATTEMPTS} failed for partition, retrying in {}s...",
-                                                backoff.as_secs()
+                                                "Download attempt {attempt}/{DOWNLOAD_MAX_ATTEMPTS} failed for partition, retrying in ~{}s...",
+                                                base_secs + jitter / 2
                                             );
                                             tokio::time::sleep(backoff).await;
                                         } else {

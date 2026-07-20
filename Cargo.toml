@@ -37,6 +37,7 @@ walkdir = "2"
 tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 fast_hilbert = "2.1"
 tempfile = "3"
+rand = "0.8"
 rayon = "1"
 futures = "0.3"
 rustc-hash = "2"

@@ -10,6 +10,7 @@ chrono.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 futures-util.workspace = true
+rand.workspace = true
 fast_hilbert.workspace = true
 h3o = "0.10"
 nmea-parser.workspace = true
