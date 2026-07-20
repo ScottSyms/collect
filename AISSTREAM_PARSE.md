@@ -44,6 +44,7 @@ partitioned by time only (not by source).
 <output>/meteo/year=YYYY/month=MM/day=DD/...
 <output>/binary/year=YYYY/month=MM/day=DD/...
 <output>/atons/year=YYYY/month=MM/day=DD/...
+<output>/other/year=YYYY/month=MM/day=DD/...  (type catch-all)
 ```
 
 ### positions
@@ -185,6 +186,18 @@ Instead of `--output-dir` / `--output-s3-bucket`, pass `--iceberg-catalog-uri` t
 
 **Type difference — unsigned → signed:** Iceberg has no unsigned integer types. Columns that are `uint64` in the local Parquet output (`h3`, `hilbert`) are stored as Iceberg `long` (signed 64-bit bigint). The H3 cell ID and Hilbert curve values both fit within signed `i64` range, so no precision is lost.
 
+**S3 storage config for Iceberg:** Iceberg writes Parquet data files to S3/MinIO via the REST catalog's warehouse location. The S3 endpoint and credentials are passed through environment variables:
+
+| Env var | Purpose |
+|---------|---------|
+| `S3_ENDPOINT` | S3/MinIO endpoint URL (e.g. `http://fishbake:9000`) |
+| `S3_ACCESS_KEY` / `AWS_ACCESS_KEY_ID` | Access key ID |
+| `S3_SECRET_KEY` / `AWS_SECRET_ACCESS_KEY` | Secret access key |
+| `S3_REGION` | AWS region (default `us-east-1`) |
+| `S3_PATH_STYLE` | Use path-style URLs for MinIO (`true`) |
+| `S3_DISABLE_EC2_METADATA` | Skip IMDS credential lookup (`true` for MinIO) |
+| `S3_DISABLE_CONFIG_LOAD` | Skip `~/.aws/config` lookup (`true` for MinIO) |
+
 #### Incremental mode with Iceberg
 
 `--incremental` is supported with Iceberg output. Pass `--output-s3-bucket` to store the watermark in S3 (the same endpoint as your Iceberg warehouse's storage backend):
@@ -224,6 +237,6 @@ prevents duplicates.
 | `meteo rows` | Type 8 met/hydro into `meteo/` |
 | `binary rows` | other Type 8 into `binary/` |
 | `aton rows` | AIS type 21 into `atons/` |
-| `other decoded` | valid messages not materialized |
+| `other decoded` | catch-all rows written to the Iceberg `other` table |
 | `unparsed` | unparseable payloads |
 | `deduped (dropped)` | duplicate rows suppressed |

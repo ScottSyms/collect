@@ -28,6 +28,7 @@ unified dataset — but each row keeps its origin in a `source` column:
 <output>/statics/year=YYYY/month=MM/day=DD/stat-....parquet
 <output>/meteo/year=YYYY/month=MM/day=DD/met-....parquet
 <output>/binary/year=YYYY/month=MM/day=DD/bin-....parquet
+<output>/other/year=YYYY/month=MM/day=DD/oth-....parquet (type catch-all)
 ```
 
 `source` is read from the input's `source` column when present, and otherwise
@@ -79,11 +80,12 @@ works.
 **`meteo`** and **`binary`** — decoded from Type 8 Binary Broadcast messages;
 see [Type 8](#type-8-binary-broadcast) below.
 
-Sentences that decode to any other message class (base-station reports, aids
-to navigation, safety messages, GNSS sentences, ...) are counted in the run
-summary (`other decoded`) but not materialized. Unparseable payloads
-(`$PGHP` wrappers, corrupt sentences) are counted as `unparsed` — the bronze
-data still holds them, nothing is lost.
+Sentences that decode to any other message class (Types 6, 10–17, 20, 22, 23,
+25, 26 — binary addressed messages, safety broadcasts, interrogations, DGNSS,
+data link management, channel management, group assignments, etc.) are written
+to the `other` Iceberg table with schema `(ts, source, station, msg_type,
+payload)`. Unparseable payloads (`$PGHP` wrappers, corrupt sentences) are
+counted as `unparsed` — the bronze data still holds them, nothing is lost.
 
 ## Type 8 Binary Broadcast
 
@@ -239,9 +241,21 @@ Instead of `--output-dir` / `--output-s3-bucket`, pass `--iceberg-catalog-uri` t
 | `--iceberg-table-prefix` | `ICEBERG_TABLE_PREFIX` | — | Prefix for table names |
 | `--iceberg-token` | `ICEBERG_TOKEN` | — | Bearer token for auth |
 
-Tables are automatically created if missing with schemas matching the shared Iceberg specification (field IDs stable across tools). All five table types are written: `positions`, `statics`, `meteo`, `binary`, `atons`.
+Tables are automatically created if missing with schemas matching the shared Iceberg specification (field IDs stable across tools). All six table types are written: `positions`, `statics`, `meteo`, `binary`, `atons`, `other`. The `other` table captures valid message types that don't have typed decoders (Types 6, 10–17, 20, 22, 23, 25, 26).
 
 **Type difference — unsigned → signed:** Iceberg has no unsigned integer types. Columns that are `uint64` in the local Parquet output (`h3`, `hilbert`) are stored as Iceberg `long` (signed 64-bit bigint). The H3 cell ID and Hilbert curve values both fit within signed `i64` range, so no precision is lost. The conversion is handled transparently in the Iceberg writer.
+
+**S3 storage config for Iceberg:** Iceberg writes Parquet data files to S3/MinIO via the REST catalog's warehouse location. The S3 endpoint and credentials are passed through environment variables:
+
+| Env var | Purpose |
+|---------|---------|
+| `S3_ENDPOINT` | S3/MinIO endpoint URL (e.g. `http://fishbake:9000`) |
+| `S3_ACCESS_KEY` / `AWS_ACCESS_KEY_ID` | Access key ID |
+| `S3_SECRET_KEY` / `AWS_SECRET_ACCESS_KEY` | Secret access key |
+| `S3_REGION` | AWS region (default `us-east-1`) |
+| `S3_PATH_STYLE` | Use path-style URLs for MinIO (`true`) |
+| `S3_DISABLE_EC2_METADATA` | Skip IMDS credential lookup (`true` for MinIO) |
+| `S3_DISABLE_CONFIG_LOAD` | Skip `~/.aws/config` lookup (`true` for MinIO) |
 
 #### Incremental mode with Iceberg
 
@@ -274,7 +288,7 @@ The watermark is stored at `s3://<bucket>/<prefix>/_ais-parse/watermark.json`. O
 | `static rows` | decoded into `statics/` |
 | `meteo rows` | Type 8 met/hydro decoded into `meteo/` |
 | `binary rows` | other Type 8 retained in `binary/` (header + hex) |
-| `other decoded` | valid messages of classes not materialized |
+| `other decoded` | catch-all rows written to the Iceberg `other` table |
 | `incomplete fragments` | multi-part fragments whose partner never arrived |
 | `unparsed` | sentences the parser rejected |
 
