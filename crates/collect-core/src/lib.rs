@@ -1641,8 +1641,30 @@ impl S3Storage {
     }
 
     /// List every object under `prefix`, following pagination. Pass `""` to
-    /// list the whole bucket.
+    /// list the whole bucket. Retries on transient S3 errors.
     pub async fn list_keys_with_prefix(&self, prefix: &str) -> Result<Vec<S3ObjectInfo>> {
+        const MAX_ATTEMPTS: usize = 3;
+        let mut last_error = None;
+        for attempt in 1..=MAX_ATTEMPTS {
+            match self.list_keys_with_prefix_inner(prefix).await {
+                Ok(keys) => return Ok(keys),
+                Err(error) => {
+                    if attempt < MAX_ATTEMPTS {
+                        let backoff = std::time::Duration::from_secs(1 << (attempt - 1));
+                        eprintln!(
+                            "List attempt {attempt}/{MAX_ATTEMPTS} failed, retrying in {}s...",
+                            backoff.as_secs()
+                        );
+                        tokio::time::sleep(backoff).await;
+                    }
+                    last_error = Some(error);
+                }
+            }
+        }
+        Err(last_error.expect("loop runs at least once"))
+    }
+
+    async fn list_keys_with_prefix_inner(&self, prefix: &str) -> Result<Vec<S3ObjectInfo>> {
         let mut keys = Vec::new();
         let mut continuation_token = None;
 
