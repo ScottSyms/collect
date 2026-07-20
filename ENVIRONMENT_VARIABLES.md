@@ -83,6 +83,10 @@ Each variable is the SCREAMING_SNAKE name of its flag unless noted.
   - Default: `60`
   - On SIGTERM the collectors flush the in-memory batch, finish queued Parquet writes, and drain uploads for up to this long. Make sure your orchestrator's stop grace period (Docker `stop_grace_period`, Nomad `kill_timeout`) exceeds this value.
 
+- `UPLOAD_CONCURRENCY`: Max concurrent S3 uploads
+  - Example: `UPLOAD_CONCURRENCY=8`
+  - Default: `4`
+
 ### S3 Configuration
 
 - `S3_BUCKET`: S3 bucket name for remote storage (enables S3 upload)
@@ -162,6 +166,9 @@ Each variable is the SCREAMING_SNAKE name of its flag unless noted.
 
 - `DRY_RUN`: List the partitions that would be processed and exit, without decoding, writing, or connecting to the output target
   - Example: `DRY_RUN=true`
+
+- `SCRATCH_DIR`: Directory for temporary scratch files (S3 downloads, intermediate Parquet). Defaults to the system temp dir. Set to a tmpfs/ramdisk like `/dev/shm` for faster I/O
+  - Example: `SCRATCH_DIR=/dev/shm`
 
 ### Common to Every Binary
 

@@ -204,6 +204,7 @@ cargo run -p ais-parse -- --input-s3-bucket normalized-ais --output-s3-bucket si
 | `--output-prefix` | `ais` | output file name prefix (added before tree suffix, env `OUTPUT_PREFIX`) |
 | `--consolidate-ais` | *(off)* | reassemble fragmented NMEA sentences before decoding |
 | `--dry-run` | *(off)* | list the partitions that would be processed and exit; never connects to the output (env `DRY_RUN`) — see [below](#dry-run) |
+| `--scratch-dir` | system tmpdir | directory for S3 download scratch and intermediate Parquet; use a tmpfs/ramdisk like `/dev/shm` for faster I/O (env `SCRATCH_DIR`) |
 | `--quiet` / `-q` | *(off)* | suppress routine progress lines; warnings/errors/summary still print (env `QUIET`) |
 | `--completions <shell>` | — | print shell completions to stdout and exit |
 | `--version` | — | prints `<crate version> (<git commit hash>)` |
