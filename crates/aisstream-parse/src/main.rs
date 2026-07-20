@@ -21,12 +21,13 @@ use iceberg::Catalog;
 use collect_core::iceberg::table_schemas;
 use collect_core::iceberg::{
     ensure_namespace, ensure_table, open_catalog, partition_spec_for, IcebergConfig, TABLE_ATONS,
-    TABLE_BINARY, TABLE_METEO, TABLE_POSITIONS, TABLE_STATICS,
+    TABLE_BINARY, TABLE_METEO, TABLE_OTHER, TABLE_POSITIONS, TABLE_STATICS,
 };
 use output_iceberg::{
     commit_batches_to_iceberg, AtonWriter as IcebergAtonWriter,
     BinaryWriter as IcebergBinaryWriter, MeteoWriter as IcebergMeteoWriter,
-    PositionsWriter as IcebergPositionsWriter, StaticsWriter as IcebergStaticsWriter,
+    OtherWriter as IcebergOtherWriter, PositionsWriter as IcebergPositionsWriter,
+    StaticsWriter as IcebergStaticsWriter,
 };
 
 mod ais_stream;
@@ -984,7 +985,7 @@ async fn main() -> Result<()> {
 
         // Open catalog and ensure tables before joining workers so each
         // partition commits immediately as its worker finishes.
-        let (catalog, positions_table, statics_table, meteo_table, binary_table, atons_table) =
+        let (catalog, positions_table, statics_table, meteo_table, binary_table, atons_table, other_table) =
             if first_error.is_none() {
                 let config: IcebergConfig = (&args.iceberg).into();
                 let catalog = open_catalog(&config)
@@ -1018,9 +1019,14 @@ async fn main() -> Result<()> {
                     table_schemas::atons_schema(),
                     partition_spec_for(&table_schemas::atons_schema(), partition_granularity)?,
                 ).await?;
-                (Some(catalog), Some(positions_table), Some(statics_table), Some(meteo_table), Some(binary_table), Some(atons_table))
+                let other_table = ensure_table(
+                    &catalog, &config, TABLE_OTHER,
+                    table_schemas::other_schema(),
+                    partition_spec_for(&table_schemas::other_schema(), partition_granularity)?,
+                ).await?;
+                (Some(catalog), Some(positions_table), Some(statics_table), Some(meteo_table), Some(binary_table), Some(atons_table), Some(other_table))
             } else {
-                (None, None, None, None, None, None)
+                (None, None, None, None, None, None, None)
             };
 
         let compression_level = args.compression_level;
@@ -1030,7 +1036,7 @@ async fn main() -> Result<()> {
                 Ok(Ok((stats, batches))) => {
                     total_stats.merge(&stats);
                     eprintln!("  [DEBUG] worker finished with {} partition(s) in this batch", batches.len());
-                    if let (Some(ref cat), Some(ref pos), Some(ref stat), Some(ref met), Some(ref bin), Some(ref atn)) = (catalog.as_ref(), positions_table.as_ref(), statics_table.as_ref(), meteo_table.as_ref(), binary_table.as_ref(), atons_table.as_ref()) {
+                    if let (Some(ref cat), Some(ref pos), Some(ref stat), Some(ref met), Some(ref bin), Some(ref atn), Some(ref other)) = (catalog.as_ref(), positions_table.as_ref(), statics_table.as_ref(), meteo_table.as_ref(), binary_table.as_ref(), atons_table.as_ref(), other_table.as_ref()) {
                         let cat: &dyn Catalog = &**cat;
                         for (i, output) in batches.into_iter().enumerate() {
                             eprintln!("  Committing partition {} to Iceberg ...", i + 1);
@@ -1039,6 +1045,7 @@ async fn main() -> Result<()> {
                             commit_batches_to_iceberg(output.meteo, met, cat, TABLE_METEO, compression_level).await?;
                             commit_batches_to_iceberg(output.binary, bin, cat, TABLE_BINARY, compression_level).await?;
                             commit_batches_to_iceberg(output.atons, atn, cat, TABLE_ATONS, compression_level).await?;
+                            commit_batches_to_iceberg(output.others, other, cat, TABLE_OTHER, compression_level).await?;
                             eprintln!("  Committed partition {} to Iceberg.", i + 1);
                         }
                     } else {
@@ -1415,6 +1422,7 @@ struct IcebergWriters {
     meteo: IcebergMeteoWriter,
     binary: IcebergBinaryWriter,
     atons: IcebergAtonWriter,
+    other: IcebergOtherWriter,
 }
 
 impl WriterSet for IcebergWriters {
@@ -1433,8 +1441,8 @@ impl WriterSet for IcebergWriters {
     fn write_aton(&mut self, row: AtonRow, payload: Option<&str>) -> Result<()> {
         self.atons.write(row, payload)
     }
-    fn write_other(&mut self, _row: OtherRow) -> Result<()> {
-        Ok(())
+    fn write_other(&mut self, row: OtherRow) -> Result<()> {
+        self.other.write(row)
     }
 }
 
@@ -1444,6 +1452,7 @@ struct IcebergPartitionOutput {
     meteo: Vec<RecordBatch>,
     binary: Vec<RecordBatch>,
     atons: Vec<RecordBatch>,
+    others: Vec<RecordBatch>,
 }
 
 fn process_partition_iceberg(
@@ -1458,6 +1467,7 @@ fn process_partition_iceberg(
         meteo: IcebergMeteoWriter::new(),
         binary: IcebergBinaryWriter::new(),
         atons: IcebergAtonWriter::new(),
+        other: IcebergOtherWriter::new(),
     };
 
     let mut seen: HashSet<DedupKey> = HashSet::new();
@@ -1483,6 +1493,7 @@ fn process_partition_iceberg(
             meteo: writers.meteo.finish()?,
             binary: writers.binary.finish()?,
             atons: writers.atons.finish()?,
+            others: writers.other.finish()?,
         },
     ))
 }

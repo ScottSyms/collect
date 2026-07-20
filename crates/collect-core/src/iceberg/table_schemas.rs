@@ -146,6 +146,21 @@ pub fn binary_schema() -> Schema {
         .expect("building binary schema")
 }
 
+pub fn other_schema() -> Schema {
+    let fields: Vec<Arc<NestedField>> = vec![
+        required(1, "ts", PrimitiveType::Timestamptz),
+        required(2, "source", PrimitiveType::String),
+        optional(3, "station", PrimitiveType::String),
+        required(4, "msg_type", PrimitiveType::String),
+        required(5, "payload", PrimitiveType::String),
+    ];
+    Schema::builder()
+        .with_schema_id(1)
+        .with_fields(fields)
+        .build()
+        .expect("building other schema")
+}
+
 pub fn atons_schema() -> Schema {
     let fields: Vec<Arc<NestedField>> = vec![
         required(1, "ts", PrimitiveType::Timestamptz),

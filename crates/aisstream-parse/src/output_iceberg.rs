@@ -1,4 +1,5 @@
 use crate::convert::{AtonRow, BinaryRow, MeteoRow, PositionRow, StaticRow};
+use crate::output::OtherRow;
 use anyhow::{Context, Result};
 use arrow::array::{
     ArrayBuilder, ArrayRef, BooleanArray, BooleanBuilder, Float64Array, Float64Builder,
@@ -756,6 +757,71 @@ impl AtonWriter {
         self.flush()?;
         Ok(std::mem::take(&mut self.batches))
     }
+}
+
+pub struct OtherWriter {
+    schema: Arc<Schema>,
+    batches: Vec<RecordBatch>,
+    rows: Vec<OtherRow>,
+}
+
+impl OtherWriter {
+    pub fn new() -> Self {
+        OtherWriter {
+            schema: other_schema(),
+            batches: Vec::new(),
+            rows: Vec::new(),
+        }
+    }
+
+    pub fn write(&mut self, row: OtherRow) -> Result<()> {
+        self.rows.push(row);
+        if self.rows.len() >= FLUSH_BATCH_ROWS {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        if self.rows.is_empty() {
+            return Ok(());
+        }
+        let r = &self.rows;
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(
+                TimestampMillisecondArray::from(r.iter().map(|x| x.ts_ms).collect::<Vec<_>>())
+                    .with_timezone("UTC"),
+            ),
+            Arc::new(StringArray::from(
+                r.iter().map(|x| x.source.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                r.iter().map(|x| x.msg_type.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                r.iter().map(|x| x.payload.as_str()).collect::<Vec<_>>(),
+            )),
+        ];
+        let batch = RecordBatch::try_new(self.schema.clone(), columns)
+            .context("assembling other batch")?;
+        self.batches.push(batch);
+        self.rows.clear();
+        Ok(())
+    }
+
+    pub fn finish(&mut self) -> Result<Vec<RecordBatch>> {
+        self.flush()?;
+        Ok(std::mem::take(&mut self.batches))
+    }
+}
+
+fn other_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        ts_field("ts", false),
+        Field::new("source", DataType::Utf8, false),
+        Field::new("msg_type", DataType::Utf8, false),
+        Field::new("payload", DataType::Utf8, false),
+    ]))
 }
 
 fn f64_col(rows: &[MeteoRow], get: impl Fn(&MeteoRow) -> Option<f64>) -> ArrayRef {

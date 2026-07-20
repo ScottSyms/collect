@@ -1,4 +1,4 @@
-use crate::decode::{AtonRow, BinaryRow, MeteoRow, PositionRow, StaticRow};
+use crate::decode::{AtonRow, BinaryRow, MeteoRow, OtherRow, PositionRow, StaticRow};
 use anyhow::{Context, Result};
 use arrow::array::{
     ArrayBuilder, ArrayRef, BooleanArray, BooleanBuilder, Float64Array, Float64Builder,
@@ -799,6 +799,81 @@ impl IcebergAtonWriter {
         self.flush_batch()?;
         Ok(self.batches)
     }
+}
+
+pub struct IcebergOtherWriter {
+    schema: Arc<Schema>,
+    rows: Vec<OtherRow>,
+    batches: Vec<RecordBatch>,
+}
+
+impl IcebergOtherWriter {
+    pub fn new() -> Self {
+        IcebergOtherWriter {
+            schema: other_schema(),
+            rows: Vec::new(),
+            batches: Vec::new(),
+        }
+    }
+
+    pub fn write(&mut self, row: OtherRow) -> Result<()> {
+        self.rows.push(row);
+        if self.rows.len() >= FLUSH_BATCH_ROWS {
+            self.flush_batch()?;
+        }
+        Ok(())
+    }
+
+    pub fn flush_batch(&mut self) -> Result<()> {
+        if self.rows.is_empty() {
+            return Ok(());
+        }
+        let r = &self.rows;
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(
+                TimestampMillisecondArray::from(r.iter().map(|x| x.ts_ms).collect::<Vec<_>>())
+                    .with_timezone("UTC"),
+            ),
+            Arc::new(StringArray::from(
+                r.iter().map(|x| x.source.as_ref()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                r.iter().map(|x| x.station.as_deref()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                r.iter().map(|x| {
+                    if x.msg_type != 0 {
+                        format!("Type{}", x.msg_type)
+                    } else {
+                        "Unknown".to_string()
+                    }
+                }).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                r.iter().map(|x| x.payload_raw.as_str()).collect::<Vec<_>>(),
+            )),
+        ];
+        let batch = RecordBatch::try_new(self.schema.clone(), columns)
+            .context("assembling other batch")?;
+        self.batches.push(batch);
+        self.rows.clear();
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<Vec<RecordBatch>> {
+        self.flush_batch()?;
+        Ok(self.batches)
+    }
+}
+
+fn other_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        ts_field("ts", false),
+        Field::new("source", DataType::Utf8, false),
+        Field::new("station", DataType::Utf8, true),
+        Field::new("msg_type", DataType::Utf8, false),
+        Field::new("payload", DataType::Utf8, false),
+    ]))
 }
 
 // ── Column helpers ────────────────────────────────────────────────────────────

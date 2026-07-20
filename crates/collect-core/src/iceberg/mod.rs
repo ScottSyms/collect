@@ -124,6 +124,7 @@ pub const TABLE_STATICS: &str = "statics";
 pub const TABLE_METEO: &str = "meteo";
 pub const TABLE_BINARY: &str = "binary";
 pub const TABLE_ATONS: &str = "atons";
+pub const TABLE_OTHER: &str = "other";
 
 pub const ALL_TABLES: &[&str] = &[
     TABLE_POSITIONS,
@@ -131,6 +132,7 @@ pub const ALL_TABLES: &[&str] = &[
     TABLE_METEO,
     TABLE_BINARY,
     TABLE_ATONS,
+    TABLE_OTHER,
 ];
 
 fn table_name(prefix: Option<&str>, base: &str) -> String {
