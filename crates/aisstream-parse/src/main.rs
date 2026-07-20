@@ -1016,14 +1016,15 @@ async fn main() -> Result<()> {
             )
             .await?;
 
+            let compression_level = args.compression_level;
             let total_partitions = partition_outputs.len();
             for (i, output) in partition_outputs.into_iter().enumerate() {
                 eprintln!("  Committing partition {}/{} to Iceberg ...", i + 1, total_partitions);
-                commit_batches_to_iceberg(output.positions, &positions_table, &catalog, TABLE_POSITIONS).await?;
-                commit_batches_to_iceberg(output.statics, &statics_table, &catalog, TABLE_STATICS).await?;
-                commit_batches_to_iceberg(output.meteo, &meteo_table, &catalog, TABLE_METEO).await?;
-                commit_batches_to_iceberg(output.binary, &binary_table, &catalog, TABLE_BINARY).await?;
-                commit_batches_to_iceberg(output.atons, &atons_table, &catalog, TABLE_ATONS).await?;
+                commit_batches_to_iceberg(output.positions, &positions_table, &catalog, TABLE_POSITIONS, compression_level).await?;
+                commit_batches_to_iceberg(output.statics, &statics_table, &catalog, TABLE_STATICS, compression_level).await?;
+                commit_batches_to_iceberg(output.meteo, &meteo_table, &catalog, TABLE_METEO, compression_level).await?;
+                commit_batches_to_iceberg(output.binary, &binary_table, &catalog, TABLE_BINARY, compression_level).await?;
+                commit_batches_to_iceberg(output.atons, &atons_table, &catalog, TABLE_ATONS, compression_level).await?;
                 eprintln!("  Committed partition {}/{} to Iceberg.", i + 1, total_partitions);
             }
         }

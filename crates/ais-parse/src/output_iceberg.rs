@@ -837,12 +837,8 @@ fn u16_aton_col(rows: &[AtonRow], get: impl Fn(&AtonRow) -> Option<u16>) -> Arra
 
 fn batch_for_writer(
     batch: &RecordBatch,
-    iceberg_schema: &iceberg::spec::Schema,
+    target_schema: &arrow::datatypes::Schema,
 ) -> Result<RecordBatch> {
-    let target_schema = Arc::new(
-        iceberg::arrow::schema_to_arrow_schema(iceberg_schema)
-            .context("converting Iceberg schema to Arrow schema")?,
-    );
     let columns: Result<Vec<ArrayRef>> = target_schema
         .fields()
         .iter()
@@ -862,7 +858,7 @@ fn batch_for_writer(
             }
         })
         .collect();
-    Ok(RecordBatch::try_new(target_schema, columns?)?)
+    Ok(RecordBatch::try_new(Arc::new(target_schema.clone()), columns?)?)
 }
 
 fn compute_partition_key(
@@ -940,9 +936,12 @@ async fn write_batches_to_table(
     let mut writer = builder.build(partition_key).await
         .context("building Iceberg DataFileWriter")?;
 
+    let target_schema = iceberg::arrow::schema_to_arrow_schema(&iceberg_schema)
+        .context("converting Iceberg schema to Arrow schema")?;
+
     eprintln!("    writing {} rows to '{}' ...", batches.iter().map(|b| b.num_rows()).sum::<usize>(), table_name);
     for batch in &batches {
-        let projected = batch_for_writer(batch, &iceberg_schema)
+        let projected = batch_for_writer(batch, &target_schema)
             .context("converting batch to Iceberg-compatible schema")?;
         writer.write(projected).await.context("writing batch to Iceberg")?;
     }

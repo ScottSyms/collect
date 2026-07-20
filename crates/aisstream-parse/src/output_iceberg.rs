@@ -796,12 +796,8 @@ fn i64_aton_col(rows: &[AtonRow], get: impl Fn(&AtonRow) -> Option<u64>) -> Arra
 
 fn batch_for_writer(
     batch: &RecordBatch,
-    iceberg_schema: &iceberg::spec::Schema,
+    target_schema: &arrow::datatypes::Schema,
 ) -> Result<RecordBatch> {
-    let target_schema = Arc::new(
-        iceberg::arrow::schema_to_arrow_schema(iceberg_schema)
-            .context("converting Iceberg schema to Arrow schema")?,
-    );
     let columns: Result<Vec<ArrayRef>> = target_schema
         .fields()
         .iter()
@@ -821,7 +817,7 @@ fn batch_for_writer(
             }
         })
         .collect();
-    Ok(RecordBatch::try_new(target_schema, columns?)?)
+    Ok(RecordBatch::try_new(Arc::new(target_schema.clone()), columns?)?)
 }
 
 pub(crate) async fn commit_batches_to_iceberg(
@@ -829,6 +825,7 @@ pub(crate) async fn commit_batches_to_iceberg(
     table: &Table,
     catalog: &dyn Catalog,
     table_name: &str,
+    compression_level: i32,
 ) -> Result<()> {
     if batches.is_empty() {
         return Ok(());
@@ -842,7 +839,7 @@ pub(crate) async fn commit_batches_to_iceberg(
     let file_name_gen =
         DefaultFileNameGenerator::new("batch".to_string(), None, DataFileFormat::Parquet);
 
-    let level = ZstdLevel::try_new(3).context("invalid zstd level")?;
+    let level = ZstdLevel::try_new(compression_level).context("invalid zstd level")?;
     let props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(level))
         .set_column_bloom_filter_enabled(ColumnPath::from("mmsi"), true)
@@ -869,9 +866,14 @@ pub(crate) async fn commit_batches_to_iceberg(
         .await
         .context("building data file writer")?;
 
+    let target_schema = Arc::new(
+        iceberg::arrow::schema_to_arrow_schema(&iceberg_schema)
+            .context("converting Iceberg schema to Arrow schema")?,
+    );
+
     eprintln!("    writing {} rows to '{}' ...", batches.iter().map(|b| b.num_rows()).sum::<usize>(), table_name);
     for batch in &batches {
-        let projected = batch_for_writer(batch, &iceberg_schema)
+        let projected = batch_for_writer(batch, &target_schema)
             .context("converting batch to Iceberg-compatible schema")?;
         data_file_writer
             .write(projected)

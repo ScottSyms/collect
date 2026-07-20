@@ -2313,7 +2313,10 @@ async fn flush_batch(
     let path = dir.join(&filename);
     let payload_bytes = buf.payload_bytes().max(1);
     let batch = buf.to_record_batch()?;
-    let batch = sort_record_batch_by_ts(&batch)?;
+    let batch = tokio::task::spawn_blocking(move || sort_record_batch_by_ts(&batch))
+        .await
+        .context("sort task panicked")?
+        .context("sorting batch by timestamp")?;
     let s3_key = key.s3_key(&filename);
     let Some(queue) = queue else {
         return Err(anyhow::anyhow!("missing write queue"));
