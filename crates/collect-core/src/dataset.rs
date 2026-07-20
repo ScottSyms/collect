@@ -445,6 +445,7 @@ pub async fn list_parquet_files(
 /// reads several buckets, entries for the same partition key can come from
 /// different buckets, and each must be downloaded through its own storage
 /// handle. Listing sets it to `0`; the caller overrides it per bucket.
+#[derive(Clone)]
 pub struct S3Entry {
     pub key: String,
     pub rel_path: String,

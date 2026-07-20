@@ -239,6 +239,7 @@ fn format_ms(ms: i64) -> String {
 }
 
 const UPLOAD_MAX_ATTEMPTS: u32 = 3;
+const DOWNLOAD_MAX_ATTEMPTS: u32 = 3;
 
 /// Upload with exponential backoff on transient failures.
 /// `S3Storage::upload_file` deletes the local file only on success, so a
@@ -720,27 +721,39 @@ async fn main() -> Result<()> {
                             let scratch_root = input_scratch_root
                                 .as_ref()
                                 .expect("remote work implies input scratch dir");
-                            match dataset::download_s3_entries(
-                                &input_storages,
-                                entries,
-                                scratch_root,
-                                PARTITION_DOWNLOAD_CONCURRENCY,
-                            )
-                            .await
-                            .context("downloading input partition from S3")
-                            {
-                                Ok(files) => files,
-                                Err(error) => {
-                                    CANCELLED.store(true, Ordering::Relaxed);
-                                    return Err(error);
+                            let mut result = None;
+                            for attempt in 1..=DOWNLOAD_MAX_ATTEMPTS {
+                                match dataset::download_s3_entries(
+                                    &input_storages,
+                                    entries.clone(),
+                                    scratch_root,
+                                    PARTITION_DOWNLOAD_CONCURRENCY,
+                                )
+                                .await
+                                {
+                                    Ok(files) => {
+                                        result = Some(files);
+                                        break;
+                                    }
+                                    Err(error) => {
+                                        if attempt < DOWNLOAD_MAX_ATTEMPTS {
+                                            let backoff = std::time::Duration::from_secs(1 << (attempt - 1));
+                                            eprintln!(
+                                                "Download attempt {attempt}/{DOWNLOAD_MAX_ATTEMPTS} failed for partition, retrying in {}s...",
+                                                backoff.as_secs()
+                                            );
+                                            tokio::time::sleep(backoff).await;
+                                        } else {
+                                            CANCELLED.store(true, Ordering::Relaxed);
+                                            return Err(error).context("downloading input partition from S3");
+                                        }
+                                    }
                                 }
                             }
+                            result.expect("loop runs at least once")
                         }
                     };
 
-                    // A time-only work item can pool downloads from several source
-                    // subtrees, so clean the scratch copies by file path rather
-                    // than a single partition dir.
                     let scratch_files: Vec<PathBuf> = if is_remote {
                         partition_files.iter().map(|f| f.path.clone()).collect()
                     } else {
@@ -875,21 +888,36 @@ async fn main() -> Result<()> {
                             let scratch_root = input_scratch_root
                                 .as_ref()
                                 .expect("remote work implies input scratch dir");
-                            match dataset::download_s3_entries(
-                                &input_storages,
-                                entries,
-                                scratch_root,
-                                PARTITION_DOWNLOAD_CONCURRENCY,
-                            )
-                            .await
-                            .context("downloading input partition from S3")
-                            {
-                                Ok(files) => files,
-                                Err(error) => {
-                                    CANCELLED.store(true, Ordering::Relaxed);
-                                    return Err(error);
+                            let mut result = None;
+                            for attempt in 1..=DOWNLOAD_MAX_ATTEMPTS {
+                                match dataset::download_s3_entries(
+                                    &input_storages,
+                                    entries.clone(),
+                                    scratch_root,
+                                    PARTITION_DOWNLOAD_CONCURRENCY,
+                                )
+                                .await
+                                {
+                                    Ok(files) => {
+                                        result = Some(files);
+                                        break;
+                                    }
+                                    Err(error) => {
+                                        if attempt < DOWNLOAD_MAX_ATTEMPTS {
+                                            let backoff = std::time::Duration::from_secs(1 << (attempt - 1));
+                                            eprintln!(
+                                                "Download attempt {attempt}/{DOWNLOAD_MAX_ATTEMPTS} failed for partition, retrying in {}s...",
+                                                backoff.as_secs()
+                                            );
+                                            tokio::time::sleep(backoff).await;
+                                        } else {
+                                            CANCELLED.store(true, Ordering::Relaxed);
+                                            return Err(error).context("downloading input partition from S3");
+                                        }
+                                    }
                                 }
                             }
+                            result.expect("loop runs at least once")
                         }
                     };
 
