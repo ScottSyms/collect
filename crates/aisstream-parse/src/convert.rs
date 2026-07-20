@@ -240,12 +240,14 @@ pub fn decode_row(
         | "GroupAssignmentCommand" => Decoded::Other(OtherRow {
             ts_ms,
             source: source.to_string(),
+            station: None,
             msg_type: msg_type.to_string(),
             payload: raw_payload.to_string(),
         }),
         _ => Decoded::Other(OtherRow {
             ts_ms,
             source: source.to_string(),
+            station: None,
             msg_type: msg_type.to_string(),
             payload: raw_payload.to_string(),
         }),

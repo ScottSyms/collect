@@ -712,6 +712,7 @@ fn u64_aton_col(rows: &[AtonRow], get: impl Fn(&AtonRow) -> Option<u64>) -> Arra
 pub struct OtherRow {
     pub ts_ms: i64,
     pub source: String,
+    pub station: Option<String>,
     pub msg_type: String,
     pub payload: String,
 }

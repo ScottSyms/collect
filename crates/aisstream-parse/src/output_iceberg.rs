@@ -796,6 +796,9 @@ impl OtherWriter {
                 r.iter().map(|x| x.source.as_str()).collect::<Vec<_>>(),
             )),
             Arc::new(StringArray::from(
+                r.iter().map(|x| x.station.as_deref()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
                 r.iter().map(|x| x.msg_type.as_str()).collect::<Vec<_>>(),
             )),
             Arc::new(StringArray::from(
@@ -819,6 +822,7 @@ fn other_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         ts_field("ts", false),
         Field::new("source", DataType::Utf8, false),
+        Field::new("station", DataType::Utf8, true),
         Field::new("msg_type", DataType::Utf8, false),
         Field::new("payload", DataType::Utf8, false),
     ]))
