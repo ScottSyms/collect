@@ -1,0 +1,95 @@
+job "aisstream-parse-iceberg" {
+  datacenters = ["duncan"]
+  type        = "batch"
+
+  periodic {
+    # Hourly, offset from the flat-Parquet aisstream-parse job (which runs
+    # on the minute) so the two don't compete for CPU on the same host at :00.
+    cron             = "0 * * * * *"
+    prohibit_overlap = true
+  }
+
+  group "decode" {
+    count = 1
+
+    task "aisstream-parse-iceberg" {
+      driver = "exec"
+
+      config {
+        command = "local/aisstream-parse"
+        args = [
+          "--input-s3-bucket", "collections/aisstream",
+          "--output-s3-bucket", "collections/ais-iceberg-state",
+          "--incremental",
+          "--since", "2",
+          "--concurrency", "4",
+          "--iceberg-warehouse", "ais",
+          "--iceberg-namespace", "ais",
+        ]
+      }
+      # --iceberg-catalog-uri is intentionally not passed as a flag: Nomad's
+      # `${...}` interpolation in `config.args` does not see env vars
+      # injected by a `template` stanza (those only land in the process
+      # environment at exec time, after args are already rendered). Instead
+      # this relies on --iceberg-catalog-uri's env fallback (ICEBERG_CATALOG_URI,
+      # see AISSTREAM_PARSE.md), set below by the Consul-templated env file.
+      #
+      # --since 2 only matters on the very first run (no watermark yet) —
+      # bounds it to the last 2 hours instead of the entire historical
+      # dataset. Without this, the first scheduled run would try to do the
+      # full backfill itself, racing any manual backfill process you run
+      # separately (see AISSTREAM_PARSE.md's idempotent-re-runs section: two
+      # processes can each see a partition as "not yet committed" and both
+      # commit it, creating a duplicate). Run the historical backfill as its
+      # own one-off job — see NOMAD.md's pipeline ordering.
+
+      artifact {
+        source      = "http://192.168.99.107:9000/binaries/aisstream-parse"
+        destination = "local/aisstream-parse"
+        mode        = "file"
+      }
+
+      # Resolve Lakekeeper's address at run time via Consul — its HTTP port
+      # is Nomad-dynamic (see nomad-lakekeeper-prod), so it can't be hardcoded.
+      template {
+        data        = <<EOH
+{{ range service "lakekeeper" }}ICEBERG_CATALOG_URI=http://{{ .Address }}:{{ .Port }}/catalog
+{{ end }}EOH
+        destination = "secrets/iceberg.env"
+        env         = true
+      }
+
+      # --output-s3-bucket here is metadata only (watermark + Iceberg commit
+      # manifest); decoded rows go to Iceberg via --iceberg-catalog-uri, not
+      # to this bucket. Same namespace/warehouse as ais-parse-iceberg — both
+      # write into the shared Iceberg tables (positions, statics, meteo,
+      # binary, atons, other), distinguished by their `source` column.
+      env {
+        S3_ENDPOINT             = "http://192.168.99.107:9000"
+        S3_REGION               = "us-east-1"
+        S3_ACCESS_KEY           = "qz5mjYcOvTgRIw6aJKgm"
+        S3_SECRET_KEY           = "uIDVBTY5eux1xgmiWqnLU6LfnjI1wYgCyrJuYggl"
+        S3_DISABLE_TLS          = "true"
+
+        # iceberg crate's own S3 file-io layer (writes Parquet data files
+        # into the warehouse) — separate env surface from S3_ENDPOINT/etc.
+        # above, same MinIO endpoint and credentials.
+        S3_PATH_STYLE           = "true"
+        S3_DISABLE_EC2_METADATA = "true"
+        S3_DISABLE_CONFIG_LOAD  = "true"
+      }
+
+      resources {
+        cpu    = 500
+        memory = 1024
+      }
+
+      restart {
+        attempts = 3
+        interval = "5m"
+        delay    = "15s"
+        mode     = "delay"
+      }
+    }
+  }
+}

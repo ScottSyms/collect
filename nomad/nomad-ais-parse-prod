@@ -16,8 +16,8 @@ job "ais-parse" {
       config {
         command = "local/ais-parse"
         args = [
-          "--input-s3-bucket", "norway-norm",
-          "--output-s3-bucket", "ais",
+          "--input-s3-bucket", "collections/norway-norm",
+          "--output-s3-bucket", "collections/ais",
           "--incremental",
           "--concurrency", "4",
         ]
@@ -29,11 +29,14 @@ job "ais-parse" {
         mode        = "file"
       }
 
+      # Fixed 2026: was reading "norway-norm" / writing "ais" (bare buckets).
+      # ais-normalize was writing nowhere useful (see its job file), so this
+      # had nothing new to process. Now reads ais-normalize's fixed output.
       env {
         S3_ENDPOINT    = "http://192.168.99.107:9000"
         S3_REGION      = "us-east-1"
-        S3_ACCESS_KEY  = "WSF8aTTn5oKc4i1fVJvP"
-        S3_SECRET_KEY  = "OqaL2H8UcUJByliObQp9ujZGHVZF1GKd91IqAkYY"
+        S3_ACCESS_KEY  = "qz5mjYcOvTgRIw6aJKgm"
+        S3_SECRET_KEY  = "uIDVBTY5eux1xgmiWqnLU6LfnjI1wYgCyrJuYggl"
         S3_DISABLE_TLS = "true"
       }
 

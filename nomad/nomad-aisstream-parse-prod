@@ -16,8 +16,8 @@ job "aisstream-parse" {
       config {
         command = "local/aisstream-parse"
         args = [
-          "--input-s3-bucket", "aisstream",
-          "--output-s3-bucket", "ais",
+          "--input-s3-bucket", "collections/aisstream",
+          "--output-s3-bucket", "collections/ais",
           "--incremental",
           "--concurrency", "4",
         ]
@@ -29,11 +29,15 @@ job "aisstream-parse" {
         mode        = "file"
       }
 
+      # Fixed 2026: was reading "aisstream" (bare bucket), which nothing has
+      # written to since collection moved to the "duncan" datacenter under
+      # the collections/ prefix (see nomad-collect-aisstream-prod). This job
+      # was processing nothing.
       env {
         S3_ENDPOINT    = "http://192.168.99.107:9000"
         S3_REGION      = "us-east-1"
-        S3_ACCESS_KEY  = "WSF8aTTn5oKc4i1fVJvP"
-        S3_SECRET_KEY  = "OqaL2H8UcUJByliObQp9ujZGHVZF1GKd91IqAkYY"
+        S3_ACCESS_KEY  = "qz5mjYcOvTgRIw6aJKgm"
+        S3_SECRET_KEY  = "uIDVBTY5eux1xgmiWqnLU6LfnjI1wYgCyrJuYggl"
         S3_DISABLE_TLS = "true"
       }
 

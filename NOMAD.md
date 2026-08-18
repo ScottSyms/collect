@@ -2,6 +2,78 @@
 
 This project includes Nomad job definitions under [nomad/](nomad/) for orchestrating `collect-socket` and other binaries.
 
+## Production pipeline (`nomad/nomad-*-prod`)
+
+The `nomad-*-prod` files are the actual running deployment — static job specs (no `-var` templating), all pointed at one MinIO endpoint (`http://192.168.99.107:9000`) and one Nomad cluster spanning the `duncan` and `dc1` datacenters. This section describes what runs, in what order, and what has to exist before it will work. (The rest of this document, below, covers the separate `collect-socket.nomad` *template* job — a generic starting point, not what's actually deployed.)
+
+### Job run order
+
+```
+1. postgres-prod                        (service — Lakekeeper's metadata store)
+2. nomad-lakekeeper-prod                (service — Iceberg REST catalog; needs #1)
+   → then: register the "ais" warehouse with Lakekeeper — see below, one-time, manual
+3. nomad-tcp-prod                       (service — fans out the upstream AIS feed on :7001)
+4. nomad-collect-norway-prod            (service — TCP, source=norway; needs #3)
+   nomad-collect-duplicate-prod         (service — TCP, source=duplicate, redundant copy; needs #3)
+   nomad-collect-aisstream-prod         (service — connects to aisstream.io directly, no dependency on #3)
+5. nomad-ais-normalize-prod             (batch/periodic, every minute; needs #4's norway+duplicate to have written something)
+6. nomad-ais-parse-prod                 (batch/periodic, every minute; needs #5's output)
+   nomad-aisstream-parse-prod           (batch/periodic, every minute; needs #4's aisstream collector)
+7. (one-time) historical Iceberg backfill — see AIS_PARSE.md's bulk-backfill guidance; run this
+   BEFORE step 8, or with step 8's jobs disabled, to avoid both processes racing to commit the
+   same partitions (see the --since 2 note in nomad-ais-parse-iceberg-prod)
+8. nomad-ais-parse-iceberg-prod         (batch/periodic, hourly; needs #6/#7 and the Iceberg warehouse from #2)
+   nomad-aisstream-parse-iceberg-prod   (batch/periodic, hourly; needs #6/#7 and the Iceberg warehouse from #2)
+```
+
+`nomad-victoria-metrics-prod` (Prometheus-compatible metrics store, Consul service discovery) can run any time after Consul is up — nothing else depends on it.
+
+Steps 5-6 (the flat-Parquet silver pipeline, writing to `collections/ais`) and step 8 (the Iceberg pipeline) are independent consumers of the same normalized/collected input — both can run indefinitely side by side; neither depends on the other.
+
+### S3 buckets needed
+
+Everything here lives under one MinIO bucket, **`collections`**, addressed by prefix (the tools split `bucket/prefix` syntax automatically — see `--s3-bucket`/`--input-s3-bucket` docs). Nothing needs to be created by hand: each tool's `S3Storage::ensure_bucket` creates the `collections` bucket on first use if it's missing.
+
+| Prefix | Written by | Read by |
+|--------|-----------|---------|
+| `collections/norway` | `nomad-collect-norway-prod` | `nomad-ais-normalize-prod` |
+| `collections/duplicate` | `nomad-collect-duplicate-prod` | `nomad-ais-normalize-prod` |
+| `collections/aisstream` | `nomad-collect-aisstream-prod` | `nomad-aisstream-parse-prod`, `nomad-aisstream-parse-iceberg-prod` |
+| `collections/norway-norm` | `nomad-ais-normalize-prod` | `nomad-ais-parse-prod`, `nomad-ais-parse-iceberg-prod` |
+| `collections/ais` | `nomad-ais-parse-prod`, `nomad-aisstream-parse-prod` | (flat-Parquet silver output — external consumers) |
+| `collections/ais-iceberg-state` | `nomad-ais-parse-iceberg-prod`, `nomad-aisstream-parse-iceberg-prod` | same two jobs, next run (watermark + [Iceberg commit manifest](AIS_PARSE.md#idempotent-re-runs-with-iceberg) — metadata only, no row data) |
+
+### Iceberg / Lakekeeper setup needed
+
+Unlike the buckets above, **the Iceberg warehouse is not auto-created** — `ensure_namespace`/`ensure_table` (what `ais-parse`/`aisstream-parse` call) only create the namespace and tables *inside* an already-registered warehouse; registering the warehouse itself is a Lakekeeper management operation, done once, by hand:
+
+1. **A storage bucket for the warehouse.** Pick a bucket (e.g. `iceberg-warehouse`) separate from `collections` — Iceberg manages its own Parquet data files and manifests here, not through any flag in this workspace.
+2. **Register the warehouse with Lakekeeper**, naming it to match `--iceberg-warehouse ais` (used by both `nomad-ais-parse-iceberg-prod` and `nomad-aisstream-parse-iceberg-prod`) and pointing its storage profile at that bucket/credentials:
+
+   ```bash
+   curl -X POST http://<lakekeeper-address>:<port>/management/v1/warehouse \
+     -H 'Content-Type: application/json' \
+     -d '{
+       "warehouse-name": "ais",
+       "storage-profile": {
+         "type": "s3",
+         "bucket": "iceberg-warehouse",
+         "endpoint": "http://192.168.99.107:9000",
+         "region": "us-east-1",
+         "path-style-access": true
+       },
+       "storage-credential": {
+         "type": "s3",
+         "credential-type": "access-key",
+         "aws-access-key-id": "<access-key>",
+         "aws-secret-access-key": "<secret-key>"
+       }
+     }'
+   ```
+
+   Field names vary by Lakekeeper version — `nomad-lakekeeper-prod` sets `LAKEKEEPER__SERVE_SWAGGER_UI = "true"`, so check the running instance's Swagger UI (`http://<lakekeeper-address>:<port>/swagger-ui`) for the exact current schema instead of trusting this verbatim.
+3. **Namespace and tables are then auto-created** on first `ais-parse`/`aisstream-parse` Iceberg-mode run — `--iceberg-namespace ais` creates the `ais` namespace, and all six tables (`positions`, `statics`, `meteo`, `binary`, `atons`, `other`) are created with their schemas and partition specs the first time each is written to. Nothing further to set up.
+
 ## Prerequisites
 
 - Nomad cluster (1.4+ recommended for Nomad Variables)
