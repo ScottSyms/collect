@@ -148,7 +148,7 @@ Other Type 8 messages retained as generic header + hex payload:
 | `--filter-source` (alias `--source`) | `FILTER_SOURCE` | — | Source filter |
 | `--year` / `--month` / `--day` / `--hour` / `--minute` | — | — | Partition time filter chain |
 | `--since <HOURS>` | `SINCE` | — | Rolling window |
-| `--incremental` | `INCREMENTAL` | off | Watermark-based incremental; requires `--output-s3-bucket` when combined with Iceberg output |
+| `--incremental` | `INCREMENTAL` | off | Watermark-based incremental |
 | `--batch-size` | `BATCH_SIZE` | `8192` | Parquet read batch rows |
 | `--compression-level` | `COMPRESSION_LEVEL` | `5` | Zstd level |
 | `--concurrency` | `CONCURRENCY` | auto | Partition concurrency |
@@ -174,7 +174,9 @@ S3 connection args: `--s3-endpoint`, `--s3-region`, `--s3-access-key`,
 
 ### Iceberg output (REST catalog)
 
-Instead of `--output-dir` / `--output-s3-bucket`, pass `--iceberg-catalog-uri` to write directly into Iceberg tables via a REST catalog. Both aisstream-parse and ais-parse share the same set of tables when writing to the same namespace.
+Pass `--iceberg-catalog-uri` to write directly into Iceberg tables via a REST catalog, instead of writing Parquet under `--output-dir`/`--output-s3-bucket`. Both aisstream-parse and ais-parse share the same set of tables when writing to the same namespace.
+
+`--output-dir` or `--output-s3-bucket` is still **required** in Iceberg mode — decoded rows go to Iceberg, not to this location, but it's where the `--incremental` watermark and the [Iceberg commit manifest](#idempotent-re-runs-with-iceberg) are stored.
 
 | Flag | Env | Default | Description |
 |------|-----|---------|-------------|
@@ -218,7 +220,11 @@ S3_DISABLE_EC2_METADATA=true \
   --iceberg-namespace melongoober
 ```
 
-The watermark lives at `s3://<bucket>/<prefix>/_aisstream-parse/watermark.json`. No Parquet data is written to the S3 bucket — it is used only for watermark persistence.
+The watermark lives at `s3://<bucket>/<prefix>/_aisstream-parse/watermark.json`. No Parquet data is written to the S3 bucket — it is used only for watermark and [commit manifest](#idempotent-re-runs-with-iceberg) persistence.
+
+#### Idempotent re-runs with Iceberg
+
+Iceberg writes here are pure append (`fast_append`) — see [ais-parse's idempotency docs](AIS_PARSE.md#idempotent-re-runs-with-iceberg) for why, and the details of the per-partition commit manifest (`_aisstream-parse/committed/<partition>.log`) that guards against duplicate rows on retry. Identical behavior here, just under the `aisstream-parse` tool name.
 
 ## Watermark / Incremental
 

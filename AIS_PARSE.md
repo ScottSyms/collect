@@ -199,7 +199,7 @@ cargo run -p ais-parse -- --input-s3-bucket normalized-ais --output-s3-bucket si
 | `--partition` | `day` | input layout granularity; output trees mirror it (env `PARTITION`) |
 | `--filter-source` (alias `--source`), `--year`…`--minute` | *(all)* | partition slice filters (env `FILTER_SOURCE`) |
 | `--since <HOURS>` | *(off)* | rolling window (env `SINCE`); with `--incremental`, first-run seed only |
-| `--incremental` | *(off)* | watermark at the output (`_ais-parse/watermark.json`), env `INCREMENTAL=true`; requires `--output-s3-bucket` when combined with Iceberg output |
+| `--incremental` | *(off)* | watermark at the output (`_ais-parse/watermark.json`), env `INCREMENTAL=true` |
 | `--batch-size` | `8192` | Parquet read batch rows (env `BATCH_SIZE`) |
 | `--compression-level` | `5` | Zstd level for output (env `COMPRESSION_LEVEL`) |
 | `--concurrency` | cores, clamped `[1, 8]` | partitions decoded in parallel (env `CONCURRENCY`) |
@@ -231,7 +231,9 @@ Combined with `--incremental`, the dry run can't see the real watermark (it live
 
 ### Iceberg output (REST catalog)
 
-Instead of `--output-dir` / `--output-s3-bucket`, pass `--iceberg-catalog-uri` to write directly into Iceberg tables via a REST catalog (Lakekeeper, Polaris, etc.). Both `ais-parse` and `aisstream-parse` share the same set of tables when writing to the same namespace.
+Pass `--iceberg-catalog-uri` to write directly into Iceberg tables via a REST catalog (Lakekeeper, Polaris, etc.), instead of writing Parquet under `--output-dir`/`--output-s3-bucket`. Both `ais-parse` and `aisstream-parse` share the same set of tables when writing to the same namespace.
+
+`--output-dir` or `--output-s3-bucket` is still **required** in Iceberg mode — decoded rows go to Iceberg, not to this location, but it's where the `--incremental` watermark and the [Iceberg commit manifest](#idempotent-re-runs-with-iceberg) are stored.
 
 | Flag | Env | Default | Description |
 |------|-----|---------|-------------|
@@ -277,7 +279,17 @@ S3_DISABLE_EC2_METADATA=true \
   --iceberg-namespace melongoober
 ```
 
-The watermark is stored at `s3://<bucket>/<prefix>/_ais-parse/watermark.json`. On the first run `--since` provides the initial cutoff; subsequent runs load the persisted watermark and skip partitions whose files haven't changed. The `--output-s3-bucket` is used only for watermark storage — no Parquet data is written to it.
+The watermark is stored at `s3://<bucket>/<prefix>/_ais-parse/watermark.json`. On the first run `--since` provides the initial cutoff; subsequent runs load the persisted watermark and skip partitions whose files haven't changed. The `--output-s3-bucket` is used only for watermark and [commit manifest](#idempotent-re-runs-with-iceberg) storage — no Parquet data is written to it.
+
+#### Idempotent re-runs with Iceberg
+
+Iceberg writes here are pure append (`fast_append`) — the `iceberg` crate has no equality-delete, overwrite, or upsert action to commit through today (tracked upstream at [apache/iceberg-rust#2186](https://github.com/apache/iceberg-rust/issues/2186), unreleased as of `iceberg` 0.10.1). Nothing at the catalog level stops the same source row from being committed twice, so `ais-parse` guards against it at the source-file level instead: before decoding a partition, it checks a small per-partition manifest — `_ais-parse/committed/<partition>.log` under the output target — and drops any source object already recorded there. After a partition's Iceberg commit fully succeeds (all six tables), the objects it just committed are recorded immediately, before moving on to the next partition.
+
+This means:
+- A killed-and-restarted run, a redelivered retry, or an operator re-running an already-completed range is cheap and safe — already-committed objects are skipped before download, not just before commit.
+- A fully re-run range that was already committed is a no-op: nothing new is downloaded, decoded, or committed.
+
+**Accepted residual risk:** a crash between two of one partition's six table commits (e.g. `positions` succeeds, `statics` doesn't) can still leave a partial duplicate for that one partition on retry, since the manifest is only updated after all six succeed. This is a narrow window (the gap between sequential REST catalog calls) and is not solved by the manifest — closing it fully would need per-table completion tracking, which isn't implemented.
 
 ### Run summary
 

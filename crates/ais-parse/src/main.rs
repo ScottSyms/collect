@@ -5,6 +5,7 @@ use rand::Rng;
 use clap::Parser;
 use collect_core::ais_consolidate::{AisConsolidator, AisConsolidatorConfig};
 use collect_core::dataset::{self, DatasetFile, PartitionKey};
+use collect_core::iceberg_commit_manifest::CommitManifest;
 use collect_core::state;
 use collect_core::LineTransformer;
 use collect_core::{apply_config_file, PartitionGranularity, S3ConnectionArgs, S3Storage};
@@ -317,10 +318,14 @@ async fn main() -> Result<()> {
     }
     match (&args.output_dir, &args.output_s3_bucket) {
         (Some(_), Some(_)) => bail!("use either --output-dir or --output-s3-bucket, not both"),
-        (None, None) if args.incremental && args.iceberg.is_iceberg_mode() => {
-            bail!("--output-s3-bucket is required for the incremental watermark with Iceberg output")
+        (None, None) if args.iceberg.is_iceberg_mode() => {
+            bail!(
+                "--output-dir or --output-s3-bucket is required with --iceberg-catalog-uri, as \
+                 a place to store the Iceberg commit manifest (and the --incremental watermark, \
+                 if used) — decoded rows still go to Iceberg, not to this location"
+            )
         }
-        (None, None) if !args.iceberg.is_iceberg_mode() => {
+        (None, None) => {
             bail!("one of --output-dir, --output-s3-bucket, or --iceberg-catalog-uri is required")
         }
         _ => {}
@@ -437,6 +442,22 @@ async fn main() -> Result<()> {
             }
             (None, Some(dir)) => state::StateStore::local(dir, "ais-parse"),
             _ => unreachable!("validated exactly one output target above"),
+        })
+    } else {
+        None
+    };
+
+    // Per-partition record of source objects already committed to Iceberg —
+    // Iceberg writes are pure append with no dedup, so this is what keeps a
+    // reprocessed partition (retry, redelivery, an operator re-running an
+    // already-completed backfill range) from creating duplicate rows.
+    let commit_manifest = if args.iceberg.is_iceberg_mode() && !args.dry_run {
+        Some(match (&output_storage, &args.output_dir) {
+            (Some(storage), _) => {
+                CommitManifest::s3(storage.clone(), args.output_s3_prefix.clone(), "ais-parse")
+            }
+            (None, Some(dir)) => CommitManifest::local(dir.clone(), "ais-parse"),
+            _ => unreachable!("validated an output target is present in Iceberg mode above"),
         })
     } else {
         None
@@ -886,6 +907,9 @@ async fn main() -> Result<()> {
             }
         }
     } else {
+        let commit_manifest = commit_manifest
+            .clone()
+            .expect("commit_manifest is Some whenever Iceberg mode is active and not dry-run");
         let mut workers = Vec::with_capacity(concurrency);
         for _ in 0..concurrency {
             let queue = queue.clone();
@@ -893,10 +917,11 @@ async fn main() -> Result<()> {
             let input_storages = input_storages.clone();
             let input_scratch_root = input_scratch_root.clone();
             let batch_size = args.batch_size;
+            let commit_manifest = commit_manifest.clone();
 
             workers.push(tokio::spawn(async move {
                 let mut stats = ParseStats::default();
-                let mut partition_batches: Vec<IcebergPartitionOutput> = Vec::new();
+                let mut partition_batches: Vec<CommittableBatch> = Vec::new();
 
                 loop {
                     if is_cancelled() {
@@ -909,6 +934,55 @@ async fn main() -> Result<()> {
 
                     let is_remote = matches!(work, PartitionWork::Remote(_));
                     let partition_label = partition_key.relative_dir_time_only();
+
+                    // Drop any source object already committed for this
+                    // partition (a prior run, possibly interrupted) — this is
+                    // the idempotency guard: Iceberg writes are pure append,
+                    // so a re-committed object would duplicate rows forever.
+                    let already_committed = commit_manifest
+                        .load(&partition_label)
+                        .await
+                        .with_context(|| {
+                            format!("loading Iceberg commit manifest for {partition_label}")
+                        })?;
+                    let (work, object_keys): (PartitionWork, Vec<String>) = match work {
+                        PartitionWork::Local(files) => {
+                            let mut kept = Vec::with_capacity(files.len());
+                            let mut keys = Vec::with_capacity(files.len());
+                            for file in files {
+                                let key = file.path.display().to_string();
+                                if !already_committed.contains(&key) {
+                                    keys.push(key);
+                                    kept.push(file);
+                                }
+                            }
+                            (PartitionWork::Local(kept), keys)
+                        }
+                        PartitionWork::Remote(entries) => {
+                            let mut kept = Vec::with_capacity(entries.len());
+                            let mut keys = Vec::with_capacity(entries.len());
+                            for entry in entries {
+                                if !already_committed.contains(&entry.key) {
+                                    keys.push(entry.key.clone());
+                                    kept.push(entry);
+                                }
+                            }
+                            (PartitionWork::Remote(kept), keys)
+                        }
+                    };
+                    if object_keys.is_empty() {
+                        if !quiet {
+                            eprintln!("  {partition_label}: already fully committed, skipping");
+                        }
+                        let done = processed.fetch_add(1, Ordering::SeqCst) + 1;
+                        if !quiet
+                            && (done == 1 || done.is_multiple_of(10) || done == total_partitions)
+                        {
+                            eprintln!("Processed {done}/{total_partitions} partition(s).");
+                        }
+                        continue;
+                    }
+
                     if !quiet {
                         let file_count = match &work {
                             PartitionWork::Local(files) => files.len(),
@@ -996,7 +1070,11 @@ async fn main() -> Result<()> {
                                 );
                             }
                             stats.merge(&partition_stats);
-                            partition_batches.push(batches);
+                            partition_batches.push(CommittableBatch {
+                                partition_rel_dir: partition_label.clone(),
+                                object_keys,
+                                output: batches,
+                            });
                         }
                         Err(error) => {
                             CANCELLED.store(true, Ordering::Relaxed);
@@ -1065,21 +1143,40 @@ async fn main() -> Result<()> {
             match worker.await {
                 Ok(Ok((stats, batches))) => {
                     total_stats.merge(&stats);
-                    eprintln!("  [DEBUG] worker finished with {} partition(s) in this batch", batches.len());
                     if let (Some(ref cat), Some(ref pos), Some(ref stat), Some(ref met), Some(ref bin), Some(ref atn), Some(ref other)) = (catalog.as_ref(), positions_table.as_ref(), statics_table.as_ref(), meteo_table.as_ref(), binary_table.as_ref(), atons_table.as_ref(), other_table.as_ref()) {
                         let cat: &dyn Catalog = &**cat;
-                        for (i, output) in batches.into_iter().enumerate() {
-                            eprintln!("  Committing partition {} to Iceberg ...", i + 1);
-                            commit_table_batches(cat, pos, output.positions, compression_level, TABLE_POSITIONS).await?;
-                            commit_table_batches(cat, stat, output.statics, compression_level, TABLE_STATICS).await?;
-                            commit_table_batches(cat, met, output.meteo, compression_level, TABLE_METEO).await?;
-                            commit_table_batches(cat, bin, output.binary, compression_level, TABLE_BINARY).await?;
-                            commit_table_batches(cat, atn, output.atons, compression_level, TABLE_ATONS).await?;
-                            commit_table_batches(cat, other, output.others, compression_level, TABLE_OTHER).await?;
-                            eprintln!("  Committed partition {} to Iceberg.", i + 1);
+                        for batch in batches {
+                            if !quiet {
+                                eprintln!("  Committing {} to Iceberg ...", batch.partition_rel_dir);
+                            }
+                            commit_table_batches(cat, pos, batch.output.positions, compression_level, TABLE_POSITIONS).await?;
+                            commit_table_batches(cat, stat, batch.output.statics, compression_level, TABLE_STATICS).await?;
+                            commit_table_batches(cat, met, batch.output.meteo, compression_level, TABLE_METEO).await?;
+                            commit_table_batches(cat, bin, batch.output.binary, compression_level, TABLE_BINARY).await?;
+                            commit_table_batches(cat, atn, batch.output.atons, compression_level, TABLE_ATONS).await?;
+                            commit_table_batches(cat, other, batch.output.others, compression_level, TABLE_OTHER).await?;
+                            // Record immediately, before the next partition's commit —
+                            // this is what makes a crash mid-run safe to retry instead
+                            // of re-appending already-committed rows (Iceberg writes
+                            // here are pure append; see CommitManifest's doc comment).
+                            commit_manifest
+                                .record(&batch.partition_rel_dir, &batch.object_keys)
+                                .await
+                                .with_context(|| {
+                                    format!(
+                                        "recording Iceberg commit manifest for {}",
+                                        batch.partition_rel_dir
+                                    )
+                                })?;
+                            if !quiet {
+                                eprintln!("  Committed {} to Iceberg.", batch.partition_rel_dir);
+                            }
                         }
                     } else {
-                        eprintln!("  [DEBUG] WARNING: catalog or table reference is None — skipping commit for partition");
+                        eprintln!(
+                            "Warning: Iceberg catalog/tables unavailable (an earlier partition \
+                             failed); skipping commit for this worker's decoded partitions."
+                        );
                     }
                 }
                 Ok(Err(error)) => {
@@ -1352,6 +1449,15 @@ struct IcebergPartitionOutput {
     binary: Vec<RecordBatch>,
     atons: Vec<RecordBatch>,
     others: Vec<RecordBatch>,
+}
+
+/// A decoded partition's output, paired with the source object keys it was
+/// built from — recorded in the commit manifest only after every table's
+/// commit for this partition succeeds.
+struct CommittableBatch {
+    partition_rel_dir: String,
+    object_keys: Vec<String>,
+    output: IcebergPartitionOutput,
 }
 
 #[allow(clippy::too_many_arguments)]

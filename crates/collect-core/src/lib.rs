@@ -34,6 +34,7 @@ use tokio_util::codec::{FramedRead, LinesCodec};
 pub mod ais_consolidate;
 pub mod dataset;
 pub mod iceberg;
+pub mod iceberg_commit_manifest;
 mod metrics;
 pub mod state;
 
