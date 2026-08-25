@@ -749,6 +749,7 @@ mod tests {
                     max_rows: None,
                     max_batch_bytes: 1024,
                     compression_level: 5,
+                    upload_concurrency: 4,
                     upload_drain_timeout_seconds: 1,
                     max_line_length: 1024,
                     health_check: false,

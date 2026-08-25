@@ -260,6 +260,7 @@ Exposed metrics (all labeled with `source="..."`):
 
 - **Graceful shutdown**: on SIGTERM/SIGINT the collectors stop reading, flush the in-memory batch, finish every queued Parquet write, and drain pending S3 uploads for up to `UPLOAD_DRAIN_TIMEOUT_SECONDS` (default 60s). Give your orchestrator a stop grace period longer than that (`kill_timeout` in Nomad, `stop_grace_period` in Docker Compose).
 - **Orphan sweep**: at startup each collector scans its output directory for Parquet files a previous run wrote but never uploaded (crash, SIGKILL, expired drain window) and uploads them in the background. Skipped when `KEEP_LOCAL=true`, since uploaded files can't be distinguished from orphans.
+- **Local cleanup**: with `KEEP_LOCAL=false`, a successful upload deletes its local Parquet file and recursively removes empty Hive partition directories, stopping before the output root. Completed Parquet files encountered during cleanup are uploaded to their output-relative S3 keys first; failed, temporary, and unknown files are preserved with their directory hierarchy.
 - **Kafka offsets**: `collect-kafka` disables auto-commit and commits offsets only after the batch containing a message is durably written to local disk, giving at-least-once delivery — a crash replays at most a few messages instead of losing them.
 
 ## S3 Integration

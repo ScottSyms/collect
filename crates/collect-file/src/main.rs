@@ -155,13 +155,6 @@ async fn run_file_ingest(
         })
         .collect();
 
-    if sources.is_empty() {
-        if !quiet {
-            eprintln!("✅ No unfinished input files found");
-        }
-        std::process::exit(EXIT_NOTHING_TO_DO);
-    }
-
     let total_files = sources.len();
     let total_bytes = sources
         .iter()
@@ -180,6 +173,24 @@ async fn run_file_ingest(
         };
         (None, s3_storage)
     };
+    if sources.is_empty() {
+        if let Some(storage) = s3_storage.clone().filter(|storage| !storage.keeps_local()) {
+            match collect_core::sweep_orphaned_uploads(common.out_dir.clone(), storage).await {
+                Ok(0) => {}
+                Ok(count) if !quiet => eprintln!(
+                    "♻️  Attempted recovery of {} orphaned parquet file(s)",
+                    count
+                ),
+                Ok(_) => {}
+                Err(error) => eprintln!("⚠️  Orphan upload sweep failed: {error}"),
+            }
+        }
+        if !quiet {
+            eprintln!("✅ No unfinished input files found");
+        }
+        std::process::exit(EXIT_NOTHING_TO_DO);
+    }
+
     let mut common = common;
     let parallel = sources.len() > 1;
     if parallel {
@@ -216,20 +227,18 @@ async fn run_file_ingest(
     if parallel {
         if let Some(storage) = options.s3_storage.clone().filter(|s| !s.keeps_local()) {
             let out_dir = options.common.out_dir.clone();
-            tokio::spawn(async move {
-                match collect_core::sweep_orphaned_uploads(out_dir, storage).await {
-                    Ok(0) => {}
-                    Ok(count) => {
-                        if !quiet {
-                            eprintln!(
-                                "♻️  Uploaded {} orphaned parquet file(s) from a previous run",
-                                count
-                            );
-                        }
+            match collect_core::sweep_orphaned_uploads(out_dir, storage).await {
+                Ok(0) => {}
+                Ok(count) => {
+                    if !quiet {
+                        eprintln!(
+                            "♻️  Attempted recovery of {} orphaned parquet file(s) from a previous run",
+                            count
+                        );
                     }
-                    Err(error) => eprintln!("⚠️  Orphan upload sweep failed: {}", error),
                 }
-            });
+                Err(error) => eprintln!("⚠️  Orphan upload sweep failed: {}", error),
+            }
         }
     }
     if sources.len() == 1 {

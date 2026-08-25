@@ -157,11 +157,13 @@ volumes:
 1. **Local First**: Files are always written locally first
 2. **Background Upload**: Files are queued for background upload (non-blocking)
 3. **Data Collection Continues**: No pauses during S3 uploads
-4. **Cleanup**: By default, local files are deleted after successful S3 upload
+4. **Cleanup**: By default, local files are deleted after successful S3 upload and empty Hive partition directories are removed recursively, up to but not including the output root
 5. **Keep Local**: Use `--keep-local` to retain local copies
 6. **Error Handling**: If S3 upload fails, local files are preserved with detailed error messages
 7. **Progress**: Upload progress is logged to stdout
 8. **Graceful Shutdown**: Application waits for pending uploads to complete before exit
+
+When cleanup reaches a non-empty partition directory, completed `.parquet` files not already owned by another uploader are uploaded to the matching output-relative S3 keys before cleanup continues. Incomplete `.parquet.tmp` files, unknown files, and files that still fail to upload are left in place, so their directory hierarchy is retained. This reconciliation is disabled with `KEEP_LOCAL=true`.
 
 ## Security Notes
 

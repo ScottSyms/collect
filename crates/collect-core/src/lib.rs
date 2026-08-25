@@ -16,9 +16,11 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use parquet::schema::types::ColumnPath;
+use std::collections::VecDeque;
 use std::error::Error;
-use std::fs::{self, File};
-use std::path::{Path, PathBuf};
+use std::fs::{self, File, OpenOptions};
+use std::io::ErrorKind;
+use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::AtomicU64;
 use std::sync::{
@@ -591,6 +593,16 @@ pub fn format_count(value: usize) -> String {
     grouped.chars().rev().collect()
 }
 
+fn validate_source_name(source: &str) -> Result<()> {
+    if source.is_empty() {
+        bail!("source name must not be empty");
+    }
+    if source.contains(['/', '\\', '\0']) {
+        bail!("source name must be a single path component: {source:?}");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{format_count, PartKey, PartitionGranularity};
@@ -601,6 +613,15 @@ mod tests {
         assert_eq!(format_count(0), "0");
         assert_eq!(format_count(1_234), "1,234");
         assert_eq!(format_count(12_345_678), "12,345,678");
+    }
+
+    #[test]
+    fn source_names_cannot_escape_the_output_directory() {
+        assert!(super::validate_source_name("norway-tcp").is_ok());
+        assert!(super::validate_source_name("").is_err());
+        assert!(super::validate_source_name("../outside").is_err());
+        assert!(super::validate_source_name("nested/source").is_err());
+        assert!(super::validate_source_name("nested\\source").is_err());
     }
 
     #[test]
@@ -782,6 +803,8 @@ mod tests {
         std::fs::write(partition_dir.join("part-1.parquet"), b"data")?;
         std::fs::write(partition_dir.join("part-2.parquet.tmp"), b"incomplete")?;
         std::fs::write(out_dir.join("stray.parquet"), b"outside layout")?;
+        let stray_claim = out_dir.join("stray.parquet.uploading");
+        std::fs::write(&stray_claim, b"not a collector claim")?;
         std::fs::write(out_dir.join(".collect-file-completed"), b"manifest")?;
 
         let orphans = super::find_orphaned_uploads(&out_dir)?;
@@ -791,10 +814,147 @@ mod tests {
             "source=ais/year=2024/month=01/day=15/part-1.parquet"
         );
         assert_eq!(orphans[0].0, partition_dir.join("part-1.parquet"));
+        assert!(
+            stray_claim.is_file(),
+            "claims outside Hive layout are ignored"
+        );
 
         // Missing out_dir is a clean no-op (first run on an empty node).
         let none = super::find_orphaned_uploads(&dir.path().join("missing"))?;
         assert!(none.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn removes_empty_partition_ancestors_but_preserves_output_root() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let out_dir = dir.path().join("out");
+        let minute_dir = out_dir.join("source=ais/year=2025/month=12/day=31/hour=23/minute=59");
+        std::fs::create_dir_all(&minute_dir)?;
+
+        let pending = super::reconcile_partition_directories(&out_dir, &minute_dir)?;
+
+        assert!(pending.is_empty());
+        assert!(out_dir.is_dir(), "the output root must never be removed");
+        assert!(
+            !out_dir.join("source=ais").exists(),
+            "the entire empty Hive directory chain should be removed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn discovers_pending_files_then_finishes_directory_cleanup() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let out_dir = dir.path().join("out");
+        let minute_dir = out_dir.join("source=ais/year=2025/month=12/day=31/hour=23/minute=59");
+        let empty_sibling = out_dir.join("source=ais/year=2025/month=11/day=01/hour=00/minute=00");
+        std::fs::create_dir_all(&minute_dir)?;
+        std::fs::create_dir_all(&empty_sibling)?;
+        let parquet = minute_dir.join("part-1.parquet");
+        std::fs::write(&parquet, b"complete")?;
+
+        let pending = super::reconcile_partition_directories(&out_dir, &minute_dir)?;
+        assert_eq!(
+            pending,
+            vec![(
+                parquet.clone(),
+                "source=ais/year=2025/month=12/day=31/hour=23/minute=59/part-1.parquet".to_string(),
+            )]
+        );
+        assert!(empty_sibling.is_dir());
+
+        std::fs::remove_file(parquet)?;
+        let pending = super::reconcile_partition_directories(&out_dir, &minute_dir)?;
+        assert!(pending.is_empty());
+        assert!(out_dir.is_dir());
+        assert!(!out_dir.join("source=ais/year=2025").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_preserves_temporary_and_unknown_files() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let out_dir = dir.path().join("out");
+        let partition_dir = out_dir.join("source=ais/year=2025/month=12");
+        std::fs::create_dir_all(&partition_dir)?;
+        let temporary = partition_dir.join("part-1.parquet.tmp");
+        let metadata = partition_dir.join("metadata.json");
+        std::fs::write(&temporary, b"incomplete")?;
+        std::fs::write(&metadata, b"{}")?;
+
+        let pending = super::reconcile_partition_directories(&out_dir, &partition_dir)?;
+
+        assert!(pending.is_empty());
+        assert!(temporary.is_file());
+        assert!(metadata.is_file());
+        assert!(partition_dir.is_dir());
+        Ok(())
+    }
+
+    #[test]
+    fn upload_claims_are_exclusive_and_do_not_hide_orphans() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let out_dir = dir.path().join("out");
+        let partition_dir = out_dir.join("source=ais/year=2025");
+        std::fs::create_dir_all(&partition_dir)?;
+        let parquet = partition_dir.join("part-1.parquet");
+        std::fs::write(&parquet, b"complete")?;
+
+        let claim = super::claim_upload(&parquet)?.expect("first owner should claim the file");
+        assert!(
+            super::claim_upload(&parquet)?.is_none(),
+            "a second uploader must not acquire the same file"
+        );
+
+        let pending = super::find_orphaned_uploads(&out_dir)?;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, parquet);
+        drop(claim);
+        assert!(
+            super::claim_upload(&pending[0].0)?.is_some(),
+            "the file should be claimable again after its owner exits"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_to_clean_outside_the_output_root() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let out_dir = dir.path().join("out");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&out_dir)?;
+        std::fs::create_dir_all(&outside)?;
+
+        let error = super::reconcile_partition_directories(&out_dir, &outside)
+            .expect_err("outside cleanup must be rejected");
+        assert!(error.to_string().contains("outside output directory"));
+        assert!(outside.is_dir());
+
+        let traversing = out_dir.join("source=ais/../../outside");
+        let error = super::reconcile_partition_directories(&out_dir, &traversing)
+            .expect_err("parent traversal must be rejected");
+        assert!(error.to_string().contains("outside output directory"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_symlinked_partition_directories() -> anyhow::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir()?;
+        let out_dir = dir.path().join("out");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&out_dir)?;
+        std::fs::create_dir_all(outside.join("year=2025"))?;
+        symlink(&outside, out_dir.join("source=ais"))?;
+
+        let linked_partition = out_dir.join("source=ais/year=2025");
+        let error = super::reconcile_partition_directories(&out_dir, &linked_partition)
+            .expect_err("symlinked partition cleanup must be rejected");
+        assert!(error.to_string().contains("output symlink"));
+        assert!(outside.join("year=2025").is_dir());
         Ok(())
     }
 
@@ -892,6 +1052,8 @@ pub async fn run_ingest<S>(source: &mut S, options: IngestOptions) -> Result<()>
 where
     S: LineSource + Send,
 {
+    validate_source_name(source.source_name())?;
+
     let IngestOptions {
         common,
         s3,
@@ -909,6 +1071,9 @@ where
     if common.health_check {
         check_health(&health_file)?;
         return Ok(());
+    }
+    if common.upload_concurrency == 0 {
+        bail!("upload concurrency must be greater than zero");
     }
 
     let s3_storage = match (s3_storage, s3) {
@@ -943,10 +1108,10 @@ where
         None => None,
     };
 
-    // Snapshot orphaned files from previous runs *before* this run writes
-    // anything new, then upload them in the background alongside live data.
-    if sweep_orphans {
-        if let Some(storage) = s3_storage.clone().filter(|storage| !storage.keeps_local()) {
+    // Snapshot orphaned files before this run writes anything new. They enter
+    // the tracked live upload queue below, so shutdown drains them as well.
+    let startup_orphans = if sweep_orphans {
+        if let Some(_storage) = s3_storage.clone().filter(|storage| !storage.keeps_local()) {
             let out_dir = common.out_dir.clone();
             match tokio::task::spawn_blocking(move || find_orphaned_uploads(&out_dir)).await {
                 Ok(Ok(orphans)) if !orphans.is_empty() => {
@@ -957,18 +1122,24 @@ where
                     metrics
                         .orphan_files_swept
                         .fetch_add(orphans.len() as u64, Ordering::Relaxed);
-                    let sweep_metrics = metrics.clone();
-                    let upload_concurrency = common.upload_concurrency;
-                    tokio::spawn(async move {
-                        upload_orphaned_files(storage, orphans, sweep_metrics, upload_concurrency).await;
-                    });
+                    orphans
                 }
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => eprintln!("⚠️  Orphan upload scan failed: {error}"),
-                Err(error) => eprintln!("⚠️  Orphan upload scan failed: {error}"),
+                Ok(Ok(_)) => Vec::new(),
+                Ok(Err(error)) => {
+                    eprintln!("⚠️  Orphan upload scan failed: {error}");
+                    Vec::new()
+                }
+                Err(error) => {
+                    eprintln!("⚠️  Orphan upload scan failed: {error}");
+                    Vec::new()
+                }
             }
+        } else {
+            Vec::new()
         }
-    }
+    } else {
+        Vec::new()
+    };
 
     let mut reader = source.open(common.max_line_length).await?;
 
@@ -1017,7 +1188,16 @@ where
         s3_storage.clone(),
         metrics.clone(),
         common.upload_concurrency,
+        common.out_dir.clone(),
     );
+    if let Some(upload_tx) = upload_tx.as_ref() {
+        for orphan in startup_orphans {
+            if upload_tx.send(orphan).await.is_err() {
+                eprintln!("⚠️  Upload queue closed while adding startup recovery files");
+                break;
+            }
+        }
+    }
     let (durable_tx, mut durable_rx) = mpsc::unbounded_channel::<u64>();
     // Bound queued batches by payload bytes, not job count, so memory stays
     // predictable regardless of batch size.
@@ -1285,12 +1465,12 @@ where
 
     if let Some(upload_tx) = upload_tx {
         drop(upload_tx);
-        if let Some(upload_worker) = upload_worker {
+        if let Some(mut upload_worker) = upload_worker {
             if log_writes {
                 eprintln!("Waiting for background uploads to complete...");
             }
             let drain_timeout = Duration::from_secs(common.upload_drain_timeout_seconds);
-            match tokio::time::timeout(drain_timeout, upload_worker).await {
+            match tokio::time::timeout(drain_timeout, &mut upload_worker).await {
                 Ok(join_result) => {
                     if let Err(error) = join_result {
                         eprintln!("Upload worker failed: {}", error);
@@ -1301,6 +1481,8 @@ where
                     }
                 }
                 Err(_) => {
+                    upload_worker.abort();
+                    let _ = upload_worker.await;
                     eprintln!(
                         "Upload drain timed out after {} seconds. Exiting.",
                         common.upload_drain_timeout_seconds
@@ -1922,14 +2104,31 @@ pub fn sort_record_batch_by_ts(batch: &RecordBatch) -> Result<RecordBatch> {
 }
 
 fn open_writer(
+    out_dir: &Path,
     path: &Path,
     schema: &Arc<Schema>,
     compression_level: i32,
 ) -> Result<ArrowWriter<File>> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("mkdir -p {}", parent.display()))?;
-    }
-    let file = File::create(path).with_context(|| format!("create {}", path.display()))?;
+    let parent = path.parent();
+    let file = loop {
+        if let Some(parent) = parent {
+            match fs::create_dir_all(parent) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| format!("mkdir -p {}", parent.display()));
+                }
+            }
+            ensure_no_symlink_descendants(out_dir, parent)?;
+        }
+        match OpenOptions::new().write(true).create_new(true).open(path) {
+            Ok(file) => break file,
+            Err(error) if error.kind() == ErrorKind::NotFound && parent.is_some() => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("create {}", path.display()));
+            }
+        }
+    };
     let zstd_level =
         ZstdLevel::try_new(compression_level).context("invalid Zstd compression level")?;
     let props = WriterProperties::builder()
@@ -1942,15 +2141,53 @@ fn open_writer(
         .set_column_dictionary_enabled(ColumnPath::from("ts"), false)
         .set_column_dictionary_enabled(ColumnPath::from("payload"), false)
         .build();
-    Ok(ArrowWriter::try_new(file, schema.clone(), Some(props))
-        .context("creating Parquet ArrowWriter")?)
+    ArrowWriter::try_new(file, schema.clone(), Some(props))
+        .context("creating Parquet ArrowWriter")
+}
+
+fn ensure_no_symlink_descendants(root: &Path, path: &Path) -> Result<()> {
+    if !is_path_within(root, path) {
+        bail!(
+            "refusing to access {} outside output directory {}",
+            path.display(),
+            root.display()
+        );
+    }
+
+    let relative = path.strip_prefix(root).expect("validated output path");
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            bail!("invalid output path component in {}", path.display());
+        };
+        current.push(component);
+        let metadata = fs::symlink_metadata(&current)
+            .with_context(|| format!("reading metadata for {}", current.display()))?;
+        if metadata.file_type().is_symlink() {
+            bail!("refusing to follow output symlink {}", current.display());
+        }
+    }
+
+    let canonical_root = fs::canonicalize(root)
+        .with_context(|| format!("canonicalizing output directory {}", root.display()))?;
+    let canonical_path = fs::canonicalize(path)
+        .with_context(|| format!("canonicalizing output path {}", path.display()))?;
+    if !canonical_path.starts_with(&canonical_root) {
+        bail!(
+            "refusing to access {} outside output directory {}",
+            path.display(),
+            root.display()
+        );
+    }
+    Ok(())
 }
 
 fn parquet_file_name() -> String {
     let now = Utc::now();
     let counter = PARQUET_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let random = rand::random::<u64>();
     format!(
-        "part-{:04}{:02}{:02}T{:02}{:02}{:02}{:03}-{:06}.parquet",
+        "part-{:04}{:02}{:02}T{:02}{:02}{:02}{:03}-{:016x}-{:06}.parquet",
         now.year(),
         now.month(),
         now.day(),
@@ -1958,6 +2195,7 @@ fn parquet_file_name() -> String {
         now.minute(),
         now.second(),
         now.timestamp_subsec_millis(),
+        random,
         counter
     )
 }
@@ -1967,11 +2205,83 @@ async fn upload_with_retry(
     path: PathBuf,
     s3_key: String,
     metrics: Arc<IngestMetrics>,
+    out_dir: PathBuf,
 ) {
+    let mut pending = VecDeque::from([(path, s3_key)]);
+
+    while let Some((path, s3_key)) = pending.pop_front() {
+        let claim = if storage.keeps_local() {
+            None
+        } else {
+            match tokio::task::spawn_blocking({
+                let path = path.clone();
+                move || claim_upload(&path)
+            })
+            .await
+            {
+                Ok(Ok(Some(claim))) => Some(claim),
+                Ok(Ok(None)) => continue,
+                Ok(Err(error)) => {
+                    metrics.uploads_failed.fetch_add(1, Ordering::Relaxed);
+                    eprintln!("⚠️  Failed to claim {} for upload: {error}", path.display());
+                    continue;
+                }
+                Err(error) => {
+                    metrics.uploads_failed.fetch_add(1, Ordering::Relaxed);
+                    eprintln!(
+                        "⚠️  Upload claim task failed for {}: {error}",
+                        path.display()
+                    );
+                    continue;
+                }
+            }
+        };
+
+        let uploaded = upload_one_with_retry(&storage, &path, &s3_key, &metrics).await;
+        drop(claim);
+
+        if !uploaded {
+            continue;
+        }
+
+        if storage.keeps_local() {
+            continue;
+        }
+
+        let cleanup = tokio::task::spawn_blocking({
+            let out_dir = out_dir.clone();
+            let parent = path.parent().map(Path::to_path_buf);
+            move || match parent {
+                Some(parent) => reconcile_partition_directories(&out_dir, &parent),
+                None => Ok(Vec::new()),
+            }
+        })
+        .await;
+
+        match cleanup {
+            Ok(Ok(files)) => pending.extend(files),
+            Ok(Err(error)) => eprintln!(
+                "⚠️  Failed to clean local partition directories after uploading {}: {error}",
+                path.display()
+            ),
+            Err(error) => eprintln!(
+                "⚠️  Local partition cleanup task failed after uploading {}: {error}",
+                path.display()
+            ),
+        }
+    }
+}
+
+async fn upload_one_with_retry(
+    storage: &S3Storage,
+    upload_path: &Path,
+    s3_key: &str,
+    metrics: &IngestMetrics,
+) -> bool {
     // Scale the attempt timeout with file size (60s base + ~2s per MiB,
     // capped at 15 min) so large files on slow links are not doomed to hit
     // the same fixed timeout on every retry.
-    let file_size = tokio::fs::metadata(&path)
+    let file_size = tokio::fs::metadata(upload_path)
         .await
         .map(|metadata| metadata.len())
         .unwrap_or(0);
@@ -1979,19 +2289,19 @@ async fn upload_with_retry(
 
     for attempt in 1..=DEFAULT_UPLOAD_RETRIES {
         let upload_result =
-            tokio::time::timeout(attempt_timeout, storage.upload_file(&path, &s3_key)).await;
+            tokio::time::timeout(attempt_timeout, storage.upload_file(upload_path, s3_key)).await;
 
         match upload_result {
             Ok(Ok(())) => {
                 metrics.uploads_succeeded.fetch_add(1, Ordering::Relaxed);
-                return;
+                return true;
             }
             Ok(Err(error)) if attempt < DEFAULT_UPLOAD_RETRIES => {
                 metrics.upload_retries.fetch_add(1, Ordering::Relaxed);
                 let backoff = Duration::from_secs(1_u64 << (attempt - 1));
                 eprintln!(
                     "Upload attempt {attempt}/{DEFAULT_UPLOAD_RETRIES} failed for {}: {}. Retrying in {}s...",
-                    path.display(),
+                    upload_path.display(),
                     error,
                     backoff.as_secs()
                 );
@@ -2002,7 +2312,7 @@ async fn upload_with_retry(
                 let backoff = Duration::from_secs(1_u64 << (attempt - 1));
                 eprintln!(
                     "Upload attempt {attempt}/{DEFAULT_UPLOAD_RETRIES} timed out for {}. Retrying in {}s...",
-                    path.display(),
+                    upload_path.display(),
                     backoff.as_secs()
                 );
                 tokio::time::sleep(backoff).await;
@@ -2010,19 +2320,54 @@ async fn upload_with_retry(
             Ok(Err(error)) => {
                 metrics.uploads_failed.fetch_add(1, Ordering::Relaxed);
                 eprintln!("⚠️  Background upload failed after retries: {}", error);
-                eprintln!("   📁 File preserved on disk for retry: {}", path.display());
-                return;
+                eprintln!(
+                    "   📁 File preserved on disk for retry: {}",
+                    upload_path.display()
+                );
+                return false;
             }
             Err(_) => {
                 metrics.uploads_failed.fetch_add(1, Ordering::Relaxed);
                 eprintln!(
                     "⚠️  Background upload timed out after retries. File preserved on disk: {}",
-                    path.display()
+                    upload_path.display()
                 );
-                return;
+                return false;
             }
         }
     }
+
+    false
+}
+
+struct UploadClaim {
+    _file: File,
+}
+
+fn claim_upload(path: &Path) -> Result<Option<UploadClaim>> {
+    let file = match OpenOptions::new().read(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("opening {} for upload", path.display()));
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            if matches!(error.kind(), ErrorKind::WouldBlock) {
+                return Ok(None);
+            }
+            return Err(error).with_context(|| format!("locking {} for upload", path.display()));
+        }
+    }
+
+    Ok(Some(UploadClaim { _file: file }))
 }
 
 /// Find parquet files under `out_dir` that a previous run wrote but never
@@ -2031,12 +2376,24 @@ async fn upload_with_retry(
 /// Returns `(local_path, s3_key)` pairs; only files inside the hive layout
 /// (`source=.../...`) are considered, and in-progress `.tmp` files are not.
 fn find_orphaned_uploads(out_dir: &Path) -> Result<Vec<(PathBuf, String)>> {
+    find_pending_uploads(out_dir, out_dir)
+}
+
+fn find_pending_uploads(out_dir: &Path, scan_root: &Path) -> Result<Vec<(PathBuf, String)>> {
     let mut orphans = Vec::new();
-    if !out_dir.is_dir() {
+    if !scan_root.is_dir() {
         return Ok(orphans);
     }
+    if scan_root != out_dir && !is_path_within(out_dir, scan_root) {
+        bail!(
+            "refusing to scan {} outside output directory {}",
+            scan_root.display(),
+            out_dir.display()
+        );
+    }
+    ensure_no_symlink_descendants(out_dir, scan_root)?;
 
-    let mut stack = vec![out_dir.to_path_buf()];
+    let mut stack = vec![scan_root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
@@ -2051,14 +2408,19 @@ fn find_orphaned_uploads(out_dir: &Path) -> Result<Vec<(PathBuf, String)>> {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
                 stack.push(path);
                 continue;
             }
-            if path.extension().and_then(|ext| ext.to_str()) != Some("parquet") {
-                continue;
-            }
-            let Ok(rel) = path.strip_prefix(out_dir) else {
+
+            let upload_path = path;
+            let Ok(rel) = upload_path.strip_prefix(out_dir) else {
                 continue;
             };
             let s3_key = rel
@@ -2069,12 +2431,130 @@ fn find_orphaned_uploads(out_dir: &Path) -> Result<Vec<(PathBuf, String)>> {
             if !s3_key.starts_with("source=") {
                 continue;
             }
-            orphans.push((path, s3_key));
+
+            let is_parquet =
+                upload_path.extension().and_then(|ext| ext.to_str()) == Some("parquet");
+            if !is_parquet {
+                continue;
+            }
+
+            orphans.push((upload_path, s3_key));
         }
     }
 
     orphans.sort();
     Ok(orphans)
+}
+
+fn reconcile_partition_directories(
+    out_dir: &Path,
+    start_dir: &Path,
+) -> Result<Vec<(PathBuf, String)>> {
+    if start_dir == out_dir {
+        return Ok(Vec::new());
+    }
+    if !is_path_within(out_dir, start_dir) {
+        bail!(
+            "refusing to clean {} outside output directory {}",
+            start_dir.display(),
+            out_dir.display()
+        );
+    }
+    if start_dir.exists() {
+        ensure_no_symlink_descendants(out_dir, start_dir)?;
+    }
+
+    let mut current = Some(start_dir.to_path_buf());
+    while let Some(dir) = current {
+        if dir == out_dir {
+            break;
+        }
+
+        match fs::remove_dir(&dir) {
+            Ok(()) => current = dir.parent().map(Path::to_path_buf),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                current = dir.parent().map(Path::to_path_buf)
+            }
+            Err(error) if error.kind() == ErrorKind::DirectoryNotEmpty => {
+                let files = find_pending_uploads(out_dir, &dir)?;
+                prune_empty_descendants(out_dir, &dir)?;
+                if !files.is_empty() {
+                    return Ok(files);
+                }
+
+                match fs::remove_dir(&dir) {
+                    Ok(()) => current = dir.parent().map(Path::to_path_buf),
+                    Err(error) if matches!(error.kind(), ErrorKind::NotFound) => {
+                        current = dir.parent().map(Path::to_path_buf)
+                    }
+                    Err(error) if error.kind() == ErrorKind::DirectoryNotEmpty => {
+                        return Ok(Vec::new());
+                    }
+                    Err(error) => {
+                        return Err(error).with_context(|| format!("removing {}", dir.display()));
+                    }
+                }
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("removing {}", dir.display()));
+            }
+        }
+    }
+
+    Ok(Vec::new())
+}
+
+fn is_path_within(root: &Path, path: &Path) -> bool {
+    path.strip_prefix(root).is_ok_and(|relative| {
+        relative
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+    })
+}
+
+fn prune_empty_descendants(out_dir: &Path, scan_root: &Path) -> Result<()> {
+    let mut stack = vec![scan_root.to_path_buf()];
+    let mut directories = Vec::new();
+
+    while let Some(dir) = stack.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("reading {}", dir.display()));
+            }
+        };
+
+        directories.push(dir);
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() && !file_type.is_symlink() {
+                stack.push(entry.path());
+            }
+        }
+    }
+
+    directories.sort_by_key(|dir| std::cmp::Reverse(dir.components().count()));
+    for dir in directories {
+        if dir == out_dir || !is_path_within(out_dir, &dir) {
+            continue;
+        }
+        match fs::remove_dir(&dir) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::NotFound | ErrorKind::DirectoryNotEmpty
+                ) => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("removing {}", dir.display()));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Upload previously found orphan files with bounded concurrency, reusing the
@@ -2085,6 +2565,7 @@ async fn upload_orphaned_files(
     files: Vec<(PathBuf, String)>,
     metrics: Arc<IngestMetrics>,
     upload_concurrency: usize,
+    out_dir: PathBuf,
 ) {
     let semaphore = Arc::new(Semaphore::new(upload_concurrency));
     let mut uploads = JoinSet::new();
@@ -2096,9 +2577,10 @@ async fn upload_orphaned_files(
         };
         let storage = storage.clone();
         let metrics = metrics.clone();
+        let out_dir = out_dir.clone();
         uploads.spawn(async move {
             let _permit = permit;
-            upload_with_retry(storage, path, s3_key, metrics).await;
+            upload_with_retry(storage, path, s3_key, metrics, out_dir).await;
         });
     }
 
@@ -2118,12 +2600,20 @@ pub async fn sweep_orphaned_uploads(out_dir: PathBuf, storage: S3Storage) -> Res
         return Ok(0);
     }
 
-    let files = tokio::task::spawn_blocking(move || find_orphaned_uploads(&out_dir))
+    let scan_out_dir = out_dir.clone();
+    let files = tokio::task::spawn_blocking(move || find_orphaned_uploads(&scan_out_dir))
         .await
         .context("orphan upload scan task")??;
     let count = files.len();
     if count > 0 {
-        upload_orphaned_files(storage, files, Arc::new(IngestMetrics::default()), DEFAULT_UPLOAD_CONCURRENCY).await;
+        upload_orphaned_files(
+            storage,
+            files,
+            Arc::new(IngestMetrics::default()),
+            DEFAULT_UPLOAD_CONCURRENCY,
+            out_dir,
+        )
+        .await;
     }
     Ok(count)
 }
@@ -2132,6 +2622,7 @@ fn spawn_upload_worker(
     s3_storage: Option<S3Storage>,
     metrics: Arc<IngestMetrics>,
     upload_concurrency: usize,
+    out_dir: PathBuf,
 ) -> (
     Option<mpsc::Sender<(PathBuf, String)>>,
     Option<tokio::task::JoinHandle<()>>,
@@ -2152,9 +2643,10 @@ fn spawn_upload_worker(
             };
             let storage = s3_storage_worker.clone();
             let metrics = metrics.clone();
+            let out_dir = out_dir.clone();
             uploads.spawn(async move {
                 let _permit = permit;
-                upload_with_retry(storage, path, s3_key, metrics).await;
+                upload_with_retry(storage, path, s3_key, metrics, out_dir).await;
             });
         }
 
@@ -2266,6 +2758,7 @@ fn spawn_write_worker(
 
 struct WriteJob {
     seq: u64,
+    out_dir: PathBuf,
     path: PathBuf,
     s3_key: String,
     batch: RecordBatch,
@@ -2282,6 +2775,7 @@ async fn write_batch_job(
 ) -> Result<()> {
     let WriteJob {
         seq,
+        out_dir,
         path,
         s3_key,
         batch,
@@ -2299,7 +2793,7 @@ async fn write_batch_job(
     let final_path = path.clone();
 
     tokio::task::spawn_blocking(move || -> Result<()> {
-        let mut writer = open_writer(&temp_path, &schema, compression_level)?;
+        let mut writer = open_writer(&out_dir, &temp_path, &schema, compression_level)?;
         writer.write(&batch).context("writing batch to Parquet")?;
         writer.close().context("closing Parquet writer")?;
         fs::rename(&temp_path, &final_path).with_context(|| {
@@ -2387,6 +2881,7 @@ async fn flush_batch(
         .tx
         .send(WriteJob {
             seq,
+            out_dir: root.to_path_buf(),
             path,
             s3_key,
             batch,

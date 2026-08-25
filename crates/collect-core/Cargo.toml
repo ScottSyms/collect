@@ -25,6 +25,8 @@ iceberg.workspace = true
 iceberg-catalog-rest.workspace = true
 iceberg-storage-opendal.workspace = true
 futures.workspace = true
+libc.workspace = true
+rand.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

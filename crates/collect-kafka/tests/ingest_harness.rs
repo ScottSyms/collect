@@ -135,6 +135,7 @@ async fn kafka_ingest_harness_writes_expected_parquet() -> Result<()> {
         max_rows: Some(2), // force multiple parquet files
         max_batch_bytes: 1024 * 1024,
         compression_level: 3,
+        upload_concurrency: 4,
         upload_drain_timeout_seconds: 1,
         max_line_length: 1024,
         health_check: false,
