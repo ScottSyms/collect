@@ -25,6 +25,10 @@ collect-core = { path = "../collect-core" }
 iceberg.workspace = true
 rayon = "1"
 
+[lib]
+name = "ais_parse"
+path = "src/lib.rs"
+
 [[bin]]
 name = "ais-parse"
 path = "src/main.rs"

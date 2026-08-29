@@ -16,3 +16,5 @@ devenv.local.yaml
 
 # Nomad prod config (contains credentials)
 /nomad/nomad-collect-prod
+NOMAD.pdf
+/nomad/nomad/

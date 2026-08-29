@@ -1,11 +1,11 @@
-job "collect-aisstream" {
-  datacenters = ["dc1"]
+job "Aisstream-Collection" {
+  datacenters = ["duncan"]
   type        = "service"
 
   group "ais_collection" {
     count = 1
 
-    task "collect-aisstream" {
+    task "Aisstream-Collection" {
       driver = "exec"
 
       config {
@@ -29,16 +29,16 @@ job "collect-aisstream" {
         OUT_DIR        = "${NOMAD_TASK_DIR}/data"
         MAX_ROWS       = "10000"
         KEEP_LOCAL     = "false"
-        S3_BUCKET      = "aisstream"
+        S3_BUCKET      = "collections/aisstream"
         S3_ENDPOINT    = "http://192.168.99.107:9000"
         S3_REGION      = "us-east-1"
-        S3_ACCESS_KEY  = "WSF8aTTn5oKc4i1fVJvP"
-        S3_SECRET_KEY  = "OqaL2H8UcUJByliObQp9ujZGHVZF1GKd91IqAkYY"
+        S3_ACCESS_KEY  = "qz5mjYcOvTgRIw6aJKgm"
+        S3_SECRET_KEY  = "uIDVBTY5eux1xgmiWqnLU6LfnjI1wYgCyrJuYggl"
         S3_DISABLE_TLS = "true"
       }
 
       service {
-        name = "collect-aisstream"
+        name = "Aisstream-Collection"
         tags = ["norway", "tcp-collector"]
 
         check {
