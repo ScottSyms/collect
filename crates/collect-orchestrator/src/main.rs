@@ -9,6 +9,7 @@ use tokio::sync::Semaphore;
 mod config;
 mod db;
 mod decode;
+mod dispatcher;
 mod http;
 mod worker;
 
@@ -60,6 +61,28 @@ struct Args {
 
     #[command(flatten)]
     iceberg: collect_core::iceberg::IcebergCliArgs,
+
+    #[arg(long, env="CALLBACK_TOKEN")]
+    callback_token: Option<String>,
+
+    // Nomad dispatch mode
+    #[arg(long, env="ENABLE_DISPATCH", value_parser=clap::builder::FalseyValueParser::new())]
+    enable_dispatch: bool,
+
+    #[arg(long, env="NOMAD_ADDR", default_value="http://nomad.service.consul:4646")]
+    nomad_addr: String,
+
+    #[arg(long, env="NOMAD_TOKEN")]
+    nomad_token: Option<String>,
+
+    #[arg(long, env="NOMAD_JOB", default_value="parse-file")]
+    nomad_job: String,
+
+    #[arg(long, env="DISPATCH_CONCURRENCY", default_value_t=32)]
+    dispatch_concurrency: usize,
+
+    #[arg(long, env="DISPATCH_RECLAIM_SECS", default_value_t=1800)]
+    dispatch_reclaim_secs: i64,
 
     #[arg(long)]
     backfill: bool,
@@ -120,10 +143,13 @@ async fn main() -> Result<()> {
         pool: pool.clone(),
         source_map: Arc::new(source_map),
         ingest_token: args.ingest_token.clone(),
+        callback_token: args.callback_token.clone().or_else(|| args.ingest_token.clone()),
     };
 
     let app = axum::Router::new()
         .route("/ingest", axum::routing::post(http::ingest_handler))
+        .route("/complete", axum::routing::post(http::complete_handler))
+        .route("/fail", axum::routing::post(http::fail_handler))
         .route("/healthz", axum::routing::get(http::healthz))
         .route("/metrics", axum::routing::get(http::metrics_handler))
         .route("/queue", axum::routing::get(http::queue_handler))
@@ -132,27 +158,44 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&args.listen_addr).await?;
     eprintln!("🚀 collect-orchestrator listening on {}", args.listen_addr);
     eprintln!("   POST /ingest  (RustFS webhook)");
+    eprintln!("   POST /complete /fail (Nomad worker callback)");
     eprintln!("   GET  /healthz /metrics /queue");
 
-    // Worker pool
-    let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "orchestrator".to_string());
-    let ctx = Arc::new(worker::WorkerContext {
-        pool: pool.clone(),
-        s3_storages: storages,
-        s3_bucket,
-        s3_prefix,
-        iceberg_config,
-        scratch_dir: args.scratch_dir,
-        batch_size: args.batch_size,
-        compression_level: args.compression_level,
-        hostname,
-    });
-    let sem = Arc::new(Semaphore::new(args.max_inflight.max(1)));
-    let worker_ctx = ctx.clone();
-    let worker_sem = sem.clone();
-    tokio::spawn(async move {
-        worker::run_worker_loop(worker_ctx, worker_sem).await;
-    });
+    if args.enable_dispatch {
+        eprintln!("📤 Nomad dispatch mode enabled: job={} addr={} concurrency={}", args.nomad_job, args.nomad_addr, args.dispatch_concurrency);
+        let cfg = dispatcher::DispatcherConfig {
+            nomad_addr: args.nomad_addr.clone(),
+            nomad_token: args.nomad_token.clone(),
+            nomad_job: args.nomad_job.clone(),
+            dispatch_concurrency: args.dispatch_concurrency,
+            poll_interval_ms: 500,
+            reclaim_secs: args.dispatch_reclaim_secs,
+        };
+        let pool2 = pool.clone();
+        tokio::spawn(async move {
+            dispatcher::run_dispatcher_loop(pool2, cfg).await;
+        });
+    } else {
+        // Worker pool (inline mode)
+        let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "orchestrator".to_string());
+        let ctx = Arc::new(worker::WorkerContext {
+            pool: pool.clone(),
+            s3_storages: storages,
+            s3_bucket,
+            s3_prefix,
+            iceberg_config,
+            scratch_dir: args.scratch_dir,
+            batch_size: args.batch_size,
+            compression_level: args.compression_level,
+            hostname,
+        });
+        let sem = Arc::new(Semaphore::new(args.max_inflight.max(1)));
+        let worker_ctx = ctx.clone();
+        let worker_sem = sem.clone();
+        tokio::spawn(async move {
+            worker::run_worker_loop(worker_ctx, worker_sem).await;
+        });
+    }
 
     axum::serve(listener, app).await?;
     Ok(())

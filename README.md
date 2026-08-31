@@ -10,7 +10,8 @@ A Rust project to collect positional data into Hive-partitioned Parquet files wi
 - **`collect-aisstream`** — aisstream.io WebSocket ingestion
 - **`ais-parse`** — silver layer: decode AIS sentences into typed Parquet (vessel positions, statics, meteo, binary, aids to navigation), via [ScottSyms/nmea-parser](https://github.com/ScottSyms/nmea-parser); local or S3 on both sides
 - **`aisstream-parse`** — silver layer: decode aisstream.io JSON from bronze Parquet into typed Parquet (vessel positions, statics, meteo, binary, aids to navigation); local or S3 on both sides
-- **`collect-orchestrator`** — event-driven per-file orchestrator: RustFS/MinIO bucket webhook → Postgres queue (`parse_queue`/`parse_history`) → bounded-parallel library decode into Iceberg (per answer 1–8: archived successes, library not fork, per-file commits, RustFS webhook, Iceberg-only, `MAX_INFLIGHT` default 4)
+- **`collect-orchestrator`** — event-driven per-file orchestrator: RustFS/MinIO bucket webhook → Postgres queue (`parse_queue`/`parse_history`) → per-file decode into Iceberg via `parse-file-worker`. Two modes: inline bounded-parallel (`MAX_INFLIGHT` default 4) or Nomad dispatch (`ENABLE_DISPATCH=true`) scattering one `parse-file` batch job per file across Nomad clients (archived successes, library not fork, per-file commits, RustFS webhook, Iceberg-only)
+- **`parse-file-worker`** — Nomad batch worker for dispatch mode: downloads one bronze Parquet, decodes via `ais-parse`/`aisstream-parse` libs, commits to Iceberg, callbacks to `POST /complete`
 
 All collectors support optional remote storage (S3/MinIO/RustFS).
 
@@ -158,7 +159,7 @@ docker run -d \
   collect:latest
 ```
 
-The image defaults to `collect-socket`; use `--entrypoint /usr/local/bin/<binary>` (e.g. `collect-file`, `collect-kafka`, `collect-aisstream`, `ais-parse`, `aisstream-parse`, `collect-orchestrator`) to run any other binary the image ships. See [NOMAD.md](NOMAD.md) for Nomad orchestration job definitions. For the orchestrator, `docker-compose.yml` runs `collect-orchestrator` on `:8080` (`POST /ingest` webhook, `GET /healthz|/metrics|/queue`); configure RustFS `NOTIFY_WEBHOOK_ENDPOINT=http://collect-orchestrator:8080/ingest` and `INGEST_TOKEN`; use `--backfill` to enqueue existing bronze objects and `--max-inflight` / `MAX_INFLIGHT` to bound parallel parses.
+The image defaults to `collect-socket`; use `--entrypoint /usr/local/bin/<binary>` (e.g. `collect-file`, `collect-kafka`, `collect-aisstream`, `ais-parse`, `aisstream-parse`, `collect-orchestrator`, `parse-file-worker`) to run any other binary the image ships. See [NOMAD.md](NOMAD.md) for Nomad orchestration job definitions. For the orchestrator, `docker-compose.yml` runs `collect-orchestrator` on `:8080` (`POST /ingest` webhook, `GET /healthz|/metrics|/queue`); configure RustFS `NOTIFY_WEBHOOK_ENDPOINT=http://collect-orchestrator:8080/ingest` and `INGEST_TOKEN`; use `--backfill` to enqueue existing bronze objects and `--max-inflight` / `MAX_INFLIGHT` to bound inline parses. Set `ENABLE_DISPATCH=true` to scatter per-file `parse-file` Nomad batch jobs instead (see `ORCHESTRATOR.md#nomad-dispatch-mode-detail` and `nomad/parse-file.nomad.hcl`).
 
 ## Configuration Precedence
 

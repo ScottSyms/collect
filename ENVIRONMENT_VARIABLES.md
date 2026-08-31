@@ -144,6 +144,31 @@ Each variable is the SCREAMING_SNAKE name of its flag unless noted.
 - `ICEBERG_TOKEN`: Bearer token for Lakekeeper / REST catalog authentication
   - Example: `ICEBERG_TOKEN=lk_demo_xxx`
 
+### Orchestrator Options (collect-orchestrator)
+
+- `LISTEN_ADDR`: HTTP listen address for `collect-orchestrator` (`POST /ingest`, `POST /complete|/fail`, `GET /healthz|/metrics|/queue`)
+  - Default: `0.0.0.0:8080`
+- `DATABASE_URL`: Postgres DSN for `parse_queue` / `parse_history` (shared with Lakekeeper)
+- `INGEST_TOKEN`: Bearer token guarding `POST /ingest` (forwarded as `NOTIFY_WEBHOOK_AUTH_TOKEN` on RustFS)
+- `CALLBACK_TOKEN`: Bearer token guarding `POST /complete|/fail` (worker → orchestrator); defaults to `INGEST_TOKEN` when unset
+- `INPUT_S3_BUCKET` / `INPUT_S3_PREFIX`: Bronze bucket/prefix to download single objects from (e.g. `collections` / `bronze`)
+- `SOURCE_MAP`: Path to `source → parser` TOML overrides (`[source_map]` table)
+- `MAX_INFLIGHT`: Max concurrent inline parses (ignored when `ENABLE_DISPATCH=true`)
+  - Default: `4`
+- `ENABLE_DISPATCH`: When `true`, dispatch each file as a Nomad `parse-file` batch job instead of inline pool
+  - Default: `false`
+- `NOMAD_ADDR`: Nomad HTTP API for dispatch (`POST /v1/job/<job>/dispatch`)
+  - Default: `http://nomad.service.consul:4646`
+- `NOMAD_TOKEN`: Nomad ACL token (`X-Nomad-Token`) for dispatch
+- `NOMAD_JOB`: Parameterized batch job name to dispatch
+  - Default: `parse-file`
+- `DISPATCH_CONCURRENCY`: Max concurrent Nomad dispatch RPCs (bounds orchestrator → Nomad, not parse parallelism)
+  - Default: `32`
+- `DISPATCH_RECLAIM_SECS`: Reclaim `dispatched` rows after this many seconds (orphaned allocs → `pending`)
+  - Default: `1800` (30 min)
+- `BATCH_SIZE` / `COMPRESSION_LEVEL` / `SCRATCH_DIR`: Per-file decode tuning forwarded to `parse-file-worker` via env
+- `S3_*` / `ICEBERG_*`: Shared S3 + Iceberg REST catalog config (same as batch tools; workers inherit via Consul-templated `ICEBERG_CATALOG_URI`)
+
 ### Batch Processing Options (ais-parse, aisstream-parse)
 
 - `INCREMENTAL`: Enable watermark-based incremental processing

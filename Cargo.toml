@@ -8,6 +8,7 @@ members = [
     "crates/collect-aisstream",
     "crates/aisstream-parse",
     "crates/collect-orchestrator",
+    "crates/parse-file-worker",
 ]
 resolver = "2"
 

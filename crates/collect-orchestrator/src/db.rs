@@ -18,6 +18,9 @@ pub struct QueueRow {
     pub updated_at: DateTime<Utc>,
     pub locked_at: Option<DateTime<Utc>>,
     pub locked_by: Option<String>,
+    pub dispatched_at: Option<DateTime<Utc>>,
+    pub nomad_job_id: Option<String>,
+    pub nomad_alloc_id: Option<String>,
 }
 
 pub async fn init_pool(database_url: &str) -> Result<PgPool> {
@@ -30,8 +33,12 @@ pub async fn init_pool(database_url: &str) -> Result<PgPool> {
 }
 
 pub async fn run_migrations(pool: &PgPool) -> Result<()> {
-    let sql = include_str!("../migrations/001_queue.sql");
-    sqlx::raw_sql(sql).execute(pool).await.context("running migrations")?;
+    for sql in [
+        include_str!("../migrations/001_queue.sql"),
+        include_str!("../migrations/002_dispatch.sql"),
+    ] {
+        sqlx::raw_sql(sql).execute(pool).await.context("running migrations")?;
+    }
     Ok(())
 }
 
@@ -64,6 +71,45 @@ pub async fn fetch_pending(pool: &PgPool, locked_by: &str) -> Result<Option<Queu
     Ok(row)
 }
 
+pub async fn fetch_pending_for_dispatch(pool: &PgPool) -> Result<Option<QueueRow>> {
+    let row = sqlx::query_as::<_, QueueRow>(
+        "UPDATE parse_queue SET status='dispatched', dispatched_at=now(), updated_at=now(), attempts=attempts+1
+         WHERE s3_key = (
+           SELECT s3_key FROM parse_queue
+           WHERE status IN ('pending','failed') AND (next_retry_at IS NULL OR next_retry_at <= now())
+           ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1
+         ) RETURNING *",
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
+pub async fn mark_dispatched(
+    pool: &PgPool,
+    s3_key: &str,
+    nomad_job_id: &str,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE parse_queue SET nomad_job_id=$1, updated_at=now() WHERE s3_key=$2",
+    )
+    .bind(nomad_job_id)
+    .bind(s3_key)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn reset_to_pending(pool: &PgPool, s3_key: &str) -> Result<()> {
+    sqlx::query(
+        "UPDATE parse_queue SET status='pending', dispatched_at=NULL, nomad_job_id=NULL, nomad_alloc_id=NULL, updated_at=now() WHERE s3_key=$1",
+    )
+    .bind(s3_key)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 pub async fn mark_failed(pool: &PgPool, s3_key: &str, error: &str, max_attempts: i32, attempts: i32) -> Result<()> {
     let backoff_secs = (5u64.saturating_mul(1u64 << attempts.min(10))).min(3600);
     let jitter: u64 = rand::random::<u64>() % backoff_secs.max(1);
@@ -74,7 +120,7 @@ pub async fn mark_failed(pool: &PgPool, s3_key: &str, error: &str, max_attempts:
     };
     if attempts >= max_attempts {
         sqlx::query(
-            "UPDATE parse_queue SET status='dead_letter', last_error=$1, locked_at=NULL, locked_by=NULL, updated_at=now(), next_retry_at=NULL WHERE s3_key=$2",
+            "UPDATE parse_queue SET status='dead_letter', last_error=$1, locked_at=NULL, locked_by=NULL, dispatched_at=NULL, nomad_job_id=NULL, nomad_alloc_id=NULL, updated_at=now(), next_retry_at=NULL WHERE s3_key=$2",
         )
         .bind(error)
         .bind(s3_key)
@@ -83,7 +129,7 @@ pub async fn mark_failed(pool: &PgPool, s3_key: &str, error: &str, max_attempts:
     } else {
         let next_at = Utc::now() + next_retry.unwrap();
         sqlx::query(
-            "UPDATE parse_queue SET status='failed', last_error=$1, locked_at=NULL, locked_by=NULL, updated_at=now(), next_retry_at=$2 WHERE s3_key=$3",
+            "UPDATE parse_queue SET status='failed', last_error=$1, locked_at=NULL, locked_by=NULL, dispatched_at=NULL, nomad_job_id=NULL, nomad_alloc_id=NULL, updated_at=now(), next_retry_at=$2 WHERE s3_key=$3",
         )
         .bind(error)
         .bind(next_at)
@@ -151,6 +197,17 @@ pub async fn reclaim_stale(pool: &PgPool, lease_secs: i64) -> Result<u64> {
     let res = sqlx::query(
         "UPDATE parse_queue SET status='pending', locked_at=NULL, locked_by=NULL, updated_at=now()
          WHERE status='processing' AND locked_at < now() - make_interval(secs => $1)",
+    )
+    .bind(lease_secs as f64)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+pub async fn reclaim_stale_dispatched(pool: &PgPool, lease_secs: i64) -> Result<u64> {
+    let res = sqlx::query(
+        "UPDATE parse_queue SET status='pending', dispatched_at=NULL, nomad_job_id=NULL, nomad_alloc_id=NULL, updated_at=now()
+         WHERE status='dispatched' AND dispatched_at < now() - make_interval(secs => $1)",
     )
     .bind(lease_secs as f64)
     .execute(pool)

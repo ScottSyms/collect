@@ -34,6 +34,7 @@ COPY --from=builder /usr/src/app/target/release/collect-aisstream /usr/local/bin
 COPY --from=builder /usr/src/app/target/release/ais-parse /usr/local/bin/ais-parse
 COPY --from=builder /usr/src/app/target/release/aisstream-parse /usr/local/bin/aisstream-parse
 COPY --from=builder /usr/src/app/target/release/collect-orchestrator /usr/local/bin/collect-orchestrator
+COPY --from=builder /usr/src/app/target/release/parse-file-worker /usr/local/bin/parse-file-worker
 
 # Create data directory
 RUN mkdir -p /data && chown appuser:appuser /data

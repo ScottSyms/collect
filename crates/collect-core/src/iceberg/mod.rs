@@ -244,3 +244,129 @@ pub async fn ensure_table(
     );
     Ok(table)
 }
+
+pub async fn commit_batches(
+    catalog: &dyn Catalog,
+    table: &iceberg::table::Table,
+    batches: Vec<arrow::record_batch::RecordBatch>,
+    compression_level: i32,
+    table_name: &str,
+) -> Result<()> {
+    if batches.is_empty() {
+        return Ok(());
+    }
+    use chrono::{Datelike, Timelike, TimeZone};
+    use iceberg::spec::{DataFileFormat, PartitionKey};
+    use iceberg::transaction::{ApplyTransactionAction, Transaction};
+    use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+    use iceberg::writer::file_writer::location_generator::{
+        DefaultFileNameGenerator, DefaultLocationGenerator,
+    };
+    use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+    use iceberg::writer::file_writer::ParquetWriterBuilder;
+    use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
+    use parquet::basic::{Compression, ZstdLevel};
+    use parquet::file::properties::WriterProperties;
+    use std::sync::Arc;
+
+    let metadata = table.metadata();
+    let iceberg_schema = metadata.current_schema();
+    let location_gen = DefaultLocationGenerator::new(metadata.clone())?;
+    let file_name_gen = DefaultFileNameGenerator::new(
+        "part".to_string(),
+        Some("iceberg".to_string()),
+        DataFileFormat::Parquet,
+    );
+    let level = ZstdLevel::try_new(compression_level).context("invalid zstd")?;
+    let props = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(level))
+        .build();
+    let writer_builder = ParquetWriterBuilder::new(props, iceberg_schema.clone());
+    let rolling = RollingFileWriterBuilder::new_with_default_file_size(
+        writer_builder,
+        table.file_io().clone(),
+        location_gen,
+        file_name_gen,
+    );
+    let builder = DataFileWriterBuilder::new(rolling);
+
+    let pk = {
+        let spec = metadata.default_partition_spec();
+        if spec.fields().is_empty() {
+            None
+        } else {
+            let first = &batches[0];
+            let ts_col = first
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::TimestampMillisecondArray>()
+                .context("ts col")?;
+            let first_ts = ts_col.value(0);
+            let dt = chrono::Utc
+                .timestamp_millis_opt(first_ts)
+                .single()
+                .context("invalid ts")?;
+            let epoch_days = (first_ts / 86400000) as i32;
+            let mut vals: Vec<i32> = Vec::new();
+            for f in spec.fields() {
+                match f.transform {
+                    iceberg::spec::Transform::Year => vals.push(dt.year()),
+                    iceberg::spec::Transform::Month => {
+                        vals.push((dt.year() - 1970) * 12 + dt.month() as i32 - 1)
+                    }
+                    iceberg::spec::Transform::Day => vals.push(epoch_days),
+                    iceberg::spec::Transform::Hour => {
+                        vals.push(epoch_days * 24 + dt.hour() as i32)
+                    }
+                    _ => {}
+                }
+            }
+            let data = iceberg::spec::Struct::from_iter(
+                vals.into_iter()
+                    .map(|v| Some(iceberg::spec::Literal::int(v))),
+            );
+            Some(PartitionKey::new(
+                spec.as_ref().clone(),
+                metadata.current_schema().clone(),
+                data,
+            ))
+        }
+    };
+
+    let mut writer = builder.build(pk).await.context("build writer")?;
+    let target_schema = Arc::new(
+        iceberg::arrow::schema_to_arrow_schema(iceberg_schema).context("arrow schema")?,
+    );
+    for batch in &batches {
+        let projected = {
+            let cols: Result<Vec<_>, _> = target_schema
+                .fields()
+                .iter()
+                .enumerate()
+                .map(|(i, f)| {
+                    let col = batch.column(i);
+                    if col.data_type() == f.data_type() {
+                        Ok(col.clone())
+                    } else {
+                        arrow::compute::cast(col, f.data_type()).context("cast")
+                    }
+                })
+                .collect();
+            arrow::record_batch::RecordBatch::try_new(target_schema.clone(), cols?)?
+        };
+        writer.write(projected).await.context("write")?;
+    }
+    let files = writer.close().await.context("close")?;
+    if files.is_empty() {
+        return Ok(());
+    }
+    let txn = Transaction::new(table);
+    let txn = txn.fast_append().add_data_files(files).apply(txn)?;
+    txn.commit(catalog).await.context("commit")?;
+    eprintln!(
+        "  committed {} to {}",
+        batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+        table_name
+    );
+    Ok(())
+}

@@ -12,6 +12,47 @@ pub struct AppState {
     pub pool: sqlx::PgPool,
     pub source_map: Arc<HashMap<String, String>>,
     pub ingest_token: Option<String>,
+    pub callback_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct CompletePayload {
+    pub s3_bucket: Option<String>,
+    pub s3_key: String,
+    pub duration_ms: Option<i64>,
+    pub stats: Option<WorkerStats>,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct WorkerStats {
+    pub rows_in: Option<i64>,
+    pub positions_out: Option<i64>,
+    pub statics_out: Option<i64>,
+    pub meteo_out: Option<i64>,
+    pub binary_out: Option<i64>,
+    pub atons_out: Option<i64>,
+    pub other_out: Option<i64>,
+    pub incomplete: Option<i64>,
+    pub unparsed: Option<i64>,
+    pub deduped: Option<i64>,
+}
+
+#[derive(Deserialize)]
+pub struct FailPayload {
+    pub s3_bucket: Option<String>,
+    pub s3_key: String,
+    pub error: Option<String>,
+}
+
+fn check_auth(state: &AppState, headers: &axum::http::HeaderMap, for_callback: bool) -> bool {
+    let token = if for_callback {
+        state.callback_token.as_ref().or(state.ingest_token.as_ref())
+    } else {
+        state.ingest_token.as_ref()
+    };
+    let Some(token) = token else { return true; };
+    let provided = headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("");
+    provided == token || provided == format!("Bearer {token}")
 }
 
 #[derive(Deserialize)]
@@ -72,13 +113,8 @@ pub async fn ingest_handler(
     headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    if let Some(token) = &state.ingest_token {
-        let provided = headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("");
-        // Accept "Bearer <token>" or bare token
-        let ok = provided == token || provided == format!("Bearer {token}");
-        if !ok {
-            return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"unauthorized"}))).into_response();
-        }
+    if !check_auth(&state, &headers, false) {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"unauthorized"}))).into_response();
     }
     let pairs = extract_keys_from_value(&body);
     if pairs.is_empty() {
@@ -136,4 +172,83 @@ pub async fn queue_handler(
     .await
     .unwrap_or_default();
     Json(rows)
+}
+
+pub async fn complete_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<CompletePayload>,
+) -> impl IntoResponse {
+    if !check_auth(&state, &headers, true) {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"unauthorized"}))).into_response();
+    }
+    let s3_key = body.s3_key.clone();
+    // Idempotent: if already in history, succeed
+    let in_history: Option<(String,)> = sqlx::query_as("SELECT s3_key FROM parse_history WHERE s3_key=$1")
+        .bind(&s3_key)
+        .fetch_optional(&state.pool)
+        .await
+        .unwrap_or(None);
+    if in_history.is_some() {
+        return (StatusCode::OK, Json(serde_json::json!({"status":"already_complete"}))).into_response();
+    }
+    let row: Option<db::QueueRow> = sqlx::query_as::<_, db::QueueRow>("SELECT * FROM parse_queue WHERE s3_key=$1")
+        .bind(&s3_key)
+        .fetch_optional(&state.pool)
+        .await
+        .unwrap_or(None);
+    let Some(row) = row else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error":"not found in queue"}))).into_response();
+    };
+    let stats_in = body.stats.clone().unwrap_or(WorkerStats { rows_in: None, positions_out: None, statics_out: None, meteo_out: None, binary_out: None, atons_out: None, other_out: None, incomplete: None, unparsed: None, deduped: None });
+    let stats = db::ArchiveStats {
+        rows_in: stats_in.rows_in.unwrap_or(0),
+        positions_out: stats_in.positions_out.unwrap_or(0),
+        statics_out: stats_in.statics_out.unwrap_or(0),
+        meteo_out: stats_in.meteo_out.unwrap_or(0),
+        binary_out: stats_in.binary_out.unwrap_or(0),
+        atons_out: stats_in.atons_out.unwrap_or(0),
+        other_out: stats_in.other_out.unwrap_or(0),
+        incomplete: stats_in.incomplete.unwrap_or(0),
+        unparsed: stats_in.unparsed.unwrap_or(0),
+        deduped: stats_in.deduped.unwrap_or(0),
+    };
+    let duration_ms = body.duration_ms.unwrap_or(0);
+    match db::archive_success(&state.pool, &row, duration_ms, &stats).await {
+        Ok(_) => (StatusCode::OK, Json(serde_json::json!({"status":"archived"}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("{e:#}")}))).into_response(),
+    }
+}
+
+pub async fn fail_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<FailPayload>,
+) -> impl IntoResponse {
+    if !check_auth(&state, &headers, true) {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"unauthorized"}))).into_response();
+    }
+    let s3_key = body.s3_key.clone();
+    let row: Option<db::QueueRow> = sqlx::query_as::<_, db::QueueRow>("SELECT * FROM parse_queue WHERE s3_key=$1")
+        .bind(&s3_key)
+        .fetch_optional(&state.pool)
+        .await
+        .unwrap_or(None);
+    let Some(row) = row else {
+        // Check history for idempotency: already succeeded, don't re-fail
+        let in_history: Option<(String,)> = sqlx::query_as("SELECT s3_key FROM parse_history WHERE s3_key=$1")
+            .bind(&s3_key)
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap_or(None);
+        if in_history.is_some() {
+            return (StatusCode::OK, Json(serde_json::json!({"status":"already_complete"}))).into_response();
+        }
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error":"not found in queue"}))).into_response();
+    };
+    let msg = body.error.clone().unwrap_or_else(|| "unknown error".to_string());
+    match db::mark_failed(&state.pool, &s3_key, &msg, row.max_attempts, row.attempts).await {
+        Ok(_) => (StatusCode::OK, Json(serde_json::json!({"status":"marked_failed"}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("{e:#}")}))).into_response(),
+    }
 }
