@@ -146,6 +146,7 @@ async fn kafka_ingest_harness_writes_expected_parquet() -> Result<()> {
         common,
         s3: None,
         s3_storage: None,
+        iceberg: None,
         health_file: health_file_path("collect-kafka-test"),
         manage_health: false,
         report_progress: false,
@@ -154,6 +155,7 @@ async fn kafka_ingest_harness_writes_expected_parquet() -> Result<()> {
                 write_workers: None,
                 sweep_orphans: false,
                 line_transformer: None,
+                silver: None,
     };
 
     run_ingest(&mut mock, opts).await?;

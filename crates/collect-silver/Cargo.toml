@@ -1,0 +1,15 @@
+[package]
+name = "collect-silver"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+arrow.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+collect-core = { path = "../collect-core" }
+ais-parse = { path = "../ais-parse" }
+aisstream-parse = { path = "../aisstream-parse" }
+iceberg.workspace = true

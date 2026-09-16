@@ -14,3 +14,4 @@ tokio-tungstenite.workspace = true
 futures-util.workspace = true
 
 collect-core = { path = "../collect-core" }
+collect-silver = { path = "../collect-silver" }

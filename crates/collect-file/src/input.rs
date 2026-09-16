@@ -757,6 +757,7 @@ mod tests {
                 },
                 s3: None,
                 s3_storage: None,
+                iceberg: None,
                 health_file,
                 manage_health: true,
                 report_progress: true,
@@ -765,6 +766,7 @@ mod tests {
                 write_workers: None,
                 sweep_orphans: false,
                 line_transformer: None,
+                silver: None,
             },
         )
         .await?;

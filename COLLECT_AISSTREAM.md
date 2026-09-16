@@ -63,10 +63,14 @@ cargo run -p collect-aisstream -- \
 | `--version` | — | — | Prints `<crate version> (<git commit hash>)` |
 | `--config <file>` | `CONFIG_FILE` | — | Load flag defaults from a flat TOML file; CLI flags and pre-set env vars still win — see [README.md](README.md#common-cli-features) |
 
-### Common + S3
+### Common + S3 + Iceberg
 
-Same as [collect-socket](COLLECT_SOCKET.md) — `CommonCliArgs` and `S3CliArgs`
-are identical.
+Same as [collect-socket](COLLECT_SOCKET.md) — `CommonCliArgs`, `S3CliArgs`,
+and `IcebergCliArgs` (optional, direct `raw`-table registration on
+successful upload) are identical, plus the same `--parser` inline-parsing
+flag ([details](COLLECT_SOCKET.md#inline-parsing---parser)). Use
+`--parser aisstream` for this feed; `--parser ais` warns at startup since
+NMEA decoding rejects every JSON row.
 
 ## Output
 

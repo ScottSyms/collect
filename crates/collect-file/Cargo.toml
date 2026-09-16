@@ -23,6 +23,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 collect-core = { path = "../collect-core" }
+collect-silver = { path = "../collect-silver" }
 
 [dev-dependencies]
 tempfile = "3"

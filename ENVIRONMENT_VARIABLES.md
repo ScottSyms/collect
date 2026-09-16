@@ -144,6 +144,17 @@ Each variable is the SCREAMING_SNAKE name of its flag unless noted.
 - `ICEBERG_TOKEN`: Bearer token for Lakekeeper / REST catalog authentication
   - Example: `ICEBERG_TOKEN=lk_demo_xxx`
 
+These same five `ICEBERG_*` variables are also accepted directly by `collect-file`, `collect-socket`, `collect-kafka`, and `collect-aisstream`. When `ICEBERG_CATALOG_URI` (and `ICEBERG_WAREHOUSE`) is set on one of these binaries, it connects once at startup, ensures a `raw` table exists (`ts`, `source`, `payload` columns; partitioned at the same granularity as `PARTITION`), and registers each bronze Parquet file into it immediately after that file's S3 upload succeeds. This is independent of, and does not require, `collect-orchestrator` — see [ORCHESTRATOR.md](ORCHESTRATOR.md#relationship-to-direct-collector-registration) for how the two relate. Leaving `ICEBERG_CATALOG_URI` unset (the default) disables this entirely; no catalog connection is attempted.
+
+### Inline Parsing Options (collectors, `--parser`)
+
+- `PARSER`: Decode each ingested line into typed silver tables inline (`none` | `ais` | `aisstream`)
+  - Example: `PARSER=ais`
+  - Default: `none` (bronze only; no decode cost, no extra output)
+  - `ais` decodes NMEA/AIVDM sentences (same library as `ais-parse`); `aisstream` decodes aisstream.io JSON payloads (same library as `aisstream-parse`). Aliases `ais-parse`/`nmea` and `aisstream-parse`/`json` are also accepted.
+  - Target reuses the existing sink flags: with `ICEBERG_CATALOG_URI` set, silver rows are committed to the six Iceberg tables (`positions`, `statics`, `meteo`, `binary`, `atons`, `other`; tables ensured once at startup); otherwise they are written as Hive-partitioned Parquet siblings (`positions/`, `statics`, …) under `OUTPUT_DIR` in the same time-only layout as the batch parsers.
+  - Bronze output is unchanged and always written. A silver failure never fails the bronze batch (logged + `collect_silver_commits_failed_total`); `collect-orchestrator --backfill` remains the repair path for gaps. See [README.md](README.md#inline-silver-parsing) and the per-table `collect_silver_*_total` metrics.
+
 ### Orchestrator Options (collect-orchestrator)
 
 - `LISTEN_ADDR`: HTTP listen address for `collect-orchestrator` (`POST /ingest`, `POST /complete|/fail`, `GET /healthz|/metrics|/queue`)

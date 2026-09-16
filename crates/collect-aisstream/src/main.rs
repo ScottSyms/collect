@@ -4,6 +4,8 @@ use collect_core::{
     apply_config_file, health_file_path, line_reader_from_async_read, print_completions,
     run_ingest, CommonCliArgs, IngestOptions, LineReader, LineSource, ReaderTransition, S3CliArgs,
 };
+use collect_core::iceberg::{init_raw_handle, IcebergCliArgs};
+use collect_core::silver::{ParserCliArgs, ParserKind};
 use futures_util::{SinkExt, StreamExt};
 use std::cmp::min;
 use std::io;
@@ -57,6 +59,12 @@ struct Args {
 
     #[command(flatten)]
     s3: S3CliArgs,
+
+    #[command(flatten)]
+    iceberg: IcebergCliArgs,
+
+    #[command(flatten)]
+    parser: ParserCliArgs,
 
     /// Print shell completions for the given shell to stdout and exit
     #[arg(long, exclusive = true)]
@@ -333,12 +341,43 @@ async fn main() -> Result<()> {
         source_name,
     );
 
+    let common_options = args.common.to_options();
+    let iceberg = if common_options.health_check {
+        None
+    } else {
+        init_raw_handle(
+            &args.iceberg,
+            common_options.partition.as_str(),
+            common_options.compression_level,
+        )
+        .await?
+    };
+    if args.parser.parser == ParserKind::Ais {
+        eprintln!(
+            "⚠️  --parser ais on an aisstream.io JSON feed: NMEA decoding will reject every \
+             row (counted as failed). Use --parser aisstream for this collector."
+        );
+    }
+    let silver = if common_options.health_check {
+        None
+    } else {
+        collect_silver::init_silver(
+            args.parser.parser,
+            &args.iceberg,
+            &common_options.out_dir,
+            common_options.partition,
+            common_options.compression_level,
+        )
+        .await?
+    };
+
     run_ingest(
         &mut source,
         IngestOptions {
-            common: args.common.to_options(),
+            common: common_options,
             s3: args.s3.to_options(),
             s3_storage: None,
+            iceberg,
             health_file,
             manage_health: true,
             report_progress: !args.quiet,
@@ -347,6 +386,7 @@ async fn main() -> Result<()> {
             write_workers: None,
             sweep_orphans: true,
             line_transformer: None,
+            silver,
         },
     )
     .await

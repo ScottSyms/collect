@@ -50,6 +50,7 @@ Default partition granularity is `day`.
 - Local filesystem output.
 - S3 / S3-compatible output with optional TLS disabled.
 - S3 uploads run in the background so ingestion does not block on network I/O.
+- Optional direct Iceberg registration: when `--iceberg-catalog-uri` is set, each collector registers its own successfully-uploaded bronze file as a row in an Iceberg `raw` table (`ts`, `source`, `payload`) right after upload, independent of `collect-orchestrator`. Best-effort (bounded retry, then log + metric on failure); off by default. See [ORCHESTRATOR.md](ORCHESTRATOR.md#relationship-to-direct-collector-registration).
 
 ### Health Checks
 
@@ -171,7 +172,7 @@ Shared ingest engine and common CLI types.
 
 ### Responsibilities
 
-- Parse common ingest CLI arguments.
+- Parse common ingest CLI arguments (including the shared `--parser` flag: `none` | `ais` | `aisstream`).
 - Apply environment variable overrides.
 - Build ingest options for shared ingestion.
 - Normalize partition granularity and defaults.
@@ -179,8 +180,10 @@ Shared ingest engine and common CLI types.
 - Run the ingest loop.
 - Manage health updates.
 - Manage background writes/uploads.
+- Optionally decode each sealed bronze batch into the six typed silver tables inline (`collect-silver`, via the `SilverCommit` trait; Iceberg commit when `--iceberg-catalog-uri` is set, otherwise Hive-Parquet siblings under the output root; failures counted, bronze unaffected).
 - Support cooperative shutdown from signal handlers and runtime monitors.
 - Optionally suppress write/upload chatter for UI-driven runs.
+- Optionally register each successfully-uploaded batch as a row in an Iceberg `raw` table (`crate::iceberg`), independent of `collect-orchestrator`.
 
 ### Ingest Pipeline
 
@@ -190,7 +193,9 @@ The engine consumes a `LineSource` that yields newline-delimited payloads and:
 - buckets rows into partition keys
 - buffers rows into batches
 - flushes batches to Parquet
+- optionally decodes the sealed batch into silver tables (after bronze durability, before upload queueing)
 - optionally uploads or keeps local files
+- optionally registers the uploaded batch with Iceberg once the upload succeeds
 - respects shutdown signals
 
 ### Shared CLI Defaults

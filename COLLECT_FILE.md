@@ -67,10 +67,16 @@ Exits `2` (instead of `0`) when there were no unfinished input files to ingest �
 | `--consolidate-ais` | off | Reassemble multi-part NMEA fragments into single sentences |
 | `--process-timestamps` | off | Extract `$PGHP` and tag-block `c:` timestamps |
 
-### Common + S3
+### Common + S3 + Iceberg
 
-Same as [collect-socket](COLLECT_SOCKET.md) — `CommonCliArgs` and `S3CliArgs`
-are identical.
+Same as [collect-socket](COLLECT_SOCKET.md) — `CommonCliArgs`, `S3CliArgs`,
+and `IcebergCliArgs` (optional, direct `raw`-table registration on
+successful upload) are identical, plus the same `--parser` inline-parsing
+flag ([details](COLLECT_SOCKET.md#inline-parsing---parser)). In parallel
+mode the Iceberg catalog connection and table handle are established once
+in `main()` and shared (cloned) across all workers, the same way S3
+storage is shared — and likewise the silver handler is one shared `Arc`,
+with per-batch decode state kept on each worker's stack.
 
 ## Output
 

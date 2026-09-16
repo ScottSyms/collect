@@ -13,7 +13,7 @@ A Rust project to collect positional data into Hive-partitioned Parquet files wi
 - **`collect-orchestrator`** — event-driven per-file orchestrator: RustFS/MinIO bucket webhook → Postgres queue (`parse_queue`/`parse_history`) → per-file decode into Iceberg via `parse-file-worker`. Two modes: inline bounded-parallel (`MAX_INFLIGHT` default 4) or Nomad dispatch (`ENABLE_DISPATCH=true`) scattering one `parse-file` batch job per file across Nomad clients (archived successes, library not fork, per-file commits, RustFS webhook, Iceberg-only)
 - **`parse-file-worker`** — Nomad batch worker for dispatch mode: downloads one bronze Parquet, decodes via `ais-parse`/`aisstream-parse` libs, commits to Iceberg, callbacks to `POST /complete`
 
-All collectors support optional remote storage (S3/MinIO/RustFS).
+All collectors support optional remote storage (S3/MinIO/RustFS), and can optionally register each successfully-uploaded bronze file directly into an Iceberg `raw` table (`--iceberg-catalog-uri`) — independent of `collect-orchestrator`; see [ORCHESTRATOR.md#relationship-to-direct-collector-registration](ORCHESTRATOR.md#relationship-to-direct-collector-registration).
 
 ## Features
 - **Multiple Input Sources**: Files, TCP streams, Kafka topics, and aisstream.io WebSocket
@@ -23,6 +23,8 @@ All collectors support optional remote storage (S3/MinIO/RustFS).
 - **Hive Partitioning**: Automatic partitioning by source and selected time granularity
 - **Parquet Format**: Efficient columnar storage with Zstd compression, sorted by timestamp
 - **S3 Integration**: Upload to AWS S3 or S3-compatible storage (MinIO) with optional TLS
+- **Direct Iceberg Registration**: Each collector can register its own uploads into an Iceberg `raw` table on successful upload, with no separate orchestrator process required (`--iceberg-catalog-uri`)
+- **Inline Silver Parsing**: Each collector can additionally decode every ingested line into the six typed silver tables as it ingests (`--parser ais|aisstream`, off by default) — Iceberg commits when `--iceberg-catalog-uri` is set, otherwise Hive-partitioned Parquet siblings under the output dir
 - **Background Uploads**: Non-blocking S3 uploads to prevent data collection pauses
 - **At-Least-Once Delivery**: Graceful-shutdown flush, startup sweep of orphaned files, and Kafka offsets committed only after data is durable on disk
 - **Observability**: Optional Prometheus `/metrics` and HTTP `/healthz` endpoint per collector
@@ -90,6 +92,7 @@ Most command-line parameters can be configured using environment variables.
 | `TCP_HOST` | `--tcp-host` | TCP host address |
 | `TCP_PORT` | `--tcp-port` | TCP port number |
 | `SOURCE` | `--source` | Logical source label |
+| `PARSER` | `--parser` | Inline silver parser: `none` (default), `ais`, or `aisstream` |
 | `PARTITION` | `--partition` | Partition granularity for ingest layout |
 | `AIS` | `--ais` | Use NMEA `c:<epoch>` tag blocks or `$PGHP` capture timestamps (collect-file only) |
 | `OUTPUT_DIR` | `--output-dir` | Output directory |
@@ -294,6 +297,25 @@ export S3_DISABLE_TLS="true"  # Use HTTP instead of HTTPS
 - **Pure Rust**: Uses rustls for TLS, no OpenSSL dependencies
 
 See [S3_INTEGRATION.md](S3_INTEGRATION.md) for detailed configuration.
+
+## Inline Silver Parsing
+
+Every collector accepts `--parser none|ais|aisstream` (env `PARSER`, default `none`):
+
+```bash
+# NMEA feed straight into Iceberg silver (plus bronze as usual)
+collect-socket --tcp-host 153.44.253.27 --tcp-port 5631 --source norway-tcp \
+  --parser ais --iceberg-catalog-uri http://lakekeeper:8181/catalog \
+  --iceberg-warehouse s3://warehouse
+
+# aisstream.io feed into local Hive-Parquet silver siblings
+collect-aisstream --api-key $AISSTREAM_API_KEY --bounding-boxes '[[[-90,-180],[90,180]]]' \
+  --parser aisstream
+```
+
+Target selection reuses the existing sink flags — no new sink flag: with `--iceberg-catalog-uri` set, each sealed bronze batch is decoded and committed to the six Iceberg tables (`positions`, `statics`, `meteo`, `binary`, `atons`, `other`, same schemas/spec as the batch parsers); otherwise silver lands as Hive-partitioned Parquet siblings (`positions/year=…/…`, time-only, no `source=` segment) under `--output-dir`. Bronze output is unchanged and always written.
+
+Semantics: decode runs in the write worker after the bronze file is durable (Kafka offsets still commit on bronze durability); a silver failure is logged and counted (`collect_silver_commits_failed_total`) but never fails the bronze batch. Dedup is per-batch and orphan-recovered uploads have no silver — run `collect-orchestrator --backfill` as the repair path for gaps. Per-table progress is exposed as `collect_silver_{positions,statics,meteo,binary,atons,other,incomplete,failed,deduped}_total`. Expect higher CPU and ~3–7× the memory bound when enabled (lower `MAX_BATCH_BYTES` if needed).
 
 ## Building from Source
 

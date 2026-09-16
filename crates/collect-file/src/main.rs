@@ -5,6 +5,8 @@ use collect_core::{
     apply_config_file, default_source_from_path, health_file_path, print_completions, run_ingest,
     update_health_status_async, CommonCliArgs, IngestOptions, S3CliArgs,
 };
+use collect_core::iceberg::{init_raw_handle, IcebergCliArgs, IcebergHandle};
+use collect_core::silver::{ParserCliArgs, SilverCommit};
 use std::collections::VecDeque;
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -46,6 +48,12 @@ struct Args {
 
     #[command(flatten)]
     s3: S3CliArgs,
+
+    #[command(flatten)]
+    iceberg: IcebergCliArgs,
+
+    #[command(flatten)]
+    parser: ParserCliArgs,
 
     /// Disable the runtime status UI and print aggregate updates every 10 files
     #[arg(long)]
@@ -108,9 +116,34 @@ async fn main() -> Result<()> {
     if !quiet && status_mode.is_plain() {
         eprintln!("📦 Discovered {} input job(s)", source.job_count());
     }
+    let common_options = args.common.to_options();
+    // Skipped for health-check pings, same as the S3 client below (which
+    // run_ingest only builds after its own health-check early return).
+    let iceberg = if common_options.health_check {
+        None
+    } else {
+        init_raw_handle(
+            &args.iceberg,
+            common_options.partition.as_str(),
+            common_options.compression_level,
+        )
+        .await?
+    };
+    let silver = if common_options.health_check {
+        None
+    } else {
+        collect_silver::init_silver(
+            args.parser.parser,
+            &args.iceberg,
+            &common_options.out_dir,
+            common_options.partition,
+            common_options.compression_level,
+        )
+        .await?
+    };
     run_file_ingest(
         source,
-        args.common.to_options(),
+        common_options,
         args.s3.to_options(),
         health_file,
         status_mode,
@@ -118,6 +151,8 @@ async fn main() -> Result<()> {
         args.consolidate_ais,
         args.process_timestamps,
         quiet,
+        iceberg,
+        silver,
     )
     .await
 }
@@ -133,6 +168,8 @@ async fn run_file_ingest(
     consolidate_ais: bool,
     process_timestamps: bool,
     quiet: bool,
+    iceberg: Option<IcebergHandle>,
+    silver: Option<Arc<dyn SilverCommit>>,
 ) -> Result<()> {
     let manifest_path = completion_manifest::manifest_path(&common.out_dir);
     let completed = match completion_manifest::load_completed(&manifest_path) {
@@ -206,6 +243,7 @@ async fn run_file_ingest(
         common,
         s3: s3_options,
         s3_storage,
+        iceberg,
         health_file: health_file.clone(),
         manage_health: false,
         report_progress: false,
@@ -223,6 +261,7 @@ async fn run_file_ingest(
         } else {
             None
         },
+        silver,
     };
     if parallel {
         if let Some(storage) = options.s3_storage.clone().filter(|s| !s.keeps_local()) {
@@ -266,6 +305,7 @@ async fn run_file_ingest(
                 common: options.common.clone(),
                 s3: options.s3.clone(),
                 s3_storage: options.s3_storage.clone(),
+                iceberg: options.iceberg.clone(),
                 health_file: health_file.clone(),
                 manage_health: true,
                 report_progress: false,
@@ -281,6 +321,7 @@ async fn run_file_ingest(
                 } else {
                     None
                 },
+                silver: options.silver.clone(),
             },
         )
         .await;

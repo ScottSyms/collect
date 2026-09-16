@@ -19,6 +19,21 @@ collect-* (bronze) → S3 PutObject → RustFS/MinIO Bucket Notification → POS
                            └───────────────► parse_history (archive) ◄─────────┴────────────────────┘                        │
 ```
 
+## Relationship to direct collector registration
+
+`collect-file`, `collect-socket`, `collect-kafka`, and `collect-aisstream` can *also* register their own bronze uploads with Iceberg directly, independent of this whole pipeline — see the "Direct Iceberg Registration" note in [ENVIRONMENT_VARIABLES.md](ENVIRONMENT_VARIABLES.md#iceberg-output-options). When a collector is started with `ICEBERG_CATALOG_URI` set, it appends one row per uploaded file straight into a `raw` table (`ts`, `source`, `payload`) right after that file's S3 upload succeeds, using `collect_core::iceberg::commit_batches` — the exact writer helper this orchestrator uses for its own six tables.
+
+The two pipelines are unrelated and can run at the same time without conflict (different tables, different code paths):
+
+- `collect-orchestrator` (this pipeline) decodes bronze files into the six normalized silver tables (`positions`, `statics`, `meteo`, `binary`, `atons`, `other`), and needs either the RustFS webhook wired up or a periodic `--backfill` run to see new files at all.
+- Direct collector registration into `raw` needs no webhook and no separate process — it's driven by the collector's own successful upload, not a bucket notification — but it is best-effort: a collector that fails to reach the Iceberg catalog after a short bounded retry logs a warning and moves on (metrics: `collect_iceberg_registrations_failed_total`), rather than queuing for durable replay. It also cannot register files recovered from a crash (orphaned uploads rediscovered on restart have no in-memory batch to register).
+
+If a deployment relies on `raw` being complete, run this orchestrator's `--backfill` (or a full orchestrator deployment) periodically as the out-of-band backstop for anything a collector missed — the same role it already plays for the six decoded tables.
+
+## Relationship to inline collector parsing (`--parser`)
+
+Collectors can also decode inline (`--parser ais|aisstream`, off by default), committing each sealed bronze batch straight into the same six silver tables this orchestrator writes (same schemas, same namespace when pointed at the same catalog). The three paths coexist: inline parsing is per-batch and best-effort (per-batch dedup only, no retry queue, orphan-recovered uploads get no silver), while this orchestrator is per-file with durable retry and archive. Running both against the same tables double-appends (both are pure `fast_append`), so pick one as the primary silver writer per deployment and keep `--backfill` as the repair path for whatever the other missed.
+
 ## Why per-file
 
 `ais-parse` and `aisstream-parse` are normally partition-batched (`PartitionKey → Vec<DatasetFile>`), but the orchestrator operates file-granular:

@@ -27,12 +27,44 @@ pub struct IngestMetrics {
     pub uploads_succeeded: AtomicU64,
     pub uploads_failed: AtomicU64,
     pub upload_retries: AtomicU64,
+    pub iceberg_registrations_succeeded: AtomicU64,
+    pub iceberg_registrations_failed: AtomicU64,
+    pub iceberg_registration_retries: AtomicU64,
     pub orphan_files_swept: AtomicU64,
+    pub silver_positions: AtomicU64,
+    pub silver_statics: AtomicU64,
+    pub silver_meteo: AtomicU64,
+    pub silver_binary: AtomicU64,
+    pub silver_atons: AtomicU64,
+    pub silver_other: AtomicU64,
+    pub silver_incomplete: AtomicU64,
+    pub silver_failed: AtomicU64,
+    pub silver_deduped: AtomicU64,
+    pub silver_commits_succeeded: AtomicU64,
+    pub silver_commits_failed: AtomicU64,
     pub last_row_unix_ms: AtomicU64,
     pub last_heartbeat_unix_ms: AtomicU64,
 }
 
 impl IngestMetrics {
+    /// Merge one batch's [`crate::silver::SilverStats`] into the counters.
+    pub fn record_silver_stats(&self, stats: &crate::silver::SilverStats) {
+        self.silver_positions
+            .fetch_add(stats.positions, Ordering::Relaxed);
+        self.silver_statics
+            .fetch_add(stats.statics, Ordering::Relaxed);
+        self.silver_meteo.fetch_add(stats.meteo, Ordering::Relaxed);
+        self.silver_binary
+            .fetch_add(stats.binary, Ordering::Relaxed);
+        self.silver_atons.fetch_add(stats.atons, Ordering::Relaxed);
+        self.silver_other.fetch_add(stats.other, Ordering::Relaxed);
+        self.silver_incomplete
+            .fetch_add(stats.incomplete, Ordering::Relaxed);
+        self.silver_failed
+            .fetch_add(stats.failed, Ordering::Relaxed);
+        self.silver_deduped
+            .fetch_add(stats.deduped, Ordering::Relaxed);
+    }
     pub fn touch_heartbeat(&self) {
         self.last_heartbeat_unix_ms
             .store(now_unix_ms(), Ordering::Relaxed);
@@ -104,10 +136,94 @@ impl IngestMetrics {
             self.upload_retries.load(Ordering::Relaxed),
         );
         metric(
+            "collect_iceberg_registrations_succeeded_total",
+            "counter",
+            "Bronze uploads registered into the Iceberg raw table",
+            self.iceberg_registrations_succeeded.load(Ordering::Relaxed),
+        );
+        metric(
+            "collect_iceberg_registrations_failed_total",
+            "counter",
+            "Bronze uploads that failed Iceberg registration after exhausting retries",
+            self.iceberg_registrations_failed.load(Ordering::Relaxed),
+        );
+        metric(
+            "collect_iceberg_registration_retries_total",
+            "counter",
+            "Iceberg registration attempts that failed and were retried",
+            self.iceberg_registration_retries.load(Ordering::Relaxed),
+        );
+        metric(
             "collect_orphan_files_swept_total",
             "counter",
             "Orphaned parquet files from previous runs queued for upload",
             self.orphan_files_swept.load(Ordering::Relaxed),
+        );
+        metric(
+            "collect_silver_positions_total",
+            "counter",
+            "Rows decoded into the silver positions table by inline parsing",
+            self.silver_positions.load(Ordering::Relaxed),
+        );
+        metric(
+            "collect_silver_statics_total",
+            "counter",
+            "Rows decoded into the silver statics table by inline parsing",
+            self.silver_statics.load(Ordering::Relaxed),
+        );
+        metric(
+            "collect_silver_meteo_total",
+            "counter",
+            "Rows decoded into the silver meteo table by inline parsing",
+            self.silver_meteo.load(Ordering::Relaxed),
+        );
+        metric(
+            "collect_silver_binary_total",
+            "counter",
+            "Rows decoded into the silver binary table by inline parsing",
+            self.silver_binary.load(Ordering::Relaxed),
+        );
+        metric(
+            "collect_silver_atons_total",
+            "counter",
+            "Rows decoded into the silver atons table by inline parsing",
+            self.silver_atons.load(Ordering::Relaxed),
+        );
+        metric(
+            "collect_silver_other_total",
+            "counter",
+            "Rows decoded into the silver other table by inline parsing",
+            self.silver_other.load(Ordering::Relaxed),
+        );
+        metric(
+            "collect_silver_incomplete_total",
+            "counter",
+            "Multi-part fragments without a partner seen by inline parsing",
+            self.silver_incomplete.load(Ordering::Relaxed),
+        );
+        metric(
+            "collect_silver_failed_total",
+            "counter",
+            "Payloads rejected by the inline parser",
+            self.silver_failed.load(Ordering::Relaxed),
+        );
+        metric(
+            "collect_silver_deduped_total",
+            "counter",
+            "Duplicate rows suppressed by inline parsing dedup",
+            self.silver_deduped.load(Ordering::Relaxed),
+        );
+        metric(
+            "collect_silver_commits_succeeded_total",
+            "counter",
+            "Bronze batches successfully decoded into silver",
+            self.silver_commits_succeeded.load(Ordering::Relaxed),
+        );
+        metric(
+            "collect_silver_commits_failed_total",
+            "counter",
+            "Bronze batches whose silver commit failed (bronze unaffected)",
+            self.silver_commits_failed.load(Ordering::Relaxed),
         );
         metric(
             "collect_last_row_unix_ms",

@@ -1315,6 +1315,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "collect-core",
+ "collect-silver",
  "futures-util",
  "serde",
  "serde_json",
@@ -1364,6 +1365,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "collect-core",
+ "collect-silver",
  "crossterm",
  "futures-util",
  "parquet",
@@ -1386,6 +1388,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "collect-core",
+ "collect-silver",
  "futures-util",
  "parquet",
  "rdkafka",
@@ -1431,6 +1434,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "collect-silver"
+version = "0.1.0"
+dependencies = [
+ "ais-parse",
+ "aisstream-parse",
+ "anyhow",
+ "arrow",
+ "async-trait",
+ "collect-core",
+ "iceberg",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "collect-socket"
 version = "0.1.0"
 dependencies = [
@@ -1438,6 +1456,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "collect-core",
+ "collect-silver",
  "serde",
  "tokio",
 ]

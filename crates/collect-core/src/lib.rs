@@ -38,6 +38,7 @@ pub mod dataset;
 pub mod iceberg;
 pub mod iceberg_commit_manifest;
 mod metrics;
+pub mod silver;
 pub mod state;
 
 pub use async_trait::async_trait;
@@ -300,6 +301,9 @@ pub struct IngestOptions {
     pub common: CommonOptions,
     pub s3: Option<S3Options>,
     pub s3_storage: Option<S3Storage>,
+    /// When set, each successfully-uploaded batch is registered as a row in
+    /// the Iceberg `raw` table (see `crate::iceberg::register_raw_upload`).
+    pub iceberg: Option<iceberg::IcebergHandle>,
     pub health_file: PathBuf,
     pub manage_health: bool,
     pub report_progress: bool,
@@ -321,6 +325,13 @@ pub struct IngestOptions {
     /// (e.g. for AIS multipart message reassembly with `AisConsolidator`).
     /// Cloned instances lose the transformer (stateful, not shared).
     pub line_transformer: Option<Box<dyn LineTransformer>>,
+
+    /// Optional inline silver parser (`--parser`). When set, every sealed
+    /// bronze batch is additionally decoded into the six typed silver tables
+    /// after the bronze Parquet file is durable on disk. Shared by `Arc`
+    /// across write workers (implementations are stateless per batch).
+    /// Cloned — unlike `line_transformer`, this is shareable.
+    pub silver: Option<Arc<dyn silver::SilverCommit>>,
 }
 
 // Manual Clone + Debug: skip line_transformer (stateful — not shareable or
@@ -329,9 +340,11 @@ impl Clone for IngestOptions {
     fn clone(&self) -> Self {
         IngestOptions {
             line_transformer: None,
+            silver: self.silver.clone(),
             common: self.common.clone(),
             s3: self.s3.clone(),
             s3_storage: self.s3_storage.clone(),
+            iceberg: self.iceberg.clone(),
             health_file: self.health_file.clone(),
             manage_health: self.manage_health,
             report_progress: self.report_progress,
@@ -349,6 +362,7 @@ impl std::fmt::Debug for IngestOptions {
             .field("common", &self.common)
             .field("s3", &self.s3)
             .field("s3_storage", &self.s3_storage)
+            .field("iceberg", &self.iceberg)
             .field("health_file", &self.health_file)
             .field("manage_health", &self.manage_health)
             .field("report_progress", &self.report_progress)
@@ -360,6 +374,7 @@ impl std::fmt::Debug for IngestOptions {
                 "line_transformer",
                 &self.line_transformer.as_ref().map(|_| "(set)"),
             )
+            .field("silver", &self.silver.as_ref().map(|s| s.describe()))
             .finish()
     }
 }
@@ -773,6 +788,7 @@ mod tests {
                 },
                 s3: None,
                 s3_storage: None,
+                iceberg: None,
                 health_file: dir.path().join("health"),
                 manage_health: false,
                 report_progress: false,
@@ -781,6 +797,7 @@ mod tests {
                 write_workers: None,
                 sweep_orphans: false,
                 line_transformer: None,
+                silver: None,
             },
         )
         .await?;
@@ -1016,6 +1033,7 @@ mod tests {
                 },
                 s3: None,
                 s3_storage: None,
+                iceberg: None,
                 health_file: dir.path().join("health"),
                 manage_health: false,
                 report_progress: false,
@@ -1024,6 +1042,7 @@ mod tests {
                 write_workers: None,
                 sweep_orphans: false,
                 line_transformer: None,
+                silver: None,
             },
         )
         .await?;
@@ -1058,6 +1077,7 @@ where
         common,
         s3,
         s3_storage,
+        iceberg,
         health_file,
         manage_health,
         report_progress,
@@ -1066,6 +1086,7 @@ where
         write_workers,
         sweep_orphans,
         mut line_transformer,
+        silver,
     } = options;
 
     if common.health_check {
@@ -1189,10 +1210,11 @@ where
         metrics.clone(),
         common.upload_concurrency,
         common.out_dir.clone(),
+        iceberg.clone(),
     );
     if let Some(upload_tx) = upload_tx.as_ref() {
         for orphan in startup_orphans {
-            if upload_tx.send(orphan).await.is_err() {
+            if upload_tx.send(orphan.into()).await.is_err() {
                 eprintln!("⚠️  Upload queue closed while adding startup recovery files");
                 break;
             }
@@ -1212,7 +1234,14 @@ where
         log_writes,
         write_workers,
         write_budget_bytes,
+        iceberg.is_some(),
+        silver.clone(),
+        metrics.clone(),
     );
+
+    if let Some(silver) = silver.as_ref() {
+        eprintln!("🔬 Inline silver parsing enabled: {}", silver.describe());
+    }
 
     if manage_health {
         update_health_status_async(&health_file, true).await?;
@@ -2202,14 +2231,20 @@ fn parquet_file_name() -> String {
 
 async fn upload_with_retry(
     storage: S3Storage,
-    path: PathBuf,
-    s3_key: String,
+    job: UploadJob,
     metrics: Arc<IngestMetrics>,
     out_dir: PathBuf,
+    iceberg: Option<iceberg::IcebergHandle>,
 ) {
-    let mut pending = VecDeque::from([(path, s3_key)]);
+    let mut pending = VecDeque::from([job]);
 
-    while let Some((path, s3_key)) = pending.pop_front() {
+    while let Some(UploadJob {
+        path,
+        s3_key,
+        source,
+        iceberg_batch,
+    }) = pending.pop_front()
+    {
         let claim = if storage.keeps_local() {
             None
         } else {
@@ -2244,6 +2279,10 @@ async fn upload_with_retry(
             continue;
         }
 
+        if let (Some(handle), Some(batch)) = (iceberg.as_ref(), iceberg_batch) {
+            register_raw_upload_with_retry(handle, batch, &source, &s3_key, &metrics).await;
+        }
+
         if storage.keeps_local() {
             continue;
         }
@@ -2259,7 +2298,7 @@ async fn upload_with_retry(
         .await;
 
         match cleanup {
-            Ok(Ok(files)) => pending.extend(files),
+            Ok(Ok(files)) => pending.extend(files.into_iter().map(UploadJob::from)),
             Ok(Err(error)) => eprintln!(
                 "⚠️  Failed to clean local partition directories after uploading {}: {error}",
                 path.display()
@@ -2338,6 +2377,51 @@ async fn upload_one_with_retry(
     }
 
     false
+}
+
+const ICEBERG_REGISTER_ATTEMPTS: u32 = 3;
+
+/// Register a successfully-uploaded batch with Iceberg, with a short bounded
+/// retry. This runs after the S3 upload has already succeeded and must never
+/// fail the upload itself: on exhaustion it logs and bumps a failure metric,
+/// leaving `collect-orchestrator --backfill` (or a manual pass) as the
+/// out-of-band backstop for anything missed.
+async fn register_raw_upload_with_retry(
+    handle: &iceberg::IcebergHandle,
+    batch: RecordBatch,
+    source: &str,
+    s3_key: &str,
+    metrics: &IngestMetrics,
+) {
+    for attempt in 1..=ICEBERG_REGISTER_ATTEMPTS {
+        match iceberg::register_raw_upload(handle, batch.clone(), source).await {
+            Ok(()) => {
+                metrics
+                    .iceberg_registrations_succeeded
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            Err(error) if attempt < ICEBERG_REGISTER_ATTEMPTS => {
+                metrics
+                    .iceberg_registration_retries
+                    .fetch_add(1, Ordering::Relaxed);
+                let backoff = Duration::from_secs(1_u64 << (attempt - 1));
+                eprintln!(
+                    "Iceberg registration attempt {attempt}/{ICEBERG_REGISTER_ATTEMPTS} failed for {s3_key}: {error:#}. Retrying in {}s...",
+                    backoff.as_secs()
+                );
+                tokio::time::sleep(backoff).await;
+            }
+            Err(error) => {
+                metrics
+                    .iceberg_registrations_failed
+                    .fetch_add(1, Ordering::Relaxed);
+                eprintln!(
+                    "⚠️  Iceberg registration failed for {s3_key} after {ICEBERG_REGISTER_ATTEMPTS} attempts: {error:#}"
+                );
+            }
+        }
+    }
 }
 
 struct UploadClaim {
@@ -2578,9 +2662,12 @@ async fn upload_orphaned_files(
         let storage = storage.clone();
         let metrics = metrics.clone();
         let out_dir = out_dir.clone();
+        let job = UploadJob::from((path, s3_key));
         uploads.spawn(async move {
             let _permit = permit;
-            upload_with_retry(storage, path, s3_key, metrics, out_dir).await;
+            // Orphan-recovered files have no in-memory batch, so they are
+            // never registered with Iceberg here (see `UploadJob` doc comment).
+            upload_with_retry(storage, job, metrics, out_dir, None).await;
         });
     }
 
@@ -2623,20 +2710,21 @@ fn spawn_upload_worker(
     metrics: Arc<IngestMetrics>,
     upload_concurrency: usize,
     out_dir: PathBuf,
+    iceberg: Option<iceberg::IcebergHandle>,
 ) -> (
-    Option<mpsc::Sender<(PathBuf, String)>>,
+    Option<mpsc::Sender<UploadJob>>,
     Option<tokio::task::JoinHandle<()>>,
 ) {
     let Some(s3_storage_worker) = s3_storage else {
         return (None, None);
     };
 
-    let (tx, mut rx) = mpsc::channel::<(PathBuf, String)>(DEFAULT_UPLOAD_QUEUE_CAPACITY);
+    let (tx, mut rx) = mpsc::channel::<UploadJob>(DEFAULT_UPLOAD_QUEUE_CAPACITY);
     let worker = tokio::spawn(async move {
         let semaphore = Arc::new(Semaphore::new(upload_concurrency));
         let mut uploads = JoinSet::new();
 
-        while let Some((path, s3_key)) = rx.recv().await {
+        while let Some(job) = rx.recv().await {
             let permit = match semaphore.clone().acquire_owned().await {
                 Ok(permit) => permit,
                 Err(_) => break,
@@ -2644,9 +2732,10 @@ fn spawn_upload_worker(
             let storage = s3_storage_worker.clone();
             let metrics = metrics.clone();
             let out_dir = out_dir.clone();
+            let iceberg = iceberg.clone();
             uploads.spawn(async move {
                 let _permit = permit;
-                upload_with_retry(storage, path, s3_key, metrics, out_dir).await;
+                upload_with_retry(storage, job, metrics, out_dir, iceberg).await;
             });
         }
 
@@ -2668,13 +2757,17 @@ struct WriteQueueHandle {
     budget_bytes: usize,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_write_worker(
     shutdown: Arc<AtomicBool>,
-    upload_tx: Option<mpsc::Sender<(PathBuf, String)>>,
+    upload_tx: Option<mpsc::Sender<UploadJob>>,
     durable_tx: mpsc::UnboundedSender<u64>,
     log_writes: bool,
     worker_limit: Option<usize>,
     budget_bytes: usize,
+    iceberg_enabled: bool,
+    silver: Option<Arc<dyn silver::SilverCommit>>,
+    metrics: Arc<IngestMetrics>,
 ) -> (
     Option<WriteQueueHandle>,
     Option<tokio::task::JoinHandle<Result<()>>>,
@@ -2693,6 +2786,8 @@ fn spawn_write_worker(
             let shutdown = shutdown.clone();
             let upload_tx = upload_tx.clone();
             let durable_tx = durable_tx.clone();
+            let silver = silver.clone();
+            let metrics = metrics.clone();
             workers.push(tokio::spawn(async move {
                 // Drain until the channel closes: a shutdown signal stops the
                 // reader, but queued batches must still reach disk. A write
@@ -2709,8 +2804,16 @@ fn spawn_write_worker(
                         break;
                     };
 
-                    if let Err(error) =
-                        write_batch_job(job, upload_tx.as_ref(), &durable_tx, log_writes).await
+                    if let Err(error) = write_batch_job(
+                        job,
+                        upload_tx.as_ref(),
+                        &durable_tx,
+                        log_writes,
+                        iceberg_enabled,
+                        silver.as_ref(),
+                        &metrics,
+                    )
+                    .await
                     {
                         shutdown.store(true, Ordering::SeqCst);
                         return Err(error);
@@ -2761,29 +2864,62 @@ struct WriteJob {
     out_dir: PathBuf,
     path: PathBuf,
     s3_key: String,
+    /// Source name, carried through to `UploadJob` for Iceberg registration.
+    source: String,
     batch: RecordBatch,
     compression_level: i32,
     /// Held while the batch occupies memory; released once written to disk.
     byte_permit: OwnedSemaphorePermit,
 }
 
+/// One file queued for S3 upload. `iceberg_batch` carries the sealed
+/// `[ts, payload]` batch that was written to `path`, so it can be
+/// registered with Iceberg immediately after the upload succeeds — it is
+/// `None` for orphan/reconciled files rediscovered from disk (no in-memory
+/// batch survives a restart), which are therefore not auto-registered.
+struct UploadJob {
+    path: PathBuf,
+    s3_key: String,
+    source: String,
+    iceberg_batch: Option<RecordBatch>,
+}
+
+impl From<(PathBuf, String)> for UploadJob {
+    fn from((path, s3_key): (PathBuf, String)) -> Self {
+        UploadJob {
+            path,
+            s3_key,
+            source: String::new(),
+            iceberg_batch: None,
+        }
+    }
+}
+
 async fn write_batch_job(
     job: WriteJob,
-    upload_tx: Option<&mpsc::Sender<(PathBuf, String)>>,
+    upload_tx: Option<&mpsc::Sender<UploadJob>>,
     durable_tx: &mpsc::UnboundedSender<u64>,
     log_writes: bool,
+    iceberg_enabled: bool,
+    silver: Option<&Arc<dyn silver::SilverCommit>>,
+    metrics: &IngestMetrics,
 ) -> Result<()> {
     let WriteJob {
         seq,
         out_dir,
         path,
         s3_key,
+        source,
         batch,
         compression_level,
         byte_permit,
     } = job;
     let schema = batch.schema();
     let batch_rows = batch.num_rows();
+    // Cheap: RecordBatch::clone() only clones the Arc-backed Arrow arrays.
+    // Taken before the batch is moved into the blocking write task below.
+    let iceberg_batch = iceberg_enabled.then(|| batch.clone());
+    let silver_batch = silver.is_some().then(|| batch.clone());
     let temp_path = path.with_file_name(format!(
         "{}.tmp",
         path.file_name()
@@ -2816,6 +2952,43 @@ async fn write_batch_job(
     // sources can advance their upstream progress markers (e.g. Kafka offsets).
     let _ = durable_tx.send(seq);
 
+    // Inline silver parsing runs after bronze durability (so upstream progress
+    // markers keep bronze-only semantics) and before the upload is queued.
+    // A silver failure never fails the bronze batch: the bronze upload
+    // proceeds and the orchestrator backfill stays the repair path.
+    if let (Some(silver), Some(silver_batch)) = (silver, silver_batch) {
+        match silver.commit_bronze_batch(&silver_batch, &source).await {
+            Ok(stats) => {
+                metrics.record_silver_stats(&stats);
+                metrics
+                    .silver_commits_succeeded
+                    .fetch_add(1, Ordering::Relaxed);
+                if log_writes && stats.rows_in > 0 {
+                    eprintln!(
+                        "🔬 Silver: {} in → {} decoded (pos={} stat={} met={} bin={} aton={} other={} incomplete={} failed={} deduped={})",
+                        stats.rows_in,
+                        stats.decoded_total(),
+                        stats.positions,
+                        stats.statics,
+                        stats.meteo,
+                        stats.binary,
+                        stats.atons,
+                        stats.other,
+                        stats.incomplete,
+                        stats.failed,
+                        stats.deduped,
+                    );
+                }
+            }
+            Err(error) => {
+                metrics
+                    .silver_commits_failed
+                    .fetch_add(1, Ordering::Relaxed);
+                eprintln!("⚠️  Silver commit failed for {}: {error:#}", path.display());
+            }
+        }
+    }
+
     if log_writes {
         eprintln!(
             "✅ Wrote {} rows to {} (queued for upload)",
@@ -2826,7 +2999,12 @@ async fn write_batch_job(
 
     if let Some(upload_tx) = upload_tx {
         upload_tx
-            .send((path, s3_key))
+            .send(UploadJob {
+                path,
+                s3_key,
+                source,
+                iceberg_batch,
+            })
             .await
             .context("Failed to queue upload task")?;
     }
@@ -2884,6 +3062,7 @@ async fn flush_batch(
             out_dir: root.to_path_buf(),
             path,
             s3_key,
+            source: key.source.clone(),
             batch,
             compression_level,
             byte_permit,

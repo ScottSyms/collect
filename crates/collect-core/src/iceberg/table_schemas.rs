@@ -10,6 +10,23 @@ fn optional(id: i32, name: &'static str, ty: PrimitiveType) -> Arc<NestedField> 
     Arc::new(NestedField::optional(id, name, ty.into()))
 }
 
+/// Schema for the `raw` table: one row per bronze Parquet file registered
+/// directly by a collector after a successful upload. Column order matches
+/// what `iceberg::commit_batches` expects the caller's `RecordBatch` to be
+/// in ([ts, source, payload]) — `ts` must stay column 0.
+pub fn raw_schema() -> Schema {
+    let fields: Vec<Arc<NestedField>> = vec![
+        required(1, "ts", PrimitiveType::Timestamptz),
+        required(2, "source", PrimitiveType::String),
+        required(3, "payload", PrimitiveType::String),
+    ];
+    Schema::builder()
+        .with_schema_id(1)
+        .with_fields(fields)
+        .build()
+        .expect("building raw schema")
+}
+
 pub fn positions_schema() -> Schema {
     let fields: Vec<Arc<NestedField>> = vec![
         required(1, "ts", PrimitiveType::Timestamptz),

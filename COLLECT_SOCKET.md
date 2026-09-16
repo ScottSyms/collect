@@ -62,6 +62,14 @@ cargo run -p collect-socket -- \
 
 See [AIS_PARSE.md](AIS_PARSE.md) for details on the consolidation pipeline.
 
+### Inline Parsing (`--parser`)
+
+| Flag | Env | Default | Description |
+|------|-----|---------|-------------|
+| `--parser` | `PARSER` | `none` | Decode lines into silver tables inline: `ais` (NMEA) or `aisstream` (JSON) |
+
+With `--iceberg-catalog-uri` set, each sealed bronze batch is committed to the six Iceberg tables; otherwise silver is written as Hive-partitioned Parquet siblings (`positions/`, `statics`, …) under `--output-dir` (time-only layout, no `source=` segment). Bronze is always written; silver failures never fail bronze. See [README.md](README.md#inline-silver-parsing).
+
 ### Common (from `CommonCliArgs`)
 
 | Flag | Env | Default | Description |
@@ -88,6 +96,20 @@ See [AIS_PARSE.md](AIS_PARSE.md) for details on the consolidation pipeline.
 | `--s3-secret-key` | `S3_SECRET_KEY` | — | Secret access key |
 | `--keep-local` | `KEEP_LOCAL` | false | Keep files after S3 upload |
 | `--s3-disable-tls` | `S3_DISABLE_TLS` | false | Use HTTP instead of HTTPS |
+
+### Iceberg (from `IcebergCliArgs`) — optional, direct raw registration
+
+Unset by default — no catalog connection is attempted unless `--iceberg-catalog-uri` is set. When set, each bronze Parquet file is registered as a row in a `raw` Iceberg table (`ts`, `source`, `payload`) immediately after its S3 upload succeeds, independent of `collect-orchestrator`. See [ORCHESTRATOR.md#relationship-to-direct-collector-registration](ORCHESTRATOR.md#relationship-to-direct-collector-registration).
+
+| Flag | Env | Default | Description |
+|------|-----|---------|-------------|
+| `--iceberg-catalog-uri` | `ICEBERG_CATALOG_URI` | — | Iceberg REST catalog URI (e.g. `http://lakekeeper:8181/catalog`); enables this feature when set |
+| `--iceberg-warehouse` | `ICEBERG_WAREHOUSE` | — | Iceberg warehouse location (required when the catalog URI is set) |
+| `--iceberg-namespace` | `ICEBERG_NAMESPACE` | `ais` | Iceberg namespace (database) |
+| `--iceberg-table-prefix` | `ICEBERG_TABLE_PREFIX` | — | Optional prefix added to the `raw` table name |
+| `--iceberg-token` | `ICEBERG_TOKEN` | — | Bearer token for Lakekeeper / REST catalog auth |
+
+Registration is best-effort: a short bounded retry, then a logged warning and a `collect_iceberg_registrations_failed_total` metric bump — it never fails or blocks the upload. Files recovered from a crash (orphaned uploads found on restart) are not registered, since no in-memory batch survives a restart; the same `--backfill`-style operator recovery documented for `collect-orchestrator` applies here too.
 
 ## Output
 

@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/collect-core",
+    "crates/collect-silver",
     "crates/collect-file",
     "crates/collect-socket",
     "crates/collect-kafka",

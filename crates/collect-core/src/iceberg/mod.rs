@@ -125,6 +125,10 @@ pub const TABLE_METEO: &str = "meteo";
 pub const TABLE_BINARY: &str = "binary";
 pub const TABLE_ATONS: &str = "atons";
 pub const TABLE_OTHER: &str = "other";
+/// Table collectors register bronze uploads into directly (see
+/// `register_raw_upload`), independent of `collect-orchestrator`'s six
+/// decoded tables above.
+pub const TABLE_RAW: &str = "raw";
 
 pub const ALL_TABLES: &[&str] = &[
     TABLE_POSITIONS,
@@ -369,4 +373,200 @@ pub async fn commit_batches(
         table_name
     );
     Ok(())
+}
+
+/// Resolved Iceberg catalog + table handle a collector holds for the
+/// lifetime of the process, used to register each successfully-uploaded
+/// bronze Parquet file as a row in the `raw` table.
+#[derive(Clone, Debug)]
+pub struct IcebergHandle {
+    pub catalog: Arc<dyn Catalog>,
+    pub table: iceberg::table::Table,
+    pub compression_level: i32,
+}
+
+/// Build the three-column `[ts, source, payload]` batch registered into
+/// `raw`, from the two-column `[ts, payload]` batch written to the bronze
+/// Parquet file. Column order matches `raw_schema()`'s field order. Pure and
+/// network-free so it's unit-testable on its own.
+fn build_raw_batch(
+    batch: &arrow::record_batch::RecordBatch,
+    source: &str,
+) -> Result<arrow::record_batch::RecordBatch> {
+    use arrow::array::StringArray;
+    use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
+
+    anyhow::ensure!(
+        batch.num_columns() >= 2,
+        "expected a [ts, payload] batch, got {} columns",
+        batch.num_columns()
+    );
+    let num_rows = batch.num_rows();
+    let ts_col = batch.column(0).clone();
+    let payload_col = batch.column(1).clone();
+    let source_col: Arc<dyn arrow::array::Array> =
+        Arc::new(StringArray::from(vec![source; num_rows]));
+
+    let raw_arrow_schema = Arc::new(ArrowSchema::new(vec![
+        Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+            false,
+        ),
+        Field::new("source", DataType::Utf8, false),
+        Field::new("payload", DataType::Utf8, false),
+    ]));
+    arrow::record_batch::RecordBatch::try_new(
+        raw_arrow_schema,
+        vec![ts_col, source_col, payload_col],
+    )
+    .context("building raw registration batch")
+}
+
+/// Register one successfully-uploaded bronze batch into the `raw` table.
+///
+/// `batch` is the same two-column `[ts, payload]` `RecordBatch` written to
+/// the bronze Parquet file (safe to pass a clone — this does not consume or
+/// affect the bronze write path). A `source` column is added so `raw` stays
+/// queryable across sources without inspecting each file's S3 key.
+pub async fn register_raw_upload(
+    handle: &IcebergHandle,
+    batch: arrow::record_batch::RecordBatch,
+    source: &str,
+) -> Result<()> {
+    let raw_batch = build_raw_batch(&batch, source)?;
+
+    commit_batches(
+        handle.catalog.as_ref(),
+        &handle.table,
+        vec![raw_batch],
+        handle.compression_level,
+        TABLE_RAW,
+    )
+    .await
+}
+
+/// Validate `args`, and — if `--iceberg-catalog-uri` is set — connect to the
+/// catalog and ensure the `raw` table exists, returning a handle ready to
+/// hand to `IngestOptions::iceberg`. Returns `None` when Iceberg output
+/// isn't configured (the collector's default, fully-inert state).
+pub async fn init_raw_handle(
+    args: &IcebergCliArgs,
+    partition_granularity: &str,
+    compression_level: i32,
+) -> Result<Option<IcebergHandle>> {
+    args.validate()?;
+    if !args.is_iceberg_mode() {
+        return Ok(None);
+    }
+
+    let config = IcebergConfig::from(args);
+    let catalog = open_catalog(&config).await?;
+    ensure_namespace(&catalog, &config).await?;
+
+    let schema = table_schemas::raw_schema();
+    let partition_spec = partition_spec_for(&schema, partition_granularity)?;
+    let table = ensure_table(&catalog, &config, TABLE_RAW, schema, partition_spec).await?;
+
+    Ok(Some(IcebergHandle {
+        catalog: Arc::new(catalog),
+        table,
+        compression_level,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{StringArray, TimestampMillisecondArray};
+    use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
+
+    #[test]
+    fn raw_schema_has_expected_fields_in_order() {
+        let schema = table_schemas::raw_schema();
+        let fields = schema.as_struct().fields();
+        let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["ts", "source", "payload"]);
+        assert_eq!(fields[0].id, 1);
+        assert_eq!(fields[1].id, 2);
+        assert_eq!(fields[2].id, 3);
+    }
+
+    #[test]
+    fn raw_schema_supports_day_partitioning() {
+        let schema = table_schemas::raw_schema();
+        let spec = partition_spec_for(&schema, "day").expect("day partitioning");
+        let built = spec.build().expect("build spec");
+        assert_eq!(built.fields().len(), 1);
+    }
+
+    fn bronze_batch(rows: &[(i64, &str)]) -> arrow::record_batch::RecordBatch {
+        let bronze_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("payload", DataType::Utf8, false),
+        ]));
+        let ts = TimestampMillisecondArray::from(rows.iter().map(|(ts, _)| *ts).collect::<Vec<_>>())
+            .with_timezone_opt(Some(Arc::from("UTC")));
+        let payload = StringArray::from(rows.iter().map(|(_, p)| *p).collect::<Vec<_>>());
+        arrow::record_batch::RecordBatch::try_new(bronze_schema, vec![Arc::new(ts), Arc::new(payload)])
+            .expect("build bronze batch")
+    }
+
+    #[test]
+    fn build_raw_batch_adds_source_column_in_schema_order() {
+        let batch = bronze_batch(&[
+            (1_700_000_000_000, "!AIVDM,1,1"),
+            (1_700_000_001_000, "!AIVDM,1,2"),
+        ]);
+
+        let raw = build_raw_batch(&batch, "norway").expect("build raw batch");
+
+        assert_eq!(raw.num_columns(), 3);
+        assert_eq!(raw.num_rows(), 2);
+        let raw_schema = raw.schema();
+        let names: Vec<&str> = raw_schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, vec!["ts", "source", "payload"]);
+
+        let source_col = raw
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("source column is Utf8");
+        assert_eq!(source_col.value(0), "norway");
+        assert_eq!(source_col.value(1), "norway");
+
+        let payload_col = raw
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("payload column is Utf8");
+        assert_eq!(payload_col.value(0), "!AIVDM,1,1");
+        assert_eq!(payload_col.value(1), "!AIVDM,1,2");
+
+        let ts_col = raw
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .expect("ts column stays a TimestampMillisecondArray");
+        assert_eq!(ts_col.value(0), 1_700_000_000_000);
+    }
+
+    #[test]
+    fn build_raw_batch_rejects_batches_with_too_few_columns() {
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+            false,
+        )]));
+        let ts = TimestampMillisecondArray::from(vec![1_700_000_000_000i64])
+            .with_timezone_opt(Some(Arc::from("UTC")));
+        let batch = arrow::record_batch::RecordBatch::try_new(schema, vec![Arc::new(ts)])
+            .expect("build single-column batch");
+
+        assert!(build_raw_batch(&batch, "norway").is_err());
+    }
 }
