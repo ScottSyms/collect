@@ -1097,6 +1097,13 @@ where
         bail!("upload concurrency must be greater than zero");
     }
 
+    if (s3_storage.is_some() || s3.is_some()) && silver.as_ref().is_some_and(|s| s.delete_local_after_commit()) {
+        bail!(
+            "--delete-after-iceberg cannot be combined with S3 upload; \
+             uploaded files are already deleted locally after upload"
+        );
+    }
+
     let s3_storage = match (s3_storage, s3) {
         (Some(storage), _) => Some(storage),
         (None, Some(s3_options)) => Some(s3_options.into_storage().await?),
@@ -2928,8 +2935,9 @@ async fn write_batch_job(
     ));
     let final_path = path.clone();
 
+    let write_out_dir = out_dir.clone();
     tokio::task::spawn_blocking(move || -> Result<()> {
-        let mut writer = open_writer(&out_dir, &temp_path, &schema, compression_level)?;
+        let mut writer = open_writer(&write_out_dir, &temp_path, &schema, compression_level)?;
         writer.write(&batch).context("writing batch to Parquet")?;
         writer.close().context("closing Parquet writer")?;
         fs::rename(&temp_path, &final_path).with_context(|| {
@@ -2956,9 +2964,11 @@ async fn write_batch_job(
     // markers keep bronze-only semantics) and before the upload is queued.
     // A silver failure never fails the bronze batch: the bronze upload
     // proceeds and the orchestrator backfill stays the repair path.
+    let mut silver_committed = false;
     if let (Some(silver), Some(silver_batch)) = (silver, silver_batch) {
         match silver.commit_bronze_batch(&silver_batch, &source).await {
             Ok(stats) => {
+                silver_committed = true;
                 metrics.record_silver_stats(&stats);
                 metrics
                     .silver_commits_succeeded
@@ -2989,9 +2999,39 @@ async fn write_batch_job(
         }
     }
 
+    // `--delete-after-iceberg`: the silver rows are committed, so the local
+    // bronze file is no longer needed. Only reached on a successful commit.
+    let mut deleted_local = false;
+    if silver_committed && silver.is_some_and(|s| s.delete_local_after_commit()) {
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {
+                deleted_local = true;
+                if let Some(parent) = path.parent().map(Path::to_path_buf) {
+                    let out_dir = out_dir.clone();
+                    // Best effort: prune now-empty partition directories.
+                    let _ = tokio::task::spawn_blocking(move || {
+                        reconcile_partition_directories(&out_dir, &parent)
+                    })
+                    .await;
+                }
+            }
+            Err(error) => eprintln!(
+                "⚠️  Failed to delete {} after Iceberg commit: {error}",
+                path.display()
+            ),
+        }
+    }
+
     if log_writes {
+        let disposition = if deleted_local {
+            "committed to Iceberg, local file deleted"
+        } else if upload_tx.is_some() {
+            "queued for upload"
+        } else {
+            "kept locally"
+        };
         eprintln!(
-            "✅ Wrote {} rows to {} (queued for upload)",
+            "✅ Wrote {} rows to {} ({disposition})",
             format_count(batch_rows),
             path.display()
         );

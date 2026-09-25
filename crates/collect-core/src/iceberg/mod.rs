@@ -6,6 +6,7 @@ use std::sync::Arc;
 use iceberg::spec::{PartitionSpecBuilder, Schema, Transform};
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
 
+pub mod sigv4;
 pub mod table_schemas;
 
 /// CLI args for Iceberg REST catalog output.
@@ -30,6 +31,12 @@ pub struct IcebergCliArgs {
     /// Bearer token for Lakekeeper / REST catalog authentication.
     #[arg(long, env = "ICEBERG_TOKEN")]
     pub iceberg_token: Option<String>,
+
+    /// Sign catalog requests with AWS SigV4 using the S3 credentials
+    /// (`S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_REGION`). Required by RustFS's
+    /// built-in Iceberg catalog (e.g. http://localhost:9000/iceberg).
+    #[arg(long, env = "ICEBERG_SIGV4")]
+    pub iceberg_sigv4: bool,
 }
 
 impl IcebergCliArgs {
@@ -55,6 +62,7 @@ pub struct IcebergConfig {
     pub namespace: String,
     pub table_prefix: Option<String>,
     pub token: Option<String>,
+    pub sigv4: bool,
 }
 
 impl From<&IcebergCliArgs> for IcebergConfig {
@@ -65,15 +73,22 @@ impl From<&IcebergCliArgs> for IcebergConfig {
             namespace: args.iceberg_namespace.clone(),
             table_prefix: args.iceberg_table_prefix.clone(),
             token: args.iceberg_token.clone(),
+            sigv4: args.iceberg_sigv4,
         }
     }
 }
 
 pub async fn open_catalog(config: &IcebergConfig) -> Result<impl Catalog> {
     let mut props: HashMap<String, String> = HashMap::new();
+    let catalog_uri = if config.sigv4 {
+        sigv4::signed_catalog_uri(&config.catalog_uri, sigv4::SigV4Credentials::from_env()?)
+            .await?
+    } else {
+        config.catalog_uri.clone()
+    };
     props.insert(
         iceberg_catalog_rest::REST_CATALOG_PROP_URI.to_string(),
-        config.catalog_uri.clone(),
+        catalog_uri,
     );
     props.insert(
         iceberg_catalog_rest::REST_CATALOG_PROP_WAREHOUSE.to_string(),
@@ -276,8 +291,15 @@ pub async fn commit_batches(
     let metadata = table.metadata();
     let iceberg_schema = metadata.current_schema();
     let location_gen = DefaultLocationGenerator::new(metadata.clone())?;
+    // The generator's counter restarts at 0 on every call, so without a
+    // per-commit component two commits into the same partition would write
+    // (and overwrite) the same object key.
     let file_name_gen = DefaultFileNameGenerator::new(
-        "part".to_string(),
+        format!(
+            "part-{:x}{:016x}",
+            chrono::Utc::now().timestamp_millis(),
+            rand::random::<u64>()
+        ),
         Some("iceberg".to_string()),
         DataFileFormat::Parquet,
     );

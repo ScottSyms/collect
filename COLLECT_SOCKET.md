@@ -108,6 +108,19 @@ Unset by default — no catalog connection is attempted unless `--iceberg-catalo
 | `--iceberg-namespace` | `ICEBERG_NAMESPACE` | `ais` | Iceberg namespace (database) |
 | `--iceberg-table-prefix` | `ICEBERG_TABLE_PREFIX` | — | Optional prefix added to the `raw` table name |
 | `--iceberg-token` | `ICEBERG_TOKEN` | — | Bearer token for Lakekeeper / REST catalog auth |
+| `--iceberg-sigv4` | `ICEBERG_SIGV4` | false | Sign catalog requests with AWS SigV4 using `S3_ACCESS_KEY` / `S3_SECRET_KEY` / `S3_REGION`; required by RustFS's built-in catalog |
+
+**RustFS catalog.** RustFS serves its Iceberg REST catalog at `<endpoint>/iceberg`, uses the bucket name as the warehouse, and rejects unsigned requests. Because the Rust REST client has no request-signing hook, `--iceberg-sigv4` starts a loopback proxy inside the process that signs each catalog call and forwards it (`collect-core/src/iceberg/sigv4.rs`). Example:
+
+```bash
+S3_ENDPOINT=http://localhost:9000 S3_ACCESS_KEY=rustfsadmin S3_SECRET_KEY=rustfsadmin \
+S3_REGION=us-east-1 S3_PATH_STYLE=true \
+cargo run -p collect-socket -- --tcp-host 153.44.253.27 --tcp-port 5631 --source norway-tcp \
+  --parser ais --iceberg-catalog-uri http://localhost:9000/iceberg \
+  --iceberg-warehouse ais --iceberg-sigv4
+```
+
+**`--delete-after-iceberg`** (env `DELETE_AFTER_ICEBERG`) deletes each local bronze Parquet file (and its empty partition directories) once the silver rows for that batch have committed to Iceberg. It requires `--parser` and `--iceberg-catalog-uri`, and is rejected together with `--s3-bucket` (S3 upload already deletes local files). Raw payloads are not kept anywhere afterwards, so rows that fail to decode are lost; a failed Iceberg commit keeps the file.
 
 Registration is best-effort: a short bounded retry, then a logged warning and a `collect_iceberg_registrations_failed_total` metric bump — it never fails or blocks the upload. Files recovered from a crash (orphaned uploads found on restart) are not registered, since no in-memory batch survives a restart; the same `--backfill`-style operator recovery documented for `collect-orchestrator` applies here too.
 

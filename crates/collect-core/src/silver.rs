@@ -87,6 +87,67 @@ pub struct ParserCliArgs {
     /// `--output-dir`. `none` (default) keeps bronze-only behavior.
     #[arg(long, env = "PARSER", default_value = "none")]
     pub parser: ParserKind,
+
+    /// Delete each local bronze Parquet file once its silver rows have been
+    /// committed to Iceberg. Requires `--parser` and `--iceberg-catalog-uri`,
+    /// and cannot be combined with S3 upload (which already deletes local
+    /// files). The raw bronze payloads are then not retained anywhere: rows
+    /// that fail to decode are counted in the log but lost. A failed Iceberg
+    /// commit keeps the file.
+    #[arg(long, env = "DELETE_AFTER_ICEBERG", value_parser = clap::builder::FalseyValueParser::new())]
+    pub delete_after_iceberg: bool,
+}
+
+impl ParserCliArgs {
+    /// Reject flag combinations that cannot work (`iceberg_mode` is whether
+    /// `--iceberg-catalog-uri` is set).
+    pub fn validate(&self, iceberg_mode: bool) -> anyhow::Result<()> {
+        if self.delete_after_iceberg {
+            anyhow::ensure!(
+                self.parser.is_enabled(),
+                "--delete-after-iceberg requires --parser (ais or aisstream)"
+            );
+            anyhow::ensure!(
+                iceberg_mode,
+                "--delete-after-iceberg requires --iceberg-catalog-uri"
+            );
+        }
+        Ok(())
+    }
+
+    /// Mark `silver` so the write worker deletes the local bronze file after
+    /// each successful commit, when `--delete-after-iceberg` is set.
+    pub fn wrap(&self, silver: Option<std::sync::Arc<dyn SilverCommit>>) -> Option<std::sync::Arc<dyn SilverCommit>> {
+        match silver {
+            Some(inner) if self.delete_after_iceberg => {
+                Some(std::sync::Arc::new(DeleteAfterCommit(inner)))
+            }
+            other => other,
+        }
+    }
+}
+
+/// Wrapper that asks the write worker to delete the local bronze file after a
+/// successful silver commit (`--delete-after-iceberg`).
+struct DeleteAfterCommit(std::sync::Arc<dyn SilverCommit>);
+
+#[async_trait::async_trait]
+impl SilverCommit for DeleteAfterCommit {
+    async fn commit_bronze_batch(
+        &self,
+        batch: &RecordBatch,
+        source: &str,
+    ) -> anyhow::Result<SilverStats> {
+        self.0.commit_bronze_batch(batch, source).await
+    }
+
+    fn describe(&self) -> String {
+        format!("{} (deleting local bronze after commit)", self.0.describe())
+    }
+
+    fn delete_local_after_commit(&self) -> bool {
+        true
+    }
 }
 
 /// Per-batch decode statistics, merged into [`crate::IngestMetrics`].
@@ -140,6 +201,12 @@ pub trait SilverCommit: Send + Sync {
 
     /// One-line description for the startup log (parser + target).
     fn describe(&self) -> String;
+
+    /// Whether the write worker should delete the local bronze file after a
+    /// successful [`commit_bronze_batch`](Self::commit_bronze_batch).
+    fn delete_local_after_commit(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

@@ -133,7 +133,7 @@ async fn main() -> Result<()> {
         None
     } else {
         collect_silver::init_silver(
-            args.parser.parser,
+            &args.parser,
             &args.iceberg,
             &common_options.out_dir,
             common_options.partition,

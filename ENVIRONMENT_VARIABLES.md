@@ -144,6 +144,13 @@ Each variable is the SCREAMING_SNAKE name of its flag unless noted.
 - `ICEBERG_TOKEN`: Bearer token for Lakekeeper / REST catalog authentication
   - Example: `ICEBERG_TOKEN=lk_demo_xxx`
 
+- `DELETE_AFTER_ICEBERG`: With `PARSER` and `ICEBERG_CATALOG_URI` set, delete each local bronze Parquet file after its silver rows commit to Iceberg (`--delete-after-iceberg`)
+  - Not allowed together with `S3_BUCKET`; raw payloads are not retained
+
+- `ICEBERG_SIGV4`: Sign REST catalog requests with AWS SigV4 (needed for RustFS's built-in catalog)
+  - Uses `S3_ACCESS_KEY`/`S3_SECRET_KEY` (or `AWS_*`) and `S3_REGION`; service name `s3`
+  - Example: `ICEBERG_SIGV4=true`
+
 These same five `ICEBERG_*` variables are also accepted directly by `collect-file`, `collect-socket`, `collect-kafka`, and `collect-aisstream`. When `ICEBERG_CATALOG_URI` (and `ICEBERG_WAREHOUSE`) is set on one of these binaries, it connects once at startup, ensures a `raw` table exists (`ts`, `source`, `payload` columns; partitioned at the same granularity as `PARTITION`), and registers each bronze Parquet file into it immediately after that file's S3 upload succeeds. This is independent of, and does not require, `collect-orchestrator` — see [ORCHESTRATOR.md](ORCHESTRATOR.md#relationship-to-direct-collector-registration) for how the two relate. Leaving `ICEBERG_CATALOG_URI` unset (the default) disables this entirely; no catalog connection is attempted.
 
 ### Inline Parsing Options (collectors, `--parser`)

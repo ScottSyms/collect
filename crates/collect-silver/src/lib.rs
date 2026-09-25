@@ -25,7 +25,7 @@ use collect_core::iceberg::{
     IcebergCliArgs, TABLE_ATONS, TABLE_BINARY, TABLE_METEO, TABLE_OTHER, TABLE_POSITIONS,
     TABLE_STATICS,
 };
-use collect_core::silver::{ParserKind, SilverCommit, SilverStats};
+use collect_core::silver::{ParserCliArgs, ParserKind, SilverCommit, SilverStats};
 use collect_core::PartitionGranularity;
 use iceberg::table::Table;
 use iceberg::Catalog;
@@ -677,6 +677,25 @@ impl SilverCommit for HiveSilver {
 /// The six Iceberg tables are ensured once here (not per batch); the Hive
 /// path needs no setup.
 pub async fn init_silver(
+    parser_args: &ParserCliArgs,
+    iceberg_args: &IcebergCliArgs,
+    out_dir: &Path,
+    partition: PartitionGranularity,
+    compression_level: i32,
+) -> Result<Option<Arc<dyn SilverCommit>>> {
+    parser_args.validate(iceberg_args.is_iceberg_mode())?;
+    let silver = init_silver_inner(
+        parser_args.parser,
+        iceberg_args,
+        out_dir,
+        partition,
+        compression_level,
+    )
+    .await?;
+    Ok(parser_args.wrap(silver))
+}
+
+async fn init_silver_inner(
     parser: ParserKind,
     iceberg_args: &IcebergCliArgs,
     out_dir: &Path,
