@@ -52,7 +52,7 @@ works.
 | `rot` | float64, nullable | rate of turn |
 | `altitude_m` | float64, nullable | SAR aircraft altitude |
 | `h3` | uint64 (local) / bigint (Iceberg) | H3 cell at resolution 10 (signed long in Iceberg; no unsigned integer types) |
-| `hilbert` | uint64 (local) / bigint (Iceberg) | Hilbert curve S2 cell id (signed long in Iceberg) |
+| `hilbert` | uint64 (local) / bigint (Iceberg) | Hilbert curve index of the position on a 31-bit-per-axis equirectangular lat/lon grid (~2 cm resolution); a spatial sort/clustering key, not an S2 cell id (signed long in Iceberg) |
 | `nav_status` | utf8 | e.g. `under way using engine` |
 | `high_accuracy` | boolean | position accuracy flag |
 | `raim` | boolean | |
