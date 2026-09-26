@@ -1606,14 +1606,6 @@ impl PartKey {
         }
     }
 
-    pub fn from_minute(source: &str, minute_id: u64) -> Self {
-        Self::from_timestamp(
-            source,
-            minute_id.saturating_mul(60_000) as i64,
-            PartitionGranularity::Minute,
-        )
-    }
-
     fn relative_dir(&self) -> String {
         match self.granularity {
             PartitionGranularity::Year => {
@@ -1973,19 +1965,6 @@ impl S3Storage {
         }
         writer.flush().await?;
         Ok(bytes_written)
-    }
-
-    /// Delete a single object by key. Deleting a key that does not exist is
-    /// treated as success by S3, so this is safe to call idempotently.
-    pub async fn delete_key(&self, key: &str) -> Result<()> {
-        self.client
-            .delete_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-            .with_context(|| format!("deleting s3://{}/{}", self.bucket, key))?;
-        Ok(())
     }
 
     /// Name of the bucket this handle points at.

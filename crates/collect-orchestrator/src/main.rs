@@ -181,7 +181,6 @@ async fn main() -> Result<()> {
         let ctx = Arc::new(worker::WorkerContext {
             pool: pool.clone(),
             s3_storages: storages,
-            s3_bucket,
             s3_prefix,
             iceberg_config,
             scratch_dir: args.scratch_dir,

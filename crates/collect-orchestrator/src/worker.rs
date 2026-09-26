@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use chrono::{Datelike, TimeZone, Timelike};
 use collect_core::iceberg::{
     commit_batches, ensure_namespace, ensure_table, open_catalog, partition_spec_for,
     IcebergConfig, TABLE_ATONS, TABLE_BINARY, TABLE_METEO, TABLE_OTHER, TABLE_POSITIONS,
@@ -20,7 +19,6 @@ use crate::decode::{decode_ais_file, decode_aisstream_file};
 pub struct WorkerContext {
     pub pool: PgPool,
     pub s3_storages: Arc<Vec<S3Storage>>,
-    pub s3_bucket: String,
     pub s3_prefix: String,
     pub iceberg_config: IcebergConfig,
     pub scratch_dir: Option<PathBuf>,
@@ -124,9 +122,7 @@ async fn process_one(row: db::QueueRow, ctx: Arc<WorkerContext>) -> Result<()> {
     let other_table = ensure_table(&catalog, &ctx.iceberg_config, TABLE_OTHER, table_schemas::other_schema(), partition_spec_for(&table_schemas::other_schema(), "day")?).await?;
 
     let catalog_ref: &dyn Catalog = &catalog;
-    // Use the per-parser iceberg writers' commit helpers via direct DataFileWriter
-    // For ais-parse we use ais_parse::output_iceberg::commit_table_batches, for aisstream similar.
-    // To keep unified, we write via generic commit helper duplicated here:
+    // Both parsers' batches commit through the shared collect-core helper.
     commit_batches(catalog_ref, &pos_table, batches.positions, ctx.compression_level, TABLE_POSITIONS).await?;
     commit_batches(catalog_ref, &stat_table, batches.statics, ctx.compression_level, TABLE_STATICS).await?;
     commit_batches(catalog_ref, &meteo_table, batches.meteo, ctx.compression_level, TABLE_METEO).await?;

@@ -100,16 +100,6 @@ pub async fn mark_dispatched(
     Ok(())
 }
 
-pub async fn reset_to_pending(pool: &PgPool, s3_key: &str) -> Result<()> {
-    sqlx::query(
-        "UPDATE parse_queue SET status='pending', dispatched_at=NULL, nomad_job_id=NULL, nomad_alloc_id=NULL, updated_at=now() WHERE s3_key=$1",
-    )
-    .bind(s3_key)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
 pub async fn mark_failed(pool: &PgPool, s3_key: &str, error: &str, max_attempts: i32, attempts: i32) -> Result<()> {
     let backoff_secs = (5u64.saturating_mul(1u64 << attempts.min(10))).min(3600);
     let jitter: u64 = rand::random::<u64>() % backoff_secs.max(1);

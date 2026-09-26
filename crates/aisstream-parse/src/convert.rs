@@ -158,7 +158,6 @@ pub struct AtonRow {
     pub raim: bool,
 }
 
-#[allow(dead_code)]
 pub enum Decoded {
     Position(PositionRow),
     Static(StaticRow),

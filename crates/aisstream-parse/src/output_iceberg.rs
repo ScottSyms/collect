@@ -893,7 +893,7 @@ fn batch_for_writer(
 /// Write `batches` as Parquet data files for `table` without touching the
 /// catalog. This is the slow part (projection, zstd, upload), so callers run it
 /// outside any commit lock; the result is registered with [`commit_data_files`].
-pub(crate) async fn write_table_batches(
+pub async fn write_table_batches(
     batches: Vec<RecordBatch>,
     table: &Table,
     table_name: &str,
@@ -979,7 +979,7 @@ pub(crate) async fn write_table_batches(
 
 /// Atomically append already-written `data_files` to `table` (a fast, catalog
 /// only step; callers serialise it per table).
-pub(crate) async fn commit_data_files(
+pub async fn commit_data_files(
     data_files: Vec<DataFile>,
     table: &Table,
     catalog: &dyn Catalog,

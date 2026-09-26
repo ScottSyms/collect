@@ -30,11 +30,7 @@ use output_iceberg::{
     StaticsWriter as IcebergStaticsWriter,
 };
 
-mod ais_stream;
-mod convert;
-mod output;
-mod output_iceberg;
-mod stats;
+use aisstream_parse::{ais_stream, convert, output, output_iceberg, stats};
 
 use convert::{decode_row, AtonRow, BinaryRow, Decoded, MeteoRow, PositionRow, StaticRow};
 use output::OtherRow;

@@ -17,7 +17,6 @@ pub struct AppState {
 
 #[derive(Deserialize)]
 pub struct CompletePayload {
-    pub s3_bucket: Option<String>,
     pub s3_key: String,
     pub duration_ms: Option<i64>,
     pub stats: Option<WorkerStats>,
@@ -39,7 +38,6 @@ pub struct WorkerStats {
 
 #[derive(Deserialize)]
 pub struct FailPayload {
-    pub s3_bucket: Option<String>,
     pub s3_key: String,
     pub error: Option<String>,
 }
@@ -59,8 +57,6 @@ fn check_auth(state: &AppState, headers: &axum::http::HeaderMap, for_callback: b
 pub struct FlatIngest {
     pub s3_bucket: Option<String>,
     pub s3_key: Option<String>,
-    pub source: Option<String>,
-    pub parser: Option<String>,
 }
 
 #[derive(Serialize)]
