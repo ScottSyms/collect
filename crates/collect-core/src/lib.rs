@@ -1935,8 +1935,8 @@ impl S3Storage {
     }
 
     /// Download an object to `local_path`, creating parent directories as needed.
-    pub async fn download_to_path(&self, key: &str, local_path: &Path) -> Result<()> {
-        let response = self
+    pub async fn download_to_path(&self, key: &str, local_path: &Path) -> Result<u64> {
+        let mut response = self
             .client
             .get_object()
             .bucket(&self.bucket)
@@ -1951,13 +1951,17 @@ impl S3Storage {
                 .with_context(|| format!("mkdir -p {}", parent.display()))?;
         }
 
-        let mut file = tokio::fs::File::create(local_path)
+        let file = tokio::fs::File::create(local_path)
             .await
             .with_context(|| format!("create {}", local_path.display()))?;
-        let mut reader = response.body.into_async_read();
-        tokio::io::copy(&mut reader, &mut file)
-            .await
-            .with_context(|| {
+        // Body chunks are small; coalesce them so each write to the blocking
+        // file pool is large instead of one round trip per chunk.
+        let mut writer = tokio::io::BufWriter::with_capacity(1024 * 1024, file);
+        let mut bytes_written: u64 = 0;
+        while let Some(chunk) = response.body.try_next().await.with_context(|| {
+            format!("read body of s3://{}/{}", self.bucket, key)
+        })? {
+            writer.write_all(&chunk).await.with_context(|| {
                 format!(
                     "copy s3://{}/{} to {}",
                     self.bucket,
@@ -1965,8 +1969,10 @@ impl S3Storage {
                     local_path.display()
                 )
             })?;
-        file.flush().await?;
-        Ok(())
+            bytes_written += chunk.len() as u64;
+        }
+        writer.flush().await?;
+        Ok(bytes_written)
     }
 
     /// Delete a single object by key. Deleting a key that does not exist is

@@ -1,9 +1,8 @@
 use anyhow::{bail, Context, Result};
 use arrow::array::{Array, StringArray, TimestampMillisecondArray};
 use chrono::TimeZone;
-use rand::Rng;
 use clap::Parser;
-use collect_core::dataset::{self, DatasetFile, PartitionKey};
+use collect_core::dataset::{self, DatasetFile, FileFeed, PartitionKey};
 use collect_core::iceberg_commit_manifest::CommitManifest;
 use collect_core::state;
 use collect_core::{apply_config_file, PartitionGranularity, S3ConnectionArgs, S3Storage};
@@ -737,7 +736,6 @@ async fn main() -> Result<()> {
                         break;
                     };
 
-                    let is_remote = matches!(work, PartitionWork::Remote(_));
                     let partition_label = partition_key.relative_dir_time_only();
                     if !quiet {
                         let file_count = match &work {
@@ -746,52 +744,24 @@ async fn main() -> Result<()> {
                         };
                         eprintln!("  starting {} ({} files) ...", partition_label, file_count);
                     }
-                    let partition_files = match work {
-                        PartitionWork::Local(files) => files,
+                    let (partition_files, progress) = match work {
+                        PartitionWork::Local(files) => (FileFeed::local(files), None),
                         PartitionWork::Remote(entries) => {
                             let scratch_root = input_scratch_root
                                 .as_ref()
-                                .expect("remote work implies input scratch dir");
-                            let mut result = None;
-                            for attempt in 1..=DOWNLOAD_MAX_ATTEMPTS {
-                                match dataset::download_s3_entries(
-                                    &input_storages,
-                                    entries.clone(),
-                                    scratch_root,
-                                    download_concurrency,
-                                )
-                                .await
-                                {
-                                    Ok(files) => {
-                                        result = Some(files);
-                                        break;
-                                    }
-                                    Err(error) => {
-                                        if attempt < DOWNLOAD_MAX_ATTEMPTS {
-                                            let base_secs = 5u64 * (1 << (attempt - 1));
-                                            let jitter = rand::thread_rng().gen_range(0..base_secs);
-                                            let backoff = std::time::Duration::from_secs(base_secs + jitter);
-                                            eprintln!(
-                                                "Download attempt {attempt}/{DOWNLOAD_MAX_ATTEMPTS} failed for partition, retrying in ~{}s...",
-                                                base_secs + jitter / 2
-                                            );
-                                            tokio::time::sleep(backoff).await;
-                                        } else {
-                                            CANCELLED.store(true, Ordering::Relaxed);
-                                            return Err(error).context("downloading input partition from S3");
-                                        }
-                                    }
-                                }
-                            }
-                            result.expect("loop runs at least once")
+                                .expect("remote work implies input scratch dir")
+                                .clone();
+                            let (feed, progress) = dataset::stream_s3_entries(
+                                input_storages.clone(),
+                                entries,
+                                scratch_root,
+                                download_concurrency,
+                                DOWNLOAD_MAX_ATTEMPTS,
+                            );
+                            (feed, Some(progress))
                         }
                     };
-
-                    let scratch_files: Vec<PathBuf> = if is_remote {
-                        partition_files.iter().map(|f| f.path.clone()).collect()
-                    } else {
-                        Vec::new()
-                    };
+                    let parse_started = std::time::Instant::now();
 
                     let output_root_for_task = output_root.clone();
                     let output_prefix_for_task = output_prefix.clone();
@@ -808,8 +778,14 @@ async fn main() -> Result<()> {
                     .await
                     .context("partition worker panicked")?;
 
-                    for scratch_file in &scratch_files {
-                        let _ = tokio::fs::remove_file(scratch_file).await;
+                    if let Some(progress) = &progress {
+                        if !quiet {
+                            eprintln!(
+                                "  {}: {}",
+                                partition_label,
+                                progress.summary(parse_started.elapsed())
+                            );
+                        }
                     }
 
                     let outputs = match result {
@@ -963,7 +939,6 @@ async fn main() -> Result<()> {
                         break;
                     };
 
-                    let is_remote = matches!(work, PartitionWork::Remote(_));
                     let partition_label = partition_key.relative_dir_time_only();
 
                     // Drop any source object already committed for this
@@ -1022,52 +997,24 @@ async fn main() -> Result<()> {
                         };
                         eprintln!("  starting {} ({} files) ...", partition_label, file_count);
                     }
-                    let partition_files = match work {
-                        PartitionWork::Local(files) => files,
+                    let (partition_files, progress) = match work {
+                        PartitionWork::Local(files) => (FileFeed::local(files), None),
                         PartitionWork::Remote(entries) => {
                             let scratch_root = input_scratch_root
                                 .as_ref()
-                                .expect("remote work implies input scratch dir");
-                            let mut result = None;
-                            for attempt in 1..=DOWNLOAD_MAX_ATTEMPTS {
-                                match dataset::download_s3_entries(
-                                    &input_storages,
-                                    entries.clone(),
-                                    scratch_root,
-                                    download_concurrency,
-                                )
-                                .await
-                                {
-                                    Ok(files) => {
-                                        result = Some(files);
-                                        break;
-                                    }
-                                    Err(error) => {
-                                        if attempt < DOWNLOAD_MAX_ATTEMPTS {
-                                            let base_secs = 5u64 * (1 << (attempt - 1));
-                                            let jitter = rand::thread_rng().gen_range(0..base_secs);
-                                            let backoff = std::time::Duration::from_secs(base_secs + jitter);
-                                            eprintln!(
-                                                "Download attempt {attempt}/{DOWNLOAD_MAX_ATTEMPTS} failed for partition, retrying in ~{}s...",
-                                                base_secs + jitter / 2
-                                            );
-                                            tokio::time::sleep(backoff).await;
-                                        } else {
-                                            CANCELLED.store(true, Ordering::Relaxed);
-                                            return Err(error).context("downloading input partition from S3");
-                                        }
-                                    }
-                                }
-                            }
-                            result.expect("loop runs at least once")
+                                .expect("remote work implies input scratch dir")
+                                .clone();
+                            let (feed, progress) = dataset::stream_s3_entries(
+                                input_storages.clone(),
+                                entries,
+                                scratch_root,
+                                download_concurrency,
+                                DOWNLOAD_MAX_ATTEMPTS,
+                            );
+                            (feed, Some(progress))
                         }
                     };
-
-                    let scratch_files: Vec<PathBuf> = if is_remote {
-                        partition_files.iter().map(|f| f.path.clone()).collect()
-                    } else {
-                        Vec::new()
-                    };
+                    let parse_started = std::time::Instant::now();
 
                     let result = tokio::task::spawn_blocking(move || {
                         process_partition_iceberg(partition_key, partition_files, batch_size)
@@ -1075,8 +1022,14 @@ async fn main() -> Result<()> {
                     .await
                     .context("partition worker panicked")?;
 
-                    for scratch_file in &scratch_files {
-                        let _ = tokio::fs::remove_file(scratch_file).await;
+                    if let Some(progress) = &progress {
+                        if !quiet {
+                            eprintln!(
+                                "  {}: {}",
+                                partition_label,
+                                progress.summary(parse_started.elapsed())
+                            );
+                        }
                     }
 
                     match result {
@@ -1220,7 +1173,7 @@ fn push_output(
 
 fn process_partition(
     partition_key: PartitionKey,
-    files: Vec<DatasetFile>,
+    files: FileFeed,
     output_root: PathBuf,
     batch_size: usize,
     compression_level: i32,
@@ -1250,7 +1203,9 @@ fn process_partition(
         atons: &mut atons,
         other: &mut other,
     };
-    for file in &files {
+    let remove_after = files.is_scratch();
+    for file in files {
+        let file = file.context("downloading input partition from S3")?;
         process_parquet_file(
             &file.path,
             &file.partition.source,
@@ -1260,6 +1215,9 @@ fn process_partition(
             &mut seen,
         )
         .with_context(|| format!("processing {}", file.path.display()))?;
+        if remove_after {
+            let _ = std::fs::remove_file(&file.path);
+        }
     }
     stats.partitions_processed += 1;
 
@@ -1564,6 +1522,7 @@ struct IcebergSink {
 impl IcebergSink {
     async fn commit(&self, batch: CommittableBatch) -> Result<()> {
         let _guard = self.commit_lock.lock().await;
+        let commit_started = std::time::Instant::now();
         let cat: &dyn Catalog = &*self.catalog;
         let level = self.compression_level;
         if !self.quiet {
@@ -1589,7 +1548,11 @@ impl IcebergSink {
                 )
             })?;
         if !self.quiet {
-            eprintln!("  Committed {} to Iceberg.", batch.partition_rel_dir);
+            eprintln!(
+                "  Committed {} to Iceberg in {:.1}s.",
+                batch.partition_rel_dir,
+                commit_started.elapsed().as_secs_f64()
+            );
         }
         Ok(())
     }
@@ -1597,7 +1560,7 @@ impl IcebergSink {
 
 fn process_partition_iceberg(
     _partition_key: PartitionKey,
-    files: Vec<DatasetFile>,
+    files: FileFeed,
     batch_size: usize,
 ) -> Result<(ParseStats, IcebergPartitionOutput)> {
     let mut stats = ParseStats::default();
@@ -1612,7 +1575,9 @@ fn process_partition_iceberg(
 
     let mut seen: HashSet<DedupKey> = HashSet::new();
 
-    for file in &files {
+    let remove_after = files.is_scratch();
+    for file in files {
+        let file = file.context("downloading input partition from S3")?;
         process_parquet_file(
             &file.path,
             &file.partition.source,
@@ -1622,6 +1587,9 @@ fn process_partition_iceberg(
             &mut seen,
         )
         .with_context(|| format!("processing {}", file.path.display()))?;
+        if remove_after {
+            let _ = std::fs::remove_file(&file.path);
+        }
     }
     stats.partitions_processed += 1;
 

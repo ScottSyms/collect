@@ -2,7 +2,12 @@ use crate::{PartitionGranularity, S3Storage};
 use anyhow::{Context, Result};
 use chrono::{Datelike, TimeZone, Utc};
 use futures_util::stream::{self, StreamExt};
+use rand::Rng;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 use walkdir::WalkDir;
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -548,57 +553,6 @@ pub async fn list_s3_parquet_entries(
     Ok(entries)
 }
 
-/// Download every matched S3 entry into `scratch_root`, preserving its relative
-/// Hive path, so the rest of the pipeline can treat it exactly like a local
-/// dataset. Each entry is fetched through `storages[entry.storage_index]`, so a
-/// single partition may draw files from several input buckets. Runs up to
-/// `concurrency` downloads at once.
-///
-/// The scratch filename is prefixed with the storage index so files that share
-/// a name across buckets cannot overwrite each other; they still live under the
-/// partition's `rel_dir`, keeping the caller's per-partition cleanup correct.
-pub async fn download_s3_entries(
-    storages: &[S3Storage],
-    entries: Vec<S3Entry>,
-    scratch_root: &Path,
-    concurrency: usize,
-) -> Result<Vec<DatasetFile>> {
-    let scratch_root = scratch_root.to_path_buf();
-    let mut files: Vec<DatasetFile> = stream::iter(entries)
-        .map(|entry| {
-            let storage = storages
-                .get(entry.storage_index)
-                .expect("entry storage_index within storages")
-                .clone();
-            let local_path = namespaced_scratch_path(&scratch_root, &entry);
-            async move {
-                storage
-                    .download_to_path(&entry.key, &local_path)
-                    .await
-                    .with_context(|| format!("downloading s3://{}", entry.key))?;
-                Ok::<_, anyhow::Error>(DatasetFile {
-                    partition: entry.partition,
-                    path: local_path,
-                    modified_ms: entry.modified_ms,
-                })
-            }
-        })
-        .buffer_unordered(concurrency.max(1))
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>>>()?;
-
-    files.sort_by(|a, b| {
-        a.partition
-            .sort_key()
-            .cmp(&b.partition.sort_key())
-            .then(a.path.cmp(&b.path))
-    });
-
-    Ok(files)
-}
-
 /// Group a partition-key-sorted list into contiguous runs sharing a key.
 ///
 /// The input MUST already be sorted by partition key — callers that concatenate
@@ -617,6 +571,183 @@ pub fn group_by_partition<T>(
         }
     }
     groups
+}
+
+/// Counters shared between a streaming download and its consumer, so a caller
+/// can tell whether a partition is download-bound (parser mostly blocked).
+#[derive(Default)]
+pub struct DownloadProgress {
+    /// Bytes fetched from S3 so far.
+    pub bytes: AtomicU64,
+    /// Nanoseconds the consumer spent blocked waiting for the next file.
+    pub wait_ns: AtomicU64,
+    /// Milliseconds from download start until the most recent file finished.
+    pub download_ms: AtomicU64,
+}
+
+impl DownloadProgress {
+    pub fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn wait(&self) -> Duration {
+        Duration::from_nanos(self.wait_ns.load(Ordering::Relaxed))
+    }
+
+    pub fn download_time(&self) -> Duration {
+        Duration::from_millis(self.download_ms.load(Ordering::Relaxed))
+    }
+
+    /// One-line report for a partition that took `total` wall-clock to parse.
+    /// A `waited` share near `total` means the run is download-bound.
+    pub fn summary(&self, total: Duration) -> String {
+        let mib = self.bytes() as f64 / (1024.0 * 1024.0);
+        let download_secs = self.download_time().as_secs_f64();
+        format!(
+            "downloaded {mib:.1} MiB in {download_secs:.1}s ({:.1} MiB/s); parser waited {:.1}s on downloads of {:.1}s total",
+            mib / download_secs.max(0.001),
+            self.wait().as_secs_f64(),
+            total.as_secs_f64(),
+        )
+    }
+}
+
+enum FeedSource {
+    Local(std::vec::IntoIter<DatasetFile>),
+    Remote {
+        rx: mpsc::Receiver<Result<DatasetFile>>,
+        progress: Arc<DownloadProgress>,
+    },
+}
+
+/// The files of one partition, yielded as they become available.
+///
+/// Local inputs are yielded immediately. Remote inputs arrive from a
+/// background download task, so parsing can start on the first file while the
+/// rest are still downloading. `next` blocks, so a remote feed must be consumed
+/// from a blocking thread (e.g. `spawn_blocking`), never directly on the async
+/// runtime.
+pub struct FileFeed {
+    source: FeedSource,
+}
+
+impl FileFeed {
+    pub fn local(files: Vec<DatasetFile>) -> Self {
+        FileFeed {
+            source: FeedSource::Local(files.into_iter()),
+        }
+    }
+
+    /// True when the yielded files are scratch copies the consumer should
+    /// delete once processed (downloaded from S3), false for the user's own
+    /// local input files.
+    pub fn is_scratch(&self) -> bool {
+        matches!(self.source, FeedSource::Remote { .. })
+    }
+}
+
+impl Iterator for FileFeed {
+    type Item = Result<DatasetFile>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match &mut self.source {
+            FeedSource::Local(files) => files.next().map(Ok),
+            FeedSource::Remote { rx, progress } => {
+                let waiting_since = Instant::now();
+                let item = rx.blocking_recv();
+                progress
+                    .wait_ns
+                    .fetch_add(waiting_since.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                item
+            }
+        }
+    }
+}
+
+/// Like [`download_s3_entries`], but hands each file to the consumer as soon as
+/// it lands instead of waiting for the whole partition.
+///
+/// Files are yielded in `entries` order (up to `concurrency` download in
+/// flight, out-of-order completions are held back) so first-wins dedup stays
+/// deterministic. The channel is small, so at most about `concurrency + 3`
+/// files sit on disk ahead of the parser. A failed download is retried up to
+/// `max_attempts` times with jittered exponential backoff; after that the error
+/// is delivered through the feed and the stream ends. Dropping the feed cancels
+/// the remaining downloads.
+pub fn stream_s3_entries(
+    storages: Arc<Vec<S3Storage>>,
+    entries: Vec<S3Entry>,
+    scratch_root: PathBuf,
+    concurrency: usize,
+    max_attempts: u32,
+) -> (FileFeed, Arc<DownloadProgress>) {
+    let progress = Arc::new(DownloadProgress::default());
+    let (tx, rx) = mpsc::channel::<Result<DatasetFile>>(2);
+    let task_progress = progress.clone();
+
+    tokio::spawn(async move {
+        let started = Instant::now();
+        let mut downloads = stream::iter(entries)
+            .map(|entry| {
+                let storage = storages
+                    .get(entry.storage_index)
+                    .expect("entry storage_index within storages")
+                    .clone();
+                let local_path = namespaced_scratch_path(&scratch_root, &entry);
+                let progress = task_progress.clone();
+                async move {
+                    let mut attempt = 1u32;
+                    let bytes = loop {
+                        match storage.download_to_path(&entry.key, &local_path).await {
+                            Ok(bytes) => break bytes,
+                            Err(error) if attempt < max_attempts => {
+                                let base_secs = 5u64 * (1 << (attempt - 1));
+                                let jitter = rand::thread_rng().gen_range(0..base_secs);
+                                let backoff = Duration::from_secs(base_secs + jitter);
+                                eprintln!(
+                                    "Download attempt {attempt}/{max_attempts} failed for s3://{}: {error:#}; retrying in ~{}s...",
+                                    entry.key,
+                                    backoff.as_secs()
+                                );
+                                tokio::time::sleep(backoff).await;
+                                attempt += 1;
+                            }
+                            Err(error) => {
+                                return Err(error)
+                                    .with_context(|| format!("downloading s3://{}", entry.key));
+                            }
+                        }
+                    };
+                    progress.bytes.fetch_add(bytes, Ordering::Relaxed);
+                    Ok::<_, anyhow::Error>(DatasetFile {
+                        partition: entry.partition,
+                        path: local_path,
+                        modified_ms: entry.modified_ms,
+                    })
+                }
+            })
+            .buffered(concurrency.max(1));
+
+        while let Some(result) = downloads.next().await {
+            task_progress
+                .download_ms
+                .store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+            let failed = result.is_err();
+            if tx.send(result).await.is_err() || failed {
+                break;
+            }
+        }
+    });
+
+    (
+        FileFeed {
+            source: FeedSource::Remote {
+                rx,
+                progress: progress.clone(),
+            },
+        },
+        progress,
+    )
 }
 
 /// `scratch_root/<rel_dir>/in<idx>-<filename>` for an entry, so same-named
