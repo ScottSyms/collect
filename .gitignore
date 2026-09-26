@@ -18,3 +18,7 @@ devenv.local.yaml
 /nomad/nomad-collect-prod
 NOMAD.pdf
 /nomad/nomad/
+
+# Incremental commit manifests / watermarks written by the parsers (run state)
+/ais-parse-state/
+/aisstream-parse-state/
