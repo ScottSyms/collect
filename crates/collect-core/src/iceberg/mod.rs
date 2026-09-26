@@ -145,15 +145,6 @@ pub const TABLE_OTHER: &str = "other";
 /// decoded tables above.
 pub const TABLE_RAW: &str = "raw";
 
-pub const ALL_TABLES: &[&str] = &[
-    TABLE_POSITIONS,
-    TABLE_STATICS,
-    TABLE_METEO,
-    TABLE_BINARY,
-    TABLE_ATONS,
-    TABLE_OTHER,
-];
-
 fn table_name(prefix: Option<&str>, base: &str) -> String {
     match prefix {
         Some(p) if !p.is_empty() => format!("{}_{}", p, base),

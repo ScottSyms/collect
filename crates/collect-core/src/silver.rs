@@ -212,7 +212,6 @@ pub trait SilverCommit: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::str::FromStr;
 
     #[test]
     fn parser_kind_parses_cli_names_and_aliases() {

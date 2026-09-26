@@ -7,7 +7,6 @@ edition.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
-serde.workspace = true
 tokio.workspace = true
 futures-util.workspace = true
 tokio-util.workspace = true

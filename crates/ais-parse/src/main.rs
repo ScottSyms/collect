@@ -28,11 +28,7 @@ use output_iceberg::{
     IcebergOtherWriter, IcebergPositionsWriter, IcebergStaticsWriter,
 };
 
-mod ais_bits;
-mod decode;
-mod output;
-mod output_iceberg;
-mod stats;
+use ais_parse::{decode, output, output_iceberg, stats};
 
 use decode::{decode_payload, AtonRow, BinaryRow, Decoded, MeteoRow, OtherRow, PositionRow, StaticRow};
 use output::{AtonWriter, BinaryWriter, MeteoWriter, OtherWriter, PositionsWriter, StaticsWriter};

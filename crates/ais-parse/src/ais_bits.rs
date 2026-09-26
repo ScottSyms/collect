@@ -88,7 +88,6 @@ impl Bits {
         self.bit_len
     }
 
-    #[allow(dead_code)] // paired with `len` to satisfy clippy::len_without_is_empty
     pub fn is_empty(&self) -> bool {
         self.bit_len == 0
     }
