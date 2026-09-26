@@ -906,8 +906,18 @@ pub(crate) async fn commit_batches_to_iceberg(
     let iceberg_schema = metadata.current_schema();
     let location_gen = DefaultLocationGenerator::new(metadata.clone())
         .context("creating location generator")?;
-    let file_name_gen =
-        DefaultFileNameGenerator::new("batch".to_string(), None, DataFileFormat::Parquet);
+    // The generator's counter restarts at 0 on every call, so without a
+    // per-commit component two commits into the same partition would write
+    // (and overwrite) the same object key.
+    let file_name_gen = DefaultFileNameGenerator::new(
+        format!(
+            "batch-{:x}{:016x}",
+            chrono::Utc::now().timestamp_millis(),
+            rand::random::<u64>()
+        ),
+        None,
+        DataFileFormat::Parquet,
+    );
 
     let level = ZstdLevel::try_new(compression_level).context("invalid zstd level")?;
     // Parquet's default row group is 1M rows, and the writer buffers a whole

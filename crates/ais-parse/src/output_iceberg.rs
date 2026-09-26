@@ -1006,8 +1006,15 @@ async fn write_batches_to_table(
     let iceberg_schema = metadata.current_schema();
     let schema = iceberg_schema.clone();
     let location_gen = DefaultLocationGenerator::new(metadata.clone())?;
+    // The generator's counter restarts at 0 on every call, so without a
+    // per-commit component two commits into the same partition would write
+    // (and overwrite) the same object key.
     let file_name_gen = DefaultFileNameGenerator::new(
-        "part".to_string(),
+        format!(
+            "part-{:x}{:016x}",
+            chrono::Utc::now().timestamp_millis(),
+            rand::random::<u64>()
+        ),
         Some("iceberg".to_string()),
         DataFileFormat::Parquet,
     );
