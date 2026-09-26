@@ -24,7 +24,7 @@ use collect_core::iceberg::{
     TABLE_BINARY, TABLE_METEO, TABLE_OTHER, TABLE_POSITIONS, TABLE_STATICS,
 };
 use output_iceberg::{
-    commit_batches_to_iceberg, AtonWriter as IcebergAtonWriter,
+    commit_data_files, write_table_batches, AtonWriter as IcebergAtonWriter,
     BinaryWriter as IcebergBinaryWriter, MeteoWriter as IcebergMeteoWriter,
     OtherWriter as IcebergOtherWriter, PositionsWriter as IcebergPositionsWriter,
     StaticsWriter as IcebergStaticsWriter,
@@ -916,6 +916,7 @@ async fn main() -> Result<()> {
                 compression_level: args.compression_level,
                 quiet,
                 commit_lock: tokio::sync::Mutex::new(()),
+                write_permits: Arc::new(tokio::sync::Semaphore::new(default_concurrency())),
             })
         };
         let mut workers = Vec::with_capacity(concurrency);
@@ -1502,9 +1503,12 @@ struct CommittableBatch {
 
 /// Shared Iceberg commit target for all partition workers.
 ///
-/// Commits are serialised behind `commit_lock`: concurrent fast-appends to the
-/// same table would race on the catalog's optimistic-concurrency check. Decode
-/// work stays parallel; only the write-and-commit step is exclusive.
+/// A commit has two phases. Writing the Parquet data files (projection, zstd,
+/// upload) is the slow part and runs unlocked: the six tables are written in
+/// parallel, and different workers' partitions overlap, bounded by
+/// `write_permits`. Only the catalog `fast_append` is serialised behind
+/// `commit_lock`, since concurrent appends to one table would race on the
+/// catalog's optimistic-concurrency check.
 struct IcebergSink {
     catalog: Arc<dyn Catalog>,
     positions: iceberg::table::Table,
@@ -1517,23 +1521,62 @@ struct IcebergSink {
     compression_level: i32,
     quiet: bool,
     commit_lock: tokio::sync::Mutex<()>,
+    write_permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl IcebergSink {
-    async fn commit(&self, batch: CommittableBatch) -> Result<()> {
-        let _guard = self.commit_lock.lock().await;
-        let commit_started = std::time::Instant::now();
-        let cat: &dyn Catalog = &*self.catalog;
+    /// Write one table's data files on its own task, holding a write permit so
+    /// concurrent workers don't oversubscribe the CPU with zstd.
+    fn spawn_write(
+        &self,
+        table: &iceberg::table::Table,
+        batches: Vec<RecordBatch>,
+        table_name: &'static str,
+    ) -> tokio::task::JoinHandle<Result<Vec<iceberg::spec::DataFile>>> {
+        let table = table.clone();
+        let permits = self.write_permits.clone();
         let level = self.compression_level;
+        tokio::spawn(async move {
+            let _permit = permits.acquire_owned().await?;
+            write_table_batches(batches, &table, table_name, level).await
+        })
+    }
+
+    async fn commit(&self, batch: CommittableBatch) -> Result<()> {
+        async fn joined(
+            handle: tokio::task::JoinHandle<Result<Vec<iceberg::spec::DataFile>>>,
+        ) -> Result<Vec<iceberg::spec::DataFile>> {
+            handle.await.context("Iceberg write task panicked")?
+        }
+
         if !self.quiet {
             eprintln!("  Committing {} to Iceberg ...", batch.partition_rel_dir);
         }
-        commit_batches_to_iceberg(batch.output.positions, &self.positions, cat, TABLE_POSITIONS, level).await?;
-        commit_batches_to_iceberg(batch.output.statics, &self.statics, cat, TABLE_STATICS, level).await?;
-        commit_batches_to_iceberg(batch.output.meteo, &self.meteo, cat, TABLE_METEO, level).await?;
-        commit_batches_to_iceberg(batch.output.binary, &self.binary, cat, TABLE_BINARY, level).await?;
-        commit_batches_to_iceberg(batch.output.atons, &self.atons, cat, TABLE_ATONS, level).await?;
-        commit_batches_to_iceberg(batch.output.others, &self.other, cat, TABLE_OTHER, level).await?;
+        let write_started = std::time::Instant::now();
+        let out = batch.output;
+        let (positions, statics, meteo, binary, atons, other) = tokio::try_join!(
+            joined(self.spawn_write(&self.positions, out.positions, TABLE_POSITIONS)),
+            joined(self.spawn_write(&self.statics, out.statics, TABLE_STATICS)),
+            joined(self.spawn_write(&self.meteo, out.meteo, TABLE_METEO)),
+            joined(self.spawn_write(&self.binary, out.binary, TABLE_BINARY)),
+            joined(self.spawn_write(&self.atons, out.atons, TABLE_ATONS)),
+            joined(self.spawn_write(&self.other, out.others, TABLE_OTHER)),
+        )?;
+        let write_secs = write_started.elapsed().as_secs_f64();
+
+        let catalog_started = std::time::Instant::now();
+        {
+            let _guard = self.commit_lock.lock().await;
+            let cat: &dyn Catalog = &*self.catalog;
+            commit_data_files(positions, &self.positions, cat, TABLE_POSITIONS).await?;
+            commit_data_files(statics, &self.statics, cat, TABLE_STATICS).await?;
+            commit_data_files(meteo, &self.meteo, cat, TABLE_METEO).await?;
+            commit_data_files(binary, &self.binary, cat, TABLE_BINARY).await?;
+            commit_data_files(atons, &self.atons, cat, TABLE_ATONS).await?;
+            commit_data_files(other, &self.other, cat, TABLE_OTHER).await?;
+        }
+        let catalog_secs = catalog_started.elapsed().as_secs_f64();
+
         // Record immediately, before the next partition's commit — this is
         // what makes a crash mid-run safe to retry instead of re-appending
         // already-committed rows (Iceberg writes here are pure append; see
@@ -1549,9 +1592,8 @@ impl IcebergSink {
             })?;
         if !self.quiet {
             eprintln!(
-                "  Committed {} to Iceberg in {:.1}s.",
-                batch.partition_rel_dir,
-                commit_started.elapsed().as_secs_f64()
+                "  Committed {} to Iceberg (write {write_secs:.1}s, catalog {catalog_secs:.1}s).",
+                batch.partition_rel_dir
             );
         }
         Ok(())

@@ -11,7 +11,7 @@ use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use chrono::{Datelike, TimeZone, Timelike};
 use iceberg::io::FileIO;
-use iceberg::spec::{DataFileFormat, PartitionKey};
+use iceberg::spec::{DataFile, DataFileFormat, PartitionKey};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
@@ -890,15 +890,17 @@ fn batch_for_writer(
     Ok(RecordBatch::try_new(Arc::new(target_schema.clone()), columns?)?)
 }
 
-pub(crate) async fn commit_batches_to_iceberg(
+/// Write `batches` as Parquet data files for `table` without touching the
+/// catalog. This is the slow part (projection, zstd, upload), so callers run it
+/// outside any commit lock; the result is registered with [`commit_data_files`].
+pub(crate) async fn write_table_batches(
     batches: Vec<RecordBatch>,
     table: &Table,
-    catalog: &dyn Catalog,
     table_name: &str,
     compression_level: i32,
-) -> Result<()> {
+) -> Result<Vec<DataFile>> {
     if batches.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let file_io: FileIO = table.file_io().clone();
@@ -972,6 +974,17 @@ pub(crate) async fn commit_batches_to_iceberg(
         .await
         .context("closing data file writer")?;
 
+    Ok(data_files)
+}
+
+/// Atomically append already-written `data_files` to `table` (a fast, catalog
+/// only step; callers serialise it per table).
+pub(crate) async fn commit_data_files(
+    data_files: Vec<DataFile>,
+    table: &Table,
+    catalog: &dyn Catalog,
+    table_name: &str,
+) -> Result<()> {
     if data_files.is_empty() {
         return Ok(());
     }
