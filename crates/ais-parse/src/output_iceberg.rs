@@ -1048,18 +1048,32 @@ async fn write_batches_to_table(
     Ok(data_files)
 }
 
-pub(crate) async fn commit_table_batches(
-    catalog: &dyn Catalog,
+/// Write `batches` as Parquet data files for `table` without touching the
+/// catalog. This is the slow part (projection, zstd, upload), so callers run it
+/// outside any commit lock; the result is registered with [`commit_data_files`].
+pub(crate) async fn write_table_batches(
     table: &Table,
     batches: Vec<RecordBatch>,
     compression_level: i32,
     table_name: &str,
-) -> Result<()> {
+) -> Result<Vec<DataFile>> {
     if batches.is_empty() {
+        return Ok(Vec::new());
+    }
+    write_batches_to_table(table, batches, compression_level, table_name).await
+}
+
+/// Atomically append already-written `data_files` to `table` (a fast, catalog
+/// only step; callers serialise it per table).
+pub(crate) async fn commit_data_files(
+    catalog: &dyn Catalog,
+    table: &Table,
+    data_files: Vec<DataFile>,
+    table_name: &str,
+) -> Result<()> {
+    if data_files.is_empty() {
         return Ok(());
     }
-
-    let data_files = write_batches_to_table(table, batches, compression_level, table_name).await?;
 
     eprintln!("    committing '{}' ...", table_name);
     let txn = Transaction::new(table);
