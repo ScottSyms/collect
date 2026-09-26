@@ -886,6 +886,62 @@ async fn main() -> Result<()> {
         let commit_manifest = commit_manifest
             .clone()
             .expect("commit_manifest is Some whenever Iceberg mode is active and not dry-run");
+
+        // Open the catalog and ensure tables up front so each worker can commit
+        // its partition as soon as it is decoded. Holding every decoded
+        // partition until the run finished made memory grow with total volume.
+        let sink = {
+            let config: IcebergConfig = (&args.iceberg).into();
+            let catalog = open_catalog(&config)
+                .await
+                .context("connecting to Iceberg catalog")?;
+            ensure_namespace(&catalog, &config).await?;
+
+            let partition_granularity = args.partition.as_str();
+            let positions = ensure_table(
+                &catalog, &config, TABLE_POSITIONS,
+                table_schemas::positions_schema(),
+                partition_spec_for(&table_schemas::positions_schema(), partition_granularity)?,
+            ).await?;
+            let statics = ensure_table(
+                &catalog, &config, TABLE_STATICS,
+                table_schemas::statics_schema(),
+                partition_spec_for(&table_schemas::statics_schema(), partition_granularity)?,
+            ).await?;
+            let meteo = ensure_table(
+                &catalog, &config, TABLE_METEO,
+                table_schemas::meteo_schema(),
+                partition_spec_for(&table_schemas::meteo_schema(), partition_granularity)?,
+            ).await?;
+            let binary = ensure_table(
+                &catalog, &config, TABLE_BINARY,
+                table_schemas::binary_schema(),
+                partition_spec_for(&table_schemas::binary_schema(), partition_granularity)?,
+            ).await?;
+            let atons = ensure_table(
+                &catalog, &config, TABLE_ATONS,
+                table_schemas::atons_schema(),
+                partition_spec_for(&table_schemas::atons_schema(), partition_granularity)?,
+            ).await?;
+            let other = ensure_table(
+                &catalog, &config, TABLE_OTHER,
+                table_schemas::other_schema(),
+                partition_spec_for(&table_schemas::other_schema(), partition_granularity)?,
+            ).await?;
+            Arc::new(IcebergSink {
+                catalog: Arc::new(catalog),
+                positions,
+                statics,
+                meteo,
+                binary,
+                atons,
+                other,
+                commit_manifest,
+                compression_level: args.compression_level,
+                quiet,
+                commit_lock: tokio::sync::Mutex::new(()),
+            })
+        };
         let mut workers = Vec::with_capacity(concurrency);
         for _ in 0..concurrency {
             let queue = queue.clone();
@@ -893,11 +949,10 @@ async fn main() -> Result<()> {
             let input_storages = input_storages.clone();
             let input_scratch_root = input_scratch_root.clone();
             let batch_size = args.batch_size;
-            let commit_manifest = commit_manifest.clone();
+            let sink = sink.clone();
 
             workers.push(tokio::spawn(async move {
                 let mut stats = ParseStats::default();
-                let mut partition_batches: Vec<CommittableBatch> = Vec::new();
 
                 loop {
                     if is_cancelled() {
@@ -915,7 +970,8 @@ async fn main() -> Result<()> {
                     // partition (a prior run, possibly interrupted) — this is
                     // the idempotency guard: Iceberg writes are pure append,
                     // so a re-committed object would duplicate rows forever.
-                    let already_committed = commit_manifest
+                    let already_committed = sink
+                        .commit_manifest
                         .load(&partition_label)
                         .await
                         .with_context(|| {
@@ -1040,11 +1096,19 @@ async fn main() -> Result<()> {
                                 );
                             }
                             stats.merge(&partition_stats);
-                            partition_batches.push(CommittableBatch {
-                                partition_rel_dir: partition_label.clone(),
-                                object_keys,
-                                output: batches,
-                            });
+                            // Commit now and drop the decoded batches before this
+                            // worker starts its next partition.
+                            if let Err(error) = sink
+                                .commit(CommittableBatch {
+                                    partition_rel_dir: partition_label.clone(),
+                                    object_keys,
+                                    output: batches,
+                                })
+                                .await
+                            {
+                                CANCELLED.store(true, Ordering::Relaxed);
+                                return Err(error);
+                            }
                         }
                         Err(error) => {
                             CANCELLED.store(true, Ordering::Relaxed);
@@ -1059,98 +1123,13 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                Ok::<_, anyhow::Error>((stats, partition_batches))
+                Ok::<_, anyhow::Error>(stats)
             }));
         }
 
-        // Open catalog and ensure tables before joining workers so each
-        // partition commits immediately as its worker finishes.
-        let (catalog, positions_table, statics_table, meteo_table, binary_table, atons_table, other_table) =
-            if first_error.is_none() {
-                let config: IcebergConfig = (&args.iceberg).into();
-                let catalog = open_catalog(&config)
-                    .await
-                    .context("connecting to Iceberg catalog")?;
-                ensure_namespace(&catalog, &config).await?;
-
-                let partition_granularity = args.partition.as_str();
-                let positions_table = ensure_table(
-                    &catalog, &config, TABLE_POSITIONS,
-                    table_schemas::positions_schema(),
-                    partition_spec_for(&table_schemas::positions_schema(), partition_granularity)?,
-                ).await?;
-                let statics_table = ensure_table(
-                    &catalog, &config, TABLE_STATICS,
-                    table_schemas::statics_schema(),
-                    partition_spec_for(&table_schemas::statics_schema(), partition_granularity)?,
-                ).await?;
-                let meteo_table = ensure_table(
-                    &catalog, &config, TABLE_METEO,
-                    table_schemas::meteo_schema(),
-                    partition_spec_for(&table_schemas::meteo_schema(), partition_granularity)?,
-                ).await?;
-                let binary_table = ensure_table(
-                    &catalog, &config, TABLE_BINARY,
-                    table_schemas::binary_schema(),
-                    partition_spec_for(&table_schemas::binary_schema(), partition_granularity)?,
-                ).await?;
-                let atons_table = ensure_table(
-                    &catalog, &config, TABLE_ATONS,
-                    table_schemas::atons_schema(),
-                    partition_spec_for(&table_schemas::atons_schema(), partition_granularity)?,
-                ).await?;
-                let other_table = ensure_table(
-                    &catalog, &config, TABLE_OTHER,
-                    table_schemas::other_schema(),
-                    partition_spec_for(&table_schemas::other_schema(), partition_granularity)?,
-                ).await?;
-                (Some(catalog), Some(positions_table), Some(statics_table), Some(meteo_table), Some(binary_table), Some(atons_table), Some(other_table))
-            } else {
-                (None, None, None, None, None, None, None)
-            };
-
-        let compression_level = args.compression_level;
-
         for worker in workers {
             match worker.await {
-                Ok(Ok((stats, batches))) => {
-                    total_stats.merge(&stats);
-                    if let (Some(ref cat), Some(ref pos), Some(ref stat), Some(ref met), Some(ref bin), Some(ref atn), Some(ref other)) = (catalog.as_ref(), positions_table.as_ref(), statics_table.as_ref(), meteo_table.as_ref(), binary_table.as_ref(), atons_table.as_ref(), other_table.as_ref()) {
-                        let cat: &dyn Catalog = &**cat;
-                        for batch in batches {
-                            if !quiet {
-                                eprintln!("  Committing {} to Iceberg ...", batch.partition_rel_dir);
-                            }
-                            commit_batches_to_iceberg(batch.output.positions, pos, cat, TABLE_POSITIONS, compression_level).await?;
-                            commit_batches_to_iceberg(batch.output.statics, stat, cat, TABLE_STATICS, compression_level).await?;
-                            commit_batches_to_iceberg(batch.output.meteo, met, cat, TABLE_METEO, compression_level).await?;
-                            commit_batches_to_iceberg(batch.output.binary, bin, cat, TABLE_BINARY, compression_level).await?;
-                            commit_batches_to_iceberg(batch.output.atons, atn, cat, TABLE_ATONS, compression_level).await?;
-                            commit_batches_to_iceberg(batch.output.others, other, cat, TABLE_OTHER, compression_level).await?;
-                            // Record immediately, before the next partition's commit —
-                            // this is what makes a crash mid-run safe to retry instead
-                            // of re-appending already-committed rows (Iceberg writes
-                            // here are pure append; see CommitManifest's doc comment).
-                            commit_manifest
-                                .record(&batch.partition_rel_dir, &batch.object_keys)
-                                .await
-                                .with_context(|| {
-                                    format!(
-                                        "recording Iceberg commit manifest for {}",
-                                        batch.partition_rel_dir
-                                    )
-                                })?;
-                            if !quiet {
-                                eprintln!("  Committed {} to Iceberg.", batch.partition_rel_dir);
-                            }
-                        }
-                    } else {
-                        eprintln!(
-                            "Warning: Iceberg catalog/tables unavailable (an earlier partition \
-                             failed); skipping commit for this worker's decoded partitions."
-                        );
-                    }
-                }
+                Ok(Ok(stats)) => total_stats.merge(&stats),
                 Ok(Err(error)) => {
                     if first_error.is_none() {
                         first_error = Some(error);
@@ -1561,6 +1540,59 @@ struct CommittableBatch {
     partition_rel_dir: String,
     object_keys: Vec<String>,
     output: IcebergPartitionOutput,
+}
+
+/// Shared Iceberg commit target for all partition workers.
+///
+/// Commits are serialised behind `commit_lock`: concurrent fast-appends to the
+/// same table would race on the catalog's optimistic-concurrency check. Decode
+/// work stays parallel; only the write-and-commit step is exclusive.
+struct IcebergSink {
+    catalog: Arc<dyn Catalog>,
+    positions: iceberg::table::Table,
+    statics: iceberg::table::Table,
+    meteo: iceberg::table::Table,
+    binary: iceberg::table::Table,
+    atons: iceberg::table::Table,
+    other: iceberg::table::Table,
+    commit_manifest: CommitManifest,
+    compression_level: i32,
+    quiet: bool,
+    commit_lock: tokio::sync::Mutex<()>,
+}
+
+impl IcebergSink {
+    async fn commit(&self, batch: CommittableBatch) -> Result<()> {
+        let _guard = self.commit_lock.lock().await;
+        let cat: &dyn Catalog = &*self.catalog;
+        let level = self.compression_level;
+        if !self.quiet {
+            eprintln!("  Committing {} to Iceberg ...", batch.partition_rel_dir);
+        }
+        commit_batches_to_iceberg(batch.output.positions, &self.positions, cat, TABLE_POSITIONS, level).await?;
+        commit_batches_to_iceberg(batch.output.statics, &self.statics, cat, TABLE_STATICS, level).await?;
+        commit_batches_to_iceberg(batch.output.meteo, &self.meteo, cat, TABLE_METEO, level).await?;
+        commit_batches_to_iceberg(batch.output.binary, &self.binary, cat, TABLE_BINARY, level).await?;
+        commit_batches_to_iceberg(batch.output.atons, &self.atons, cat, TABLE_ATONS, level).await?;
+        commit_batches_to_iceberg(batch.output.others, &self.other, cat, TABLE_OTHER, level).await?;
+        // Record immediately, before the next partition's commit — this is
+        // what makes a crash mid-run safe to retry instead of re-appending
+        // already-committed rows (Iceberg writes here are pure append; see
+        // CommitManifest's doc comment).
+        self.commit_manifest
+            .record(&batch.partition_rel_dir, &batch.object_keys)
+            .await
+            .with_context(|| {
+                format!(
+                    "recording Iceberg commit manifest for {}",
+                    batch.partition_rel_dir
+                )
+            })?;
+        if !self.quiet {
+            eprintln!("  Committed {} to Iceberg.", batch.partition_rel_dir);
+        }
+        Ok(())
+    }
 }
 
 fn process_partition_iceberg(

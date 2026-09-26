@@ -910,7 +910,12 @@ pub(crate) async fn commit_batches_to_iceberg(
         DefaultFileNameGenerator::new("batch".to_string(), None, DataFileFormat::Parquet);
 
     let level = ZstdLevel::try_new(compression_level).context("invalid zstd level")?;
+    // Parquet's default row group is 1M rows, and the writer buffers a whole
+    // row group (payload strings and bloom filters included) before flushing
+    // it. A smaller cap bounds per-writer memory for slightly more metadata.
+    const MAX_ROW_GROUP_ROWS: usize = 128 * 1024;
     let props = WriterProperties::builder()
+        .set_max_row_group_size(MAX_ROW_GROUP_ROWS)
         .set_compression(Compression::ZSTD(level))
         .set_column_bloom_filter_enabled(ColumnPath::from("mmsi"), true)
         .set_column_bloom_filter_enabled(ColumnPath::from("station"), true)
