@@ -15,6 +15,10 @@ collect-* (ingest)  →  ais-parse (decode)
 Input and output can each independently be a local directory or an S3/MinIO
 bucket.
 
+New to the project? [TUTORIAL.md](TUTORIAL.md) walks through local storage,
+partitioning, S3, and Iceberg in order; this page is a reference for this
+one binary.
+
 ## What it produces
 
 Sibling hive-partitioned datasets under the output root — `positions/` and
@@ -205,13 +209,16 @@ cargo run -p ais-parse -- --input-s3-bucket normalized-ais --output-s3-bucket si
 | `--concurrency` | cores, clamped `[1, 8]` | partitions decoded in parallel (env `CONCURRENCY`) |
 | `--download-concurrency` | `4` | concurrent S3 downloads per partition; lower if MinIO is overloaded (env `DOWNLOAD_CONCURRENCY`) |
 | `--output-prefix` | `ais` | output file name prefix (added before tree suffix, env `OUTPUT_PREFIX`) |
-| `--consolidate-ais` | *(off)* | reassemble fragmented NMEA sentences before decoding |
+| `--consolidate-ais` | *(off)* | reassemble fragmented NMEA sentences before decoding (env `CONSOLIDATE_AIS`) |
+| `--process-timestamps` | *(off)* | correct row timestamps from `$PGHP`/tag-block `c:` capture timestamps (env `PROCESS_TIMESTAMPS`) |
+| `--fail-fast` | *(off)* | abort the run on the first partition failure instead of skipping it and continuing (env `FAIL_FAST`) |
+| `--max-partition-failures` | `5` | abort the run once this many partitions have failed and been skipped (env `MAX_PARTITION_FAILURES`) |
 | `--dry-run` | *(off)* | list the partitions that would be processed and exit; never connects to the output (env `DRY_RUN`) — see [below](#dry-run) |
 | `--scratch-dir` | system tmpdir | directory for S3 download scratch and intermediate Parquet; use a tmpfs/ramdisk like `/dev/shm` for faster I/O (env `SCRATCH_DIR`) |
 | `--quiet` / `-q` | *(off)* | suppress routine progress lines; warnings/errors/summary still print (env `QUIET`) |
 | `--completions <shell>` | — | print shell completions to stdout and exit |
 | `--version` | — | prints `<crate version> (<git commit hash>)` |
-| `--config <file>` | — | load flag defaults from a flat TOML file (env `CONFIG_FILE`); CLI flags and pre-set env vars still win — see [README.md](README.md#common-cli-features) |
+| `--config <file>` | — | load flag defaults from a flat TOML file (env `CONFIG_FILE`); CLI flags and pre-set env vars still win — see [CLI_REFERENCE.md](CLI_REFERENCE.md#shared-across-all-six-binaries) |
 
 ### Dry run
 
@@ -308,9 +315,10 @@ This means:
 
 | Code | Meaning |
 |------|---------|
-| `0` | processed successfully (or `--dry-run` completed, even with 0 partitions found) |
-| `1` | error |
+| `0` | processed successfully (or `--dry-run` completed, even with 0 partitions found); also success when one or more partitions failed but stayed under `--max-partition-failures` — check the run summary's "partitions skipped" line |
+| `1` | unclassified error |
 | `2` | nothing to process — no matching input files, or (with `--incremental`) nothing new since the watermark |
+| `5` | too many partitions failed (`--max-partition-failures` exceeded), or one failed with `--fail-fast` set |
 | `deduped (dropped)` | duplicate rows suppressed by row-level dedup |
 
 A quick way to eyeball decoded output:

@@ -4,6 +4,10 @@ Recursively ingests plain text, gzip, bzip2, and zip files into
 Hive-partitioned Parquet with Zstd compression. Supports AIS multi-part
 message consolidation and `$PGHP` timestamp processing.
 
+New to the project? [TUTORIAL.md](TUTORIAL.md) walks through local storage,
+partitioning, S3, and Iceberg in order; this page is a reference for this
+one binary.
+
 ## Pipeline
 
 ```
@@ -56,27 +60,31 @@ cargo run -p collect-file -- \
 | `--quiet` / `-q` (env `QUIET`) | off | Suppress routine progress lines; warnings/errors still print |
 | `--completions <shell>` | — | Print shell completions to stdout and exit |
 | `--version` | — | Prints `<crate version> (<git commit hash>)` |
-| `--config <file>` (env `CONFIG_FILE`) | — | Load flag defaults from a flat TOML file; CLI flags and pre-set env vars still win — see [README.md](README.md#common-cli-features) |
+| `--config <file>` (env `CONFIG_FILE`) | — | Load flag defaults from a flat TOML file; CLI flags and pre-set env vars still win — see [CLI_REFERENCE.md](CLI_REFERENCE.md#shared-across-all-six-binaries) |
 
-Exits `2` (instead of `0`) when there were no unfinished input files to ingest — distinct from a hard error (`1`).
+Exits [`NOTHING_TO_DO`](CLI_REFERENCE.md#exit-codes) (`2`, instead of `0`) when there were no unfinished input files to ingest — distinct from a hard error (`1`).
 
 ### AIS Processing
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--consolidate-ais` | off | Reassemble multi-part NMEA fragments into single sentences |
-| `--process-timestamps` | off | Extract `$PGHP` and tag-block `c:` timestamps |
+| Flag | Env | Default | Description |
+|------|-----|---------|-------------|
+| `--consolidate-ais` | `CONSOLIDATE_AIS` | off | Reassemble multi-part NMEA fragments into single sentences |
+| `--process-timestamps` | `PROCESS_TIMESTAMPS` | off | Extract `$PGHP` and tag-block `c:` timestamps |
 
 ### Common + S3 + Iceberg
 
-Same as [collect-socket](COLLECT_SOCKET.md) — `CommonCliArgs`, `S3CliArgs`,
-and `IcebergCliArgs` (optional, direct `raw`-table registration on
-successful upload) are identical, plus the same `--parser` inline-parsing
-flag ([details](COLLECT_SOCKET.md#inline-parsing---parser)). In parallel
-mode the Iceberg catalog connection and table handle are established once
-in `main()` and shared (cloned) across all workers, the same way S3
-storage is shared — and likewise the silver handler is one shared `Arc`,
-with per-batch decode state kept on each worker's stack.
+Full flag/env tables: [CLI_REFERENCE.md](CLI_REFERENCE.md#common-to-the-four-collectors-commoncliargs)
+(`CommonCliArgs` — includes `--health-check`, `--metrics-addr`,
+`--data-drought-seconds`), [S3](CLI_REFERENCE.md#s3--collectors-s3cliargs-one-sink)
+(`S3CliArgs`), and [Iceberg](CLI_REFERENCE.md#iceberg-icebergcliargs-all-six-binaries)
+(`IcebergCliArgs` — optional, direct `raw`-table registration on
+successful upload), plus the same `--parser` inline-parsing flag
+([details](CLI_REFERENCE.md#inline-parsing-collectors-only-parsercliargs)).
+No reconnect flags — `collect-file` has no live upstream connection to
+lose. In parallel mode the Iceberg catalog connection and table handle are
+established once in `main()` and shared (cloned) across all workers, the
+same way S3 storage is shared — and likewise the silver handler is one
+shared `Arc`, with per-batch decode state kept on each worker's stack.
 
 ## Output
 

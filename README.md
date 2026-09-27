@@ -2,364 +2,67 @@
 
 ![screenshot](screenshot.png)
 
-A Rust project to collect positional data into Hive-partitioned Parquet files with Zstd compression — the bronze layer of a medallion pipeline for maritime (AIS) data. It provides:
+A Rust project to collect positional data into Hive-partitioned Parquet
+files with Zstd compression — the bronze layer of a medallion pipeline for
+maritime (AIS) data. Six binaries: four source-specific collectors and two
+data parsers, run either ad hoc or unattended (Nomad, containers).
 
-- **`collect-file`** — recursive file ingestion (plain, gzip, bzip2, zip)
-- **`collect-socket`** — TCP line-stream ingestion
-- **`collect-kafka`** — Kafka topic ingestion with at-least-once offset commits
-- **`collect-aisstream`** — aisstream.io WebSocket ingestion
-- **`ais-parse`** — silver layer: decode AIS sentences into typed Parquet (vessel positions, statics, meteo, binary, aids to navigation), via [ScottSyms/nmea-parser](https://github.com/ScottSyms/nmea-parser); local or S3 on both sides
-- **`aisstream-parse`** — silver layer: decode aisstream.io JSON from bronze Parquet into typed Parquet (vessel positions, statics, meteo, binary, aids to navigation); local or S3 on both sides
+**New here?** Start with [TUTORIAL.md](TUTORIAL.md) — a four-stage
+walkthrough from local storage to Apache Iceberg. This page is a map of the
+docs, not a guide.
 
-All collectors support optional remote storage (S3/MinIO/RustFS), and can optionally register each successfully-uploaded bronze file directly into an Iceberg `raw` table (`--iceberg-catalog-uri`).
+## The binaries
 
-## Features
-- **Multiple Input Sources**: Files, TCP streams, Kafka topics, and aisstream.io WebSocket
-- **Compressed Inputs**: Plain text, gzip, bzip2, and zip files
-- **AIS Consolidation**: On-ingest fragment reassembly via `--consolidate-ais`, tag-block/`$PGHP` timestamp processing via `--process-timestamps`, parallel partition processing, S3-to-S3, and watermark-based incremental scheduling (`--incremental`)
-- **AIS Decoding**: Typed Parquet output decoded from AIVDM sentences and AISStream JSON — positions (MMSI, lat/lon, SOG/COG), vessel statics (name, destination, dimensions), and Type 8 Binary Broadcast including full meteorological/hydrological data (wind, temperature, pressure, waves, currents, tides); unrecognized Type 8 subtypes retained as hex
-- **Hive Partitioning**: Automatic partitioning by source and selected time granularity
-- **Parquet Format**: Efficient columnar storage with Zstd compression, sorted by timestamp
-- **S3 Integration**: Upload to AWS S3 or S3-compatible storage (MinIO) with optional TLS
-- **Direct Iceberg Registration**: Each collector can register its own uploads into an Iceberg `raw` table on successful upload, with no separate orchestrator process required (`--iceberg-catalog-uri`)
-- **Inline Silver Parsing**: Each collector can additionally decode every ingested line into the six typed silver tables as it ingests (`--parser ais|aisstream`, off by default) — Iceberg commits when `--iceberg-catalog-uri` is set, otherwise Hive-partitioned Parquet siblings under the output dir
-- **Background Uploads**: Non-blocking S3 uploads to prevent data collection pauses
-- **At-Least-Once Delivery**: Graceful-shutdown flush, startup sweep of orphaned files, and Kafka offsets committed only after data is durable on disk
-- **Observability**: Optional Prometheus `/metrics` and HTTP `/healthz` endpoint per collector
-- **Docker Support**: Full Docker and docker-compose integration with health checks
-- **Environment Variables**: Complete environment variable support for containerized deployments
-- **Bounded Memory**: Byte-budgeted write pipeline; predictable footprint under backpressure
-- **Health Monitoring**: File-based health checks plus an HTTP endpoint for orchestration
-- **Pure Rust TLS**: Uses rustls for secure connections without OpenSSL dependencies
+- **[`collect-file`](COLLECT_FILE.md)** — recursive file ingestion (plain, gzip, bzip2, zip)
+- **[`collect-socket`](COLLECT_SOCKET.md)** — TCP line-stream ingestion
+- **[`collect-kafka`](COLLECT_KAFKA.md)** — Kafka topic ingestion with at-least-once offset commits
+- **[`collect-aisstream`](COLLECT_AISSTREAM.md)** — aisstream.io WebSocket ingestion
+- **[`ais-parse`](AIS_PARSE.md)** — silver layer: decode AIS sentences into typed Parquet (positions, statics, meteo, binary, aids to navigation), via [ScottSyms/nmea-parser](https://github.com/ScottSyms/nmea-parser); local or S3 on both sides
+- **[`aisstream-parse`](AISSTREAM_PARSE.md)** — silver layer: decode aisstream.io JSON from bronze Parquet into the same typed tables; local or S3 on both sides
 
-## Quick Start
+All four collectors support optional S3/MinIO/RustFS upload, and can
+register or fully decode into Apache Iceberg as they ingest — see
+[TUTORIAL.md](TUTORIAL.md) stages 3 and 4.
 
-### Using Environment Variables (Recommended for Docker)
+## Documentation map
 
-```bash
-# TCP stream with S3
-export TCP_HOST="153.44.253.27"
-export TCP_PORT="5631"
-export SOURCE="norway-tcp"
-export S3_BUCKET="maritime-data"
-export S3_REGION="us-west-2"
+| Doc | Covers |
+|---|---|
+| [TUTORIAL.md](TUTORIAL.md) | Staged walkthrough: local storage → partitioning → S3 → Iceberg |
+| [CLI_REFERENCE.md](CLI_REFERENCE.md) | Every flag/env var, exit codes, health signals, metrics, delivery guarantees |
+| [COLLECT_FILE.md](COLLECT_FILE.md) / [COLLECT_SOCKET.md](COLLECT_SOCKET.md) / [COLLECT_KAFKA.md](COLLECT_KAFKA.md) / [COLLECT_AISSTREAM.md](COLLECT_AISSTREAM.md) | Per-collector usage and behavior |
+| [AIS_PARSE.md](AIS_PARSE.md) / [AISSTREAM_PARSE.md](AISSTREAM_PARSE.md) | Decoded (silver) table schemas, incremental/idempotent decoding |
+| [DOCKER_HEALTH_CHECK.md](DOCKER_HEALTH_CHECK.md) | Health-check mechanics for containers |
+| [NOMAD.md](NOMAD.md) | Nomad job definitions and cluster deployment |
 
-cargo run -p collect-socket --
-```
-
-### Using Command Line Arguments
-
-```bash
-# File input
-cargo run -p collect-file -- --input data.txt --source mydata
-
-# TCP stream
-cargo run -p collect-socket -- --tcp-host 153.44.253.27 --tcp-port 5631 --source norway-tcp
-
-# Kafka topic
-cargo run -p collect-kafka -- --kafka-brokers broker:9092 --kafka-topic ais-raw --kafka-group-id collect
-
-# aisstream.io WebSocket (worldwide bounding box)
-cargo run -p collect-aisstream -- --api-key $AISSTREAM_API_KEY --bounding-boxes '[[[-90,-180],[90,180]]]'
-
-# File input with S3
-cargo run -p collect-file -- --input data.txt --source mydata --compression-level 1 --s3-bucket maritime-data
-
-# Consolidate AIS and decode in one step
-cargo run -p ais-parse -- --input-dir data --output-dir silver --partition day --consolidate-ais --process-timestamps
-
-# Decode into typed Parquet (positions, statics, meteo, binary, atons)
-cargo run -p ais-parse -- --input-dir data --output-dir silver --partition day
-```
-
-See [COLLECT_SOCKET.md](COLLECT_SOCKET.md), [COLLECT_FILE.md](COLLECT_FILE.md),
-[COLLECT_KAFKA.md](COLLECT_KAFKA.md), and [COLLECT_AISSTREAM.md](COLLECT_AISSTREAM.md)
-for the ingest binaries. See [AIS_PARSE.md](AIS_PARSE.md) for the decoded
-(silver) schemas and [AISSTREAM_PARSE.md](AISSTREAM_PARSE.md) for the
-AISStream JSON decoder. See [specifications.md](specifications.md) for detailed design documentation.
-
-`collect-file` auto-detects plain text, gzip, bzip2, and zip inputs. Zip archives are read entry-by-entry in archive order. Hidden dotfiles are skipped silently. `--concurrency` overrides the auto-selected file worker count.
-
-## Environment Variables
-
-Most command-line parameters can be configured using environment variables.
-
-| Environment Variable | CLI Argument | Description |
-|---------------------|--------------|-------------|
-| `INPUT_PATH` | `--input` | Input file or directory path |
-| `TCP_HOST` | `--tcp-host` | TCP host address |
-| `TCP_PORT` | `--tcp-port` | TCP port number |
-| `SOURCE` | `--source` | Logical source label |
-| `PARSER` | `--parser` | Inline silver parser: `none` (default), `ais`, or `aisstream` |
-| `PARTITION` | `--partition` | Partition granularity for ingest layout |
-| `CONSOLIDATE_AIS` | `--consolidate-ais` | Reassemble fragmented multi-part NMEA sentences before writing |
-| `PROCESS_TIMESTAMPS` | `--process-timestamps` | Use NMEA tag-block `c:<epoch>` or `$PGHP` capture timestamps to correct row timestamps |
-| `OUTPUT_DIR` | `--output-dir` | Output directory |
-| `MAX_ROWS` | `--max-rows` | Max rows per file |
-| `MAX_BATCH_BYTES` | `--max-batch-bytes` | Max payload bytes per Parquet file |
-| `COMPRESSION_LEVEL` | `--compression-level` | Zstd compression level for Parquet output |
-| `MAX_LINE_LENGTH` | `--max-line-length` | Max bytes per input line |
-| `UPLOAD_DRAIN_TIMEOUT_SECONDS` | `--upload-drain-timeout-seconds` | Max seconds to wait for upload drain |
-| `HEALTH_CHECK` | `--health-check` | Run health check |
-| `S3_BUCKET` | `--s3-bucket` | S3 bucket name |
-| `S3_ENDPOINT` | `--s3-endpoint` | S3 endpoint URL |
-| `S3_REGION` | `--s3-region` | S3 region |
-| `S3_ACCESS_KEY` | `--s3-access-key` | S3 access key |
-| `S3_SECRET_KEY` | `--s3-secret-key` | S3 secret key |
-| `KEEP_LOCAL` | `--keep-local` | Keep local files |
-| `S3_DISABLE_TLS` | `--s3-disable-tls` | Disable TLS for S3 (use HTTP) |
-
-See [ENVIRONMENT_VARIABLES.md](ENVIRONMENT_VARIABLES.md) for detailed usage examples.
-
-## Docker Usage
-
-### Using docker-compose (Recommended)
-
-```yaml
-version: '3.8'
-
-services:
-  data-ingest:
-    build: .
-    image: collect:latest
-    environment:
-      # TCP Stream
-      - TCP_HOST=153.44.253.27
-      - TCP_PORT=5631
-      - SOURCE=norway-tcp
-      
-      # S3 Configuration  
-      - S3_BUCKET=maritime-data
-      - S3_REGION=us-west-2
-      - S3_ACCESS_KEY=${AWS_ACCESS_KEY_ID}
-      - S3_SECRET_KEY=${AWS_SECRET_ACCESS_KEY}
-    volumes:
-      - ./output:/data
-    healthcheck:
-      test: ["CMD", "/usr/local/bin/collect-socket", "--health-check"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-```
-
-### Building the Docker Image
+## Docker
 
 ```bash
 docker build -t collect .
-```
-
-### Running with Docker
-
-```bash
-# TCP stream with environment variables
-docker run -d \
-  --name data-ingest \
-  -e TCP_HOST="153.44.253.27" \
-  -e TCP_PORT="5631" \
-  -e SOURCE="norway-tcp" \
+docker run -d --name data-ingest \
+  -e TCP_HOST=153.44.253.27 -e TCP_PORT=5631 -e SOURCE=norway-tcp \
   -v $(pwd)/output:/data \
   collect:latest
 ```
 
-The image defaults to `collect-socket`; use `--entrypoint /usr/local/bin/<binary>` (e.g. `collect-file`, `collect-kafka`, `collect-aisstream`, `ais-parse`, `aisstream-parse`) to run any other binary the image ships. See [NOMAD.md](NOMAD.md) for Nomad orchestration job definitions.
+The image defaults to `collect-socket`; use `--entrypoint /usr/local/bin/<binary>`
+(`collect-file`, `collect-kafka`, `collect-aisstream`, `ais-parse`,
+`aisstream-parse`) to run any other binary the image ships. A
+docker-compose example lives in [docker-compose.yml](docker-compose.yml);
+see [NOMAD.md](NOMAD.md) for cluster deployment instead.
 
-## Configuration Precedence
-
-Configuration values are applied in the following order (highest to lowest precedence):
-
-1. **Command-line arguments** (highest precedence)
-2. **Environment variables**
-3. **Default values** (lowest precedence)
-
-This allows you to set base configuration via environment variables and override specific values with command-line arguments when needed.
-
-## Common CLI Features
-
-Every binary in this workspace supports:
-
-- **`--version`** — prints the crate version plus the short git commit hash it was built from, e.g. `ais-parse 0.1.0 (baf9f52)`, so you can tell exactly which build is running in a container.
-- **`--completions <shell>`** — prints shell completions (bash, zsh, fish, elvish, powershell) to stdout and exits; wire it into your shell's completion directory, e.g. `collect-file --completions zsh > ~/.zfunc/_collect-file`.
-- **`--quiet` / `-q`** (env `QUIET`) — suppresses routine progress lines (scanning/listing/per-batch "processed N" chatter). Warnings, errors, and the final run summary still print.
-- **`--config <file>`** (env `CONFIG_FILE`) — loads flag defaults from a flat TOML file. Keys are the same `SCREAMING_SNAKE` names shown as `[env: ...]` in `--help` (e.g. `OUTPUT_DIR`, `S3_BUCKET`). A repeatable flag like `--input-s3-bucket` takes a TOML array (`INPUT_S3_BUCKET = ["a", "b"]`), which is joined the same way the comma-separated env var is. Precedence is **CLI flag > pre-set environment variable > config file > built-in default** — a config file only fills in values nothing else already provided. Nested tables aren't supported; keep the file flat. Example:
-
-  ```toml
-  # collect-file.toml
-  OUTPUT_DIR = "/data"
-  S3_BUCKET = "bronze"
-  S3_ENDPOINT = "http://minio:9000"
-  S3_DISABLE_TLS = true
-  ```
-
-  ```bash
-  collect-file --config collect-file.toml --input /path/to/data
-  ```
-
-`ais-parse` and `aisstream-parse` additionally support:
-
-- **`--dry-run`** (env `DRY_RUN`) — lists the partitions that would be processed and exits without decoding, writing, or connecting to the output target at all (so it can't trigger the S3 auto-create-bucket path). With `--incremental`, the dry run can't see the real watermark (that lives at the output it's intentionally not touching) and falls back to `--since`/full-dataset selection — a printed note says so.
-- **Exit code `2`** when there was nothing to process (no matching input files, or nothing new since the watermark) — distinct from `0` (processed successfully) and `1` (error). `collect-file` uses the same convention when it finds no unfinished input files. `--dry-run` always exits `0`, since successfully reporting "nothing to do" is a successful dry run.
-
-## Output Structure
-
-Data is organized in Hive-partitioned directories:
-
-```
-data/
-├── source=file-ingest/
-│   └── year=2025/
-│       └── month=01/
-│           └── day=15/
-│               └── part-20250115T000000000-000000.parquet
-└── source=norway-tcp/
-    └── year=2025/
-        └── month=01/
-            └── day=15/
-                └── part-20250115T000000000-000001.parquet
-```
-
-Use `--partition day|hour|minute|month|year` to choose how deep the time hierarchy goes. The default is `day`.
-
-## Health Checks
-
-The application includes health check functionality for container orchestration:
+## Building from source
 
 ```bash
-# Check health status
-./target/release/collect-socket --health-check
-
-# Or using environment variable
-HEALTH_CHECK=true ./target/release/collect-socket
-```
-
-Health status is tracked in `/tmp/collect-socket.health` for the socket binary and `/tmp/collect-file.health` for the file binary.
-
-When `--metrics-addr` is set (see below), an HTTP `GET /healthz` endpoint is also available — it returns `200` while the ingest loop's heartbeat is fresh and `503` once it goes stale (60-second window), so it detects hung loops rather than just live processes. Prefer it for Nomad/Kubernetes HTTP checks. See [DOCKER_HEALTH_CHECK.md](DOCKER_HEALTH_CHECK.md) for Docker-specific health check setup.
-
-## Observability
-
-Every collector can serve Prometheus metrics with `--metrics-addr` (or `METRICS_ADDR`):
-
-```bash
-cargo run -p collect-socket -- --tcp-host host --tcp-port 5631 --metrics-addr 0.0.0.0:9184
-curl localhost:9184/metrics
-curl localhost:9184/healthz
-```
-
-Exposed metrics (all labeled with `source="..."`):
-
-| Metric | Type | Meaning |
-|--------|------|---------|
-| `collect_rows_processed_total` | counter | Rows ingested since process start |
-| `collect_batches_sealed_total` | counter | Batches queued for Parquet writing |
-| `collect_batches_durable_total` | counter | Batches durably written to local disk |
-| `collect_buffered_bytes` | gauge | Payload bytes in the open batch |
-| `collect_uploads_succeeded_total` | counter | Completed S3 uploads |
-| `collect_uploads_failed_total` | counter | Uploads abandoned after retries |
-| `collect_upload_retries_total` | counter | Upload attempts retried |
-| `collect_orphan_files_swept_total` | counter | Orphaned files queued at startup |
-| `collect_last_row_unix_ms` | gauge | Timestamp of most recent row |
-| `collect_last_heartbeat_unix_ms` | gauge | Ingest loop heartbeat |
-
-## Delivery Guarantees
-
-- **Graceful shutdown**: on SIGTERM/SIGINT the collectors stop reading, flush the in-memory batch, finish every queued Parquet write, and drain pending S3 uploads for up to `UPLOAD_DRAIN_TIMEOUT_SECONDS` (default 60s). Give your orchestrator a stop grace period longer than that (`kill_timeout` in Nomad, `stop_grace_period` in Docker Compose).
-- **Orphan sweep**: at startup each collector scans its output directory for Parquet files a previous run wrote but never uploaded (crash, SIGKILL, expired drain window) and uploads them in the background. Skipped when `KEEP_LOCAL=true`, since uploaded files can't be distinguished from orphans.
-- **Local cleanup**: with `KEEP_LOCAL=false`, a successful upload deletes its local Parquet file and recursively removes empty Hive partition directories, stopping before the output root. Completed Parquet files encountered during cleanup are uploaded to their output-relative S3 keys first; failed, temporary, and unknown files are preserved with their directory hierarchy.
-- **Kafka offsets**: `collect-kafka` disables auto-commit and commits offsets only after the batch containing a message is durably written to local disk, giving at-least-once delivery — a crash replays at most a few messages instead of losing them.
-
-## S3 Integration
-
-Supports AWS S3 and S3-compatible storage (MinIO) with background uploads to prevent data collection pauses:
-
-### AWS S3
-```bash
-export S3_BUCKET="my-data-bucket"
-export S3_REGION="us-west-2"
-export S3_ACCESS_KEY="AKIAIOSFODNN7EXAMPLE"
-export S3_SECRET_KEY="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
-```
-
-### MinIO (with optional non-TLS mode)
-```bash
-export S3_BUCKET="data-lake"
-export S3_ENDPOINT="http://minio:9000"
-export S3_REGION="us-east-1"
-export S3_ACCESS_KEY="minioadmin"
-export S3_SECRET_KEY="minioadmin"
-export S3_DISABLE_TLS="true"  # Use HTTP instead of HTTPS
-```
-
-### Features
-- **Background Uploads**: Files are queued and uploaded asynchronously to prevent blocking data collection
-- **Error Handling**: Failed uploads preserve local files with detailed error reporting
-- **TLS Optional**: Can disable TLS for local development or internal networks
-- **Pure Rust**: Uses rustls for TLS, no OpenSSL dependencies
-
-See [S3_INTEGRATION.md](S3_INTEGRATION.md) for detailed configuration.
-
-## Inline Silver Parsing
-
-Every collector accepts `--parser none|ais|aisstream` (env `PARSER`, default `none`):
-
-```bash
-# NMEA feed straight into Iceberg silver (plus bronze as usual)
-collect-socket --tcp-host 153.44.253.27 --tcp-port 5631 --source norway-tcp \
-  --parser ais --iceberg-catalog-uri http://lakekeeper:8181/catalog \
-  --iceberg-warehouse s3://warehouse
-
-# aisstream.io feed into local Hive-Parquet silver siblings
-collect-aisstream --api-key $AISSTREAM_API_KEY --bounding-boxes '[[[-90,-180],[90,180]]]' \
-  --parser aisstream
-```
-
-Target selection reuses the existing sink flags — no new sink flag: with `--iceberg-catalog-uri` set, each sealed bronze batch is decoded and committed to the six Iceberg tables (`positions`, `statics`, `meteo`, `binary`, `atons`, `other`, same schemas/spec as the batch parsers); otherwise silver lands as Hive-partitioned Parquet siblings (`positions/year=…/…`, time-only, no `source=` segment) under `--output-dir`. Bronze output is unchanged and always written.
-
-Semantics: decode runs in the write worker after the bronze file is durable (Kafka offsets still commit on bronze durability); a silver failure is logged and counted (`collect_silver_commits_failed_total`) but never fails the bronze batch. Dedup is per-batch and orphan-recovered uploads have no silver — re-run `ais-parse`/`aisstream-parse` in batch mode against the bronze data to backfill any gaps. Per-table progress is exposed as `collect_silver_{positions,statics,meteo,binary,atons,other,incomplete,failed,deduped}_total`. Expect higher CPU and ~3–7× the memory bound when enabled (lower `MAX_BATCH_BYTES` if needed).
-
-## Building from Source
-
-```bash
-# Install Rust (if not already installed)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# Clone and build
 git clone <repository-url>
 cd collect
 cargo build --release --workspace
-
-# Run
 ./target/release/collect-file --help
-./target/release/collect-socket --help
 ```
 
-## Performance Tuning
+## Configuration precedence
 
-- **MAX_ROWS**: Cap rows per file when you want smaller Parquet chunks (default: flush on the partition boundary)
-- **MAX_BATCH_BYTES**: Cap buffered payload size per Parquet file (default: 64 MiB). The write pipeline holds at most ~4× this in flight, so worst-case ingest memory is roughly `5 × MAX_BATCH_BYTES` plus a small base.
-- **Compression**: Zstd level 5 by default; level 3 is ~40% faster for a few percent more size — a good trade for CPU-constrained live collectors
-- **collect-file `--concurrency`**: overrides the auto-selected worker count (defaults to ~1–2× cores; per-worker buffers scale down automatically)
-- **ais-parse / aisstream-parse `--concurrency`**: partitions are decoded in parallel (defaults to number of CPUs)
-- **Async Processing**: Leverages Tokio for high-performance async I/O
-- **Resource Limits**: Set appropriate memory limits in Docker for large datasets
-
-## Troubleshooting
-
-### Environment Variables Not Working
-- Ensure variable names match exactly (case-sensitive)
-- Check variable export in shell: `export VARIABLE_NAME=value`
-- Verify docker-compose environment syntax
-
-### Build Issues
-```bash
-# Update Rust toolchain
-rustup update
-
-# Clean and rebuild
-cargo clean && cargo build --release --workspace
-```
-
-### Connection Issues
-- **TCP**: Verify host/port accessibility: `telnet 153.44.253.27 5631`
-- **S3**: Validate credentials and bucket permissions
-
-See individual documentation files for detailed troubleshooting guides.
+For any flag: **command-line argument > environment variable > `--config`
+file > built-in default**. See [CLI_REFERENCE.md](CLI_REFERENCE.md#shared-across-all-six-binaries)
+for `--config`'s TOML format.

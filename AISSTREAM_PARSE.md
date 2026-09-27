@@ -5,6 +5,10 @@ and decodes the AISStream JSON payloads into typed, queryable Parquet
 datasets — positions, statics, meteo, binary, and aids to navigation —
 using the same schema conventions as [ais-parse](AIS_PARSE.md).
 
+New to the project? [TUTORIAL.md](TUTORIAL.md) walks through local storage,
+partitioning, S3, and Iceberg in order; this page is a reference for this
+one binary.
+
 ## Pipeline
 
 ```
@@ -157,9 +161,11 @@ Other Type 8 messages retained as generic header + hex payload:
 | `--dry-run` | `DRY_RUN` | off | List the partitions that would be processed and exit; never connects to the output (see [ais-parse's dry-run docs](AIS_PARSE.md#dry-run) — identical behavior) |
 | `--scratch-dir` | `SCRATCH_DIR` | system tmpdir | Directory for S3 download scratch and intermediate Parquet; use a tmpfs/ramdisk like `/dev/shm` for faster I/O |
 | `--quiet` / `-q` | `QUIET` | off | Suppress routine progress lines; warnings/errors/summary still print |
+| `--fail-fast` | `FAIL_FAST` | off | Abort the run on the first partition failure instead of skipping it and continuing |
+| `--max-partition-failures` | `MAX_PARTITION_FAILURES` | `5` | Abort the run once this many partitions have failed and been skipped |
 | `--completions <shell>` | — | — | Print shell completions to stdout and exit |
 | `--version` | — | — | Prints `<crate version> (<git commit hash>)` |
-| `--config <file>` | `CONFIG_FILE` | — | Load flag defaults from a flat TOML file; CLI flags and pre-set env vars still win — see [README.md](README.md#common-cli-features) |
+| `--config <file>` | `CONFIG_FILE` | — | Load flag defaults from a flat TOML file; CLI flags and pre-set env vars still win — see [CLI_REFERENCE.md](CLI_REFERENCE.md#shared-across-all-six-binaries) |
 
 S3 connection args: `--s3-endpoint`, `--s3-region`, `--s3-access-key`,
 `--s3-secret-key`, `--s3-disable-tls` (env vars: `S3_ENDPOINT`, etc.)
@@ -168,9 +174,10 @@ S3 connection args: `--s3-endpoint`, `--s3-region`, `--s3-access-key`,
 
 | Code | Meaning |
 |------|---------|
-| `0` | processed successfully (or `--dry-run` completed, even with 0 partitions found) |
-| `1` | error |
+| `0` | processed successfully (or `--dry-run` completed, even with 0 partitions found); also success when one or more partitions failed but stayed under `--max-partition-failures` — check the run summary's "partitions skipped" line |
+| `1` | unclassified error |
 | `2` | nothing to process — no matching input files, or (with `--incremental`) nothing new since the watermark |
+| `5` | too many partitions failed (`--max-partition-failures` exceeded), or one failed with `--fail-fast` set |
 
 ### Iceberg output (REST catalog)
 
