@@ -24,15 +24,11 @@ The `nomad-*-prod` files are the actual running deployment — static job specs 
    same partitions (see the --since 2 note in nomad-ais-parse-iceberg-prod)
 8. nomad-ais-parse-iceberg-prod         (batch/periodic, hourly; needs #6/#7 and the Iceberg warehouse from #2)
    nomad-aisstream-parse-iceberg-prod   (batch/periodic, hourly; needs #6/#7 and the Iceberg warehouse from #2)
-9. collect-orchestrator (+ parse-file)  (service + parameterized batch — event-driven Iceberg pipeline, alternative/supplement to step 8)
-   → 9a. collect-orchestrator-prod      (service — webhook → Postgres queue, needs #1 and #2)
-        one-time: nomad job run nomad/parse-file.nomad.hcl  (register parameterized batch job, no allocs yet)
-   → 9b. per-file dispatched allocs     (batch — one parse-file per bronze object, auto-scales with Nomad clients)
 ```
 
 `nomad-victoria-metrics-prod` (Prometheus-compatible metrics store, Consul service discovery) can run any time after Consul is up — nothing else depends on it.
 
-Steps 5-6 (the flat-Parquet silver pipeline, writing to `collections/ais`) and step 8 (the Iceberg periodic pipeline) are independent consumers of the same normalized/collected input — both can run indefinitely side by side; neither depends on the other. Step 9 (the orchestrator event-driven pipeline) is a per-file alternative to step 8 that writes the same six Iceberg tables (`positions`, `statics`, `meteo`, `binary`, `atons`, `other` in namespace `ais`); run it alongside or instead of the hourly periodic Iceberg jobs, but avoid running both orchestrator and periodic Iceberg jobs over the same partitions at the same time without deduplication (see `AIS_PARSE.md#idempotent-re-runs` and `ORCHESTRATOR.md#failure-semantics`).
+Steps 5-6 (the flat-Parquet silver pipeline, writing to `collections/ais`) and step 8 (the Iceberg periodic pipeline) are independent consumers of the same normalized/collected input — both can run indefinitely side by side; neither depends on the other. Re-running step 8 over a partition it already committed is safe (see `AIS_PARSE.md#idempotent-re-runs`).
 
 ### S3 buckets needed
 
@@ -80,31 +76,7 @@ Unlike the buckets above, **the Iceberg warehouse is not auto-created** — `ens
 
 ### Direct collector registration (optional, not enabled in the jobs above)
 
-`collect-socket`/`collect-aisstream`/`collect-kafka`/`collect-file` also accept the same `--iceberg-*` flags and, if given a catalog URI, register each of their own uploads as a row in a seventh table, `raw` (auto-created the same way as the six above), independent of steps 5-9. None of `nomad-collect-norway-prod`, `nomad-collect-duplicate-prod`, or `nomad-collect-aisstream-prod` currently set `ICEBERG_CATALOG_URI`, so this path is inactive in the deployment described here — enabling it on one of those jobs is an explicit opt-in (add the `ICEBERG_*` env vars from the table in [ENVIRONMENT_VARIABLES.md](ENVIRONMENT_VARIABLES.md#iceberg-output-options)), not a prerequisite for anything else in this pipeline. See [ORCHESTRATOR.md#relationship-to-direct-collector-registration](ORCHESTRATOR.md#relationship-to-direct-collector-registration). The same jobs also accept `PARSER=ais|aisstream` for inline silver decoding (same opt-in pattern; see [ORCHESTRATOR.md#relationship-to-inline-collector-parsing---parser](ORCHESTRATOR.md#relationship-to-inline-collector-parsing---parser) before enabling alongside the orchestrator).
-
-## Orchestrator Nomad dispatch (new)
-
-`collect-orchestrator` can run inline (default, `MAX_INFLIGHT` semaphore) or scatter work via Nomad (`ENABLE_DISPATCH=true`). In dispatch mode every bronze file becomes one `parse-file` parameterized batch alloc that runs `parse-file-worker`, commits to Iceberg, and callbacks to `POST /complete`.
-
-**Register once (no allocs until dispatched):**
-
-```bash
-nomad job run nomad/parse-file.nomad.hcl
-```
-
-**Vars (Nomad Variables, consolidated via `~/code/nomad/vars/prod.json`):**
-
-```bash
-nomad var put nomad/jobs/parse-file S3_ACCESS_KEY=... S3_SECRET_KEY=... CALLBACK_TOKEN=...
-# orchestrator uses same token (falls back to INGEST_TOKEN):
-# in nomad/collect-orchestrator-prod env: CALLBACK_TOKEN / INGEST_TOKEN, NOMAD_ADDR, NOMAD_TOKEN, NOMAD_JOB=parse-file
-```
-
-The job uses `artifact http://192.168.99.107:9000/binaries/parse-file-worker` + Consul templates for `CALLBACK_URL` (`collect-orchestrator` service) and `ICEBERG_CATALOG_URI` (`lakekeeper` service). Secrets (`S3_ACCESS_KEY/SECRET_KEY/CALLBACK_TOKEN`) come from `nomadVar "nomad/jobs/parse-file"` (`secrets/vars.env`). See `nomad/parse-file.nomad.hcl:32` and `ORCHESTRATOR.md#nomad-dispatch-mode-detail` for `DISPATCH_CONCURRENCY` (default 32) and `DISPATCH_RECLAIM_SECS` (default 1800). New Nomad clients automatically receive new `parse-file` allocs.
-
-**Toggle:** `nomad/collect-orchestrator-prod` defaults `ENABLE_DISPATCH=false` (inline). Set `ENABLE_DISPATCH=true` and redeploy to use dispatch; set back to `false` to roll back inline (reclaim converts `dispatched` rows after `DISPATCH_RECLAIM_SECS`).
-
-**Queue visibility:** `GET /queue?status=dispatched|pending|failed|dead_letter` and `GET /metrics` (`orchestrator_queue_depth{status="dispatched"}`). See `ORCHESTRATOR.md` for `POST /complete` / `POST /fail` payloads and failure semantics.
+`collect-socket`/`collect-aisstream`/`collect-kafka`/`collect-file` also accept the same `--iceberg-*` flags and, if given a catalog URI, register each of their own uploads as a row in a seventh table, `raw` (auto-created the same way as the six above), independent of steps 5-8. None of `nomad-collect-norway-prod`, `nomad-collect-duplicate-prod`, or `nomad-collect-aisstream-prod` currently set `ICEBERG_CATALOG_URI`, so this path is inactive in the deployment described here — enabling it on one of those jobs is an explicit opt-in (add the `ICEBERG_*` env vars from the table in [ENVIRONMENT_VARIABLES.md](ENVIRONMENT_VARIABLES.md#iceberg-output-options)), not a prerequisite for anything else in this pipeline. The same jobs also accept `PARSER=ais|aisstream` for inline silver decoding (same opt-in pattern).
 
 ## Prerequisites
 

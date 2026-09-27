@@ -50,7 +50,7 @@ Default partition granularity is `day`.
 - Local filesystem output.
 - S3 / S3-compatible output with optional TLS disabled.
 - S3 uploads run in the background so ingestion does not block on network I/O.
-- Optional direct Iceberg registration: when `--iceberg-catalog-uri` is set, each collector registers its own successfully-uploaded bronze file as a row in an Iceberg `raw` table (`ts`, `source`, `payload`) right after upload, independent of `collect-orchestrator`. Best-effort (bounded retry, then log + metric on failure); off by default. See [ORCHESTRATOR.md](ORCHESTRATOR.md#relationship-to-direct-collector-registration).
+- Optional direct Iceberg registration: when `--iceberg-catalog-uri` is set, each collector registers its own successfully-uploaded bronze file as a row in an Iceberg `raw` table (`ts`, `source`, `payload`) right after upload. Best-effort (bounded retry, then log + metric on failure); off by default.
 
 ### Health Checks
 
@@ -183,7 +183,7 @@ Shared ingest engine and common CLI types.
 - Optionally decode each sealed bronze batch into the six typed silver tables inline (`collect-silver`, via the `SilverCommit` trait; Iceberg commit when `--iceberg-catalog-uri` is set, otherwise Hive-Parquet siblings under the output root; failures counted, bronze unaffected).
 - Support cooperative shutdown from signal handlers and runtime monitors.
 - Optionally suppress write/upload chatter for UI-driven runs.
-- Optionally register each successfully-uploaded batch as a row in an Iceberg `raw` table (`crate::iceberg`), independent of `collect-orchestrator`.
+- Optionally register each successfully-uploaded batch as a row in an Iceberg `raw` table (`crate::iceberg`).
 
 ### Ingest Pipeline
 

@@ -2376,8 +2376,8 @@ const ICEBERG_REGISTER_ATTEMPTS: u32 = 3;
 /// Register a successfully-uploaded batch with Iceberg, with a short bounded
 /// retry. This runs after the S3 upload has already succeeded and must never
 /// fail the upload itself: on exhaustion it logs and bumps a failure metric,
-/// leaving `collect-orchestrator --backfill` (or a manual pass) as the
-/// out-of-band backstop for anything missed.
+/// leaving a re-run of `ais-parse`/`aisstream-parse` in batch mode (or a
+/// manual pass) as the out-of-band backstop for anything missed.
 async fn register_raw_upload_with_retry(
     handle: &iceberg::IcebergHandle,
     batch: RecordBatch,

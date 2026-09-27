@@ -99,7 +99,7 @@ With `--iceberg-catalog-uri` set, each sealed bronze batch is committed to the s
 
 ### Iceberg (from `IcebergCliArgs`) — optional, direct raw registration
 
-Unset by default — no catalog connection is attempted unless `--iceberg-catalog-uri` is set. When set, each bronze Parquet file is registered as a row in a `raw` Iceberg table (`ts`, `source`, `payload`) immediately after its S3 upload succeeds, independent of `collect-orchestrator`. See [ORCHESTRATOR.md#relationship-to-direct-collector-registration](ORCHESTRATOR.md#relationship-to-direct-collector-registration).
+Unset by default — no catalog connection is attempted unless `--iceberg-catalog-uri` is set. When set, each bronze Parquet file is registered as a row in a `raw` Iceberg table (`ts`, `source`, `payload`) immediately after its S3 upload succeeds.
 
 | Flag | Env | Default | Description |
 |------|-----|---------|-------------|
@@ -122,7 +122,7 @@ cargo run -p collect-socket -- --tcp-host 153.44.253.27 --tcp-port 5631 --source
 
 **`--delete-after-iceberg`** (env `DELETE_AFTER_ICEBERG`) deletes each local bronze Parquet file (and its empty partition directories) once the silver rows for that batch have committed to Iceberg. It requires `--parser` and `--iceberg-catalog-uri`, and is rejected together with `--s3-bucket` (S3 upload already deletes local files). Raw payloads are not kept anywhere afterwards, so rows that fail to decode are lost; a failed Iceberg commit keeps the file.
 
-Registration is best-effort: a short bounded retry, then a logged warning and a `collect_iceberg_registrations_failed_total` metric bump — it never fails or blocks the upload. Files recovered from a crash (orphaned uploads found on restart) are not registered, since no in-memory batch survives a restart; the same `--backfill`-style operator recovery documented for `collect-orchestrator` applies here too.
+Registration is best-effort: a short bounded retry, then a logged warning and a `collect_iceberg_registrations_failed_total` metric bump — it never fails or blocks the upload. Files recovered from a crash (orphaned uploads found on restart) are not registered, since no in-memory batch survives a restart; re-run `ais-parse`/`aisstream-parse` in batch mode against the bronze data to backfill any gaps.
 
 ## Output
 

@@ -151,7 +151,7 @@ Each variable is the SCREAMING_SNAKE name of its flag unless noted.
   - Uses `S3_ACCESS_KEY`/`S3_SECRET_KEY` (or `AWS_*`) and `S3_REGION`; service name `s3`
   - Example: `ICEBERG_SIGV4=true`
 
-These same five `ICEBERG_*` variables are also accepted directly by `collect-file`, `collect-socket`, `collect-kafka`, and `collect-aisstream`. When `ICEBERG_CATALOG_URI` (and `ICEBERG_WAREHOUSE`) is set on one of these binaries, it connects once at startup, ensures a `raw` table exists (`ts`, `source`, `payload` columns; partitioned at the same granularity as `PARTITION`), and registers each bronze Parquet file into it immediately after that file's S3 upload succeeds. This is independent of, and does not require, `collect-orchestrator` — see [ORCHESTRATOR.md](ORCHESTRATOR.md#relationship-to-direct-collector-registration) for how the two relate. Leaving `ICEBERG_CATALOG_URI` unset (the default) disables this entirely; no catalog connection is attempted.
+These same five `ICEBERG_*` variables are also accepted directly by `collect-file`, `collect-socket`, `collect-kafka`, and `collect-aisstream`. When `ICEBERG_CATALOG_URI` (and `ICEBERG_WAREHOUSE`) is set on one of these binaries, it connects once at startup, ensures a `raw` table exists (`ts`, `source`, `payload` columns; partitioned at the same granularity as `PARTITION`), and registers each bronze Parquet file into it immediately after that file's S3 upload succeeds. Leaving `ICEBERG_CATALOG_URI` unset (the default) disables this entirely; no catalog connection is attempted.
 
 ### Inline Parsing Options (collectors, `--parser`)
 
@@ -160,32 +160,7 @@ These same five `ICEBERG_*` variables are also accepted directly by `collect-fil
   - Default: `none` (bronze only; no decode cost, no extra output)
   - `ais` decodes NMEA/AIVDM sentences (same library as `ais-parse`); `aisstream` decodes aisstream.io JSON payloads (same library as `aisstream-parse`). Aliases `ais-parse`/`nmea` and `aisstream-parse`/`json` are also accepted.
   - Target reuses the existing sink flags: with `ICEBERG_CATALOG_URI` set, silver rows are committed to the six Iceberg tables (`positions`, `statics`, `meteo`, `binary`, `atons`, `other`; tables ensured once at startup); otherwise they are written as Hive-partitioned Parquet siblings (`positions/`, `statics`, …) under `OUTPUT_DIR` in the same time-only layout as the batch parsers.
-  - Bronze output is unchanged and always written. A silver failure never fails the bronze batch (logged + `collect_silver_commits_failed_total`); `collect-orchestrator --backfill` remains the repair path for gaps. See [README.md](README.md#inline-silver-parsing) and the per-table `collect_silver_*_total` metrics.
-
-### Orchestrator Options (collect-orchestrator)
-
-- `LISTEN_ADDR`: HTTP listen address for `collect-orchestrator` (`POST /ingest`, `POST /complete|/fail`, `GET /healthz|/metrics|/queue`)
-  - Default: `0.0.0.0:8080`
-- `DATABASE_URL`: Postgres DSN for `parse_queue` / `parse_history` (shared with Lakekeeper)
-- `INGEST_TOKEN`: Bearer token guarding `POST /ingest` (forwarded as `NOTIFY_WEBHOOK_AUTH_TOKEN` on RustFS)
-- `CALLBACK_TOKEN`: Bearer token guarding `POST /complete|/fail` (worker → orchestrator); defaults to `INGEST_TOKEN` when unset
-- `INPUT_S3_BUCKET` / `INPUT_S3_PREFIX`: Bronze bucket/prefix to download single objects from (e.g. `collections` / `bronze`)
-- `SOURCE_MAP`: Path to `source → parser` TOML overrides (`[source_map]` table)
-- `MAX_INFLIGHT`: Max concurrent inline parses (ignored when `ENABLE_DISPATCH=true`)
-  - Default: `4`
-- `ENABLE_DISPATCH`: When `true`, dispatch each file as a Nomad `parse-file` batch job instead of inline pool
-  - Default: `false`
-- `NOMAD_ADDR`: Nomad HTTP API for dispatch (`POST /v1/job/<job>/dispatch`)
-  - Default: `http://nomad.service.consul:4646`
-- `NOMAD_TOKEN`: Nomad ACL token (`X-Nomad-Token`) for dispatch
-- `NOMAD_JOB`: Parameterized batch job name to dispatch
-  - Default: `parse-file`
-- `DISPATCH_CONCURRENCY`: Max concurrent Nomad dispatch RPCs (bounds orchestrator → Nomad, not parse parallelism)
-  - Default: `32`
-- `DISPATCH_RECLAIM_SECS`: Reclaim `dispatched` rows after this many seconds (orphaned allocs → `pending`)
-  - Default: `1800` (30 min)
-- `BATCH_SIZE` / `COMPRESSION_LEVEL` / `SCRATCH_DIR`: Per-file decode tuning forwarded to `parse-file-worker` via env
-- `S3_*` / `ICEBERG_*`: Shared S3 + Iceberg REST catalog config (same as batch tools; workers inherit via Consul-templated `ICEBERG_CATALOG_URI`)
+  - Bronze output is unchanged and always written. A silver failure never fails the bronze batch (logged + `collect_silver_commits_failed_total`); re-run `ais-parse`/`aisstream-parse` in batch mode against the bronze data to backfill any gaps. See [README.md](README.md#inline-silver-parsing) and the per-table `collect_silver_*_total` metrics.
 
 ### Batch Processing Options (ais-parse, aisstream-parse)
 

@@ -10,10 +10,8 @@ A Rust project to collect positional data into Hive-partitioned Parquet files wi
 - **`collect-aisstream`** — aisstream.io WebSocket ingestion
 - **`ais-parse`** — silver layer: decode AIS sentences into typed Parquet (vessel positions, statics, meteo, binary, aids to navigation), via [ScottSyms/nmea-parser](https://github.com/ScottSyms/nmea-parser); local or S3 on both sides
 - **`aisstream-parse`** — silver layer: decode aisstream.io JSON from bronze Parquet into typed Parquet (vessel positions, statics, meteo, binary, aids to navigation); local or S3 on both sides
-- **`collect-orchestrator`** — event-driven per-file orchestrator: RustFS/MinIO bucket webhook → Postgres queue (`parse_queue`/`parse_history`) → per-file decode into Iceberg via `parse-file-worker`. Two modes: inline bounded-parallel (`MAX_INFLIGHT` default 4) or Nomad dispatch (`ENABLE_DISPATCH=true`) scattering one `parse-file` batch job per file across Nomad clients (archived successes, library not fork, per-file commits, RustFS webhook, Iceberg-only)
-- **`parse-file-worker`** — Nomad batch worker for dispatch mode: downloads one bronze Parquet, decodes via `ais-parse`/`aisstream-parse` libs, commits to Iceberg, callbacks to `POST /complete`
 
-All collectors support optional remote storage (S3/MinIO/RustFS), and can optionally register each successfully-uploaded bronze file directly into an Iceberg `raw` table (`--iceberg-catalog-uri`) — independent of `collect-orchestrator`; see [ORCHESTRATOR.md#relationship-to-direct-collector-registration](ORCHESTRATOR.md#relationship-to-direct-collector-registration).
+All collectors support optional remote storage (S3/MinIO/RustFS), and can optionally register each successfully-uploaded bronze file directly into an Iceberg `raw` table (`--iceberg-catalog-uri`).
 
 ## Features
 - **Multiple Input Sources**: Files, TCP streams, Kafka topics, and aisstream.io WebSocket
@@ -78,7 +76,7 @@ See [COLLECT_SOCKET.md](COLLECT_SOCKET.md), [COLLECT_FILE.md](COLLECT_FILE.md),
 [COLLECT_KAFKA.md](COLLECT_KAFKA.md), and [COLLECT_AISSTREAM.md](COLLECT_AISSTREAM.md)
 for the ingest binaries. See [AIS_PARSE.md](AIS_PARSE.md) for the decoded
 (silver) schemas and [AISSTREAM_PARSE.md](AISSTREAM_PARSE.md) for the
-AISStream JSON decoder. See [ORCHESTRATOR.md](ORCHESTRATOR.md) for the webhook → queue → Iceberg orchestrator and [specifications.md](specifications.md) for detailed design documentation.
+AISStream JSON decoder. See [specifications.md](specifications.md) for detailed design documentation.
 
 `collect-file` auto-detects plain text, gzip, bzip2, and zip inputs. Zip archives are read entry-by-entry in archive order. Hidden dotfiles are skipped silently. `--concurrency` overrides the auto-selected file worker count.
 
@@ -162,7 +160,7 @@ docker run -d \
   collect:latest
 ```
 
-The image defaults to `collect-socket`; use `--entrypoint /usr/local/bin/<binary>` (e.g. `collect-file`, `collect-kafka`, `collect-aisstream`, `ais-parse`, `aisstream-parse`, `collect-orchestrator`, `parse-file-worker`) to run any other binary the image ships. See [NOMAD.md](NOMAD.md) for Nomad orchestration job definitions. For the orchestrator, `docker-compose.yml` runs `collect-orchestrator` on `:8080` (`POST /ingest` webhook, `GET /healthz|/metrics|/queue`); configure RustFS `NOTIFY_WEBHOOK_ENDPOINT=http://collect-orchestrator:8080/ingest` and `INGEST_TOKEN`; use `--backfill` to enqueue existing bronze objects and `--max-inflight` / `MAX_INFLIGHT` to bound inline parses. Set `ENABLE_DISPATCH=true` to scatter per-file `parse-file` Nomad batch jobs instead (see `ORCHESTRATOR.md#nomad-dispatch-mode-detail` and `nomad/parse-file.nomad.hcl`).
+The image defaults to `collect-socket`; use `--entrypoint /usr/local/bin/<binary>` (e.g. `collect-file`, `collect-kafka`, `collect-aisstream`, `ais-parse`, `aisstream-parse`) to run any other binary the image ships. See [NOMAD.md](NOMAD.md) for Nomad orchestration job definitions.
 
 ## Configuration Precedence
 
@@ -315,7 +313,7 @@ collect-aisstream --api-key $AISSTREAM_API_KEY --bounding-boxes '[[[-90,-180],[9
 
 Target selection reuses the existing sink flags — no new sink flag: with `--iceberg-catalog-uri` set, each sealed bronze batch is decoded and committed to the six Iceberg tables (`positions`, `statics`, `meteo`, `binary`, `atons`, `other`, same schemas/spec as the batch parsers); otherwise silver lands as Hive-partitioned Parquet siblings (`positions/year=…/…`, time-only, no `source=` segment) under `--output-dir`. Bronze output is unchanged and always written.
 
-Semantics: decode runs in the write worker after the bronze file is durable (Kafka offsets still commit on bronze durability); a silver failure is logged and counted (`collect_silver_commits_failed_total`) but never fails the bronze batch. Dedup is per-batch and orphan-recovered uploads have no silver — run `collect-orchestrator --backfill` as the repair path for gaps. Per-table progress is exposed as `collect_silver_{positions,statics,meteo,binary,atons,other,incomplete,failed,deduped}_total`. Expect higher CPU and ~3–7× the memory bound when enabled (lower `MAX_BATCH_BYTES` if needed).
+Semantics: decode runs in the write worker after the bronze file is durable (Kafka offsets still commit on bronze durability); a silver failure is logged and counted (`collect_silver_commits_failed_total`) but never fails the bronze batch. Dedup is per-batch and orphan-recovered uploads have no silver — re-run `ais-parse`/`aisstream-parse` in batch mode against the bronze data to backfill any gaps. Per-table progress is exposed as `collect_silver_{positions,statics,meteo,binary,atons,other,incomplete,failed,deduped}_total`. Expect higher CPU and ~3–7× the memory bound when enabled (lower `MAX_BATCH_BYTES` if needed).
 
 ## Building from Source
 

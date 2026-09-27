@@ -141,8 +141,7 @@ pub const TABLE_BINARY: &str = "binary";
 pub const TABLE_ATONS: &str = "atons";
 pub const TABLE_OTHER: &str = "other";
 /// Table collectors register bronze uploads into directly (see
-/// `register_raw_upload`), independent of `collect-orchestrator`'s six
-/// decoded tables above.
+/// `register_raw_upload`), independent of the six decoded tables above.
 pub const TABLE_RAW: &str = "raw";
 
 fn table_name(prefix: Option<&str>, base: &str) -> String {
