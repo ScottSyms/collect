@@ -16,17 +16,17 @@ Input files (txt/gz/bz2/zip) → collect-file → Bronze Parquet
 ```bash
 # Ingest a single file
 cargo run -p collect-file -- \
-  --input-dir data.txt \
+  --input data.txt \
   --source my-source
 
 # Ingest a directory (recursive)
 cargo run -p collect-file -- \
-  --input-dir /path/to/data/ \
+  --input /path/to/data/ \
   --source maritime
 
 # With S3 output
 cargo run -p collect-file -- \
-  --input-dir data.txt \
+  --input data.txt \
   --source ais \
   --s3-bucket bronze --s3-prefix ais \
   --s3-endpoint http://minio:9000 \
@@ -34,7 +34,7 @@ cargo run -p collect-file -- \
 
 # With AIS processing
 cargo run -p collect-file -- \
-  --input-dir data.txt \
+  --input data.txt \
   --consolidate-ais --process-timestamps
 ```
 
@@ -44,7 +44,7 @@ cargo run -p collect-file -- \
 
 | Flag | Env | Default | Description |
 |------|-----|---------|-------------|
-| `--input` (alias `--input-dir`) | `INPUT_PATH` | — | Input file or directory (recursive) |
+| `--input` | `INPUT_PATH` | — | Input file or directory (recursive) |
 | `--source` / `-s` | `SOURCE` | file stem/dir name | Logical source label |
 
 ### Processing

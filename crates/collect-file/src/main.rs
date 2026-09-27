@@ -32,7 +32,7 @@ mod status;
 )]
 struct Args {
     /// Input file or directory to ingest
-    #[arg(long = "input", visible_alias = "input-dir", env = "INPUT_PATH")]
+    #[arg(long = "input", env = "INPUT_PATH")]
     input: Option<PathBuf>,
 
     /// Logical source label; defaults to input file stem or directory name
@@ -68,12 +68,12 @@ struct Args {
 
     /// Enable AIS multi-part message consolidation (reassembles fragmented
     /// NMEA sentences in-line before writing to the Parquet batch).
-    #[arg(long)]
+    #[arg(long, env = "CONSOLIDATE_AIS", value_parser = clap::builder::FalseyValueParser::new())]
     consolidate_ais: bool,
 
     /// Process $PGHP timestamp lines and tag-block c: carry-forward to
     /// correct row timestamps. Independent of --consolidate-ais.
-    #[arg(long)]
+    #[arg(long, env = "PROCESS_TIMESTAMPS", value_parser = clap::builder::FalseyValueParser::new())]
     process_timestamps: bool,
 
     /// Print shell completions for the given shell to stdout and exit

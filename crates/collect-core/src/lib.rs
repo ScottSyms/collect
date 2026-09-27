@@ -52,7 +52,11 @@ const DEFAULT_OUT_DIR: &str = "data";
 const DEFAULT_UPLOAD_DRAIN_TIMEOUT_SECONDS: u64 = 60;
 const DEFAULT_MAX_LINE_LENGTH: usize = 65_536;
 const DEFAULT_MAX_BATCH_BYTES: usize = 64 * 1024 * 1024;
-const DEFAULT_COMPRESSION_LEVEL: i32 = 5;
+/// `pub` so the batch parsers (`ais-parse`/`aisstream-parse`), which don't
+/// flatten `CommonCliArgs` and so declare their own `--compression-level`
+/// with a concrete `default_value_t`, reference the same constant instead of
+/// a duplicated literal `5`.
+pub const DEFAULT_COMPRESSION_LEVEL: i32 = 5;
 const DEFAULT_S3_REGION: &str = "us-east-1";
 const DEFAULT_HEALTH_STALE_WINDOW_SECONDS: u64 = 60;
 /// On by default (see Phase 3b of the reliability hardening plan): a

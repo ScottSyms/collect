@@ -41,12 +41,12 @@ struct Args {
 
     /// Enable AIS multi-part message reassembly (combines fragmented NMEA
     /// sentences into single sentences before writing).
-    #[arg(long)]
+    #[arg(long, env = "CONSOLIDATE_AIS", value_parser = clap::builder::FalseyValueParser::new())]
     consolidate_ais: bool,
 
     /// Process $PGHP timestamp lines and tag-block c: carry-forward to
     /// correct row timestamps. Independent of --consolidate-ais.
-    #[arg(long)]
+    #[arg(long, env = "PROCESS_TIMESTAMPS", value_parser = clap::builder::FalseyValueParser::new())]
     process_timestamps: bool,
 
     #[command(flatten)]

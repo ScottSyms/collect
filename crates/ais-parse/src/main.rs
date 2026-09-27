@@ -151,11 +151,7 @@ struct Args {
     partition: PartitionGranularity,
 
     /// Filter to a specific source label (processes all sources if omitted)
-    #[arg(
-        long = "filter-source",
-        visible_alias = "source",
-        env = "FILTER_SOURCE"
-    )]
+    #[arg(long = "filter-source", env = "FILTER_SOURCE")]
     source: Option<String>,
 
     /// Process only this year's partitions (narrow further with --month, --day, ...)
@@ -194,7 +190,7 @@ struct Args {
     batch_size: usize,
 
     /// Zstd compression level for output files
-    #[arg(long, env = "COMPRESSION_LEVEL", default_value_t = 5)]
+    #[arg(long, env = "COMPRESSION_LEVEL", default_value_t = collect_core::DEFAULT_COMPRESSION_LEVEL)]
     compression_level: i32,
 
     /// Number of partitions to process concurrently; auto-selected when omitted
@@ -216,12 +212,12 @@ struct Args {
 
     /// Apply AIS multipart consolidation before decoding (reassembles
     /// fragmented NMEA sentences into single sentences before parsing).
-    #[arg(long)]
+    #[arg(long, env = "CONSOLIDATE_AIS", value_parser = clap::builder::FalseyValueParser::new())]
     consolidate_ais: bool,
 
     /// Process $PGHP timestamp lines and tag-block c: carry-forward to
     /// correct row timestamps. Independent of --consolidate-ais.
-    #[arg(long)]
+    #[arg(long, env = "PROCESS_TIMESTAMPS", value_parser = clap::builder::FalseyValueParser::new())]
     process_timestamps: bool,
 
     /// List the partitions that would be processed and exit without

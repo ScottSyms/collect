@@ -157,11 +157,7 @@ struct Args {
     partition: PartitionGranularity,
 
     /// Filter to a specific source label (processes all sources if omitted)
-    #[arg(
-        long = "filter-source",
-        visible_alias = "source",
-        env = "FILTER_SOURCE"
-    )]
+    #[arg(long = "filter-source", env = "FILTER_SOURCE")]
     source: Option<String>,
 
     /// Process only this year's partitions (narrow further with --month, --day, ...)
@@ -200,7 +196,7 @@ struct Args {
     batch_size: usize,
 
     /// Zstd compression level for output files
-    #[arg(long, env = "COMPRESSION_LEVEL", default_value_t = 5)]
+    #[arg(long, env = "COMPRESSION_LEVEL", default_value_t = collect_core::DEFAULT_COMPRESSION_LEVEL)]
     compression_level: i32,
 
     /// Number of partitions to process concurrently; auto-selected when omitted

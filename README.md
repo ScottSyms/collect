@@ -51,7 +51,7 @@ cargo run -p collect-socket --
 
 ```bash
 # File input
-cargo run -p collect-file -- --input-dir data.txt --source mydata
+cargo run -p collect-file -- --input data.txt --source mydata
 
 # TCP stream
 cargo run -p collect-socket -- --tcp-host 153.44.253.27 --tcp-port 5631 --source norway-tcp
@@ -63,7 +63,7 @@ cargo run -p collect-kafka -- --kafka-brokers broker:9092 --kafka-topic ais-raw 
 cargo run -p collect-aisstream -- --api-key $AISSTREAM_API_KEY --bounding-boxes '[[[-90,-180],[90,180]]]'
 
 # File input with S3
-cargo run -p collect-file -- --input-dir data.txt --source mydata --compression-level 1 --s3-bucket maritime-data
+cargo run -p collect-file -- --input data.txt --source mydata --compression-level 1 --s3-bucket maritime-data
 
 # Consolidate AIS and decode in one step
 cargo run -p ais-parse -- --input-dir data --output-dir silver --partition day --consolidate-ais --process-timestamps
@@ -92,7 +92,8 @@ Most command-line parameters can be configured using environment variables.
 | `SOURCE` | `--source` | Logical source label |
 | `PARSER` | `--parser` | Inline silver parser: `none` (default), `ais`, or `aisstream` |
 | `PARTITION` | `--partition` | Partition granularity for ingest layout |
-| `AIS` | `--ais` | Use NMEA `c:<epoch>` tag blocks or `$PGHP` capture timestamps (collect-file only) |
+| `CONSOLIDATE_AIS` | `--consolidate-ais` | Reassemble fragmented multi-part NMEA sentences before writing |
+| `PROCESS_TIMESTAMPS` | `--process-timestamps` | Use NMEA tag-block `c:<epoch>` or `$PGHP` capture timestamps to correct row timestamps |
 | `OUTPUT_DIR` | `--output-dir` | Output directory |
 | `MAX_ROWS` | `--max-rows` | Max rows per file |
 | `MAX_BATCH_BYTES` | `--max-batch-bytes` | Max payload bytes per Parquet file |
