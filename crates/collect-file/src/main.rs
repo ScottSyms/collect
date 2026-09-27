@@ -4,6 +4,7 @@ use collect_core::ais_consolidate::{AisConsolidator, AisConsolidatorConfig};
 use collect_core::{
     apply_config_file, default_source_from_path, health_file_path, print_completions, run_ingest,
     update_health_status_async, CommonCliArgs, IngestOptions, S3CliArgs,
+    log::LoggingCliArgs,
 };
 use collect_core::iceberg::{init_raw_handle, IcebergCliArgs, IcebergHandle};
 use collect_core::silver::{ParserCliArgs, SilverCommit};
@@ -23,7 +24,6 @@ mod status;
 
 /// Exit code used when there was nothing to ingest (distinct from success
 /// with rows written, and from a hard error).
-const EXIT_NOTHING_TO_DO: i32 = 2;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -32,7 +32,7 @@ const EXIT_NOTHING_TO_DO: i32 = 2;
 )]
 struct Args {
     /// Input file or directory to ingest
-    #[arg(long = "input", visible_alias = "input-dir", env = "INPUT_PATH")]
+    #[arg(long = "input", env = "INPUT_PATH")]
     input: Option<PathBuf>,
 
     /// Logical source label; defaults to input file stem or directory name
@@ -45,6 +45,9 @@ struct Args {
 
     #[command(flatten)]
     common: CommonCliArgs,
+
+    #[command(flatten)]
+    logging: LoggingCliArgs,
 
     #[command(flatten)]
     s3: S3CliArgs,
@@ -65,12 +68,12 @@ struct Args {
 
     /// Enable AIS multi-part message consolidation (reassembles fragmented
     /// NMEA sentences in-line before writing to the Parquet batch).
-    #[arg(long)]
+    #[arg(long, env = "CONSOLIDATE_AIS", value_parser = clap::builder::FalseyValueParser::new())]
     consolidate_ais: bool,
 
     /// Process $PGHP timestamp lines and tag-block c: carry-forward to
     /// correct row timestamps. Independent of --consolidate-ais.
-    #[arg(long)]
+    #[arg(long, env = "PROCESS_TIMESTAMPS", value_parser = clap::builder::FalseyValueParser::new())]
     process_timestamps: bool,
 
     /// Print shell completions for the given shell to stdout and exit
@@ -97,6 +100,8 @@ async fn main() -> Result<()> {
         apply_config_file(config_path)?;
         args = Args::parse();
     }
+
+    args.logging.init("collect-file");
 
     let quiet = args.quiet;
     let status_mode = status::StatusMode::from_tty(!args.noui && std::io::stdout().is_terminal());
@@ -225,7 +230,7 @@ async fn run_file_ingest(
         if !quiet {
             eprintln!("✅ No unfinished input files found");
         }
-        std::process::exit(EXIT_NOTHING_TO_DO);
+        std::process::exit(collect_core::exitcode::NOTHING_TO_DO);
     }
 
     let mut common = common;
@@ -380,7 +385,7 @@ async fn run_parallel_file_ingest(
     quiet: bool,
 ) -> Result<()> {
     let running = Arc::new(AtomicBool::new(true));
-    update_health_status_async(&health_file, true).await?;
+    update_health_status_async(&health_file, true, None).await?;
     let completed_files = Arc::new(AtomicUsize::new(0));
     let started_at = Instant::now();
 
@@ -393,7 +398,7 @@ async fn run_parallel_file_ingest(
 
         while health_running.load(Ordering::SeqCst) {
             heartbeat.tick().await;
-            if let Err(error) = update_health_status_async(&health_file_for_task, true).await {
+            if let Err(error) = update_health_status_async(&health_file_for_task, true, None).await {
                 eprintln!("Failed to update health status: {}", error);
             }
         }
@@ -537,7 +542,7 @@ async fn run_parallel_file_ingest(
         return Err(anyhow::anyhow!("ingest cancelled"));
     }
 
-    update_health_status_async(&health_file, false).await?;
+    update_health_status_async(&health_file, false, Some("shutting down")).await?;
 
     if let Some(error) = first_error {
         return Err(error);

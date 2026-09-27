@@ -12,6 +12,10 @@ pub struct ParseStats {
     /// Rows dropped because an identical (ts, mmsi, source-keyed) row was
     /// already emitted for this partition in this run.
     pub rows_deduped: u64,
+    /// Partitions skipped after their decode, Iceberg commit, or upload
+    /// failed and --max-partition-failures wasn't exceeded (--fail-fast
+    /// aborts on the first one instead of counting it here).
+    pub partitions_failed: u64,
 }
 
 impl ParseStats {
@@ -26,6 +30,7 @@ impl ParseStats {
         self.others_out += other.others_out;
         self.failed += other.failed;
         self.rows_deduped += other.rows_deduped;
+        self.partitions_failed += other.partitions_failed;
     }
 
     pub fn print_summary(&self) {
@@ -40,5 +45,8 @@ impl ParseStats {
         eprintln!("  other rows           : {}", self.others_out);
         eprintln!("  unparsed             : {}", self.failed);
         eprintln!("  deduped (dropped)    : {}", self.rows_deduped);
+        if self.partitions_failed > 0 {
+            eprintln!("  \u{26a0}\u{fe0f} partitions skipped   : {} (see --max-partition-failures)", self.partitions_failed);
+        }
     }
 }

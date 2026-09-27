@@ -44,6 +44,27 @@ pub struct IngestMetrics {
     pub silver_commits_failed: AtomicU64,
     pub last_row_unix_ms: AtomicU64,
     pub last_heartbeat_unix_ms: AtomicU64,
+    /// Seconds of no ingested rows before [`Self::health_state`] reports a
+    /// drought. `0` (the default) disables the drought check entirely — set
+    /// once at startup via [`Self::set_drought_seconds`] from a CLI flag.
+    drought_seconds: AtomicU64,
+    /// When the ingest loop started. `last_row_unix_ms` is 0 until the
+    /// first row arrives, so drought silence is measured from the later of
+    /// this and `last_row_unix_ms` — otherwise a feed that legitimately
+    /// takes a few seconds to produce its first row would look like a
+    /// decades-long drought (silence since the Unix epoch) the instant the
+    /// process starts.
+    started_unix_ms: AtomicU64,
+}
+
+/// Result of [`IngestMetrics::health_state`] — the single source of truth
+/// consulted by the health file, `/healthz`, and (once a drought is active)
+/// the process's own decision to give up. `reason` is `None` exactly when
+/// `healthy` is `true`.
+#[derive(Debug, Clone, Default)]
+pub struct HealthState {
+    pub healthy: bool,
+    pub reason: Option<String>,
 }
 
 impl IngestMetrics {
@@ -70,18 +91,64 @@ impl IngestMetrics {
             .store(now_unix_ms(), Ordering::Relaxed);
     }
 
+    /// Call once, right after construction, so drought detection measures
+    /// silence from process start rather than from the Unix epoch.
+    pub fn mark_started(&self) {
+        self.started_unix_ms.store(now_unix_ms(), Ordering::Relaxed);
+    }
+
     pub fn touch_last_row(&self) {
         self.last_row_unix_ms
             .store(now_unix_ms(), Ordering::Relaxed);
     }
 
-    /// Healthy while the ingest loop's heartbeat is fresh — the loop ticks it
-    /// every second, so staleness means the loop is stuck or gone.
-    fn is_healthy(&self) -> bool {
-        let last = self.last_heartbeat_unix_ms.load(Ordering::Relaxed);
-        last > 0
-            && now_unix_ms().saturating_sub(last)
-                < super::DEFAULT_HEALTH_STALE_WINDOW_SECONDS * 1000
+    /// Enable data-drought detection: [`Self::health_state`] reports unhealthy
+    /// once `secs` have passed with no ingested row. Call once at startup;
+    /// `0` (the default) leaves drought detection disabled.
+    pub fn set_drought_seconds(&self, secs: u64) {
+        self.drought_seconds.store(secs, Ordering::Relaxed);
+    }
+
+    /// The health status every surface (health file, `/healthz`, and the
+    /// ingest loop's own give-up decision) agrees on. Unhealthy for one of
+    /// two reasons: the heartbeat itself is stale (the loop is stuck or
+    /// gone — checked first, since a stale heartbeat makes the drought
+    /// gauge below meaningless), or — while the loop is still ticking —
+    /// no row has been ingested within the configured drought window.
+    pub fn health_state(&self) -> HealthState {
+        let now = now_unix_ms();
+        let heartbeat = self.last_heartbeat_unix_ms.load(Ordering::Relaxed);
+        let heartbeat_stale = heartbeat == 0
+            || now.saturating_sub(heartbeat) >= super::DEFAULT_HEALTH_STALE_WINDOW_SECONDS * 1000;
+        if heartbeat_stale {
+            return HealthState {
+                healthy: false,
+                reason: Some("heartbeat stale".to_string()),
+            };
+        }
+
+        let drought_secs = self.drought_seconds.load(Ordering::Relaxed);
+        if drought_secs > 0 {
+            let last_row = self.last_row_unix_ms.load(Ordering::Relaxed);
+            let started = self.started_unix_ms.load(Ordering::Relaxed);
+            // No row yet counts as ongoing silence since startup, not since
+            // the Unix epoch (last_row is 0 until the first row arrives).
+            let baseline = last_row.max(started);
+            let silence_secs = now.saturating_sub(baseline) / 1000;
+            if silence_secs >= drought_secs {
+                return HealthState {
+                    healthy: false,
+                    reason: Some(format!(
+                        "no rows ingested for {silence_secs}s (limit {drought_secs}s)"
+                    )),
+                };
+            }
+        }
+
+        HealthState {
+            healthy: true,
+            reason: None,
+        }
     }
 
     fn render_prometheus(&self, source: &str) -> String {
@@ -304,13 +371,14 @@ async fn handle_connection(mut socket: TcpStream, source: &str, metrics: &Ingest
             metrics.render_prometheus(source),
         ),
         "/healthz" | "/health" => {
-            if metrics.is_healthy() {
+            let state = metrics.health_state();
+            if state.healthy {
                 ("200 OK", "text/plain; charset=utf-8", "healthy\n".to_string())
             } else {
                 (
                     "503 Service Unavailable",
                     "text/plain; charset=utf-8",
-                    "unhealthy\n".to_string(),
+                    format!("unhealthy: {}\n", state.reason.as_deref().unwrap_or("unknown")),
                 )
             }
         }
@@ -345,6 +413,66 @@ mod tests {
             .await
             .expect("read response");
         response
+    }
+
+    #[test]
+    fn healthy_with_fresh_heartbeat_and_drought_disabled() {
+        let metrics = IngestMetrics::default();
+        metrics.touch_heartbeat();
+        metrics.mark_started();
+        // drought_seconds left at 0 (disabled)
+        let state = metrics.health_state();
+        assert!(state.healthy, "{state:?}");
+        assert!(state.reason.is_none());
+    }
+
+    #[test]
+    fn unhealthy_when_heartbeat_stale() {
+        let metrics = IngestMetrics::default();
+        metrics.mark_started();
+        metrics.last_heartbeat_unix_ms.store(1, Ordering::Relaxed); // ancient
+        let state = metrics.health_state();
+        assert!(!state.healthy);
+        assert_eq!(state.reason.as_deref(), Some("heartbeat stale"));
+    }
+
+    #[test]
+    fn no_row_since_start_is_not_a_drought_immediately() {
+        let metrics = IngestMetrics::default();
+        metrics.touch_heartbeat();
+        metrics.mark_started();
+        metrics.set_drought_seconds(300);
+        // No row has arrived yet, but startup was just now: must not read
+        // as "silent since the Unix epoch."
+        let state = metrics.health_state();
+        assert!(state.healthy, "{state:?}");
+    }
+
+    #[test]
+    fn drought_fires_once_silence_exceeds_the_threshold() {
+        let metrics = IngestMetrics::default();
+        metrics.touch_heartbeat();
+        let long_ago = now_unix_ms() - 400_000; // 400s ago
+        metrics.started_unix_ms.store(long_ago, Ordering::Relaxed);
+        metrics.set_drought_seconds(300);
+        let state = metrics.health_state();
+        assert!(!state.healthy);
+        assert!(
+            state.reason.as_deref().unwrap_or("").contains("no rows ingested"),
+            "{state:?}"
+        );
+    }
+
+    #[test]
+    fn a_recent_row_resets_the_drought_clock() {
+        let metrics = IngestMetrics::default();
+        metrics.touch_heartbeat();
+        let long_ago = now_unix_ms() - 400_000;
+        metrics.started_unix_ms.store(long_ago, Ordering::Relaxed);
+        metrics.set_drought_seconds(300);
+        metrics.touch_last_row(); // a row just arrived
+        let state = metrics.health_state();
+        assert!(state.healthy, "{state:?}");
     }
 
     #[tokio::test]

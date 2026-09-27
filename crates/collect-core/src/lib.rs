@@ -34,24 +34,38 @@ use tokio::task::JoinSet;
 use tokio_util::codec::{FramedRead, LinesCodec};
 
 pub mod ais_consolidate;
+pub mod backoff;
 pub mod dataset;
+pub mod exitcode;
 pub mod iceberg;
 pub mod iceberg_commit_manifest;
+pub mod log;
 mod metrics;
 pub mod silver;
 pub mod state;
 
 pub use async_trait::async_trait;
-pub use metrics::IngestMetrics;
+pub use metrics::{HealthState, IngestMetrics};
 pub use tokio_util::codec::LinesCodecError;
 
 const DEFAULT_OUT_DIR: &str = "data";
 const DEFAULT_UPLOAD_DRAIN_TIMEOUT_SECONDS: u64 = 60;
 const DEFAULT_MAX_LINE_LENGTH: usize = 65_536;
 const DEFAULT_MAX_BATCH_BYTES: usize = 64 * 1024 * 1024;
-const DEFAULT_COMPRESSION_LEVEL: i32 = 5;
+/// `pub` so the batch parsers (`ais-parse`/`aisstream-parse`), which don't
+/// flatten `CommonCliArgs` and so declare their own `--compression-level`
+/// with a concrete `default_value_t`, reference the same constant instead of
+/// a duplicated literal `5`.
+pub const DEFAULT_COMPRESSION_LEVEL: i32 = 5;
 const DEFAULT_S3_REGION: &str = "us-east-1";
 const DEFAULT_HEALTH_STALE_WINDOW_SECONDS: u64 = 60;
+/// On by default (see Phase 3b of the reliability hardening plan): a
+/// collector that has connected fine but received nothing in 5 minutes is
+/// almost always stuck or pointed at the wrong upstream, not legitimately
+/// idle — an operator should be told rather than have the process sit
+/// silently. `--data-drought-seconds 0` disables the check for a feed that
+/// really is this quiet.
+const DEFAULT_DATA_DROUGHT_SECONDS: u64 = 300;
 const DEFAULT_UPLOAD_QUEUE_CAPACITY: usize = 128;
 const DEFAULT_UPLOAD_CONCURRENCY: usize = 4;
 const DEFAULT_WRITE_QUEUE_CAPACITY: usize = 64;
@@ -208,6 +222,11 @@ pub struct CommonCliArgs {
     /// Serve Prometheus metrics and /healthz on this address, e.g. 0.0.0.0:9184
     #[arg(long, env = "METRICS_ADDR")]
     pub metrics_addr: Option<String>,
+
+    /// Exit if no row has been ingested for this many seconds, even though
+    /// the upstream connection appears fine (0 disables the check)
+    #[arg(long, env = "DATA_DROUGHT_SECONDS", default_value_t = DEFAULT_DATA_DROUGHT_SECONDS)]
+    pub data_drought_seconds: u64,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -283,6 +302,7 @@ pub struct CommonOptions {
     pub max_line_length: usize,
     pub health_check: bool,
     pub metrics_addr: Option<String>,
+    pub data_drought_seconds: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -471,6 +491,7 @@ impl CommonCliArgs {
             max_line_length: self.max_line_length,
             health_check: self.health_check,
             metrics_addr: self.metrics_addr.clone(),
+            data_drought_seconds: self.data_drought_seconds,
         }
     }
 }
@@ -785,6 +806,7 @@ mod tests {
                     max_line_length: 1024,
                     health_check: false,
                     metrics_addr: None,
+                    data_drought_seconds: 0,
                 },
                 s3: None,
                 s3_storage: None,
@@ -1030,6 +1052,7 @@ mod tests {
                     max_line_length: 1024,
                     health_check: false,
                     metrics_addr: None,
+                    data_drought_seconds: 0,
                 },
                 s3: None,
                 s3_storage: None,
@@ -1112,6 +1135,8 @@ where
 
     let metrics = Arc::new(IngestMetrics::default());
     metrics.touch_heartbeat();
+    metrics.mark_started();
+    metrics.set_drought_seconds(common.data_drought_seconds);
     let metrics_server = match &common.metrics_addr {
         Some(addr) => {
             match metrics::spawn_metrics_server(
@@ -1122,13 +1147,21 @@ where
             .await
             {
                 Ok((handle, local_addr)) => {
-                    eprintln!("📡 Metrics endpoint listening on http://{local_addr}/metrics");
+                    log::info(
+                        "metrics_endpoint_listening",
+                        &format!("metrics endpoint listening on http://{local_addr}/metrics"),
+                        &[],
+                    );
                     Some(handle)
                 }
                 Err(error) => {
                     // Never fail ingest because a metrics port is taken (e.g.
                     // several collect-file workers sharing one address).
-                    eprintln!("⚠️  Metrics endpoint disabled: {error}");
+                    log::warn(
+                        "metrics_endpoint_disabled",
+                        &format!("metrics endpoint disabled: {error}"),
+                        &[],
+                    );
                     None
                 }
             }
@@ -1247,11 +1280,15 @@ where
     );
 
     if let Some(silver) = silver.as_ref() {
-        eprintln!("🔬 Inline silver parsing enabled: {}", silver.describe());
+        log::info(
+            "silver_parsing_enabled",
+            &format!("inline silver parsing enabled: {}", silver.describe()),
+            &[],
+        );
     }
 
     if manage_health {
-        update_health_status_async(&health_file, true).await?;
+        update_health_status_async(&health_file, true, None).await?;
     }
 
     let mut heartbeat = tokio::time::interval(HEALTH_UPDATE_INTERVAL);
@@ -1269,10 +1306,34 @@ where
         tokio::select! {
             _ = heartbeat.tick() => {
                 metrics.touch_heartbeat();
+                let state = metrics.health_state();
                 if manage_health {
-                    if let Err(error) = update_health_status_async(&health_file, true).await {
-                        eprintln!("Failed to update health status: {}", error);
+                    if let Err(error) =
+                        update_health_status_async(&health_file, state.healthy, state.reason.as_deref()).await
+                    {
+                        log::warn(
+                            "health_file_write_failed",
+                            &format!("failed to update health status: {error}"),
+                            &[],
+                        );
                     }
+                }
+                // The heartbeat was just touched above, so the only way
+                // health_state() can be unhealthy here is a data drought
+                // (see HealthState's doc comment) — bounded retry doesn't
+                // apply to "connected fine but nothing arriving", so this
+                // exits directly rather than looping.
+                if !state.healthy {
+                    let reason = state.reason.as_deref().unwrap_or("unknown");
+                    log::error(
+                        "data_drought",
+                        &format!("giving up: {reason}"),
+                        &[("source", source.source_name())],
+                    );
+                    if manage_health {
+                        let _ = update_health_status_async(&health_file, false, Some(reason)).await;
+                    }
+                    std::process::exit(exitcode::DATA_DROUGHT);
                 }
             }
             _ = progress_heartbeat.tick(), if report_progress => {
@@ -1533,15 +1594,25 @@ where
     }
 
     if manage_health {
-        update_health_status_async(&health_file, false).await?;
+        update_health_status_async(&health_file, false, Some("shutting down")).await?;
     }
     Ok(())
 }
 
-pub async fn update_health_status_async(health_file: &Path, healthy: bool) -> Result<()> {
+/// Write the health-status file an exec-based check (`--health-check`,
+/// Docker `HEALTHCHECK`) reads from a separate process invocation — so it
+/// carries a `reason` alongside the status, not just a bare bool, to agree
+/// with `/healthz` and [`metrics::HealthState`] on *why* a still-running
+/// process considers itself unhealthy (e.g. a data drought), not only
+/// whether it has stopped updating the file at all.
+pub async fn update_health_status_async(
+    health_file: &Path,
+    healthy: bool,
+    reason: Option<&str>,
+) -> Result<()> {
     let status = if healthy { "healthy" } else { "unhealthy" };
     let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    let content = format!("{}:{}", status, timestamp);
+    let content = format!("{}:{}:{}", status, timestamp, reason.unwrap_or(""));
 
     tokio::fs::write(health_file, content)
         .await
@@ -1552,10 +1623,12 @@ pub async fn update_health_status_async(health_file: &Path, healthy: bool) -> Re
 pub fn check_health(health_file: &Path) -> Result<()> {
     match std::fs::read_to_string(health_file) {
         Ok(content) => {
-            let Some((status, timestamp_str)) = content.trim().split_once(':') else {
+            let mut parts = content.trim().splitn(3, ':');
+            let (Some(status), Some(timestamp_str)) = (parts.next(), parts.next()) else {
                 println!("Health check: UNHEALTHY (bad status file)");
                 return Err(anyhow::anyhow!("bad health status file"));
             };
+            let reason = parts.next().filter(|r| !r.is_empty());
 
             let timestamp: u64 = timestamp_str.parse().unwrap_or(0);
             let current_time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
@@ -1566,7 +1639,10 @@ pub fn check_health(health_file: &Path) -> Result<()> {
                 println!("Health check: HEALTHY");
                 Ok(())
             } else {
-                println!("Health check: UNHEALTHY (stale or bad status)");
+                match reason {
+                    Some(reason) => println!("Health check: UNHEALTHY ({reason})"),
+                    None => println!("Health check: UNHEALTHY (stale or bad status)"),
+                }
                 Err(anyhow::anyhow!("health check failed"))
             }
         }
@@ -2376,8 +2452,8 @@ const ICEBERG_REGISTER_ATTEMPTS: u32 = 3;
 /// Register a successfully-uploaded batch with Iceberg, with a short bounded
 /// retry. This runs after the S3 upload has already succeeded and must never
 /// fail the upload itself: on exhaustion it logs and bumps a failure metric,
-/// leaving `collect-orchestrator --backfill` (or a manual pass) as the
-/// out-of-band backstop for anything missed.
+/// leaving a re-run of `ais-parse`/`aisstream-parse` in batch mode (or a
+/// manual pass) as the out-of-band backstop for anything missed.
 async fn register_raw_upload_with_retry(
     handle: &iceberg::IcebergHandle,
     batch: RecordBatch,

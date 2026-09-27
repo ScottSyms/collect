@@ -13,14 +13,15 @@
 //! `collect-core` for S3 and Iceberg helpers, so the reverse edge would be a
 //! dependency cycle).
 //!
-//! Design notes (see ORCHESTRATOR.md for the queue-based counterpart):
+//! Design notes:
 //!
 //! - Decoding runs in the write worker, **after** the bronze batch is durable
 //!   on local disk — so Kafka offset commits (driven by `on_batch_durable`)
 //!   and the shutdown flush keep their existing bronze-only semantics.
 //! - A silver failure never fails the bronze batch: it is logged, counted,
 //!   and the batch's bronze upload proceeds. The bronze dataset stays the
-//!   authoritative backstop; `collect-orchestrator --backfill` repairs gaps.
+//!   authoritative backstop; re-running `ais-parse`/`aisstream-parse` in
+//!   batch mode against it repairs gaps.
 //! - Dedup is per-batch (a bounded `HashSet`), not global: a crash-replay can
 //!   still double-append silver rows. Accepted residual risk, same class as
 //!   the batch parsers' narrow six-commit window.

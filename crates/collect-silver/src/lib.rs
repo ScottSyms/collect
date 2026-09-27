@@ -13,9 +13,9 @@
 //!   siblings (`positions/`, `statics`, …) under the output root, using the
 //!   same time-only layout as the `ais-parse` batch binaries.
 //!
-//! Row dispatch mirrors `collect-orchestrator`'s `decode.rs` (same writers,
-//! same per-batch `DedupKey` scheme), but operates on the in-memory bronze
-//! batch instead of a Parquet file on disk.
+//! Row dispatch reuses the same writers and per-batch `DedupKey` scheme as
+//! the `ais-parse`/`aisstream-parse` batch binaries, but operates on the
+//! in-memory bronze batch instead of a Parquet file on disk.
 
 use anyhow::{Context, Result};
 use arrow::array::{StringArray, TimestampMillisecondArray};

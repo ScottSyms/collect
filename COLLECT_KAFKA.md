@@ -4,6 +4,10 @@ Consumes messages from a Kafka topic into Hive-partitioned Parquet with
 Zstd compression. Commits offsets only after each Parquet batch is durably
 written.
 
+New to the project? [TUTORIAL.md](TUTORIAL.md) walks through local storage,
+partitioning, S3, and Iceberg in order; this page is a reference for this
+one binary.
+
 ## Pipeline
 
 ```
@@ -50,15 +54,19 @@ cargo run -p collect-kafka -- \
 | `--quiet` / `-q` | `QUIET` | off | Suppress routine progress lines; warnings/errors still print |
 | `--completions <shell>` | — | — | Print shell completions to stdout and exit |
 | `--version` | — | — | Prints `<crate version> (<git commit hash>)` |
-| `--config <file>` | `CONFIG_FILE` | — | Load flag defaults from a flat TOML file; CLI flags and pre-set env vars still win — see [README.md](README.md#common-cli-features) |
+| `--config <file>` | `CONFIG_FILE` | — | Load flag defaults from a flat TOML file; CLI flags and pre-set env vars still win — see [CLI_REFERENCE.md](CLI_REFERENCE.md#shared-across-all-six-binaries) |
 
-### Common + S3 + Iceberg
+### Common + S3 + Iceberg + reconnect
 
-Same as [collect-socket](COLLECT_SOCKET.md) — `CommonCliArgs`, `S3CliArgs`,
-and `IcebergCliArgs` (optional, direct `raw`-table registration on
-successful upload) are identical, plus the same `--parser` inline-parsing
-flag ([details](COLLECT_SOCKET.md#inline-parsing---parser)). Offsets still
-commit on bronze durability, not on silver commits.
+Full flag/env tables: [CLI_REFERENCE.md](CLI_REFERENCE.md#common-to-the-four-collectors-commoncliargs)
+(`CommonCliArgs`), [S3](CLI_REFERENCE.md#s3--collectors-s3cliargs-one-sink)
+(`S3CliArgs`), [Iceberg](CLI_REFERENCE.md#iceberg-icebergcliargs-all-six-binaries)
+(`IcebergCliArgs` — optional, direct `raw`-table registration on
+successful upload), and [reconnect](CLI_REFERENCE.md#reconnect-the-three-streaming-collectors)
+(`--max-reconnect-seconds`, bounds the broker-reconnect backoff below),
+plus the same `--parser` inline-parsing flag
+([details](CLI_REFERENCE.md#inline-parsing-collectors-only-parsercliargs)).
+Offsets still commit on bronze durability, not on silver commits.
 
 ## Output
 
@@ -71,6 +79,15 @@ commit on bronze durability, not on silver commits.
 Kafka offsets are committed after the corresponding Parquet batch is durably
 written to local disk (not before). On restart, the consumer resumes from the
 last committed offset, ensuring at-least-once delivery.
+
+## Reconnection
+
+On a broker disconnect, `collect-kafka` re-subscribes with exponential
+backoff (1s → 5s max, same as `collect-socket`/`collect-aisstream`). If the
+broker can't be reached again within `--max-reconnect-seconds` (default
+300s) of total retrying, the process gives up and exits with
+[`UPSTREAM_UNAVAILABLE`](CLI_REFERENCE.md#exit-codes); set it to `0` to
+retry forever instead.
 
 ## Oversized Messages
 

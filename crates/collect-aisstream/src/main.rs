@@ -1,8 +1,10 @@
 use anyhow::{Context as _, Result};
 use clap::Parser;
+use collect_core::backoff::{Backoff, ReconnectCliArgs};
 use collect_core::{
-    apply_config_file, health_file_path, line_reader_from_async_read, print_completions,
+    apply_config_file, health_file_path, line_reader_from_async_read, log, print_completions,
     run_ingest, CommonCliArgs, IngestOptions, LineReader, LineSource, ReaderTransition, S3CliArgs,
+    log::LoggingCliArgs,
 };
 use collect_core::iceberg::{init_raw_handle, IcebergCliArgs};
 use collect_core::silver::{ParserCliArgs, ParserKind};
@@ -56,6 +58,12 @@ struct Args {
 
     #[command(flatten)]
     common: CommonCliArgs,
+
+    #[command(flatten)]
+    logging: LoggingCliArgs,
+
+    #[command(flatten)]
+    reconnect: ReconnectCliArgs,
 
     #[command(flatten)]
     s3: S3CliArgs,
@@ -175,6 +183,7 @@ struct AisStreamSource {
     filter_mmsi: Vec<String>,
     filter_message_types: Vec<String>,
     source: String,
+    max_reconnect_seconds: u64,
 }
 
 impl AisStreamSource {
@@ -184,6 +193,7 @@ impl AisStreamSource {
         filter_mmsi: Vec<String>,
         filter_message_types: Vec<String>,
         source: String,
+        max_reconnect_seconds: u64,
     ) -> Self {
         Self {
             api_key,
@@ -191,6 +201,7 @@ impl AisStreamSource {
             filter_mmsi,
             filter_message_types,
             source,
+            max_reconnect_seconds,
         }
     }
 
@@ -244,32 +255,44 @@ impl AisStreamSource {
         shutdown: &AtomicBool,
         max_line_length: usize,
     ) -> Result<ReaderTransition> {
-        let mut delay = WS_RECONNECT_INITIAL_DELAY;
+        const UPSTREAM: &str = "AISStream";
+        let mut backoff = Backoff::new(
+            WS_RECONNECT_INITIAL_DELAY,
+            WS_RECONNECT_MAX_DELAY,
+            self.max_reconnect_seconds,
+        );
 
-        while !shutdown.load(std::sync::atomic::Ordering::SeqCst) {
-            eprintln!(
-                "AISStream disconnected. Reconnecting in {}s...",
-                delay.as_secs()
-            );
-            tokio::time::sleep(delay).await;
-
+        loop {
             if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
                 return Ok(ReaderTransition::Stop);
             }
 
+            log::warn(
+                "reconnect_attempt",
+                &format!("{UPSTREAM} disconnected, attempting to reconnect"),
+                &[],
+            );
             match self.connect(max_line_length).await {
                 Ok(reader) => {
-                    eprintln!("Reconnected to AISStream");
+                    log::info("reconnected", &format!("reconnected to {UPSTREAM}"), &[]);
                     return Ok(ReaderTransition::Continue(reader));
                 }
                 Err(error) => {
-                    eprintln!("Reconnect failed: {}", error);
-                    delay = min(delay.saturating_mul(2), WS_RECONNECT_MAX_DELAY);
+                    log::warn(
+                        "reconnect_failed",
+                        &format!("reconnect to {UPSTREAM} failed: {error}"),
+                        &[],
+                    );
                 }
             }
-        }
 
-        Ok(ReaderTransition::Stop)
+            if !backoff.wait(shutdown).await {
+                if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Ok(ReaderTransition::Stop);
+                }
+                collect_core::backoff::give_up(UPSTREAM, self.max_reconnect_seconds);
+            }
+        }
     }
 }
 
@@ -315,6 +338,8 @@ async fn main() -> Result<()> {
         args = Args::parse();
     }
 
+    args.logging.init("collect-aisstream");
+
     // Tidy delimiter-split lists: drop empties, trim whitespace.
     for list in [&mut args.filter_mmsi, &mut args.filter_message_types] {
         *list = list
@@ -339,6 +364,7 @@ async fn main() -> Result<()> {
         args.filter_mmsi,
         args.filter_message_types,
         source_name,
+        args.reconnect.max_reconnect_seconds,
     );
 
     let common_options = args.common.to_options();

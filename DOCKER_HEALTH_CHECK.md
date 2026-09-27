@@ -1,108 +1,127 @@
-# Docker Health Check Setup
+# Docker & container health checks
 
-This document covers the Docker-friendly health checks implemented for the data ingestion binaries.
+Three independent, but consistent, ways to know whether a collector
+(`collect-socket`, `collect-kafka`, `collect-file`, `collect-aisstream`) is
+healthy — full flag reference in [CLI_REFERENCE.md](CLI_REFERENCE.md#health-signals).
+The batch parsers (`ais-parse`, `aisstream-parse`) are one-shot jobs, not
+long-running services, so none of this applies to them — their health
+signal is just their [exit code](CLI_REFERENCE.md#exit-codes) when the run
+finishes.
 
-## Health Check Features
+## 1. Process exit code (authoritative)
 
-### 1. Built-in Health Check Command
-The application supports a `--health-check` flag that can be used by Docker's HEALTHCHECK instruction.
+A collector that gives up exits non-zero with a code that says why:
+
+| Code | Meaning |
+|---|---|
+| `3` | Upstream connection retry window exhausted (`--max-reconnect-seconds`) |
+| `4` | No rows ingested within the drought window despite a healthy connection (`--data-drought-seconds`) |
+| `1` | Any other unclassified error (bad config, etc.) |
+
+This is what a restart policy (Nomad `restart {}`, Docker's own
+`restart: unless-stopped`) actually acts on. The other two mechanisms below
+are for observing a still-*running* process.
+
+## 2. `--health-check` (exec-based, for Docker `HEALTHCHECK`)
 
 ```bash
-# Manual health check
 ./target/release/collect-socket --health-check
-./target/release/collect-file --health-check
 ```
 
-### 2. Health Status Tracking
-- The application maintains a health status file at `/tmp/collect-socket.health` (socket binary) or `/tmp/collect-file.health` (file binary)
-- Status is refreshed every second while ingesting
-- Health check considers the application healthy if:
-  - Status file exists
-  - Status is "healthy" 
-  - Timestamp is within the last 60 seconds
+Reads a status file the running process refreshes every second
+(`/tmp/collect-<binary>.health`, content `<status>:<unix-timestamp>:<reason>`)
+and exits `0`/prints `HEALTHY` if the status is `healthy` and the timestamp
+is under 60 seconds old; otherwise exits `1` and prints the reason (e.g.
+`UNHEALTHY (no rows ingested for 320s (limit 300s))`).
 
-### 3. Docker Integration
-
-#### Building the Docker Image
-```bash
-docker build -t collect .
-```
-
-#### Running with Docker Compose
-```bash
-# Start the service
-docker-compose up -d
-
-# Check health status
-docker-compose ps
-
-# View health check logs
-docker inspect --format='{{json .State.Health}}' data-ingest | jq
-```
-
-The default image entrypoint is `collect-socket`; use `--entrypoint /usr/local/bin/collect-file` for file ingestion.
-
-#### Manual Docker Run Examples
-
-**File Input:**
 ```bash
 docker run -d \
   --name data-ingest \
   --entrypoint /usr/local/bin/collect-file \
-  -v $(pwd)/input:/input:ro \
-  -v $(pwd)/output:/data \
+  -v $(pwd)/input:/input:ro -v $(pwd)/output:/data \
   --health-cmd "/usr/local/bin/collect-file --health-check" \
-  --health-interval 30s \
-  --health-timeout 10s \
-  --health-retries 3 \
-  collect \
-  --input /input/data.txt --source mydata
+  --health-interval 30s --health-timeout 10s --health-retries 3 \
+  collect --input /input/data.txt --source mydata
 ```
 
-**TCP Input:**
+The same pattern applies to any of the four collectors — swap the binary
+name in both `--entrypoint` and `--health-cmd`, and the trailing args for
+that binary's own (see [CLI_REFERENCE.md](CLI_REFERENCE.md)):
+
 ```bash
-docker run -d \
-  --name data-ingest \
-  -v $(pwd)/output:/data \
-  --health-cmd "/usr/local/bin/collect-socket --health-check" \
-  --health-interval 30s \
-  --health-timeout 10s \
-  --health-retries 3 \
-  collect \
-  --tcp-host 153.44.253.27 --tcp-port 5631 --source norway-tcp
+# collect-socket
+--entrypoint /usr/local/bin/collect-socket
+--health-cmd "/usr/local/bin/collect-socket --health-check"
+... collect --tcp-host 153.44.253.27 --tcp-port 5631 --source norway-tcp
+
+# collect-kafka
+--entrypoint /usr/local/bin/collect-kafka
+--health-cmd "/usr/local/bin/collect-kafka --health-check"
+... collect --kafka-brokers broker:9092 --kafka-topic ais-raw --kafka-group-id collect
+
+# collect-aisstream
+--entrypoint /usr/local/bin/collect-aisstream
+--health-cmd "/usr/local/bin/collect-aisstream --health-check"
+... collect --api-key $AISSTREAM_API_KEY --bounding-boxes '[[[-90,-180],[90,180]]]'
 ```
 
-### 4. Health Check Endpoints
+## 3. `GET /healthz` (HTTP, for Nomad/Kubernetes checks)
 
-The health check system provides these status codes:
-- **Exit 0**: Healthy - application is running and processing data
-- **Exit 1**: Unhealthy - application is stalled, crashed, or not processing data
+Opt-in via `--metrics-addr 0.0.0.0:9184` (or any address). Returns `200
+healthy` or `503 unhealthy: <reason>`, the same reason text as (2), plus
+`GET /metrics` for Prometheus scraping:
 
-### 5. Troubleshooting
-
-#### Viewing Health Status
 ```bash
-# Check current health status
-docker exec data-ingest cat /tmp/collect-socket.health
+cargo run -p collect-socket -- --tcp-host host --tcp-port 5631 --metrics-addr 0.0.0.0:9184
+curl localhost:9184/healthz
+curl localhost:9184/metrics
+```
 
-# Use /tmp/collect-file.health when the container runs the file binary
+A Nomad HTTP check:
 
-# View container health history
+```hcl
+check {
+  type     = "http"
+  path     = "/healthz"
+  port     = "metrics"
+  interval = "10s"
+  timeout  = "2s"
+}
+```
+
+## What "unhealthy" actually means
+
+All three surfaces above are computed from the same state, so they always
+agree, whether the process has already exited or is still running with a
+problem:
+
+1. **Heartbeat stale** — the ingest loop itself is stuck or gone. This is
+   the only thing the pre-existing (pre-drought-detection) health check
+   ever looked at.
+2. **Data drought** — the loop is ticking fine, but no row has arrived
+   within `--data-drought-seconds` (default 300s, `0` disables it). Once
+   confirmed, the process itself exits `4` — see (1) above — so this
+   reason is really only observable in the brief window before that exit,
+   or if you've raised the window past what the process's own drought
+   check uses (you haven't; they read the same value).
+
+## Troubleshooting
+
+```bash
+# Current health-file contents
+docker exec data-ingest cat /tmp/collect-socket.health   # or collect-<binary>.health
+
+# Container health check history (exec-based)
 docker inspect data-ingest | jq '.State.Health.Log'
 
-# Follow application logs
-docker-compose logs -f data-ingest
+# Why did it exit?
+docker inspect data-ingest --format='{{.State.ExitCode}}'
+docker-compose logs -f data-ingest   # --log-format text is easier to read here;
+                                      # --log-format json if you're piping into a log pipeline
 ```
 
-#### Common Issues
-1. **Health check failing**: Check if the application is actually processing data
-2. **Stale timestamps**: Application may be stuck in a loop or blocked on input
-3. **Permission issues**: Ensure the application can write to the relevant `/tmp/collect-*.health` file
-
-#### Debug Mode
-```bash
-# Run with debug output
-docker run --rm -it collect --health-check
-```
-
-This health check system provides comprehensive monitoring for Docker environments, ensuring your data ingestion pipeline maintains high availability and can be automatically managed by orchestration systems.
+Common causes, by exit code: `3` (upstream unreachable — check host/port/
+broker reachability, credentials), `4` (data drought — check the actual
+upstream is producing data; a filter like `--bounding-boxes`/
+`--filter-mmsi` too narrow is a common cause on `collect-aisstream`), `1`
+(check the log line right before exit — bad config is the usual cause).

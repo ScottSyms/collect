@@ -140,6 +140,7 @@ async fn kafka_ingest_harness_writes_expected_parquet() -> Result<()> {
         max_line_length: 1024,
         health_check: false,
         metrics_addr: None,
+        data_drought_seconds: 0,
     };
 
     let opts = IngestOptions {
