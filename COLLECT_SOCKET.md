@@ -87,7 +87,7 @@ set, each bronze Parquet file is registered as a row in a `raw` Iceberg
 table (`ts`, `source`, `payload`) immediately after its S3 upload
 succeeds.
 
-**RustFS catalog.** RustFS serves its Iceberg REST catalog at `<endpoint>/iceberg`, uses the bucket name as the warehouse, and rejects unsigned requests. Because the Rust REST client has no request-signing hook, `--iceberg-sigv4` starts a loopback proxy inside the process that signs each catalog call and forwards it (`collect-core/src/iceberg/sigv4.rs`). Example:
+**RustFS catalog.** RustFS serves its Iceberg REST catalog at `<endpoint>/iceberg`, uses the bucket name as the warehouse, and rejects unsigned requests. Because the Rust REST client has no request-signing hook, `--iceberg-sigv4` starts a loopback proxy inside the process that signs each catalog call and forwards it (`collect-core/src/iceberg/sigv4.rs`). The target bucket must also be enabled as a "table bucket" first — RustFS's web console has an "Enable this bucket" action for this; there's no documented CLI/REST call. Example:
 
 ```bash
 S3_ENDPOINT=http://localhost:9000 S3_ACCESS_KEY=rustfsadmin S3_SECRET_KEY=rustfsadmin \

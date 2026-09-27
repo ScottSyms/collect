@@ -133,17 +133,30 @@ catalog, for example, has no separate token auth — it authenticates the
 same way S3 itself does):
 
 ```bash
+S3_ENDPOINT=http://localhost:9000 S3_ACCESS_KEY=root S3_SECRET_KEY=vishnu \
+S3_REGION=us-east-1 S3_PATH_STYLE=true \
 cargo run -p ais-parse --release -- \
   --input-s3-bucket raw/duplicate \
   --output-dir ./ais-parse-state \
-  --s3-endpoint http://localhost:9000 --s3-access-key root --s3-secret-key vishnu \
   --iceberg-catalog-uri http://localhost:9000/iceberg --iceberg-warehouse data \
   --iceberg-sigv4
 ```
 
-`--iceberg-sigv4` signs catalog requests with the same S3 credentials
-(service name `s3`), which is what a catalog exposed directly by an S3-
-compatible store (rather than a separate service like Lakekeeper) expects.
+`--iceberg-sigv4` signs catalog requests with S3 credentials (service name
+`s3`), which is what a catalog exposed directly by an S3-compatible store
+(rather than a separate service like Lakekeeper) expects. Note these are
+set as **environment variables**, not `--s3-*` flags: Iceberg mode's S3
+config (both the signing above and the actual data-file writes a commit
+does) is resolved from the environment only, independently of any `--s3-*`
+flags you also pass for bronze upload/download — see
+[CLI_REFERENCE.md](CLI_REFERENCE.md#iceberg-icebergcliargs-all-six-binaries)
+for the full list, including `S3_PATH_STYLE`, needed here and specific to
+this path.
+
+RustFS also requires a one-time step per bucket before it can serve as a
+warehouse: enable it as a "table bucket" via RustFS's web console (there's
+no documented CLI/API call for it). Skip this for any other catalog
+(Lakekeeper, etc.).
 
 `--delete-after-iceberg` (collectors only, requires `--parser` and cannot be
 combined with S3 upload) deletes each local bronze file once its silver rows

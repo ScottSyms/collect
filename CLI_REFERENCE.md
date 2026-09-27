@@ -66,7 +66,23 @@ applicable to a two-sided tool).
 | `--iceberg-namespace <ns>` | `ICEBERG_NAMESPACE` | `ais` | |
 | `--iceberg-table-prefix <prefix>` | `ICEBERG_TABLE_PREFIX` | — | e.g. `ais` → `ais_positions` |
 | `--iceberg-token <token>` | `ICEBERG_TOKEN` | — | Bearer token for a Lakekeeper-style REST catalog |
-| `--iceberg-sigv4` | `ICEBERG_SIGV4` | off | Sign catalog requests with the S3 credentials above (service `s3`) — needed for a catalog served directly by an S3-compatible store, e.g. RustFS's built-in `/iceberg` endpoint, rather than a separate token-authenticated service |
+| `--iceberg-sigv4` | `ICEBERG_SIGV4` | off | Sign catalog requests with S3 credentials (service `s3`) — needed for a catalog served directly by an S3-compatible store, e.g. RustFS's built-in `/iceberg` endpoint, rather than a separate token-authenticated service |
+
+**Iceberg mode reads its S3 config from environment variables only** —
+`S3_ENDPOINT`, `S3_REGION`, `S3_ACCESS_KEY`/`AWS_ACCESS_KEY_ID`,
+`S3_SECRET_KEY`/`AWS_SECRET_ACCESS_KEY`, and `S3_PATH_STYLE` (`true`/`false`,
+Iceberg-only — the non-Iceberg S3 path always uses path style unconditionally
+and ignores this var) — independently of the `--s3-*` flags above, which only
+configure bronze upload/download. Set both if you're using S3 upload and
+Iceberg together. This applies to `--iceberg-sigv4` signing and to the
+Iceberg table's underlying data-file storage (the actual Parquet writes a
+commit does), not just one or the other.
+
+**RustFS-specific setup**: a bucket must be explicitly enabled as a "table
+bucket" before it can serve as `--iceberg-warehouse` — RustFS's web console
+has an "Enable this bucket" action for this; there is no documented CLI or
+REST call for it, though `PUT /iceberg/v1/buckets/<bucket>` (SigV4-signed)
+does it. Skip this for a catalog that isn't RustFS (Lakekeeper, etc.).
 
 ## Inline parsing (collectors only, `ParserCliArgs`)
 
