@@ -754,6 +754,7 @@ mod tests {
                     max_line_length: 1024,
                     health_check: false,
                     metrics_addr: None,
+                    data_drought_seconds: 0,
                 },
                 s3: None,
                 s3_storage: None,

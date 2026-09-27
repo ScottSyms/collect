@@ -3,6 +3,7 @@ use clap::Parser;
 use collect_core::{
     apply_config_file, health_file_path, line_reader_from_async_read, print_completions,
     run_ingest, CommonCliArgs, IngestOptions, LineReader, LineSource, ReaderTransition, S3CliArgs,
+    log::LoggingCliArgs,
 };
 use collect_core::iceberg::{init_raw_handle, IcebergCliArgs};
 use collect_core::silver::ParserCliArgs;
@@ -64,6 +65,9 @@ struct Args {
 
     #[command(flatten)]
     common: CommonCliArgs,
+
+    #[command(flatten)]
+    logging: LoggingCliArgs,
 
     #[command(flatten)]
     s3: S3CliArgs,
@@ -289,6 +293,8 @@ async fn main() -> Result<()> {
         apply_config_file(config_path)?;
         args = Args::parse();
     }
+
+    args.logging.init("collect-kafka");
 
     let brokers = args
         .kafka_brokers

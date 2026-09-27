@@ -54,7 +54,6 @@ const OUTPUT_TREES: [&str; 6] = [
 
 /// Exit code used when there was nothing to process (distinct from success
 /// with rows written, and from a hard error).
-const EXIT_NOTHING_TO_DO: i32 = 2;
 
 static CANCELLED: AtomicBool = AtomicBool::new(false);
 
@@ -187,6 +186,9 @@ struct Args {
     #[command(flatten)]
     iceberg: collect_core::iceberg::IcebergCliArgs,
 
+    #[command(flatten)]
+    logging: collect_core::log::LoggingCliArgs,
+
     /// Print shell completions for the given shell to stdout and exit
     #[arg(long, exclusive = true)]
     completions: Option<clap_complete::Shell>,
@@ -291,6 +293,8 @@ async fn main() -> Result<()> {
         apply_config_file(config_path)?;
         args = Args::parse();
     }
+
+    args.logging.init("aisstream-parse");
 
     args.normalize();
     args.split_s3_args();
@@ -577,7 +581,7 @@ async fn main() -> Result<()> {
             if args.dry_run {
                 return Ok(());
             }
-            std::process::exit(EXIT_NOTHING_TO_DO);
+            std::process::exit(collect_core::exitcode::NOTHING_TO_DO);
         }
         if !quiet {
             eprintln!("Found {} matching object(s).", entries.len());
@@ -613,7 +617,7 @@ async fn main() -> Result<()> {
             if args.dry_run {
                 return Ok(());
             }
-            std::process::exit(EXIT_NOTHING_TO_DO);
+            std::process::exit(collect_core::exitcode::NOTHING_TO_DO);
         }
         files.sort_by(|a, b| {
             a.partition
@@ -654,7 +658,7 @@ async fn main() -> Result<()> {
             if args.dry_run {
                 return Ok(());
             }
-            std::process::exit(EXIT_NOTHING_TO_DO);
+            std::process::exit(collect_core::exitcode::NOTHING_TO_DO);
         }
     }
 
