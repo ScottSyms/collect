@@ -1,14 +1,14 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use collect_core::ais_consolidate::{AisConsolidator, AisConsolidatorConfig};
+use collect_core::backoff::{Backoff, ReconnectCliArgs};
 use collect_core::{
-    apply_config_file, health_file_path, line_reader_from_async_read, print_completions,
+    apply_config_file, health_file_path, line_reader_from_async_read, log, print_completions,
     run_ingest, CommonCliArgs, IngestOptions, LineReader, LineSource, ReaderTransition, S3CliArgs,
     log::LoggingCliArgs,
 };
 use collect_core::iceberg::{init_raw_handle, IcebergCliArgs};
 use collect_core::silver::ParserCliArgs;
-use std::cmp::min;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -56,6 +56,9 @@ struct Args {
     logging: LoggingCliArgs,
 
     #[command(flatten)]
+    reconnect: ReconnectCliArgs,
+
+    #[command(flatten)]
     s3: S3CliArgs,
 
     #[command(flatten)]
@@ -79,11 +82,17 @@ struct TcpInputSource {
     host: String,
     port: u16,
     source: String,
+    max_reconnect_seconds: u64,
 }
 
 impl TcpInputSource {
-    fn new(host: String, port: u16, source: String) -> Self {
-        Self { host, port, source }
+    fn new(host: String, port: u16, source: String, max_reconnect_seconds: u64) -> Self {
+        Self {
+            host,
+            port,
+            source,
+            max_reconnect_seconds,
+        }
     }
 
     async fn connect(&self, max_line_length: usize) -> Result<LineReader> {
@@ -99,37 +108,48 @@ impl TcpInputSource {
         shutdown: &AtomicBool,
         max_line_length: usize,
     ) -> Result<ReaderTransition> {
-        let mut delay = TCP_RECONNECT_INITIAL_DELAY;
+        let upstream = format!("TCP {}:{}", self.host, self.port);
+        let mut backoff = Backoff::new(
+            TCP_RECONNECT_INITIAL_DELAY,
+            TCP_RECONNECT_MAX_DELAY,
+            self.max_reconnect_seconds,
+        );
 
-        while !shutdown.load(std::sync::atomic::Ordering::SeqCst) {
-            eprintln!(
-                "TCP input disconnected. Reconnecting to {}:{} in {}s...",
-                self.host,
-                self.port,
-                delay.as_secs()
-            );
-            tokio::time::sleep(delay).await;
-
+        loop {
             if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
                 return Ok(ReaderTransition::Stop);
             }
 
+            log::warn(
+                "reconnect_attempt",
+                &format!("{upstream} disconnected, attempting to reconnect"),
+                &[("upstream", &upstream)],
+            );
             match self.connect(max_line_length).await {
                 Ok(reader) => {
-                    eprintln!("Reconnected to TCP {}:{}", self.host, self.port);
+                    log::info(
+                        "reconnected",
+                        &format!("reconnected to {upstream}"),
+                        &[("upstream", &upstream)],
+                    );
                     return Ok(ReaderTransition::Continue(reader));
                 }
                 Err(error) => {
-                    eprintln!(
-                        "Reconnect failed for TCP {}:{}: {}",
-                        self.host, self.port, error
+                    log::warn(
+                        "reconnect_failed",
+                        &format!("reconnect to {upstream} failed: {error}"),
+                        &[("upstream", &upstream)],
                     );
-                    delay = min(delay.saturating_mul(2), TCP_RECONNECT_MAX_DELAY);
                 }
             }
-        }
 
-        Ok(ReaderTransition::Stop)
+            if !backoff.wait(shutdown).await {
+                if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Ok(ReaderTransition::Stop);
+                }
+                collect_core::backoff::give_up(&upstream, self.max_reconnect_seconds);
+            }
+        }
     }
 }
 
@@ -186,7 +206,12 @@ async fn main() -> Result<()> {
     let source_name = args.source.unwrap_or_else(|| "tcp".to_string());
 
     let health_file = health_file_path("collect-socket");
-    let mut source = TcpInputSource::new(host, port, source_name);
+    let mut source = TcpInputSource::new(
+        host,
+        port,
+        source_name,
+        args.reconnect.max_reconnect_seconds,
+    );
 
     let common_options = args.common.to_options();
     let iceberg = if common_options.health_check {

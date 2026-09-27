@@ -34,6 +34,7 @@ use tokio::task::JoinSet;
 use tokio_util::codec::{FramedRead, LinesCodec};
 
 pub mod ais_consolidate;
+pub mod backoff;
 pub mod dataset;
 pub mod exitcode;
 pub mod iceberg;

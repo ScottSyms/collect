@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
+use collect_core::backoff::{Backoff, ReconnectCliArgs};
 use collect_core::{
-    apply_config_file, health_file_path, line_reader_from_async_read, print_completions,
+    apply_config_file, health_file_path, line_reader_from_async_read, log, print_completions,
     run_ingest, CommonCliArgs, IngestOptions, LineReader, LineSource, ReaderTransition, S3CliArgs,
     log::LoggingCliArgs,
 };
@@ -70,6 +71,9 @@ struct Args {
     logging: LoggingCliArgs,
 
     #[command(flatten)]
+    reconnect: ReconnectCliArgs,
+
+    #[command(flatten)]
     s3: S3CliArgs,
 
     #[command(flatten)]
@@ -99,6 +103,7 @@ struct KafkaInputSource {
     /// Consumer of the most recently opened stream; used to commit offsets.
     consumer: Option<Arc<StreamConsumer>>,
     tracker: OffsetTracker,
+    max_reconnect_seconds: u64,
 }
 
 impl KafkaInputSource {
@@ -109,6 +114,7 @@ impl KafkaInputSource {
         auto_offset_reset: String,
         source: String,
         shutdown: Arc<AtomicBool>,
+        max_reconnect_seconds: u64,
     ) -> Self {
         Self {
             brokers,
@@ -119,6 +125,55 @@ impl KafkaInputSource {
             shutdown,
             consumer: None,
             tracker: OffsetTracker::new(PendingLines::default()),
+            max_reconnect_seconds,
+        }
+    }
+
+    /// Re-subscribe with bounded exponential backoff. Unlike TCP/WebSocket,
+    /// `open()` here both connects and spawns the forwarding task, so this
+    /// wraps the whole thing rather than a separate `connect()` step.
+    async fn reconnect(&mut self, max_line_length: usize) -> Result<ReaderTransition> {
+        const UPSTREAM: &str = "Kafka";
+        let mut backoff = Backoff::new(
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(5),
+            self.max_reconnect_seconds,
+        );
+
+        loop {
+            if self.shutdown.load(Ordering::SeqCst) {
+                return Ok(ReaderTransition::Stop);
+            }
+
+            log::warn(
+                "reconnect_attempt",
+                &format!("{UPSTREAM} consumer disconnected, attempting to reconnect"),
+                &[("topic", &self.topic)],
+            );
+            match self.open(max_line_length).await {
+                Ok(reader) => {
+                    log::info(
+                        "reconnected",
+                        &format!("reconnected to {UPSTREAM} topic {}", self.topic),
+                        &[("topic", &self.topic)],
+                    );
+                    return Ok(ReaderTransition::Continue(reader));
+                }
+                Err(error) => {
+                    log::warn(
+                        "reconnect_failed",
+                        &format!("reconnect to {UPSTREAM} failed: {error}"),
+                        &[("topic", &self.topic)],
+                    );
+                }
+            }
+
+            if !backoff.wait(&self.shutdown).await {
+                if self.shutdown.load(Ordering::SeqCst) {
+                    return Ok(ReaderTransition::Stop);
+                }
+                collect_core::backoff::give_up(UPSTREAM, self.max_reconnect_seconds);
+            }
         }
     }
 
@@ -258,9 +313,7 @@ impl LineSource for KafkaInputSource {
         if shutdown.load(Ordering::SeqCst) {
             Ok(ReaderTransition::Stop)
         } else {
-            Ok(ReaderTransition::Continue(
-                self.open(max_line_length).await?,
-            ))
+            self.reconnect(max_line_length).await
         }
     }
 
@@ -273,9 +326,7 @@ impl LineSource for KafkaInputSource {
         if shutdown.load(Ordering::SeqCst) {
             Ok(ReaderTransition::Stop)
         } else {
-            Ok(ReaderTransition::Continue(
-                self.open(max_line_length).await?,
-            ))
+            self.reconnect(max_line_length).await
         }
     }
 }
@@ -318,6 +369,7 @@ async fn main() -> Result<()> {
         args.kafka_auto_offset_reset,
         source_name,
         shutdown.clone(),
+        args.reconnect.max_reconnect_seconds,
     );
 
     let common_options = args.common.to_options();
