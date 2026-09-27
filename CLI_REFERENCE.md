@@ -1,6 +1,6 @@
 # CLI reference
 
-The full flag/env surface for all six binaries. `<binary> --help` is always
+The full flag/env surface for all seven binaries. `<binary> --help` is always
 the authoritative source for the version you're running — this groups the
 same information by the shared structs the flags come from, so it's easier
 to see what's common across binaries versus what's bespoke to one.
@@ -8,7 +8,7 @@ to see what's common across binaries versus what's bespoke to one.
 New to the project? Start with [TUTORIAL.md](TUTORIAL.md) instead — this
 page is a reference, not a walkthrough.
 
-## Shared across all six binaries
+## Shared across all seven binaries
 
 | Flag | Env | Default | Notes |
 |---|---|---|---|
@@ -18,9 +18,9 @@ page is a reference, not a walkthrough.
 | `--config <path>` | `CONFIG_FILE` | — | Load flag defaults from a flat TOML file (same keys as the env var names below); explicit flags and already-set env vars still win |
 | `-h, --help` / `-V, --version` | — | — | |
 
-## Common to the four collectors (`CommonCliArgs`)
+## Common to the five collectors (`CommonCliArgs`)
 
-`collect-socket`, `collect-kafka`, `collect-file`, `collect-aisstream`.
+`collect-socket`, `collect-kafka`, `collect-file`, `collect-aisstream`, `collect-barentswatch`.
 
 | Flag | Env | Default | Notes |
 |---|---|---|---|
@@ -57,7 +57,7 @@ The connection flags themselves are the same names/envs as the collectors'
 table above, minus `--s3-bucket`/`--s3-prefix`/`--keep-local` (not
 applicable to a two-sided tool).
 
-## Iceberg (`IcebergCliArgs`, all six binaries)
+## Iceberg (`IcebergCliArgs`, all seven binaries)
 
 | Flag | Env | Default | Notes |
 |---|---|---|---|
@@ -91,9 +91,9 @@ does it. Skip this for a catalog that isn't RustFS (Lakekeeper, etc.).
 | `--parser none\|ais\|aisstream` | `PARSER` | `none` | Decode each ingested row inline into the six silver tables as it arrives; `none` keeps today's bronze-only behavior |
 | `--delete-after-iceberg` | `DELETE_AFTER_ICEBERG` | off | Delete each local bronze file once its silver rows commit to Iceberg. Requires `--parser` + `--iceberg-catalog-uri`; rejected together with `--s3-bucket` |
 
-## Reconnect (the three streaming collectors)
+## Reconnect (the four streaming collectors)
 
-`collect-socket`, `collect-kafka`, `collect-aisstream` — not `collect-file`,
+`collect-socket`, `collect-kafka`, `collect-aisstream`, `collect-barentswatch` — not `collect-file`,
 which has no live connection to lose.
 
 | Flag | Env | Default | Notes |
@@ -180,7 +180,7 @@ bound when `--parser` is set; lower `--max-batch-bytes` if needed.
 
 ## Exit codes
 
-Shared across all six binaries (`collect_core::exitcode`):
+Shared across all seven binaries (`collect_core::exitcode`):
 
 | Code | Meaning |
 |---|---|
@@ -202,7 +202,7 @@ Shared across all six binaries (`collect_core::exitcode`):
 | `--consolidate-ais` | `CONSOLIDATE_AIS` | Reassemble fragmented NMEA sentences before writing |
 | `--process-timestamps` | `PROCESS_TIMESTAMPS` | Correct row timestamps from `$PGHP`/tag-block `c:` |
 
-Plus [Common](#common-to-the-four-collectors-commoncliargs), [S3](#s3--collectors-s3cliargs-one-sink), [Iceberg](#iceberg-icebergcliargs-all-six-binaries), [inline parsing](#inline-parsing-collectors-only-parsercliargs), [reconnect](#reconnect-the-three-streaming-collectors), and the [shared flags](#shared-across-all-six-binaries).
+Plus [Common](#common-to-the-five-collectors-commoncliargs), [S3](#s3--collectors-s3cliargs-one-sink), [Iceberg](#iceberg-icebergcliargs-all-six-binaries), [inline parsing](#inline-parsing-collectors-only-parsercliargs), [reconnect](#reconnect-the-four-streaming-collectors), and the [shared flags](#shared-across-all-seven-binaries).
 
 ## `collect-kafka`
 
@@ -215,7 +215,7 @@ Plus [Common](#common-to-the-four-collectors-commoncliargs), [S3](#s3--collector
 | `-s, --source <label>` | `SOURCE` | Defaults to the topic name |
 | `-q, --quiet` | `QUIET` | |
 
-Plus [Common](#common-to-the-four-collectors-commoncliargs), [S3](#s3--collectors-s3cliargs-one-sink), [Iceberg](#iceberg-icebergcliargs-all-six-binaries), [inline parsing](#inline-parsing-collectors-only-parsercliargs), [reconnect](#reconnect-the-three-streaming-collectors), and the [shared flags](#shared-across-all-six-binaries).
+Plus [Common](#common-to-the-five-collectors-commoncliargs), [S3](#s3--collectors-s3cliargs-one-sink), [Iceberg](#iceberg-icebergcliargs-all-six-binaries), [inline parsing](#inline-parsing-collectors-only-parsercliargs), [reconnect](#reconnect-the-four-streaming-collectors), and the [shared flags](#shared-across-all-seven-binaries).
 
 ## `collect-file`
 
@@ -229,7 +229,7 @@ Plus [Common](#common-to-the-four-collectors-commoncliargs), [S3](#s3--collector
 | `--consolidate-ais` | `CONSOLIDATE_AIS` | |
 | `--process-timestamps` | `PROCESS_TIMESTAMPS` | |
 
-Plus [Common](#common-to-the-four-collectors-commoncliargs), [S3](#s3--collectors-s3cliargs-one-sink), [Iceberg](#iceberg-icebergcliargs-all-six-binaries), [inline parsing](#inline-parsing-collectors-only-parsercliargs), and the [shared flags](#shared-across-all-six-binaries). No reconnect flags — no live connection to lose.
+Plus [Common](#common-to-the-five-collectors-commoncliargs), [S3](#s3--collectors-s3cliargs-one-sink), [Iceberg](#iceberg-icebergcliargs-all-six-binaries), [inline parsing](#inline-parsing-collectors-only-parsercliargs), and the [shared flags](#shared-across-all-seven-binaries). No reconnect flags — no live connection to lose.
 
 ## `collect-aisstream`
 
@@ -242,7 +242,21 @@ Plus [Common](#common-to-the-four-collectors-commoncliargs), [S3](#s3--collector
 | `-s, --source <label>` | `SOURCE` | Default `aisstream` |
 | `-q, --quiet` | `QUIET` | |
 
-Plus [Common](#common-to-the-four-collectors-commoncliargs), [S3](#s3--collectors-s3cliargs-one-sink), [Iceberg](#iceberg-icebergcliargs-all-six-binaries), [inline parsing](#inline-parsing-collectors-only-parsercliargs), [reconnect](#reconnect-the-three-streaming-collectors), and the [shared flags](#shared-across-all-six-binaries).
+Plus [Common](#common-to-the-five-collectors-commoncliargs), [S3](#s3--collectors-s3cliargs-one-sink), [Iceberg](#iceberg-icebergcliargs-all-six-binaries), [inline parsing](#inline-parsing-collectors-only-parsercliargs), [reconnect](#reconnect-the-four-streaming-collectors), and the [shared flags](#shared-across-all-seven-binaries).
+
+## `collect-barentswatch`
+
+| Flag | Env | Notes |
+|---|---|---|
+| `--client-id <id>` | `BARENTSWATCH_CLIENT_ID` | |
+| `--client-secret <secret>` | `BARENTSWATCH_CLIENT_SECRET` | |
+| `--endpoint <url>` | `BARENTSWATCH_ENDPOINT` | Default `https://live.ais.barentswatch.no/v1/combined` |
+| `--model-type Standard\|Full` | `MODEL_TYPE` | Default `Full` |
+| `--model-format Json` | `MODEL_FORMAT` | Default `Json` (GeoJSON not supported) |
+| `-s, --source <label>` | `SOURCE` | Default `barentswatch` |
+| `-q, --quiet` | `QUIET` | |
+
+Plus [Common](#common-to-the-five-collectors-commoncliargs), [S3](#s3--collectors-s3cliargs-one-sink), [Iceberg](#iceberg-icebergcliargs-all-six-binaries), [inline parsing](#inline-parsing-collectors-only-parsercliargs), [reconnect](#reconnect-the-four-streaming-collectors), and the [shared flags](#shared-across-all-seven-binaries).
 
 ## `ais-parse` / `aisstream-parse`
 

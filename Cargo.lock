@@ -1316,6 +1316,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "collect-barentswatch"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "clap_complete",
+ "collect-core",
+ "collect-silver",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "collect-core"
 version = "0.1.0"
 dependencies = [

@@ -8,6 +8,7 @@ members = [
     "crates/ais-parse",
     "crates/collect-aisstream",
     "crates/aisstream-parse",
+    "crates/collect-barentswatch",
 ]
 resolver = "2"
 
@@ -43,6 +44,7 @@ rand = "0.8"
 rayon = "1"
 rlimit = "0.10"
 libc = "0.2"
+bytes = "1"
 # Pinned to the fork's last library-only commit (the 0.11.0 release line).
 # Later fork commits fold a CLI, S3 I/O, and an iceberg 0.3 dependency into
 # the library itself; iceberg pins parquet 52, which conflicts with the
