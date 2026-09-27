@@ -13,7 +13,7 @@ use rayon::prelude::*;
 use std::collections::{HashSet, VecDeque};
 use std::fs::File as StdFile;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arrow::record_batch::RecordBatch;
@@ -42,13 +42,59 @@ const BINARY_TREE: &str = "binary";
 const ATONS_TREE: &str = "atons";
 const OTHER_TREE: &str = "other";
 
-/// Exit code used when there was nothing to process (distinct from success
-/// with rows written, and from a hard error).
-
 static CANCELLED: AtomicBool = AtomicBool::new(false);
 
 fn is_cancelled() -> bool {
     CANCELLED.load(Ordering::Relaxed)
+}
+
+/// Count of partitions skipped so far after a decode, Iceberg commit, or
+/// upload failure. Shared across worker tasks so `--max-partition-failures`
+/// bounds the whole run's total, not each worker's own count.
+static PARTITIONS_FAILED: AtomicU64 = AtomicU64::new(0);
+
+/// Record one partition's failure and decide whether the run may continue.
+/// Logs the failure either way. Exits directly with
+/// [`collect_core::exitcode::PARTIAL_FAILURE_THRESHOLD`] — never returns —
+/// once `--fail-fast` is set or the running total exceeds
+/// `max_partition_failures`, matching this codebase's convention of exiting
+/// at the decision point rather than threading a special error type through
+/// every caller.
+fn record_partition_failure(
+    partition_label: &str,
+    error: &anyhow::Error,
+    fail_fast: bool,
+    max_partition_failures: u64,
+) {
+    let count = PARTITIONS_FAILED.fetch_add(1, Ordering::SeqCst) + 1;
+    collect_core::log::error(
+        "partition_failed",
+        &format!("partition {partition_label} failed: {error:#}"),
+        &[
+            ("partition", partition_label),
+            ("failure_count", &count.to_string()),
+        ],
+    );
+    if fail_fast {
+        collect_core::log::error(
+            "partial_failure_abort",
+            "--fail-fast is set; aborting on this partition's failure",
+            &[],
+        );
+        CANCELLED.store(true, Ordering::Relaxed);
+        std::process::exit(collect_core::exitcode::PARTIAL_FAILURE_THRESHOLD);
+    }
+    if count > max_partition_failures {
+        collect_core::log::error(
+            "partial_failure_threshold_exceeded",
+            &format!(
+                "{count} partitions have failed, exceeding --max-partition-failures={max_partition_failures}"
+            ),
+            &[],
+        );
+        CANCELLED.store(true, Ordering::Relaxed);
+        std::process::exit(collect_core::exitcode::PARTIAL_FAILURE_THRESHOLD);
+    }
 }
 
 /// Unique key for row-level dedup within a single partition run. The leading
@@ -186,6 +232,15 @@ struct Args {
     /// Suppress informational progress lines; warnings and errors still print
     #[arg(short, long, env = "QUIET")]
     quiet: bool,
+
+    /// Abort the run as soon as a single partition fails (decode, Iceberg
+    /// commit, or upload), instead of skipping it and continuing
+    #[arg(long, env = "FAIL_FAST")]
+    fail_fast: bool,
+
+    /// Abort the run once this many partitions have failed and been skipped
+    #[arg(long, env = "MAX_PARTITION_FAILURES", default_value_t = 5)]
+    max_partition_failures: u64,
 
     #[command(flatten)]
     iceberg: collect_core::iceberg::IcebergCliArgs,
@@ -730,6 +785,8 @@ async fn main() -> Result<()> {
     let consolidate_ais = args.consolidate_ais;
     let process_timestamps = args.process_timestamps;
     let compression_level = args.compression_level;
+    let fail_fast = args.fail_fast;
+    let max_partition_failures = args.max_partition_failures;
     let mut total_stats = ParseStats::default();
     let mut first_error = None;
 
@@ -749,7 +806,7 @@ async fn main() -> Result<()> {
             workers.push(tokio::spawn(async move {
                 let mut stats = ParseStats::default();
 
-                loop {
+                'partition: loop {
                     if is_cancelled() {
                         break;
                     }
@@ -832,8 +889,14 @@ async fn main() -> Result<()> {
                             outputs
                         }
                         Err(error) => {
-                            CANCELLED.store(true, Ordering::Relaxed);
-                            return Err(error);
+                            record_partition_failure(
+                                &partition_label,
+                                &error,
+                                fail_fast,
+                                max_partition_failures,
+                            );
+                            stats.partitions_failed += 1;
+                            continue 'partition;
                         }
                     };
 
@@ -850,8 +913,14 @@ async fn main() -> Result<()> {
                                     format!("uploading {} to S3", local_path.display())
                                 })
                             {
-                                CANCELLED.store(true, Ordering::Relaxed);
-                                return Err(error);
+                                record_partition_failure(
+                                    &partition_label,
+                                    &error,
+                                    fail_fast,
+                                    max_partition_failures,
+                                );
+                                stats.partitions_failed += 1;
+                                continue 'partition;
                             }
                         }
                     }
@@ -955,7 +1024,7 @@ async fn main() -> Result<()> {
             workers.push(tokio::spawn(async move {
                 let mut stats = ParseStats::default();
 
-                loop {
+                'partition: loop {
                     if is_cancelled() {
                         break;
                     }
@@ -1079,9 +1148,10 @@ async fn main() -> Result<()> {
                                     partition_stats.failed,
                                 );
                             }
-                            stats.merge(&partition_stats);
                             // Commit now and drop the decoded batches before this
-                            // worker starts its next partition.
+                            // worker starts its next partition. Stats merge only
+                            // on success, so a failed commit's rows don't show up
+                            // in the run summary as if they landed in Iceberg.
                             if let Err(error) = sink
                                 .commit(CommittableBatch {
                                     partition_rel_dir: partition_label.clone(),
@@ -1090,13 +1160,26 @@ async fn main() -> Result<()> {
                                 })
                                 .await
                             {
-                                CANCELLED.store(true, Ordering::Relaxed);
-                                return Err(error);
+                                record_partition_failure(
+                                    &partition_label,
+                                    &error,
+                                    fail_fast,
+                                    max_partition_failures,
+                                );
+                                stats.partitions_failed += 1;
+                                continue 'partition;
                             }
+                            stats.merge(&partition_stats);
                         }
                         Err(error) => {
-                            CANCELLED.store(true, Ordering::Relaxed);
-                            return Err(error);
+                            record_partition_failure(
+                                &partition_label,
+                                &error,
+                                fail_fast,
+                                max_partition_failures,
+                            );
+                            stats.partitions_failed += 1;
+                            continue 'partition;
                         }
                     }
 
