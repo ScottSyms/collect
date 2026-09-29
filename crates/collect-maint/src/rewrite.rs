@@ -83,10 +83,7 @@ pub async fn read_files(table: &Table, paths: &HashSet<String>) -> Result<Vec<Re
 /// Sorts all rows by `columns` (ascending, nulls last), returning one batch.
 /// No columns means concatenate only.
 pub fn sort_batches(batches: &[RecordBatch], columns: &[String]) -> Result<RecordBatch> {
-    let schema = batches
-        .first()
-        .context("no batches to sort")?
-        .schema();
+    let schema = batches.first().context("no batches to sort")?.schema();
     let all = concat_batches(&schema, batches)?;
     if columns.is_empty() {
         return Ok(all);
@@ -110,14 +107,15 @@ pub fn sort_batches(batches: &[RecordBatch], columns: &[String]) -> Result<Recor
     Ok(take_record_batch(&all, &indices)?)
 }
 
-/// Writes `batch` (already sorted) into one partition as rolling ~512 MiB
-/// zstd files with row groups capped at [`MAX_ROW_GROUP_ROWS`] and bloom
+/// Writes `batch` (already sorted) into one partition as rolling zstd files of
+/// about `target_bytes` each with row groups capped at [`MAX_ROW_GROUP_ROWS`] and bloom
 /// filters on `bloom_columns`. The partition value comes from the input files
 /// rather than the data, so it cannot be mislabelled.
 pub async fn write_partition(
     table: &Table,
     partition: Option<Struct>,
     batch: RecordBatch,
+    target_bytes: u64,
     bloom_columns: &[&str],
 ) -> Result<Vec<DataFile>> {
     let metadata = table.metadata();
@@ -136,8 +134,9 @@ pub async fn write_partition(
             props = props.set_column_bloom_filter_enabled(ColumnPath::from(*col), true);
         }
     }
-    let rolling = RollingFileWriterBuilder::new_with_default_file_size(
+    let rolling = RollingFileWriterBuilder::new(
         ParquetWriterBuilder::new(props.build(), schema.clone()),
+        target_bytes as usize,
         table.file_io().clone(),
         location_gen,
         name_gen,
@@ -174,7 +173,10 @@ pub async fn write_partition(
     let mut offset = 0;
     while offset < batch.num_rows() {
         let len = MAX_ROW_GROUP_ROWS.min(batch.num_rows() - offset);
-        writer.write(batch.slice(offset, len)).await.context("write")?;
+        writer
+            .write(batch.slice(offset, len))
+            .await
+            .context("write")?;
         offset += len;
     }
     Ok(writer.close().await.context("close")?)

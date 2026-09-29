@@ -14,7 +14,14 @@ pub fn split_location(location: &str) -> Result<(String, String)> {
         .1;
     let (bucket, path) = rest.split_once('/').unwrap_or((rest, ""));
     let path = path.trim_matches('/');
-    Ok((bucket.to_string(), if path.is_empty() { String::new() } else { format!("{path}/") }))
+    Ok((
+        bucket.to_string(),
+        if path.is_empty() {
+            String::new()
+        } else {
+            format!("{path}/")
+        },
+    ))
 }
 
 fn key_of(path: &str) -> String {
@@ -66,14 +73,13 @@ pub async fn referenced_keys(table: &Table) -> Result<HashSet<String>> {
 /// Objects under the table location that no snapshot references and that are
 /// older than `cutoff_ms` (writers upload before they commit, so a young
 /// unreferenced object may be an in-flight write).
-pub async fn find(
-    table: &Table,
-    storage: &S3Storage,
-    cutoff_ms: i64,
-) -> Result<Vec<S3ObjectInfo>> {
+pub async fn find(table: &Table, storage: &S3Storage, cutoff_ms: i64) -> Result<Vec<S3ObjectInfo>> {
     let (_, prefix) = split_location(table.metadata().location())?;
     let referenced = referenced_keys(table).await?;
-    anyhow::ensure!(!referenced.is_empty(), "no referenced objects found; refusing to list orphans");
+    anyhow::ensure!(
+        !referenced.is_empty(),
+        "no referenced objects found; refusing to list orphans"
+    );
     let listed = storage.list_keys_with_prefix(&prefix).await?;
     Ok(listed
         .into_iter()
@@ -87,8 +93,14 @@ mod tests {
 
     #[test]
     fn splits_locations() {
-        assert_eq!(split_location("s3://b/a/b").unwrap(), ("b".into(), "a/b/".into()));
-        assert_eq!(split_location("s3://b").unwrap(), ("b".into(), String::new()));
+        assert_eq!(
+            split_location("s3://b/a/b").unwrap(),
+            ("b".into(), "a/b/".into())
+        );
+        assert_eq!(
+            split_location("s3://b").unwrap(),
+            ("b".into(), String::new())
+        );
         assert_eq!(key_of("s3://b/a/b.parquet"), "a/b.parquet");
     }
 }

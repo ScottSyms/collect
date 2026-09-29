@@ -165,6 +165,10 @@ anywhere once they're decoded.
 
 ## What next
 
+- **Keeping Iceberg tables fast**: ingest leaves many small files and
+  snapshots. [AIS_COMPACT.md](AIS_COMPACT.md) covers `ais-compact`, which
+  merges them into sorted files and cleans up after itself (RustFS's catalog
+  has no compactor of its own).
 - **Running unattended** (Nomad, containers, restart policies, health
   signals, log format): [CLI_REFERENCE.md](CLI_REFERENCE.md) for the full
   flag surface, [DOCKER_HEALTH_CHECK.md](DOCKER_HEALTH_CHECK.md) for health

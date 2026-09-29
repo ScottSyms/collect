@@ -13,8 +13,8 @@ use arrow::array::{Array, StringArray, TimestampMillisecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use collect_core::iceberg::{
-    commit_batches, ensure_namespace, ensure_table, open_catalog, partition_spec_for,
-    table_ident, table_schemas, IcebergConfig, TABLE_RAW,
+    commit_batches, ensure_namespace, ensure_table, open_catalog, partition_spec_for, table_ident,
+    table_schemas, IcebergConfig, TABLE_RAW,
 };
 use collect_core::S3Storage;
 use collect_maint::rewrite::{live_files, read_files, sort_batches};
@@ -22,7 +22,11 @@ use iceberg::Catalog;
 
 fn batch(ts: i64, payload: &str) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
-        Field::new("ts", DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())), false),
+        Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+            false,
+        ),
         Field::new("source", DataType::Utf8, false),
         Field::new("payload", DataType::Utf8, false),
     ]));
@@ -40,7 +44,13 @@ fn batch(ts: i64, payload: &str) -> RecordBatch {
 fn run(rustfs: &support::Rustfs, args: &[&str]) -> (i32, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_ais-compact"))
         .args(["--iceberg-catalog-uri", &rustfs.iceberg_catalog_uri()])
-        .args(["--iceberg-warehouse", "cli-test", "--iceberg-sigv4", "--table", "raw"])
+        .args([
+            "--iceberg-warehouse",
+            "cli-test",
+            "--iceberg-sigv4",
+            "--table",
+            "raw",
+        ])
         .args(args)
         .env("S3_ENDPOINT", rustfs.endpoint())
         .env("S3_ACCESS_KEY", &rustfs.access_key)
@@ -101,14 +111,22 @@ async fn compact_expire_orphans_end_to_end() {
     let schema = table_schemas::raw_schema();
     let spec = partition_spec_for(&schema, "day").unwrap();
     let ident = table_ident(&config, TABLE_RAW);
-    let mut table = ensure_table(&catalog, &config, TABLE_RAW, schema, spec).await.unwrap();
+    let mut table = ensure_table(&catalog, &config, TABLE_RAW, schema, spec)
+        .await
+        .unwrap();
 
     // Six one-row commits in a long-closed day, written newest-first.
     let day = 1_780_000_000_000i64;
     for i in (0..6).rev() {
-        commit_batches(&catalog, &table, vec![batch(day + i * 1000, &format!("p{i}"))], 3, TABLE_RAW)
-            .await
-            .unwrap();
+        commit_batches(
+            &catalog,
+            &table,
+            vec![batch(day + i * 1000, &format!("p{i}"))],
+            3,
+            TABLE_RAW,
+        )
+        .await
+        .unwrap();
         table = catalog.load_table(&ident).await.unwrap();
     }
     assert_eq!(live_files(&table).await.unwrap().len(), 6);
@@ -123,15 +141,30 @@ async fn compact_expire_orphans_end_to_end() {
     // Apply: one sorted file, sort order registered, small manifests merged.
     let (code, text) = run(
         &rustfs,
-        &["compact", "--apply", "--min-age-hours", "0", "--consolidate-manifests", "2"],
+        &[
+            "compact",
+            "--apply",
+            "--min-age-hours",
+            "0",
+            "--consolidate-manifests",
+            "2",
+        ],
     );
     assert_eq!(code, 0, "{text}");
-    assert!(text.contains("rewrote") && text.contains("sort order registered"), "{text}");
+    assert!(
+        text.contains("rewrote") && text.contains("sort order registered"),
+        "{text}"
+    );
     assert!(text.contains("consolidated"), "{text}");
     let table = catalog.load_table(&ident).await.unwrap();
     let files = live_files(&table).await.unwrap();
     assert_eq!(files.len(), 1);
-    assert!(files[0].path.rsplit('/').next().unwrap().starts_with("compact-"));
+    assert!(files[0]
+        .path
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .starts_with("compact-"));
     assert_eq!(table.metadata().default_sort_order().fields.len(), 1);
     let paths: HashSet<String> = files.iter().map(|f| f.path.clone()).collect();
     let rows = sort_batches(&read_files(&table, &paths).await.unwrap(), &[]).unwrap();
@@ -145,14 +178,29 @@ async fn compact_expire_orphans_end_to_end() {
     assert_eq!(code, 2, "{text}");
 
     // Expire everything but the newest snapshot, then free the objects.
-    let (code, text) = run(&rustfs, &["expire", "--apply", "--older-than-days", "0", "--retain-last", "1"]);
+    let (code, text) = run(
+        &rustfs,
+        &[
+            "expire",
+            "--apply",
+            "--older-than-days",
+            "0",
+            "--retain-last",
+            "1",
+        ],
+    );
     assert_eq!(code, 0, "{text}");
     let table = catalog.load_table(&ident).await.unwrap();
     assert_eq!(table.metadata().snapshots().count(), 1);
 
     let s3 = [
-        "--s3-endpoint", &rustfs.endpoint(), "--s3-access-key", &rustfs.access_key,
-        "--s3-secret-key", &rustfs.secret_key, "--s3-disable-tls",
+        "--s3-endpoint",
+        &rustfs.endpoint(),
+        "--s3-access-key",
+        &rustfs.access_key,
+        "--s3-secret-key",
+        &rustfs.secret_key,
+        "--s3-disable-tls",
     ];
     let mut dry = vec!["orphans", "--older-than-days", "0"];
     dry.extend(s3);

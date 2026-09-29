@@ -11,8 +11,8 @@ use arrow::array::{Array, StringArray, TimestampMillisecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use collect_core::iceberg::{
-    commit_batches, ensure_namespace, ensure_table, open_catalog, partition_spec_for,
-    table_schemas, table_ident, IcebergConfig, TABLE_RAW,
+    commit_batches, ensure_namespace, ensure_table, open_catalog, partition_spec_for, table_ident,
+    table_schemas, IcebergConfig, TABLE_RAW,
 };
 use collect_core::S3Storage;
 use collect_maint::commit::{prepare_replace, RestClient};
@@ -21,7 +21,11 @@ use iceberg::Catalog;
 
 fn raw_batch(rows: &[(i64, &str)]) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
-        Field::new("ts", DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())), false),
+        Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+            false,
+        ),
         Field::new("source", DataType::Utf8, false),
         Field::new("payload", DataType::Utf8, false),
     ]));
@@ -33,7 +37,9 @@ fn raw_batch(rows: &[(i64, &str)]) -> RecordBatch {
                     .with_timezone("UTC"),
             ),
             Arc::new(StringArray::from(vec!["s"; rows.len()])),
-            Arc::new(StringArray::from(rows.iter().map(|r| r.1).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+            )),
         ],
     )
     .unwrap()
@@ -82,7 +88,9 @@ async fn replace_commit_is_accepted_and_readable() {
     ensure_namespace(&catalog, &config).await.unwrap();
     let schema = table_schemas::raw_schema();
     let spec = partition_spec_for(&schema, "day").unwrap();
-    let mut table = ensure_table(&catalog, &config, TABLE_RAW, schema, spec).await.unwrap();
+    let mut table = ensure_table(&catalog, &config, TABLE_RAW, schema, spec)
+        .await
+        .unwrap();
 
     // Three tiny commits, deliberately out of order across commits, one day.
     let day = 1_780_000_000_000i64; // fixed instant; all rows fall on one UTC day
@@ -94,7 +102,10 @@ async fn replace_commit_is_accepted_and_readable() {
         commit_batches(&catalog, &table, vec![raw_batch(&rows)], 3, TABLE_RAW)
             .await
             .unwrap();
-        table = catalog.load_table(&table_ident(&config, TABLE_RAW)).await.unwrap();
+        table = catalog
+            .load_table(&table_ident(&config, TABLE_RAW))
+            .await
+            .unwrap();
     }
 
     let before = live_files(&table).await.unwrap();
@@ -103,9 +114,15 @@ async fn replace_commit_is_accepted_and_readable() {
 
     let batches = read_files(&table, &remove).await.unwrap();
     let sorted = sort_batches(&batches, &["ts".to_string()]).unwrap();
-    let added = write_partition(&table, before[0].partition.clone(), sorted, &["source"])
-        .await
-        .unwrap();
+    let added = write_partition(
+        &table,
+        before[0].partition.clone(),
+        sorted,
+        512 << 20,
+        &["source"],
+    )
+    .await
+    .unwrap();
     assert_eq!(added.len(), 1);
 
     let prepared = prepare_replace(&table, &remove, added).await.unwrap();

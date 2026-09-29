@@ -78,7 +78,9 @@ async fn ensure_sort_order(
         action = action.asc(c, NullOrder::Last);
     }
     let txn = action.apply(txn)?;
-    txn.commit(catalog).await.context("registering sort order")?;
+    txn.commit(catalog)
+        .await
+        .context("registering sort order")?;
     Ok(true)
 }
 
@@ -108,7 +110,14 @@ async fn rewrite_partition(
         let batches = read_files(&table, &paths).await?;
         let sorted = sort_batches(&batches, sort)?;
         drop(batches);
-        let added = write_partition(&table, p.partition.clone(), sorted, &BLOOM_COLUMNS).await?;
+        let added = write_partition(
+            &table,
+            p.partition.clone(),
+            sorted,
+            opts.plan.target_bytes,
+            &BLOOM_COLUMNS,
+        )
+        .await?;
         let out_bytes = added.iter().map(|f| f.file_size_in_bytes()).sum();
         let out_files = added.len();
         let prepared = match prepare_replace(&table, &paths, added.clone()).await {
@@ -118,11 +127,17 @@ async fn rewrite_partition(
                 return Err(e);
             }
         };
-        if rest.commit(ident, &prepared.requirements, &prepared.updates).await? {
+        if rest
+            .commit(ident, &prepared.requirements, &prepared.updates)
+            .await?
+        {
             return Ok(Some((p, out_files, out_bytes)));
         }
         discard(&table, &added).await;
-        eprintln!("  {}: table changed during rewrite, retrying ({attempt}/{MAX_COMMIT_ATTEMPTS})", p.label);
+        eprintln!(
+            "  {}: table changed during rewrite, retrying ({attempt}/{MAX_COMMIT_ATTEMPTS})",
+            p.label
+        );
     }
     bail!("gave up after {MAX_COMMIT_ATTEMPTS} conflicting commits")
 }

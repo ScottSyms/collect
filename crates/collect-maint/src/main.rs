@@ -108,9 +108,17 @@ struct OrphanArgs {
 
 fn table_names(cli: &Cli) -> Vec<String> {
     if cli.tables.is_empty() {
-        [TABLE_RAW, TABLE_POSITIONS, TABLE_STATICS, TABLE_METEO, TABLE_BINARY, TABLE_ATONS, TABLE_OTHER]
-            .map(String::from)
-            .to_vec()
+        [
+            TABLE_RAW,
+            TABLE_POSITIONS,
+            TABLE_STATICS,
+            TABLE_METEO,
+            TABLE_BINARY,
+            TABLE_ATONS,
+            TABLE_OTHER,
+        ]
+        .map(String::from)
+        .to_vec()
     } else {
         cli.tables.clone()
     }
@@ -138,7 +146,10 @@ async fn run() -> Result<i32> {
         return Ok(exitcode::SUCCESS);
     }
     cli.iceberg.validate()?;
-    anyhow::ensure!(cli.iceberg.is_iceberg_mode(), "--iceberg-catalog-uri is required");
+    anyhow::ensure!(
+        cli.iceberg.is_iceberg_mode(),
+        "--iceberg-catalog-uri is required"
+    );
     let config = IcebergConfig::from(&cli.iceberg);
     let catalog = open_catalog(&config).await?;
     let rest = RestClient::connect(&config).await?;
@@ -230,7 +241,11 @@ async fn inspect(table: &iceberg::table::Table, a: &InspectArgs) -> Result<()> {
     let sort = table.metadata().default_sort_order();
     println!(
         "  {} data files, {:.1} MiB, {} rows; {} under {} MiB",
-        files.len(), mib(total), records, small, a.target_file_mb / 2
+        files.len(),
+        mib(total),
+        records,
+        small,
+        a.target_file_mb / 2
     );
     println!(
         "  {} partitions need compaction, {} are fine; {} snapshots, {} small manifests; sort order: {}",
@@ -255,12 +270,19 @@ async fn expire(
         return Ok(0);
     }
     if !a.apply {
-        println!("  would expire {} of {} snapshots", ids.len(), table.metadata().snapshots().count());
+        println!(
+            "  would expire {} of {} snapshots",
+            ids.len(),
+            table.metadata().snapshots().count()
+        );
         return Ok(ids.len());
     }
     let n = ids.len();
     let (req, upd) = expire_commit(table, ids);
-    anyhow::ensure!(rest.commit(ident, &req, &upd).await?, "table changed; rerun");
+    anyhow::ensure!(
+        rest.commit(ident, &req, &upd).await?,
+        "table changed; rerun"
+    );
     println!("  expired {n} snapshots");
     Ok(n)
 }
@@ -281,7 +303,11 @@ async fn orphans_cmd(table: &iceberg::table::Table, a: &OrphanArgs) -> Result<us
     let found = orphans::find(table, &storage, now_ms() - a.older_than_days * DAY_MS).await?;
     let bytes: u64 = found.iter().map(|o| o.size).sum();
     if !a.apply {
-        println!("  would delete {} orphaned objects ({:.1} MiB)", found.len(), mib(bytes));
+        println!(
+            "  would delete {} orphaned objects ({:.1} MiB)",
+            found.len(),
+            mib(bytes)
+        );
         return Ok(found.len());
     }
     let (bucket, _) = orphans::split_location(table.metadata().location())?;
@@ -292,6 +318,10 @@ async fn orphans_cmd(table: &iceberg::table::Table, a: &OrphanArgs) -> Result<us
             .await
             .with_context(|| format!("deleting {}", o.key))?;
     }
-    println!("  deleted {} orphaned objects ({:.1} MiB)", found.len(), mib(bytes));
+    println!(
+        "  deleted {} orphaned objects ({:.1} MiB)",
+        found.len(),
+        mib(bytes)
+    );
     Ok(found.len())
 }

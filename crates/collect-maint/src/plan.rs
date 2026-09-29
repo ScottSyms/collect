@@ -19,7 +19,14 @@ pub const COMPACT_PREFIX: &str = "compact-";
 pub const DEFAULT_SORT: [&str; 2] = ["mmsi", "ts"];
 
 /// Columns that get parquet bloom filters when present.
-pub const BLOOM_COLUMNS: [&str; 6] = ["mmsi", "station", "source", "imo_number", "call_sign", "name"];
+pub const BLOOM_COLUMNS: [&str; 6] = [
+    "mmsi",
+    "station",
+    "source",
+    "imo_number",
+    "call_sign",
+    "name",
+];
 
 pub fn sort_columns(schema: &Schema, overrides: &[String]) -> Result<Vec<String>> {
     if overrides.is_empty() {
@@ -68,7 +75,10 @@ pub enum Skip {
 }
 
 fn is_compacted(f: &LiveFile) -> bool {
-    f.path.rsplit('/').next().is_some_and(|n| n.starts_with(COMPACT_PREFIX))
+    f.path
+        .rsplit('/')
+        .next()
+        .is_some_and(|n| n.starts_with(COMPACT_PREFIX))
 }
 
 /// A partition needs rewriting if any file wasn't written by this tool (new
@@ -86,7 +96,10 @@ pub fn plan(
 ) -> (Vec<PartitionPlan>, Vec<(String, Skip)>) {
     let mut groups: BTreeMap<String, Vec<LiveFile>> = BTreeMap::new();
     for f in files {
-        groups.entry(format!("{:?}", f.partition)).or_default().push(f);
+        groups
+            .entry(format!("{:?}", f.partition))
+            .or_default()
+            .push(f);
     }
     let mut plans = Vec::new();
     let mut skipped = Vec::new();
@@ -104,7 +117,13 @@ pub fn plan(
             if input_bytes > opts.max_partition_bytes {
                 skipped.push((label, Skip::TooBig));
             } else {
-                plans.push(PartitionPlan { key, label, partition, files, input_bytes });
+                plans.push(PartitionPlan {
+                    key,
+                    label,
+                    partition,
+                    files,
+                    input_bytes,
+                });
             }
         }
     }
@@ -124,8 +143,12 @@ pub fn partition_range_ms(table: &Table, partition: Option<&Struct>) -> Option<(
 
 fn range_for(transform: Transform, v: i32) -> Option<(i64, i64)> {
     let month_start = |m: i32| {
-        let date = NaiveDate::from_ymd_opt(1970 + m.div_euclid(12), m.rem_euclid(12) as u32 + 1, 1)?;
-        Some(Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0)?).timestamp_millis())
+        let date =
+            NaiveDate::from_ymd_opt(1970 + m.div_euclid(12), m.rem_euclid(12) as u32 + 1, 1)?;
+        Some(
+            Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0)?)
+                .timestamp_millis(),
+        )
     };
     let v64 = i64::from(v);
     match transform {
@@ -142,7 +165,11 @@ pub fn describe_partition(table: &Table, partition: Option<&Struct>) -> String {
         Some((start, _)) => {
             let dt = Utc.timestamp_millis_opt(start).single();
             let spec = table.metadata().default_partition_spec();
-            let name = spec.fields().first().map(|f| f.name.as_str()).unwrap_or("ts");
+            let name = spec
+                .fields()
+                .first()
+                .map(|f| f.name.as_str())
+                .unwrap_or("ts");
             dt.map(|d| {
                 if matches!(spec.fields()[0].transform, Transform::Hour) {
                     format!("{name}={}", d.format("%Y-%m-%dT%H"))
@@ -161,7 +188,12 @@ mod tests {
     use super::*;
 
     fn file(name: &str, size: u64) -> LiveFile {
-        LiveFile { path: format!("s3://b/t/data/{name}"), size, records: 1, partition: None }
+        LiveFile {
+            path: format!("s3://b/t/data/{name}"),
+            size,
+            records: 1,
+            partition: None,
+        }
     }
     const T: u64 = 512 << 20;
 
@@ -172,14 +204,26 @@ mod tests {
 
     #[test]
     fn compacted_full_files_are_left_alone() {
-        assert!(!needs_compaction(&[file("compact-a-0.parquet", T), file("compact-a-1.parquet", T)], T));
+        assert!(!needs_compaction(
+            &[
+                file("compact-a-0.parquet", T),
+                file("compact-a-1.parquet", T)
+            ],
+            T
+        ));
     }
 
     #[test]
     fn one_small_tail_is_left_alone_but_two_small_are_merged() {
-        let tail = [file("compact-a-0.parquet", T), file("compact-a-1.parquet", 10 << 20)];
+        let tail = [
+            file("compact-a-0.parquet", T),
+            file("compact-a-1.parquet", 10 << 20),
+        ];
         assert!(!needs_compaction(&tail, T));
-        let two = [file("compact-a-0.parquet", 10 << 20), file("compact-b-0.parquet", 20 << 20)];
+        let two = [
+            file("compact-a-0.parquet", 10 << 20),
+            file("compact-b-0.parquet", 20 << 20),
+        ];
         assert!(needs_compaction(&two, T));
     }
 
