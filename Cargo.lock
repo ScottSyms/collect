@@ -1392,6 +1392,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "collect-maint"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "chrono",
+ "clap",
+ "clap_complete",
+ "collect-core",
+ "futures-util",
+ "iceberg",
+ "parquet",
+ "reqwest",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "collect-silver"
 version = "0.1.0"
 dependencies = [

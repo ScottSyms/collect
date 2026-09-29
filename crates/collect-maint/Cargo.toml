@@ -1,0 +1,30 @@
+[package]
+name = "collect-maint"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+arrow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+futures-util.workspace = true
+parquet.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+uuid = { version = "1", features = ["v4"] }
+collect-core = { path = "../collect-core" }
+iceberg.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lib]
+name = "collect_maint"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ais-compact"
+path = "src/main.rs"

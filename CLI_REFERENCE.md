@@ -283,3 +283,39 @@ Plus [S3 connection](#s3--batch-parsers-s3connectionargs-connection-only),
 [shared flags](#shared-across-all-six-binaries). No `--upload-concurrency`,
 `--max-rows`, etc. — these are batch tools, not streaming collectors, so
 they don't flatten `CommonCliArgs`.
+
+## `ais-compact`
+
+Table maintenance for Iceberg catalogs with no compactor of their own (RustFS's
+built-in catalog). Takes the [Iceberg flags](#iceberg-icebergcliargs-all-six-binaries)
+(`--iceberg-catalog-uri`, `--iceberg-warehouse`, `--iceberg-sigv4`, …) plus the
+S3 credentials in the environment, and one subcommand. Every command that
+changes anything is a **dry run unless `--apply` is given**.
+
+`--table <name>` (repeatable, before or after the subcommand) picks tables by
+base name without the prefix; the default is `raw positions statics meteo
+binary atons other`.
+
+| Subcommand | Flags | What it does |
+|---|---|---|
+| `inspect` | `--target-file-mb` (512) | File counts and sizes, partitions needing work, snapshots, small manifests, sort order |
+| `compact` | `--apply`, `--min-age-hours` (2), `--target-file-mb` (512), `--max-partition-mb` (1024), `--sort-by a,b` (`mmsi,ts`), `--consolidate-manifests <n>` (20, 0 = off) | Rewrites each *closed* partition that has any freshly ingested file, or two or more files under half the target, into sorted, right-sized zstd files (128Ki-row groups, bloom filters on `mmsi station source imo_number call_sign name`), committed as one Iceberg `replace` snapshot. Registers the sort order on the table. Merges small manifests when at least `n` exist |
+| `expire` | `--apply`, `--older-than-days` (7), `--retain-last` (5) | Drops old snapshots (never the current one or a branch/tag head). Metadata only |
+| `orphans` | `--apply`, `--older-than-days` (3), S3 connection flags | Deletes objects under the table location that no snapshot references. Run after `expire` to actually free space |
+
+Notes:
+
+- **Sort:** `--sort-by` defaults to `mmsi,ts`, keeping only columns the table
+  has, so `raw` (no `mmsi`) sorts by `ts`. Nulls sort last.
+- **Memory:** a partition is sorted in memory. `--max-partition-mb` bounds its
+  *compressed* input; expect several times that in RAM. Larger partitions are
+  skipped with a message, not failed.
+- **Idempotent:** files written by the tool are named `compact-*`; a partition of
+  full-size `compact-*` files is left alone, and one small tail file is not
+  rewritten again.
+- **Concurrent ingest:** commits are pinned to the snapshot they were planned
+  against. If ingest commits first the catalog answers 409 and the partition is
+  reloaded and re-planned (up to 4 attempts).
+- **Format:** Iceberg v2 tables without delete files only.
+- Exit codes: `0` did something (or `inspect`), `2` nothing to do, `5` a table
+  or partition failed.
