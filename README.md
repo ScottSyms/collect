@@ -20,6 +20,7 @@ docs, not a guide.
 - **[`ais-parse`](AIS_PARSE.md)** — silver layer: decode AIS sentences into typed Parquet (positions, statics, meteo, binary, aids to navigation), via [ScottSyms/nmea-parser](https://github.com/ScottSyms/nmea-parser); local or S3 on both sides
 - **[`aisstream-parse`](AISSTREAM_PARSE.md)** — silver layer: decode aisstream.io JSON from bronze Parquet into the same typed tables; local or S3 on both sides
 - **[`ais-compact`](AIS_COMPACT.md)** — Iceberg table maintenance for RustFS and other catalogs with no compactor: sorted compaction, snapshot expiry, orphan cleanup
+- **[`ais-tracks`](AIS_TRACKS.md)** — derived tables built with DataFusion SQL: vessel identity, annotated track points, tracks, stops matched to World Port Index ports, and voyages; written to a namespace you choose
 
 All four collectors support optional S3/MinIO/RustFS upload, and can
 register or fully decode into Apache Iceberg as they ingest — see
@@ -34,6 +35,7 @@ register or fully decode into Apache Iceberg as they ingest — see
 | [COLLECT_FILE.md](COLLECT_FILE.md) / [COLLECT_SOCKET.md](COLLECT_SOCKET.md) / [COLLECT_KAFKA.md](COLLECT_KAFKA.md) / [COLLECT_AISSTREAM.md](COLLECT_AISSTREAM.md) | Per-collector usage and behavior |
 | [AIS_PARSE.md](AIS_PARSE.md) / [AISSTREAM_PARSE.md](AISSTREAM_PARSE.md) | Decoded (silver) table schemas, incremental/idempotent decoding |
 | [AIS_COMPACT.md](AIS_COMPACT.md) | Compacting, sorting, expiring and cleaning Iceberg tables |
+| [AIS_TRACKS.md](AIS_TRACKS.md) | Derived vessel, track, stop and voyage tables: design, columns, run order, queries, limits |
 | [DOCKER_HEALTH_CHECK.md](DOCKER_HEALTH_CHECK.md) | Health-check mechanics for containers |
 | [NOMAD.md](NOMAD.md) | Nomad job definitions and cluster deployment |
 
