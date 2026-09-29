@@ -9,7 +9,6 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
-use chrono::{Datelike, TimeZone, Timelike};
 use iceberg::io::FileIO;
 use iceberg::spec::{DataFile, DataFileFormat, PartitionKey};
 use iceberg::table::Table;
@@ -1016,26 +1015,11 @@ fn compute_partition_key(
         .downcast_ref::<TimestampMillisecondArray>()
         .context("expected timestamp column at index 0")?;
     let first_ts = ts_array.value(0);
-    let dt = chrono::Utc
-        .timestamp_millis_opt(first_ts)
-        .single()
-        .context("invalid timestamp in partition computation")?;
-
-    let epoch_days = (first_ts / (1000 * 86400)) as i32;
-    let mut partition_values: Vec<i32> = Vec::new();
-    for field in spec.fields() {
-        match field.transform {
-            iceberg::spec::Transform::Year => partition_values.push(dt.year()),
-            iceberg::spec::Transform::Month => {
-                partition_values.push((dt.year() - 1970) * 12 + dt.month() as i32 - 1);
-            }
-            iceberg::spec::Transform::Day => partition_values.push(epoch_days),
-            iceberg::spec::Transform::Hour => {
-                partition_values.push(epoch_days * 24 + dt.hour() as i32);
-            }
-            _ => {}
-        }
-    }
+    let partition_values: Vec<i32> = spec
+        .fields()
+        .iter()
+        .filter_map(|f| collect_core::iceberg::partition_value(f.transform, first_ts))
+        .collect();
 
     let partition_data = iceberg::spec::Struct::from_iter(
         partition_values.into_iter().map(|v| Some(iceberg::spec::Literal::int(v))),
