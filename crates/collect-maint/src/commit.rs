@@ -12,8 +12,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use collect_core::iceberg::{sigv4, IcebergConfig};
 use iceberg::spec::{
     DataFile, FormatVersion, ManifestContentType, ManifestFile, ManifestListWriter,
-    ManifestWriterBuilder,
-    Operation, Snapshot, SnapshotReference, SnapshotRetention, Summary,
+    ManifestWriterBuilder, Operation, Snapshot, SnapshotReference, SnapshotRetention, Summary,
 };
 use iceberg::table::Table;
 use iceberg::{TableIdent, TableRequirement, TableUpdate};
@@ -169,8 +168,7 @@ pub async fn prepare_replace(
         removed_bytes,
         added_bytes,
     );
-    let (requirements, updates) =
-        seal(table, snapshot_id, commit_uuid, manifests, summary).await?;
+    let (requirements, updates) = seal(table, snapshot_id, commit_uuid, manifests, summary).await?;
     Ok(PreparedReplace {
         requirements,
         updates,
@@ -292,10 +290,7 @@ pub async fn prepare_consolidate(
             let spec = metadata
                 .partition_spec_by_id(mf.partition_spec_id)
                 .ok_or_else(|| anyhow!("unknown partition spec {}", mf.partition_spec_id))?;
-            let path = format!(
-                "{}/metadata/{commit_uuid}-m{n}.avro",
-                metadata.location()
-            );
+            let path = format!("{}/metadata/{commit_uuid}-m{n}.avro", metadata.location());
             n += 1;
             writers.insert(
                 mf.partition_spec_id,

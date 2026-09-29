@@ -304,7 +304,8 @@ Table maintenance for Iceberg catalogs with no compactor of their own (RustFS's
 built-in catalog). Takes the [Iceberg flags](#iceberg-icebergcliargs-all-six-binaries)
 (`--iceberg-catalog-uri`, `--iceberg-warehouse`, `--iceberg-sigv4`, …) plus the
 S3 credentials in the environment, and one subcommand. Every command that
-changes anything is a **dry run unless `--apply` is given**.
+changes anything is a **dry run unless `--apply` is given**. Behavior, safety
+and limits: [AIS_COMPACT.md](AIS_COMPACT.md).
 
 `--table <name>` (repeatable, before or after the subcommand) picks tables by
 base name without the prefix; the default is `raw positions statics meteo
