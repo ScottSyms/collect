@@ -156,6 +156,23 @@ pub fn table_ident(config: &IcebergConfig, base: &str) -> TableIdent {
     TableIdent::new(NamespaceIdent::new(config.namespace.clone()), name)
 }
 
+/// The Iceberg partition value for a millisecond timestamp under a time
+/// transform: years since 1970, months since 1970-01, days since 1970-01-01,
+/// or hours since the epoch. `None` for any other transform. Single source of
+/// truth for every writer that builds a `PartitionKey` by hand.
+pub fn partition_value(transform: Transform, ts_ms: i64) -> Option<i32> {
+    use chrono::{Datelike, TimeZone, Timelike};
+    let dt = chrono::Utc.timestamp_millis_opt(ts_ms).single()?;
+    let days = ts_ms.div_euclid(86_400_000) as i32;
+    match transform {
+        Transform::Year => Some(dt.year() - 1970),
+        Transform::Month => Some((dt.year() - 1970) * 12 + dt.month0() as i32),
+        Transform::Day => Some(days),
+        Transform::Hour => Some(days * 24 + dt.hour() as i32),
+        _ => None,
+    }
+}
+
 /// Partition spec for a timestamp column at the given granularity.
 /// Iceberg supports year/month/day/hour — minute is NOT supported.
 pub fn partition_spec_for(schema: &Schema, granularity: &str) -> Result<PartitionSpecBuilder> {
@@ -264,7 +281,6 @@ pub async fn commit_batches(
     if batches.is_empty() {
         return Ok(());
     }
-    use chrono::{Datelike, Timelike, TimeZone};
     use iceberg::spec::{DataFileFormat, PartitionKey};
     use iceberg::transaction::{ApplyTransactionAction, Transaction};
     use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
@@ -318,25 +334,11 @@ pub async fn commit_batches(
                 .downcast_ref::<arrow::array::TimestampMillisecondArray>()
                 .context("ts col")?;
             let first_ts = ts_col.value(0);
-            let dt = chrono::Utc
-                .timestamp_millis_opt(first_ts)
-                .single()
-                .context("invalid ts")?;
-            let epoch_days = (first_ts / 86400000) as i32;
-            let mut vals: Vec<i32> = Vec::new();
-            for f in spec.fields() {
-                match f.transform {
-                    iceberg::spec::Transform::Year => vals.push(dt.year()),
-                    iceberg::spec::Transform::Month => {
-                        vals.push((dt.year() - 1970) * 12 + dt.month() as i32 - 1)
-                    }
-                    iceberg::spec::Transform::Day => vals.push(epoch_days),
-                    iceberg::spec::Transform::Hour => {
-                        vals.push(epoch_days * 24 + dt.hour() as i32)
-                    }
-                    _ => {}
-                }
-            }
+            let vals: Vec<i32> = spec
+                .fields()
+                .iter()
+                .filter_map(|f| partition_value(f.transform, first_ts))
+                .collect();
             let data = iceberg::spec::Struct::from_iter(
                 vals.into_iter()
                     .map(|v| Some(iceberg::spec::Literal::int(v))),
@@ -502,6 +504,21 @@ mod tests {
         assert_eq!(fields[0].id, 1);
         assert_eq!(fields[1].id, 2);
         assert_eq!(fields[2].id, 3);
+    }
+
+    #[test]
+    fn partition_values_are_epoch_relative() {
+        // 2026-09-27T13:45:00Z
+        let ts = 1_790_516_700_000i64;
+        assert_eq!(partition_value(Transform::Year, ts), Some(56)); // not 2026
+        assert_eq!(partition_value(Transform::Month, ts), Some(56 * 12 + 8));
+        assert_eq!(partition_value(Transform::Day, ts), Some(20_723));
+        assert_eq!(partition_value(Transform::Hour, ts), Some(20_723 * 24 + 13));
+        assert_eq!(partition_value(Transform::Identity, ts), None);
+        // 1970-01-01T00:00:00Z is zero under every transform.
+        for t in [Transform::Year, Transform::Month, Transform::Day, Transform::Hour] {
+            assert_eq!(partition_value(t, 0), Some(0));
+        }
     }
 
     #[test]
