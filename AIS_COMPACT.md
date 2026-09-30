@@ -42,7 +42,7 @@ ais-compact --iceberg-catalog-uri http://localhost:9000/iceberg \
 ```
 
 `--iceberg-*` flags come from the shared
-[Iceberg flags](CLI_REFERENCE.md#iceberg-icebergcliargs-all-six-binaries), so
+[Iceberg flags](CLI_REFERENCE.md#iceberg-icebergcliargs-all-binaries), so
 `ICEBERG_CATALOG_URI`, `ICEBERG_WAREHOUSE` and friends work as environment
 variables too. Use `--iceberg-table-prefix` and `--iceberg-namespace` if your
 writers do.

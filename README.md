@@ -4,8 +4,9 @@
 
 A Rust project to collect positional data into Hive-partitioned Parquet
 files with Zstd compression — the bronze layer of a medallion pipeline for
-maritime (AIS) data. Six binaries: four source-specific collectors and two
-data parsers, run either ad hoc or unattended (Nomad, containers).
+maritime (AIS) data. Source-specific collectors, data parsers, and two batch
+tools (table maintenance, and derived vessel / track / stop / voyage tables),
+run either ad hoc or unattended (Nomad, containers).
 
 **New here?** Start with [TUTORIAL.md](TUTORIAL.md) — a four-stage
 walkthrough from local storage to Apache Iceberg. This page is a map of the
@@ -68,5 +69,5 @@ cargo build --release --workspace
 ## Configuration precedence
 
 For any flag: **command-line argument > environment variable > `--config`
-file > built-in default**. See [CLI_REFERENCE.md](CLI_REFERENCE.md#shared-across-all-six-binaries)
+file > built-in default**. See [CLI_REFERENCE.md](CLI_REFERENCE.md#shared-across-all-binaries)
 for `--config`'s TOML format.

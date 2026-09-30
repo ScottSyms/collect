@@ -51,7 +51,7 @@ cargo run -p collect-socket -- \
 | `--quiet` / `-q` | `QUIET` | off | Suppress routine progress lines; warnings/errors still print |
 | `--completions <shell>` | — | — | Print shell completions to stdout and exit |
 | `--version` | — | — | Prints `<crate version> (<git commit hash>)` |
-| `--config <file>` | `CONFIG_FILE` | — | Load flag defaults from a flat TOML file; CLI flags and pre-set env vars still win — see [CLI_REFERENCE.md](CLI_REFERENCE.md#shared-across-all-six-binaries) |
+| `--config <file>` | `CONFIG_FILE` | — | Load flag defaults from a flat TOML file; CLI flags and pre-set env vars still win — see [CLI_REFERENCE.md](CLI_REFERENCE.md#shared-across-all-binaries) |
 
 ### AIS Processing
 
@@ -73,12 +73,12 @@ With `--iceberg-catalog-uri` set, each sealed bronze batch is committed to the s
 ### Common, S3, Iceberg, reconnect, logging
 
 Full flag/env tables now live in one place:
-[CLI_REFERENCE.md](CLI_REFERENCE.md#common-to-the-four-collectors-commoncliargs)
+[CLI_REFERENCE.md](CLI_REFERENCE.md#common-to-the-five-collectors-commoncliargs)
 (`--output-dir`, `--partition`, buffering/upload flags, `--health-check`,
 `--metrics-addr`, `--data-drought-seconds`),
 [S3](CLI_REFERENCE.md#s3--collectors-s3cliargs-one-sink),
-[Iceberg](CLI_REFERENCE.md#iceberg-icebergcliargs-all-six-binaries), and
-[reconnect](CLI_REFERENCE.md#reconnect-the-three-streaming-collectors)
+[Iceberg](CLI_REFERENCE.md#iceberg-icebergcliargs-all-binaries), and
+[reconnect](CLI_REFERENCE.md#reconnect-the-four-streaming-collectors)
 (`--max-reconnect-seconds`).
 
 Iceberg registration here is optional and direct — unset by default, no

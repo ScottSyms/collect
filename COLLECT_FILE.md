@@ -60,7 +60,7 @@ cargo run -p collect-file -- \
 | `--quiet` / `-q` (env `QUIET`) | off | Suppress routine progress lines; warnings/errors still print |
 | `--completions <shell>` | — | Print shell completions to stdout and exit |
 | `--version` | — | Prints `<crate version> (<git commit hash>)` |
-| `--config <file>` (env `CONFIG_FILE`) | — | Load flag defaults from a flat TOML file; CLI flags and pre-set env vars still win — see [CLI_REFERENCE.md](CLI_REFERENCE.md#shared-across-all-six-binaries) |
+| `--config <file>` (env `CONFIG_FILE`) | — | Load flag defaults from a flat TOML file; CLI flags and pre-set env vars still win — see [CLI_REFERENCE.md](CLI_REFERENCE.md#shared-across-all-binaries) |
 
 Exits [`NOTHING_TO_DO`](CLI_REFERENCE.md#exit-codes) (`2`, instead of `0`) when there were no unfinished input files to ingest — distinct from a hard error (`1`).
 
@@ -73,10 +73,10 @@ Exits [`NOTHING_TO_DO`](CLI_REFERENCE.md#exit-codes) (`2`, instead of `0`) when 
 
 ### Common + S3 + Iceberg
 
-Full flag/env tables: [CLI_REFERENCE.md](CLI_REFERENCE.md#common-to-the-four-collectors-commoncliargs)
+Full flag/env tables: [CLI_REFERENCE.md](CLI_REFERENCE.md#common-to-the-five-collectors-commoncliargs)
 (`CommonCliArgs` — includes `--health-check`, `--metrics-addr`,
 `--data-drought-seconds`), [S3](CLI_REFERENCE.md#s3--collectors-s3cliargs-one-sink)
-(`S3CliArgs`), and [Iceberg](CLI_REFERENCE.md#iceberg-icebergcliargs-all-six-binaries)
+(`S3CliArgs`), and [Iceberg](CLI_REFERENCE.md#iceberg-icebergcliargs-all-binaries)
 (`IcebergCliArgs` — optional, direct `raw`-table registration on
 successful upload), plus the same `--parser` inline-parsing flag
 ([details](CLI_REFERENCE.md#inline-parsing-collectors-only-parsercliargs)).

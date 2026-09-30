@@ -165,7 +165,7 @@ Other Type 8 messages retained as generic header + hex payload:
 | `--max-partition-failures` | `MAX_PARTITION_FAILURES` | `5` | Abort the run once this many partitions have failed and been skipped |
 | `--completions <shell>` | — | — | Print shell completions to stdout and exit |
 | `--version` | — | — | Prints `<crate version> (<git commit hash>)` |
-| `--config <file>` | `CONFIG_FILE` | — | Load flag defaults from a flat TOML file; CLI flags and pre-set env vars still win — see [CLI_REFERENCE.md](CLI_REFERENCE.md#shared-across-all-six-binaries) |
+| `--config <file>` | `CONFIG_FILE` | — | Load flag defaults from a flat TOML file; CLI flags and pre-set env vars still win — see [CLI_REFERENCE.md](CLI_REFERENCE.md#shared-across-all-binaries) |
 
 S3 connection args: `--s3-endpoint`, `--s3-region`, `--s3-access-key`,
 `--s3-secret-key`, `--s3-disable-tls` (env vars: `S3_ENDPOINT`, etc.)

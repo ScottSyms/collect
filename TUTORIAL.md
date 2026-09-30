@@ -149,7 +149,7 @@ set as **environment variables**, not `--s3-*` flags: Iceberg mode's S3
 config (both the signing above and the actual data-file writes a commit
 does) is resolved from the environment only, independently of any `--s3-*`
 flags you also pass for bronze upload/download — see
-[CLI_REFERENCE.md](CLI_REFERENCE.md#iceberg-icebergcliargs-all-six-binaries)
+[CLI_REFERENCE.md](CLI_REFERENCE.md#iceberg-icebergcliargs-all-binaries)
 for the full list, including `S3_PATH_STYLE`, needed here and specific to
 this path.
 

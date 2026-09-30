@@ -20,10 +20,12 @@ Flags are also listed in [CLI_REFERENCE.md](CLI_REFERENCE.md#ais-tracks).
 > (held to row-for-row agreement with the original SQL), the whole chain with
 > thinning on and off, and the daily flow end to end against real Iceberg tables
 > on the local filesystem (a test catalog and a small stand-in for the REST
-> commit endpoint), covering first builds, reruns, late data and forced ranges.
-> What has not been exercised is a live REST/S3 catalog such as RustFS or
-> Lakekeeper: the commits reuse [`ais-compact`](AIS_COMPACT.md)'s code, but try
-> `--apply` on a scratch namespace first.
+> commit endpoint). Those end-to-end tests fold a multi-vessel fleet in day by
+> day and compare the incremental `vessels`, `stops` and `voyages` with a
+> from-scratch computation after every day, and cover reruns, late data and
+> forced ranges. What has not been exercised is a live REST/S3 catalog such as
+> RustFS or Lakekeeper: the commits reuse [`ais-compact`](AIS_COMPACT.md)'s code,
+> but try `--apply` on a scratch namespace first.
 
 ## Contents
 
@@ -33,7 +35,9 @@ Flags are also listed in [CLI_REFERENCE.md](CLI_REFERENCE.md#ais-tracks).
 - [Namespaces and table names](#namespaces-and-table-names)
 - [Commands](#commands): [`statics-daily` and `vessels`](#statics-daily-and-vessels), [`ports load`](#ports-load),
   [`track-points`](#track-points), [`tracks`](#tracks),
-  [`stop-segments`](#stop-segments), [`stops` and `voyages`](#stops-and-voyages), and [`daily` and catch-up](#daily-and-catch-up)
+  [`stop-segments`](#stop-segments), [`stops` and `voyages`](#stops-and-voyages),
+  [`daily` and catch-up](#daily-and-catch-up), and
+  [`reduce-day`](#running-at-scale-reduce-day)
 - [Operating it](#operating-it)
 - [Querying the results](#querying-the-results)
 - [Limits and known gaps](#limits-and-known-gaps)
@@ -60,7 +64,7 @@ Flags are also listed in [CLI_REFERENCE.md](CLI_REFERENCE.md#ais-tracks).
   day partition, so a rerun is idempotent and cheap. State that crosses
   midnight is carried explicitly (see [Operating it](#operating-it)).
 - **Dry run by default.** Every command computes and reports; nothing is
-  written without `--apply`.
+  written without `--apply` (`reduce-day` writes only if given `--out-dir`).
 
 ## The tables and how they connect
 
@@ -68,7 +72,7 @@ Flags are also listed in [CLI_REFERENCE.md](CLI_REFERENCE.md#ais-tracks).
 |-------|-------------|-------|-------------|
 | `vessel_attributes` | value a vessel ever reported for an identity attribute | folded in daily | none |
 | `vessels` | MMSI | folded in daily | none |
-| `vessel_daily` | vessel and day: first/last seen, reports | daily (from `track-points`) | day of `ts` |
+| `vessel_daily` | vessel and day: first/last seen, reports, and the day's movement totals | daily (from `track-points`) | day of `ts` |
 | `attribute_daily`, `static_daily` | vessel and day: what its static reports said | daily (`statics-daily`) | day of `ts` |
 | `ref_ports` | port, per World Port Index release | appended per release | none |
 | `track_points` | kept report (each stands for one or more `positions` rows) | daily | day of `ts` |
@@ -83,11 +87,13 @@ Flags are also listed in [CLI_REFERENCE.md](CLI_REFERENCE.md#ais-tracks).
 | `build_log` | step and day built, with what it was built from | appended after each build | none |
 
 ```
-statics ─────────────────────────────► vessel_attributes ─► vessels
-positions ─► track_points ─┬─► tracks ──────────┐
-                           └─► stop_segments ─► stops ─► voyages
-                     ref_ports ───────────────────┘        ▲
-                     statics (declared destination) ───────┘
+positions ─► track_points ─┬─► tracks
+   │                       └─► stop_segments ─► stops ─┬─► voyages / open_voyages
+   ├─► vessel_daily ──────────────────────────────────┘        ▲   (state: voyage_state)
+   └─► vessel_state (carried into the next day)                 │
+statics ─┬─► attribute_daily, static_daily ─► vessels, vessel_attributes
+         └─► destination_daily ───────────────────────────────────┘ (declared destinations)
+ref_ports ─► stops (port match)
 ```
 
 Silver tables are read from `--iceberg-namespace`; derived tables are written
@@ -102,35 +108,38 @@ S3 environment variables the other binaries use:
 export S3_ENDPOINT=http://localhost:9000 S3_ACCESS_KEY=... S3_SECRET_KEY=... \
        S3_REGION=us-east-1 S3_PATH_STYLE=true
 CAT="--iceberg-catalog-uri http://localhost:9000/iceberg --iceberg-warehouse data --iceberg-sigv4"
+OUT="--output-namespace curated"
 
 # One-off: reference data (download Pub 150 from the NGA first)
-ais-tracks $CAT --output-namespace curated ports load \
-  --file UpdatedPub150.csv --release 2026-03-01 --apply
+ais-tracks $CAT $OUT ports load --file UpdatedPub150.csv --release 2026-03-01 --apply
 
-# Vessel identity
-ais-tracks $CAT --output-namespace curated vessels --apply
-
-# A day at a time, in this order
-D="--from 2026-03-01 --to 2026-03-31"
-ais-tracks $CAT --output-namespace curated track-points   $D --apply
-ais-tracks $CAT --output-namespace curated tracks         $D --apply
-ais-tracks $CAT --output-namespace curated stop-segments  $D --apply
-
-# Folded in from the above (stops and voyages together)
-ais-tracks $CAT --output-namespace curated stops   --apply   # folds voyages in too
+# Then everything, for every completed day that is new or whose input changed:
+ais-tracks $CAT $OUT daily --catch-up --apply
 ```
 
-Or let it work out what needs doing, and do only that:
+`daily` runs `track-points`, `statics-daily`, `tracks` and `stop-segments`, then
+`stops` and `voyages` together, then `vessels`. Say which days that would be,
+and why, without building anything:
 
 ```bash
-# Build every completed day that is new or whose input changed since:
-ais-tracks $CAT --output-namespace curated daily --catch-up --apply
-
-# Just say which days that would be, and why:
-ais-tracks $CAT --output-namespace curated daily --catch-up --plan
+ais-tracks $CAT $OUT daily --catch-up --plan
 ```
 
-Drop `--apply` from any line to see what it would do first.
+Each step is also a command of its own, for a range of days or to rerun one:
+
+```bash
+D="--from 2026-03-01 --to 2026-03-31"
+ais-tracks $CAT $OUT track-points   $D --apply    # from silver positions
+ais-tracks $CAT $OUT statics-daily  $D --apply    # from silver statics
+ais-tracks $CAT $OUT tracks         $D --apply
+ais-tracks $CAT $OUT stop-segments  $D --apply
+ais-tracks $CAT $OUT stops          --apply       # also folds voyages in
+ais-tracks $CAT $OUT vessels        --apply       # folds the daily aggregates in
+```
+
+Drop `--apply` from any line to see what it would do first. Before pointing it at
+a real day's worth of data, `reduce-day` (below) reports how much thinning would
+keep without writing anything.
 
 ## Namespaces and table names
 
@@ -142,7 +151,7 @@ Drop `--apply` from any line to see what it would do first.
 
 The remaining catalog flags (`--iceberg-catalog-uri`, `--iceberg-warehouse`,
 `--iceberg-token`, `--iceberg-sigv4`, …) are shared with the other binaries;
-see [CLI_REFERENCE.md](CLI_REFERENCE.md#iceberg-icebergcliargs-all-seven-binaries).
+see [CLI_REFERENCE.md](CLI_REFERENCE.md#iceberg-icebergcliargs-all-binaries).
 The namespace is created if it does not exist. Tables carry no fixed prefix, so
 the namespace is what separates one set of derived tables from another (say, one
 per experiment).
@@ -152,7 +161,9 @@ per experiment).
 ## Commands
 
 All commands accept the catalog and namespace flags above, and are dry runs
-unless `--apply` is given.
+unless `--apply` is given. `track-points`, `statics-daily`, `tracks` and
+`stop-segments` also take the day-selection flags described under
+[`daily` and catch-up](#daily-and-catch-up).
 
 ### `statics-daily` and `vessels`
 
@@ -162,14 +173,17 @@ ais-tracks $CAT vessels [--full] [--from-silver] [--plan] [--apply]
 ```
 
 Vessel identity from static and position reports, kept up to date without
-rescanning history. Each built day leaves three small tables behind:
+rescanning history. Each built day leaves small tables behind:
 
 - **`vessel_daily`**, from the reduce pass (so no extra scan): when each vessel
   was first and last heard that day and how many reports it sent, duplicates
-  and position-less reports included.
+  and position-less reports included; plus the day's movement totals
+  (first and last positioned row, points, distance raw and clean, gaps,
+  outliers, top speed), which `voyages` uses.
 - **`attribute_daily`** and **`static_daily`**, from `statics-daily`, which reads
   only that day's static reports: every distinct value a vessel reported for
-  each identity attribute with counts, and its static-report summary.
+  each identity attribute with counts, its static-report summary, and
+  (`destination_daily`) the destinations it declared.
 
 `vessels` and `vessel_attributes` are a fold of those. Every measure is a sum,
 minimum or maximum, so a new day merges into the existing tables: the cost
@@ -251,7 +265,8 @@ Reads a day of silver `positions` and writes the reduced, annotated rows to
 described under [Running at scale](#running-at-scale-reduce-day): one pass routes the day's
 reports to on-disk vessel buckets, then each bucket is reduced in turn, and the
 rows stream into one Parquet writer and one Iceberg snapshot per day. Peak
-memory is one bucket, not the day.
+memory is one bucket, not the day. It also writes that day's `vessel_state` and
+`vessel_daily`, and logs the day last.
 
 Each vessel's stream continues from the day before: when the previous day is
 built in the same run its end-of-day state is carried in memory, otherwise it
@@ -274,7 +289,7 @@ replaces only that day's partition.
 | `sum_sog`, `n_sog`, `max_sog` | the same for valid reported speed only |
 | `max_dev_nm` | the farthest a collapsed report was from this row |
 | `max_hop_speed_kn` | the fastest hop among the reports it stands for |
-| `keep_reason` | bitmask of why the row was kept (see the table below) |
+| `keep_reason` | bitmask of why the row was kept: 1 first, 2 last, 4 gap, 8 flagged, 16 next to a flagged row, 32 distance, 64 interval, 128 turn, 256 speed change, 512 nav change, 1024 just before a gap (see [`reduce-day`](#running-at-scale-reduce-day)) |
 
 The return leg after a spike is flagged `is_speed_jump` but not `is_spike`,
 because it is measured from the bad point; the spike is the row to discard.
@@ -373,9 +388,9 @@ and the rows of the stops they touch, recomputes those stops from the existing
 row plus today's piece, matches ports for them, and rewrites two partitions: D
 (the touched stops) and D-1 (without the stops that moved on). Rerunning a day
 is harmless: a stop's existing row is left alone if it already includes the
-piece. A first run, `--full`, or a rebuilt earlier day's segments, instead
-refold every stop from all the segments, in chunks of vessels so it fits in
-memory.
+piece. A first run, `--full`, or a rebuilt earlier day's segments **replay**:
+`stops` is cleared and every day is folded in again, from the start, through the
+same code (see Voyages below for why the two are folded together).
 
 | Column | Meaning |
 |--------|---------|
@@ -486,21 +501,119 @@ same step, because their ids chain across midnight; they are rebuilt whenever
 either neighbour was, which is conservative but simple. (Snapshot summaries would
 be the usual place for this, but they describe the whole table.)
 
+`stops` and `voyages` are folded together, day by day, and log one row per day.
+The token for a `stops` day is the `stop_segments` build it read. They fold in
+new days as an increment, and replay every day from the start when an
+already-folded day's segments were rebuilt, when nothing is folded yet, or when
+the voyage state is missing or out of step. `vessels` folds in new days, and
+refolds when a folded day's aggregates were rebuilt since.
+
+The bookkeeping tables (you rarely need to read them, but they are ordinary
+tables):
+
+| Table | Columns |
+|-------|---------|
+| `vessel_state` | `ts` (the day it is as of), `mmsi`, `last_ts`, `lat`, `lon`: the vessel's last positioned report that day |
+| `build_log` | `step`, `day`, `input_token`, `output_rows`, `built_at`: one row per step and day built; the latest wins |
+| `voyage_state` | one row per vessel: `mmsi`, `first_ts`, `last_ts` (first and last positioned row seen), `from_ts` (where its current leg began: the last stop's departure, or `first_ts`), `origin_*` (the last stop it left), the leg's running totals `dist_nm_raw`, `dist_nm_clean`, `max_sog_knots`, `n_points`, `n_gaps`, `n_outliers`, and `through` (the last day folded in) |
+| `vessel_daily` | `ts` (the day), `mmsi`, `first_seen`, `last_seen`, `n_positions`, then the day's movement: `first_stream_ts`, `last_stream_ts`, `n_points`, `dist_nm_raw`, `dist_nm_clean`, `n_gaps`, `n_outliers`, `max_sog_knots` |
+| `attribute_daily` | `ts`, `mmsi`, `attribute`, `value`, `n_obs`, `first_seen`, `last_seen` |
+| `static_daily` | `ts`, `mmsi`, `first_static_seen`, `last_static_seen`, `n_statics`, `ais_class` |
+| `destination_daily` | `ts`, `mmsi`, `destination`, `n` (times declared), `last_ts`, `eta` (the latest ETA given) |
+
 Days are built in date order. Days with no input are reported and skipped.
 `--plan` cannot say which later days a rebuilt day will ripple into, since that
 depends on the states it produces; it marks them "follows a rebuilt day".
 
 Exit code `2` means nothing needed building, which suits a scheduler.
 
+## Running at scale: `reduce-day`
+
+`track-points` is built for hundreds of millions of reports a day on a small
+machine. `reduce-day` is the same reduction as a stand-alone command: run it on
+a real day *without* `--out-dir` to see, before anything is written, how much
+each thinning rule keeps and why.
+
+```bash
+# Report what thinning would keep on a real day (writes nothing):
+ais-tracks $CAT reduce-day --day 2026-03-10
+
+# Write the reduced rows as Parquet, or work from a local directory:
+ais-tracks reduce-day --source-dir ./silver --day 2026-03-10 --out-dir ./out
+```
+
+It makes one sequential pass over the day, writing each report to one of a few
+hundred scratch files chosen by a hash of the MMSI (a fixed-width 31-byte
+record, zstd-compressed, no payload text). Then it loads one bucket at a time,
+sorts it, and reduces each vessel in a single pass. Memory is one bucket plus a
+small output chunk, whatever the size of the day, and silver need not be sorted
+or compacted. Reports with an implausible MMSI (zero, more than nine digits) are
+set aside and counted, so a bogus id cannot form a giant fake vessel.
+
+The reducer computes what the original SQL did (duplicate ranks, movement, gap /
+jump / spike / invalid flags), and a test holds the two to row-for-row
+agreement on randomised days when thinning is off. With thinning on (the
+default), only some rows are kept, and each kept row carries what it stands for.
+A stream row is kept when any of these hold:
+
+| Keep a row when | Flag | Default |
+|---|---|---|
+| it is the vessel's first or last positioned row of the day | | |
+| the silence before it exceeds the gap limit, or it is the row just before one | `--gap-minutes` | 30 |
+| it is a jump, spike or invalid value, or is next to one | `--max-speed-kn` | 60 |
+| the vessel moved this far since the last kept row | `--keep-distance-nm` | 0.1 |
+| this long has passed since the last kept row | `--keep-interval-s` | 120 |
+| the course changed this much while moving | `--keep-turn-deg` | 15 |
+| the speed changed this much | `--keep-speed-kn` | 2 |
+| the navigation status changed | | |
+
+`--no-thin` keeps every row. On a kept row `dist_nm` is the summed raw hop
+distance since the previous kept row, so distance totals stay exact; `n_raw` is
+the number of reports it stands for; `n_collapsed_dups`, `n_no_position` and
+`n_outliers_raw` split that count; `sum_speed` / `n_speed` and `sum_sog` /
+`n_sog` give count-weighted mean speeds; `max_dev_nm` is how far a collapsed
+report was from the kept one. Duplicates (the same message heard by another
+receiver) are collapsed into the kept row and counted, not kept; they are only
+detected within the day.
+
+The report printed at the end shows how many rows each policy keeps and why, and
+checks that `represented` equals `routed`. How much thinning saves depends on
+your traffic mix (many reports are duplicates from overlapping receivers, and
+moored vessels are already sparse), so run it dry on a real day first.
+
+Everything downstream reads thinned rows and weights by `n_raw` and the carried
+sums, so counts, sums and distances agree with the unthinned answer. Stop and leg
+boundaries blur by up to about half the speed-smoothing window (5 minutes) with
+dense reports, and thinning adds up to one `--keep-interval-s` to that; this is
+tested (`tests/pipeline.rs`).
+
+Measured on synthetic days from `gen-day` (a mix of moored, underway and class B
+vessels, 40% of reports duplicated across receivers), release build, one machine,
+reducing only:
+
+| Reports | Buckets | Kept | Time | Peak memory | Scratch |
+|---|---|---|---|---|---|
+| 2.4 M | 1 | 26.9% | 3 s | 302 MB | 0.05 GB |
+| 61 M | 21 | 27.1% | 44 s | 335 MB | 1.3 GB |
+| 183 M | 61 | 27.1% | 131 s | 431 MB | 3.8 GB |
+
+Memory stays flat as the day grows because it is set by the bucket size
+(`--target-bucket-rows`, default 3 million reports, about 56 bytes each while
+loaded), not by the day. Scratch is about 21 bytes per report, so a 500 M report
+day needs roughly 10 GB. These are synthetic numbers; the retention on real
+traffic will differ. `gen-day --out DIR --rows N` writes such a day.
+
 ## Operating it
 
 **Order.** `ports load` once per release. Then, per day, `track-points`,
-`tracks`, `stop-segments` (or just `daily`), then `stops` and `voyages`. A
-missing input is reported by name ("run track-points first").
+`statics-daily`, `tracks`, `stop-segments`, then `stops` (which folds in
+`voyages`) and `vessels`: or just `daily`. A missing input is reported by name
+("run track-points first").
 
 **Daily runs.** Schedule `daily --catch-up --apply` after the day ends. It builds
 yesterday, folds it into `stops` and `vessels`, and rebuilds any earlier day
-whose silver data changed, with everything else skipped. Nothing in the chain is a full rebuild any more.
+whose silver data changed, with everything else skipped. Nothing in the chain is
+a full rebuild any more.
 
 **Reruns and backfills.** Rerunning a day replaces only that day's partition,
 and `--catch-up` works out what needs it. With explicit `--from/--to`, rebuilding
@@ -521,13 +634,16 @@ any other table, pointing `ais-compact` at the output namespace:
 
 ```bash
 ais-compact $CAT --iceberg-namespace curated \
-  --table track_points --table tracks --table stop_segments compact --apply
+  --table track_points --table tracks --table stop_segments --table stops --table voyages \
+  compact --apply
 ```
 
 **Atomicity.** Every write is a single Iceberg snapshot that adds the new files
 and removes the old ones, using the same hand-built `replace` commit as
 `ais-compact` (iceberg-rust 0.9 has no overwrite action). A concurrent commit
-makes it retry, up to four times; on failure the new files are deleted.
+makes it retry, up to four times; on failure the new files are deleted. A day is
+written table by table, and logged last, so a crash part-way is repaired by
+rerunning it.
 
 ## Querying the results
 
@@ -596,6 +712,14 @@ WHERE v.multiple_imos ORDER BY v.mmsi, a.rank;
 - **`vessel_key` and identity are not time-aware.** One row per MMSI with the
   candidate history in `vessel_attributes`; there are no intervals for
   identity changes, and `mid` is not yet mapped to a country name.
+- **Stop and leg boundaries blur by up to about 5 minutes** with dense reports:
+  stationary is judged on speed averaged over a 10-minute window. Thinning can add
+  up to one `--keep-interval-s`.
+- **Implausible MMSIs are set aside**, counted in the run's report and left out of
+  every derived table.
+- **A leg's destination stop is described as it stood the day the leg ended**
+  (see Voyages); declared destinations are counted per day and only for closed
+  legs, and late static reports for a day already folded do not refresh them.
 - **Port matching is proximity, not a port-call record.** Radii are fixed by
   harbour size, and unmatched stops keep null ports.
 - **`declared_matches_dest` is text matching.** Declared destinations are free
@@ -618,15 +742,23 @@ movement-based definitions rather than replacing them.
 
 ## Source map
 
+Paths are under `crates/ais-tracks/`.
+
 | Path | Role |
 |------|------|
-| `crates/ais-tracks/src/main.rs` | CLI and command wiring |
-| `src/vessels.rs` | `vessels` and `vessel_attributes` SQL and schemas |
-| `src/ports.rs` | World Port Index loader and `ref_ports` schema |
-| `src/track_points.rs` | duplicate, movement and outlier SQL |
+| `src/main.rs` | CLI and command wiring |
+| `src/daily.rs` | the daily steps (`track-points`, `statics-daily`, `tracks`, `stop-segments`, `stops` + `voyages`, `vessels`), day selection, logging |
+| `src/state.rs` | `vessel_state` and `build_log`, day selection, the state digest |
+| `src/reduce.rs`, `src/router.rs`, `src/reduce_day.rs`, `src/source.rs` | the bounded-memory reducer: per-vessel state machine and thinning, on-disk bucket router, driver, silver and local-directory sources |
+| `src/params.rs` | definitions shared by the reducer and the SQL |
+| `src/track_points.rs` | the original SQL for `track_points`, kept as the test oracle |
 | `src/tracks.rs` | segment roll-up SQL |
 | `src/stops.rs` | `stop_segments` and `stops` SQL, port matching |
-| `src/voyages.rs` | leg construction SQL |
+| `src/legs.rs` | voyage legs advanced a day at a time (state machine, interval sums, open and closed rows) |
+| `src/voyages.rs` | the from-scratch voyage SQL, kept as the test oracle, and the `voyages` schema |
+| `src/vessels.rs` | `vessels` and `vessel_attributes`, the daily aggregates, the merge |
+| `src/ports.rs` | World Port Index loader and `ref_ports` schema |
 | `src/carry.rs` | previous-day state and schema checks |
-| `src/output.rs` | create/replace commits (whole table, or one day partition) |
-| `tests/pipeline.rs` | the whole chain on synthetic AIS |
+| `src/output.rs` | create/replace commits (whole table, or one day partition), streaming day writer |
+| `src/bin/gen_day.rs` | `gen-day`, a synthetic day generator |
+| `tests/` | `pipeline.rs` (chain, thinning on and off), `reduce_oracle.rs` (reducer vs SQL), `vessels_fold.rs`, `day_writer.rs`, `daily_e2e.rs` (the daily flow on real Iceberg tables, with `support/` holding the test catalog and scenarios) |

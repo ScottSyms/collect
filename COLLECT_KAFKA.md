@@ -54,15 +54,15 @@ cargo run -p collect-kafka -- \
 | `--quiet` / `-q` | `QUIET` | off | Suppress routine progress lines; warnings/errors still print |
 | `--completions <shell>` | — | — | Print shell completions to stdout and exit |
 | `--version` | — | — | Prints `<crate version> (<git commit hash>)` |
-| `--config <file>` | `CONFIG_FILE` | — | Load flag defaults from a flat TOML file; CLI flags and pre-set env vars still win — see [CLI_REFERENCE.md](CLI_REFERENCE.md#shared-across-all-six-binaries) |
+| `--config <file>` | `CONFIG_FILE` | — | Load flag defaults from a flat TOML file; CLI flags and pre-set env vars still win — see [CLI_REFERENCE.md](CLI_REFERENCE.md#shared-across-all-binaries) |
 
 ### Common + S3 + Iceberg + reconnect
 
-Full flag/env tables: [CLI_REFERENCE.md](CLI_REFERENCE.md#common-to-the-four-collectors-commoncliargs)
+Full flag/env tables: [CLI_REFERENCE.md](CLI_REFERENCE.md#common-to-the-five-collectors-commoncliargs)
 (`CommonCliArgs`), [S3](CLI_REFERENCE.md#s3--collectors-s3cliargs-one-sink)
-(`S3CliArgs`), [Iceberg](CLI_REFERENCE.md#iceberg-icebergcliargs-all-six-binaries)
+(`S3CliArgs`), [Iceberg](CLI_REFERENCE.md#iceberg-icebergcliargs-all-binaries)
 (`IcebergCliArgs` — optional, direct `raw`-table registration on
-successful upload), and [reconnect](CLI_REFERENCE.md#reconnect-the-three-streaming-collectors)
+successful upload), and [reconnect](CLI_REFERENCE.md#reconnect-the-four-streaming-collectors)
 (`--max-reconnect-seconds`, bounds the broker-reconnect backoff below),
 plus the same `--parser` inline-parsing flag
 ([details](CLI_REFERENCE.md#inline-parsing-collectors-only-parsercliargs)).

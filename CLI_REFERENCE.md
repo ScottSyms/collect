@@ -1,6 +1,6 @@
 # CLI reference
 
-The full flag/env surface for all seven binaries. `<binary> --help` is always
+The full flag/env surface for every binary. `<binary> --help` is always
 the authoritative source for the version you're running — this groups the
 same information by the shared structs the flags come from, so it's easier
 to see what's common across binaries versus what's bespoke to one.
@@ -8,7 +8,7 @@ to see what's common across binaries versus what's bespoke to one.
 New to the project? Start with [TUTORIAL.md](TUTORIAL.md) instead — this
 page is a reference, not a walkthrough.
 
-## Shared across all seven binaries
+## Shared across all binaries
 
 | Flag | Env | Default | Notes |
 |---|---|---|---|
@@ -57,7 +57,7 @@ The connection flags themselves are the same names/envs as the collectors'
 table above, minus `--s3-bucket`/`--s3-prefix`/`--keep-local` (not
 applicable to a two-sided tool).
 
-## Iceberg (`IcebergCliArgs`, all seven binaries)
+## Iceberg (`IcebergCliArgs`, all binaries)
 
 | Flag | Env | Default | Notes |
 |---|---|---|---|
@@ -180,7 +180,7 @@ bound when `--parser` is set; lower `--max-batch-bytes` if needed.
 
 ## Exit codes
 
-Shared across all seven binaries (`collect_core::exitcode`):
+Shared across all binaries (`collect_core::exitcode`):
 
 | Code | Meaning |
 |---|---|
@@ -202,7 +202,7 @@ Shared across all seven binaries (`collect_core::exitcode`):
 | `--consolidate-ais` | `CONSOLIDATE_AIS` | Reassemble fragmented NMEA sentences before writing |
 | `--process-timestamps` | `PROCESS_TIMESTAMPS` | Correct row timestamps from `$PGHP`/tag-block `c:` |
 
-Plus [Common](#common-to-the-five-collectors-commoncliargs), [S3](#s3--collectors-s3cliargs-one-sink), [Iceberg](#iceberg-icebergcliargs-all-six-binaries), [inline parsing](#inline-parsing-collectors-only-parsercliargs), [reconnect](#reconnect-the-four-streaming-collectors), and the [shared flags](#shared-across-all-seven-binaries).
+Plus [Common](#common-to-the-five-collectors-commoncliargs), [S3](#s3--collectors-s3cliargs-one-sink), [Iceberg](#iceberg-icebergcliargs-all-binaries), [inline parsing](#inline-parsing-collectors-only-parsercliargs), [reconnect](#reconnect-the-four-streaming-collectors), and the [shared flags](#shared-across-all-binaries).
 
 ## `collect-kafka`
 
@@ -215,7 +215,7 @@ Plus [Common](#common-to-the-five-collectors-commoncliargs), [S3](#s3--collector
 | `-s, --source <label>` | `SOURCE` | Defaults to the topic name |
 | `-q, --quiet` | `QUIET` | |
 
-Plus [Common](#common-to-the-five-collectors-commoncliargs), [S3](#s3--collectors-s3cliargs-one-sink), [Iceberg](#iceberg-icebergcliargs-all-six-binaries), [inline parsing](#inline-parsing-collectors-only-parsercliargs), [reconnect](#reconnect-the-four-streaming-collectors), and the [shared flags](#shared-across-all-seven-binaries).
+Plus [Common](#common-to-the-five-collectors-commoncliargs), [S3](#s3--collectors-s3cliargs-one-sink), [Iceberg](#iceberg-icebergcliargs-all-binaries), [inline parsing](#inline-parsing-collectors-only-parsercliargs), [reconnect](#reconnect-the-four-streaming-collectors), and the [shared flags](#shared-across-all-binaries).
 
 ## `collect-file`
 
@@ -229,7 +229,7 @@ Plus [Common](#common-to-the-five-collectors-commoncliargs), [S3](#s3--collector
 | `--consolidate-ais` | `CONSOLIDATE_AIS` | |
 | `--process-timestamps` | `PROCESS_TIMESTAMPS` | |
 
-Plus [Common](#common-to-the-five-collectors-commoncliargs), [S3](#s3--collectors-s3cliargs-one-sink), [Iceberg](#iceberg-icebergcliargs-all-six-binaries), [inline parsing](#inline-parsing-collectors-only-parsercliargs), and the [shared flags](#shared-across-all-seven-binaries). No reconnect flags — no live connection to lose.
+Plus [Common](#common-to-the-five-collectors-commoncliargs), [S3](#s3--collectors-s3cliargs-one-sink), [Iceberg](#iceberg-icebergcliargs-all-binaries), [inline parsing](#inline-parsing-collectors-only-parsercliargs), and the [shared flags](#shared-across-all-binaries). No reconnect flags — no live connection to lose.
 
 ## `collect-aisstream`
 
@@ -242,7 +242,7 @@ Plus [Common](#common-to-the-five-collectors-commoncliargs), [S3](#s3--collector
 | `-s, --source <label>` | `SOURCE` | Default `aisstream` |
 | `-q, --quiet` | `QUIET` | |
 
-Plus [Common](#common-to-the-five-collectors-commoncliargs), [S3](#s3--collectors-s3cliargs-one-sink), [Iceberg](#iceberg-icebergcliargs-all-six-binaries), [inline parsing](#inline-parsing-collectors-only-parsercliargs), [reconnect](#reconnect-the-four-streaming-collectors), and the [shared flags](#shared-across-all-seven-binaries).
+Plus [Common](#common-to-the-five-collectors-commoncliargs), [S3](#s3--collectors-s3cliargs-one-sink), [Iceberg](#iceberg-icebergcliargs-all-binaries), [inline parsing](#inline-parsing-collectors-only-parsercliargs), [reconnect](#reconnect-the-four-streaming-collectors), and the [shared flags](#shared-across-all-binaries).
 
 ## `collect-barentswatch`
 
@@ -256,7 +256,7 @@ Plus [Common](#common-to-the-five-collectors-commoncliargs), [S3](#s3--collector
 | `-s, --source <label>` | `SOURCE` | Default `barentswatch` |
 | `-q, --quiet` | `QUIET` | |
 
-Plus [Common](#common-to-the-five-collectors-commoncliargs), [S3](#s3--collectors-s3cliargs-one-sink), [Iceberg](#iceberg-icebergcliargs-all-six-binaries), [inline parsing](#inline-parsing-collectors-only-parsercliargs), [reconnect](#reconnect-the-four-streaming-collectors), and the [shared flags](#shared-across-all-seven-binaries).
+Plus [Common](#common-to-the-five-collectors-commoncliargs), [S3](#s3--collectors-s3cliargs-one-sink), [Iceberg](#iceberg-icebergcliargs-all-binaries), [inline parsing](#inline-parsing-collectors-only-parsercliargs), [reconnect](#reconnect-the-four-streaming-collectors), and the [shared flags](#shared-across-all-binaries).
 
 ## `ais-parse` / `aisstream-parse`
 
@@ -293,15 +293,15 @@ don't.
 | `--max-partition-failures <n>` | `MAX_PARTITION_FAILURES` | `5` | Abort once this many partitions have failed and been skipped |
 
 Plus [S3 connection](#s3--batch-parsers-s3connectionargs-connection-only),
-[Iceberg](#iceberg-icebergcliargs-all-six-binaries), and the
-[shared flags](#shared-across-all-six-binaries). No `--upload-concurrency`,
+[Iceberg](#iceberg-icebergcliargs-all-binaries), and the
+[shared flags](#shared-across-all-binaries). No `--upload-concurrency`,
 `--max-rows`, etc. — these are batch tools, not streaming collectors, so
 they don't flatten `CommonCliArgs`.
 
 ## `ais-compact`
 
 Table maintenance for Iceberg catalogs with no compactor of their own (RustFS's
-built-in catalog). Takes the [Iceberg flags](#iceberg-icebergcliargs-all-six-binaries)
+built-in catalog). Takes the [Iceberg flags](#iceberg-icebergcliargs-all-binaries)
 (`--iceberg-catalog-uri`, `--iceberg-warehouse`, `--iceberg-sigv4`, …) plus the
 S3 credentials in the environment, and one subcommand. Every command that
 changes anything is a **dry run unless `--apply` is given**. Behavior, safety
@@ -339,7 +339,7 @@ Notes:
 
 Derived tables from the silver layer: vessel identity, annotated track points,
 tracks, stops and voyages, computed with DataFusion SQL. Takes the
-[Iceberg flags](#iceberg-icebergcliargs-all-seven-binaries) plus S3 credentials
+[Iceberg flags](#iceberg-icebergcliargs-all-binaries) plus S3 credentials
 in the environment, and one subcommand. Every command is a **dry run unless
 `--apply` is given**. Behavior, columns and limits: [AIS_TRACKS.md](AIS_TRACKS.md).
 
@@ -356,23 +356,26 @@ to the output namespace. `--iceberg-table-prefix` applies to the input only.
 | `statics-daily` | the day selection flags, `--scratch`, `--apply` | Per-day identity aggregates from that day's static reports (`attribute_daily`, `static_daily`) |
 | `vessels` | `--full`, `--from-silver`, `--scratch`, `--plan`, `--apply` | Folds new days' `vessel_daily`, `attribute_daily` and `static_daily` into `vessels` and `vessel_attributes` (refolds all when needed). `--from-silver` rebuilds from the whole silver tables instead |
 | `ports load` | `--file <csv>`, `--release <label>`, `--apply` | Appends a World Port Index (Pub 150) release to `ref_ports`; a label can be loaded once |
-| `track-points` | `--from <date>` (alias `--day`), `--to <date>`, `--lookback-days` (1), `--buckets`, `--target-bucket-rows` (3000000), `--scratch`, `--keep-scratch`, `--no-thin`, `--keep-distance-nm` (0.1), `--keep-interval-s` (120), `--keep-turn-deg` (15), `--keep-speed-kn` (2), `--max-speed-kn` (60), `--gap-minutes` (30), `--apply` | Reads a day of silver `positions`, reduces it with bounded memory (duplicates, movement, outlier flags, optional thinning) and writes one row per kept report to `track_points`, per UTC day partition |
-| `tracks` | `--from`, `--to`, `--shards` (4), `--apply` | Continuous segments per day, chained across midnight by `track_id` |
-| `stop-segments` | `--from`, `--to`, `--shards` (4), `--slow-kn` (0.5), `--smooth-minutes` (10), `--resume-nm` (1.0), `--min-stop-minutes` (30), `--apply` | Stationary runs per day, chained across midnight by `stop_id` |
+| `track-points` | the day selection flags, `--lookback-days` (1), `--buckets`, `--target-bucket-rows` (3000000), `--scratch`, `--keep-scratch`, `--no-thin`, `--keep-distance-nm` (0.1), `--keep-interval-s` (120), `--keep-turn-deg` (15), `--keep-speed-kn` (2), `--max-speed-kn` (60), `--gap-minutes` (30), `--apply` | Reads a day of silver `positions`, reduces it with bounded memory (duplicates, movement, outlier flags, optional thinning) and writes one row per kept report to `track_points`, per UTC day partition |
+| `tracks` | the day selection flags, `--shards` (4), `--apply` | Continuous segments per day, chained across midnight by `track_id` |
+| `stop-segments` | the day selection flags, `--shards` (4), `--slow-kn` (0.5), `--smooth-minutes` (10), `--resume-nm` (1.0), `--min-stop-minutes` (30), `--apply` | Stationary runs per day, chained across midnight by `stop_id` |
 | `stops` (alias `voyages`) | `--full`, `--scratch`, `--plan`, `--apply` | Folds newly built `stop_segments` days, day by day, into `stops` (partitioned by the day a stop ends, port-matched) and into `voyages` / `open_voyages`; replays every day when needed |
 | `daily` | the flags of `track-points`, plus `--shards` (4) and the `stop-segments` flags | `track-points`, `statics-daily`, `tracks`, `stop-segments`, then `stops` and `voyages` (if `ref_ports` is loaded) and `vessels`; with `--catch-up`, only what needs building |
 | `reduce-day` | `--day`, `--source-dir`, `--out-dir`, `--scratch`, `--buckets`, `--target-bucket-rows` (3000000), `--no-thin`, `--keep-distance-nm` (0.1), `--keep-interval-s` (120), `--keep-turn-deg` (15), `--keep-speed-kn` (2), `--max-speed-kn` (60), `--gap-minutes` (30) | Memory-bounded reduction of one day of raw reports: routes to on-disk vessel buckets, flags and optionally thins. Dry run unless `--out-dir` is given; needs no catalog with `--source-dir`. See [AIS_TRACKS.md](AIS_TRACKS.md#running-at-scale-reduce-day) |
 
 Notes:
 
-- **Order:** `ports load`, then `track-points`, `tracks`, `stop-segments` for
-  each day in date order (or `daily`), then `stops` and `voyages`.
-- **Day selection** (`track-points`, `tracks`, `stop-segments`, `daily`): `--from`
-  [`--to`] rebuilds exactly those days; `--catch-up` builds the days with input
+- **Order:** `ports load`, then for each day in date order `track-points`,
+  `statics-daily`, `tracks`, `stop-segments` (or just `daily`), then `stops` (which
+  folds in `voyages`) and `vessels`.
+- **Day selection** (`track-points`, `statics-daily`, `tracks`, `stop-segments`,
+  `daily`): `--from` (alias `--day`) [`--to`] rebuilds exactly those days; `--catch-up` builds the days with input
   that were never built or whose input changed (`--full` forces all, `--include-today`
   adds today, `--plan` only reports). Builds are logged in `build_log`, and each
   built day saves `vessel_state`.
 - **Dates** are UTC, `YYYY-MM-DD`, and `--to` is inclusive.
-- **Idempotent:** rerunning a day replaces only that day's partition; `vessels`,
-  `stops` and `voyages` are replaced whole. Each write is one Iceberg snapshot.
+- **Idempotent:** rerunning a day replaces only that day's partition, and
+  `stops`, `voyages`, `vessels` and `vessel_attributes` fold in only new days
+  (replaying or refolding when an earlier day changed). Each write is one Iceberg
+  snapshot.
 - Exit codes: `0` success, `1` error, `2` no day in the range had data.
