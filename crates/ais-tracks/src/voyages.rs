@@ -88,13 +88,15 @@ dagg AS (
     SELECT l.voyage_id, st.ts AS st_ts, st.eta AS st_eta,
            regexp_replace(trim(st.destination), '[@ ]+$', '') AS dest
     FROM legs l JOIN statics st
-      ON st.mmsi = l.mmsi AND st.ts > l.depart_ts AND (l.arrive_ts IS NULL OR st.ts <= l.arrive_ts)
-    WHERE st.destination IS NOT NULL
+      ON st.mmsi = l.mmsi
+     AND st.ts >= date_trunc('day', l.depart_ts)
+     AND st.ts < date_trunc('day', l.arrive_ts) + INTERVAL '1 day'
+    WHERE l.arrive_ts IS NOT NULL AND st.destination IS NOT NULL
   ) x WHERE dest <> '' GROUP BY voyage_id, dest
 ),
 dr AS (
   SELECT dagg.*,
-    CAST(row_number() OVER (PARTITION BY voyage_id ORDER BY n DESC, last_ts DESC) AS INT) AS rk,
+    CAST(row_number() OVER (PARTITION BY voyage_id ORDER BY n DESC, last_ts DESC, dest) AS INT) AS rk,
     count(*) OVER (PARTITION BY voyage_id) AS n_dest
   FROM dagg
 ),
@@ -119,7 +121,8 @@ decl AS (
     format!(
         "
 WITH bounds AS (
-  SELECT mmsi, min(ts) AS first_ts, max(ts_end) AS last_ts FROM tracks GROUP BY mmsi
+  SELECT mmsi, min(ts) AS first_ts, max(ts) AS last_ts
+  FROM track_points WHERE has_position AND NOT is_duplicate GROUP BY mmsi
 ),
 ordered AS (
   SELECT stops.*,
@@ -127,11 +130,17 @@ ordered AS (
     CAST(row_number() OVER w AS INT) AS stop_no
   FROM stops WINDOW w AS (PARTITION BY mmsi ORDER BY arrive_ts)
 ),
+-- A vessel has moved on from its last stop if it was seen after the stop ended.
+moved AS (
+  SELECT o.stop_id, coalesce(b.last_ts > o.depart_ts, false) AS moved_on
+  FROM ordered o LEFT JOIN bounds b ON o.mmsi = b.mmsi
+),
 legs0 AS (
   -- between consecutive stops, and after the last one if the vessel moved on
-  SELECT mmsi, stop_id AS origin_stop_id, next_stop_id AS dest_stop_id,
-         depart_ts, next_arrive_ts AS arrive_ts
-  FROM ordered WHERE next_stop_id IS NOT NULL OR NOT is_current
+  SELECT ordered.mmsi, ordered.stop_id AS origin_stop_id, ordered.next_stop_id AS dest_stop_id,
+         ordered.depart_ts, ordered.next_arrive_ts AS arrive_ts
+  FROM ordered JOIN moved ON ordered.stop_id = moved.stop_id
+  WHERE ordered.next_stop_id IS NOT NULL OR moved.moved_on
   UNION ALL
   -- before the first stop, if the vessel was seen moving first
   SELECT o.mmsi, CAST(NULL AS VARCHAR) AS origin_stop_id, o.stop_id AS dest_stop_id,
@@ -156,11 +165,10 @@ metrics AS (
     sum(tp.dist_nm) FILTER (WHERE tp.has_position AND NOT tp.is_duplicate
                               AND NOT tp.gap_before AND NOT tp.is_speed_jump)
       AS distance_nm_clean,
-    max(tp.sog_knots) FILTER (WHERE tp.has_position AND NOT tp.is_duplicate
-                                AND NOT tp.is_sog_invalid) AS max_sog_knots,
-    count(*) AS n_points,
+    max(tp.max_sog) FILTER (WHERE tp.has_position AND NOT tp.is_duplicate) AS max_sog_knots,
+    CAST(sum(tp.n_raw) AS BIGINT) AS n_points,
     count(*) FILTER (WHERE tp.gap_before) AS n_gaps,
-    count(*) FILTER (WHERE tp.is_outlier) AS n_outliers
+    CAST(sum(tp.n_outliers_raw) AS BIGINT) AS n_outliers
   FROM legs l JOIN track_points tp
     ON tp.mmsi = l.mmsi AND tp.ts > l.depart_ts AND (l.arrive_ts IS NULL OR tp.ts <= l.arrive_ts)
   GROUP BY l.voyage_id
@@ -177,9 +185,10 @@ SELECT l.voyage_id, l.mmsi, l.depart_ts, l.arrive_ts,
   d.lat AS dest_lat, d.lon AS dest_lon, d.port_id AS dest_port_id,
   d.port_name AS dest_port_name, d.port_unlocode AS dest_unlocode,
   d.port_country AS dest_country, d.port_distance_nm AS dest_port_distance_nm,
-  m.distance_nm_raw, m.distance_nm_clean,
+  coalesce(m.distance_nm_raw, 0.0) AS distance_nm_raw,
+  coalesce(m.distance_nm_clean, 0.0) AS distance_nm_clean,
   CASE WHEN l.arrive_ts IS NOT NULL AND l.arrive_ts > l.depart_ts
-       THEN m.distance_nm_clean
+       THEN coalesce(m.distance_nm_clean, 0.0)
             / ((CAST(l.arrive_ts AS BIGINT) - CAST(l.depart_ts AS BIGINT)) / 3600000000.0)
   END AS avg_speed_kn,
   m.max_sog_knots,

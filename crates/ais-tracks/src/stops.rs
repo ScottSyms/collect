@@ -68,7 +68,10 @@ pub fn stop_segments_schema() -> Schema {
         .expect("building stop_segments schema")
 }
 
-/// Column order here is the column order of [`stops_sql`]'s result.
+/// Column order here is the column order of [`stops_sql`]'s result. The table is
+/// partitioned by day of `depart_ts` (see [`crate::daily::run_stops`]), so a stop
+/// that is still going moves forward one partition a day and every other stop
+/// stays where it is.
 pub fn stops_schema() -> Schema {
     use PrimitiveType::*;
     let fields = vec![
@@ -84,16 +87,15 @@ pub fn stops_schema() -> Schema {
         required(10, "radius_nm", Double),
         required(11, "n_moored", Long),
         required(12, "n_anchored", Long),
-        required(13, "is_current", Boolean),
-        optional(14, "port_id", Long),
-        optional(15, "port_name", String),
-        optional(16, "port_unlocode", String),
-        optional(17, "port_country", String),
-        optional(18, "port_distance_nm", Double),
-        optional(19, "port2_id", Long),
-        optional(20, "port2_distance_nm", Double),
-        optional(21, "wpi_release", String),
-        required(22, "computed_at", Timestamptz),
+        optional(13, "port_id", Long),
+        optional(14, "port_name", String),
+        optional(15, "port_unlocode", String),
+        optional(16, "port_country", String),
+        optional(17, "port_distance_nm", Double),
+        optional(18, "port2_id", Long),
+        optional(19, "port2_distance_nm", Double),
+        optional(20, "wpi_release", String),
+        required(21, "computed_at", Timestamptz),
     ];
     Schema::builder()
         .with_schema_id(1)
@@ -139,19 +141,20 @@ pub fn segments_sql(p: &StopParams, shard: u32) -> String {
         "
 WITH pts AS (
   SELECT mmsi, ts, latitude, longitude, sog_knots, source, nav_status, prev_ts, dist_nm,
-         gap_before,
-         coalesce(CASE WHEN is_sog_invalid THEN NULL ELSE sog_knots END, implied_speed_kn)
-           AS speed_kn
+         gap_before, sum_speed, n_speed, max_dev_nm,
+         -- how many positioned reports this row stands for (1 when unthinned)
+         (n_raw - n_collapsed_dups - n_no_position) AS w
   FROM track_points
   WHERE ts >= '{ds}' AND ts < '{de}' AND mmsi % {n} = {shard}
     AND has_position AND NOT is_duplicate AND NOT is_spike
 ),
 smooth AS (
   SELECT pts.*,
-    avg(speed_kn) OVER (PARTITION BY mmsi ORDER BY ts
-      RANGE BETWEEN INTERVAL '{half} seconds' PRECEDING
-                AND INTERVAL '{half} seconds' FOLLOWING) AS speed_smooth
+    sum(sum_speed) OVER sw / nullif(sum(n_speed) OVER sw, 0) AS speed_smooth
   FROM pts
+  WINDOW sw AS (PARTITION BY mmsi ORDER BY ts
+    RANGE BETWEEN INTERVAL '{half} seconds' PRECEDING
+              AND INTERVAL '{half} seconds' FOLLOWING)
 ),
 marked AS (
   SELECT smooth.*,
@@ -175,25 +178,26 @@ runs AS (
 ),
 slowrows AS (
   SELECT runs.*,
-    avg(latitude) OVER cw AS c_lat,
-    degrees(atan2(avg(sin(radians(longitude))) OVER cw,
-                  avg(cos(radians(longitude))) OVER cw)) AS c_lon
+    sum(latitude * w) OVER cw / sum(w) OVER cw AS c_lat,
+    degrees(atan2(sum(sin(radians(longitude)) * w) OVER cw,
+                  sum(cos(radians(longitude)) * w) OVER cw)) AS c_lon
   FROM runs WHERE is_slow
   WINDOW cw AS (PARTITION BY mmsi, run_no)
 ),
 agg AS (
   SELECT mmsi, run_no,
     min(ts) AS ts, max(ts) AS ts_end,
-    CAST(count(*) AS INT) AS n_points,
+    CAST(sum(w) AS INT) AS n_points,
     bool_or(rn = 1) AS at_day_start,
     bool_or(rn = n_rows) AS open_at_day_end,
     first_value(prev_ts {first}) AS first_prev_ts,
     first_value(displaced {first}) AS first_displaced,
     max(c_lat) AS lat, max(c_lon) AS lon,
-    max({dev}) AS radius_nm,
-    CAST(count(*) FILTER (WHERE nav_status ILIKE '%moored%') AS INT) AS n_moored,
-    CAST(count(*) FILTER (WHERE nav_status ILIKE '%anchor%') AS INT) AS n_anchored,
-    avg(speed_kn) AS mean_speed_kn
+    -- a thinned row also covers reports up to max_dev_nm away from it
+    max({dev} + max_dev_nm) AS radius_nm,
+    CAST(coalesce(sum(w) FILTER (WHERE nav_status ILIKE '%moored%'), 0) AS INT) AS n_moored,
+    CAST(coalesce(sum(w) FILTER (WHERE nav_status ILIKE '%anchor%'), 0) AS INT) AS n_anchored,
+    sum(sum_speed) / nullif(sum(n_speed), 0) AS mean_speed_kn
   FROM slowrows
   GROUP BY mmsi, run_no
 )
@@ -217,8 +221,37 @@ ORDER BY a.mmsi, a.ts"
     )
 }
 
-/// The SQL merging `stop_segments` into `stops` and matching ports. Reads the
-/// registered `stop_segments`, `tracks` and `ref_ports` tables.
+/// The stop pieces to merge, as `stop_parts` expects them, from every row of
+/// `stop_segments`. A row here is one piece of one stop; a stop in
+/// `stop_parts` may also be one whole stop already merged (`n_segments` says
+/// how many pieces it holds).
+pub fn parts_from_segments_sql() -> String {
+    "SELECT stop_id, mmsi, ts, ts_end, CAST(1 AS BIGINT) AS n_segments,
+            CAST(n_points AS BIGINT) AS n_points, lat, lon, radius_nm,
+            CAST(n_moored AS BIGINT) AS n_moored, CAST(n_anchored AS BIGINT) AS n_anchored
+     FROM stop_segments"
+        .to_string()
+}
+
+/// The parts for an increment: the existing rows (`stop_base`) of the stops that
+/// today's pieces (`day_pieces`) touch, plus those pieces that the base does not
+/// already include. A base row includes a piece when it departs at or after the
+/// piece ends, which is what makes rerunning a day harmless.
+pub fn parts_with_base_sql() -> String {
+    "SELECT stop_id, mmsi, arrive_ts AS ts, depart_ts AS ts_end,
+            CAST(n_segments AS BIGINT) AS n_segments, n_points, lat, lon, radius_nm,
+            n_moored, n_anchored
+     FROM stop_base
+     UNION ALL
+     SELECT p.stop_id, p.mmsi, p.ts, p.ts_end, CAST(1 AS BIGINT), CAST(p.n_points AS BIGINT),
+            p.lat, p.lon, p.radius_nm, CAST(p.n_moored AS BIGINT), CAST(p.n_anchored AS BIGINT)
+     FROM day_pieces p LEFT JOIN stop_base b ON p.stop_id = b.stop_id
+     WHERE b.stop_id IS NULL OR p.ts_end > b.depart_ts"
+        .to_string()
+}
+
+/// The SQL merging `stop_parts` into stops and matching ports. Reads the
+/// registered `stop_parts` and `ref_ports` tables.
 pub fn stops_sql() -> String {
     let seg_dist = haversine("s.lat", "s.lon", "p.plat", "p.plon");
     format!(
@@ -226,14 +259,13 @@ pub fn stops_sql() -> String {
 WITH seg AS (
   SELECT mmsi, stop_id,
     min(ts) AS arrive_ts, max(ts_end) AS depart_ts,
-    CAST(count(*) AS INT) AS n_segments, CAST(sum(n_points) AS BIGINT) AS n_points,
+    CAST(sum(n_segments) AS INT) AS n_segments, CAST(sum(n_points) AS BIGINT) AS n_points,
     sum(lat * n_points) / sum(n_points) AS lat,
     degrees(atan2(sum(sin(radians(lon)) * n_points), sum(cos(radians(lon)) * n_points))) AS lon,
     max(radius_nm) AS radius_nm,
     CAST(sum(n_moored) AS BIGINT) AS n_moored, CAST(sum(n_anchored) AS BIGINT) AS n_anchored
-  FROM stop_segments GROUP BY mmsi, stop_id
+  FROM stop_parts GROUP BY mmsi, stop_id
 ),
-seen AS (SELECT mmsi, max(ts_end) AS last_seen FROM tracks GROUP BY mmsi),
 ports AS (
   SELECT port_id, name, unlocode, country, wpi_release,
     latitude AS plat, longitude AS plon,
@@ -280,15 +312,21 @@ best AS (
 SELECT seg.stop_id, seg.mmsi, seg.arrive_ts, seg.depart_ts,
   (CAST(seg.depart_ts AS BIGINT) - CAST(seg.arrive_ts AS BIGINT)) / 1000000.0 AS duration_s,
   seg.n_segments, seg.n_points, seg.lat, seg.lon, seg.radius_nm, seg.n_moored, seg.n_anchored,
-  coalesce(seen.last_seen <= seg.depart_ts, true) AS is_current,
   best.port_id, best.port_name, best.port_unlocode, best.port_country, best.port_distance_nm,
   best.port2_id, best.port2_distance_nm, best.wpi_release,
   now() AS computed_at
 FROM seg
-LEFT JOIN seen ON seg.mmsi = seen.mmsi
 LEFT JOIN best ON seg.mmsi = best.mmsi AND seg.stop_id = best.stop_id
 ORDER BY seg.mmsi, seg.arrive_ts"
     )
+}
+
+/// Defines `stop_parts` as every piece in the registered `stop_segments`.
+pub async fn define_parts_from_segments(ctx: &SessionContext) -> Result<()> {
+    let _ = ctx.deregister_table("stop_parts")?;
+    let view = ctx.sql(&parts_from_segments_sql()).await?.into_view();
+    ctx.register_table("stop_parts", view)?;
+    Ok(())
 }
 
 /// Registers the previous day's last stop piece per vessel.

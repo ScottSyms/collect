@@ -123,6 +123,27 @@ pub async fn ensure_day_table(
     ensure_table(catalog, config, base_name, schema, spec).await
 }
 
+/// Like [`ensure_day_table`], partitioned by day of the named timestamp column.
+pub async fn ensure_day_table_on(
+    catalog: &impl Catalog,
+    config: &IcebergConfig,
+    base_name: &str,
+    schema: Schema,
+    column: &str,
+) -> Result<Table> {
+    ensure_namespace(catalog, config).await?;
+    anyhow::ensure!(
+        schema.as_struct().fields().iter().any(|f| f.name == column),
+        "schema has no '{column}' field"
+    );
+    let spec = PartitionSpecBuilder::new(schema.clone()).add_partition_field(
+        column,
+        format!("{column}_day"),
+        iceberg::spec::Transform::Day,
+    )?;
+    ensure_table(catalog, config, base_name, schema, spec).await
+}
+
 /// The Iceberg partition value for a day: days since 1970-01-01.
 pub fn day_partition(days_since_epoch: i32) -> Struct {
     Struct::from_iter([Some(Literal::int(days_since_epoch))])
@@ -179,6 +200,10 @@ pub async fn commit_day(
             created: remove.is_empty(),
         };
 
+        // Clearing a partition that is already empty changes nothing.
+        if remove.is_empty() && added.is_empty() {
+            return Ok(report);
+        }
         if remove.is_empty() || table.metadata().current_snapshot().is_none() {
             let txn = Transaction::new(&table);
             let txn = txn.fast_append().add_data_files(added.clone()).apply(txn)?;
@@ -211,5 +236,132 @@ pub async fn commit_day(
         eprintln!("  {base_name}: table changed during commit, retrying ({attempt}/{MAX_COMMIT_ATTEMPTS})");
     }
     discard(&catalog.load_table(&ident).await?, &added).await;
+    bail!("{base_name}: gave up after {MAX_COMMIT_ATTEMPTS} conflicting commits")
+}
+
+/// Writes one day's batches into that day's partition as they arrive, rolling
+/// to a new file at the target size. Nothing is visible until the files it
+/// returns are passed to [`commit_day`].
+///
+/// [`write_day_shard`] needs the whole shard in one batch; this takes any
+/// number of small ones, so a day can be streamed through in bounded memory.
+pub struct DayWriter {
+    writer: Box<dyn iceberg::writer::IcebergWriter>,
+    target: std::sync::Arc<arrow::datatypes::Schema>,
+    pub rows: usize,
+}
+
+impl DayWriter {
+    pub async fn new(table: &Table, days_since_epoch: i32, bloom: &[&str]) -> Result<Self> {
+        use iceberg::spec::{DataFileFormat, PartitionKey};
+        use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+        use iceberg::writer::file_writer::location_generator::{
+            DefaultFileNameGenerator, DefaultLocationGenerator,
+        };
+        use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+        use iceberg::writer::file_writer::ParquetWriterBuilder;
+        use iceberg::writer::IcebergWriterBuilder;
+        use parquet::basic::{Compression, ZstdLevel};
+        use parquet::file::properties::WriterProperties;
+        use parquet::schema::types::ColumnPath;
+
+        let metadata = table.metadata();
+        let schema = metadata.current_schema();
+        let location_gen = DefaultLocationGenerator::new(metadata.clone())?;
+        let name_gen = DefaultFileNameGenerator::new(
+            format!("reduce-{}", uuid::Uuid::new_v4().simple()),
+            Some("iceberg".to_string()),
+            DataFileFormat::Parquet,
+        );
+        let mut props = WriterProperties::builder()
+            .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
+            .set_max_row_group_size(collect_maint::rewrite::MAX_ROW_GROUP_ROWS);
+        for col in bloom {
+            if schema.field_by_name(col).is_some() {
+                props = props.set_column_bloom_filter_enabled(ColumnPath::from(*col), true);
+            }
+        }
+        let rolling = RollingFileWriterBuilder::new(
+            ParquetWriterBuilder::new(props.build(), schema.clone()),
+            TARGET_FILE_BYTES as usize,
+            table.file_io().clone(),
+            location_gen,
+            name_gen,
+        );
+        let key = PartitionKey::new(
+            metadata.default_partition_spec().as_ref().clone(),
+            schema.clone(),
+            day_partition(days_since_epoch),
+        );
+        let writer = DataFileWriterBuilder::new(rolling)
+            .build(Some(key))
+            .await
+            .context("build writer")?;
+        Ok(Self {
+            writer: Box::new(writer),
+            target: std::sync::Arc::new(iceberg::arrow::schema_to_arrow_schema(schema)?),
+            rows: 0,
+        })
+    }
+
+    /// Writes one batch (columns in the table's order; types are cast to it).
+    pub async fn write(&mut self, batch: &RecordBatch) -> Result<()> {
+        let cols = batch
+            .columns()
+            .iter()
+            .zip(self.target.fields())
+            .map(|(c, f)| {
+                if c.data_type() == f.data_type() {
+                    Ok(c.clone())
+                } else {
+                    arrow::compute::cast(c, f.data_type()).map_err(anyhow::Error::from)
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let projected = RecordBatch::try_new(self.target.clone(), cols)?;
+        self.rows += projected.num_rows();
+        self.writer.write(projected).await.context("write")?;
+        Ok(())
+    }
+
+    /// Closes the writer and returns the files, ready for [`commit_day`].
+    pub async fn finish(mut self) -> Result<Vec<DataFile>> {
+        self.writer.close().await.context("close")
+    }
+}
+
+
+/// Replaces `base_name`'s contents with `batches`, like [`replace_table`], but an
+/// empty result is a valid answer: it clears the table. For tables that hold a
+/// current picture (say, the legs still under way) rather than accumulated history.
+pub async fn replace_table_or_clear(
+    catalog: &impl Catalog,
+    rest: &RestClient,
+    config: &IcebergConfig,
+    base_name: &str,
+    schema: Schema,
+    batches: &[RecordBatch],
+    bloom: &[&str],
+) -> Result<WriteReport> {
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    if rows > 0 {
+        return replace_table(catalog, rest, config, base_name, schema, batches, bloom).await;
+    }
+    ensure_namespace(catalog, config).await?;
+    let spec = PartitionSpecBuilder::new(schema.clone());
+    let ident = table_ident(config, base_name);
+    ensure_table(catalog, config, base_name, schema, spec).await?;
+    for attempt in 1..=MAX_COMMIT_ATTEMPTS {
+        let table = catalog.load_table(&ident).await?;
+        let remove: HashSet<String> = live_files(&table).await?.into_iter().map(|f| f.path).collect();
+        if remove.is_empty() {
+            return Ok(WriteReport::default());
+        }
+        let prepared = prepare_replace(&table, &remove, Vec::new()).await?;
+        if rest.commit(&ident, &prepared.requirements, &prepared.updates).await? {
+            return Ok(WriteReport { rows: 0, files_added: 0, files_removed: remove.len(), created: false });
+        }
+        eprintln!("  {base_name}: table changed during clear, retrying ({attempt}/{MAX_COMMIT_ATTEMPTS})");
+    }
     bail!("{base_name}: gave up after {MAX_COMMIT_ATTEMPTS} conflicting commits")
 }

@@ -89,14 +89,15 @@ pub fn shard_sql(day_start: DateTime<Utc>, shards: u32, shard: u32) -> String {
     let ds = lit(day_start);
     let de = lit(day_start + Duration::days(1));
     // Same total order `track_points` uses, so pieces are deterministic.
-    let order = "ts, latitude, longitude, dup_rank, source, station, payload";
+    let order = "ts, latitude, longitude, dup_rank, source, station";
     let first = "ORDER BY ts, latitude, longitude";
     format!(
         "
 WITH pts AS (
-  SELECT mmsi, ts, latitude, longitude, sog_knots, dist_nm, has_position, is_duplicate,
-         gap_before, is_speed_jump, is_spike, is_outlier, is_sog_invalid,
-         dup_rank, source, station, payload,
+  SELECT mmsi, ts, latitude, longitude, dist_nm, has_position, is_duplicate,
+         gap_before, is_speed_jump, is_spike, is_outlier,
+         dup_rank, source, station,
+         n_raw, n_collapsed_dups, n_no_position, n_outliers_raw, sum_sog, n_sog, max_sog,
          (has_position AND NOT is_duplicate) AS in_stream
   FROM track_points
   WHERE ts >= '{ds}' AND ts < '{de}' AND mmsi % {shards} = {shard}
@@ -110,13 +111,16 @@ frag AS (
 agg AS (
   SELECT mmsi, frag_no,
     min(ts) AS ts, max(ts) AS ts_end,
-    CAST(count(*) AS INT) AS n_rows,
-    CAST(count(*) FILTER (WHERE in_stream) AS INT) AS n_stream,
-    CAST(count(*) FILTER (WHERE is_duplicate) AS INT) AS n_duplicates,
-    CAST(count(*) FILTER (WHERE NOT has_position) AS INT) AS n_no_position,
+    -- Rows may stand for several reports (thinning); n_raw and the other
+    -- weights say how many, and equal 1 when nothing was thinned.
+    CAST(sum(n_raw) AS INT) AS n_rows,
+    CAST(coalesce(sum(n_raw - n_collapsed_dups - n_no_position) FILTER (WHERE in_stream), 0) AS INT)
+      AS n_stream,
+    CAST(sum(n_collapsed_dups) AS INT) AS n_duplicates,
+    CAST(sum(n_no_position) AS INT) AS n_no_position,
     CAST(count(*) FILTER (WHERE is_speed_jump) AS INT) AS n_jumps,
     CAST(count(*) FILTER (WHERE is_spike) AS INT) AS n_spikes,
-    CAST(count(*) FILTER (WHERE is_outlier) AS INT) AS n_outliers,
+    CAST(sum(n_outliers_raw) AS INT) AS n_outliers,
     first_value(latitude {first}) FILTER (WHERE in_stream) AS start_lat,
     first_value(longitude {first}) FILTER (WHERE in_stream) AS start_lon,
     last_value(latitude {first}) FILTER (WHERE in_stream) AS end_lat,
@@ -132,8 +136,9 @@ agg AS (
     max(latitude) FILTER (WHERE in_stream AND NOT is_outlier) AS clean_max_lat,
     min(longitude) FILTER (WHERE in_stream AND NOT is_outlier) AS clean_min_lon,
     max(longitude) FILTER (WHERE in_stream AND NOT is_outlier) AS clean_max_lon,
-    avg(sog_knots) FILTER (WHERE in_stream AND NOT is_sog_invalid) AS mean_sog_knots,
-    max(sog_knots) FILTER (WHERE in_stream AND NOT is_sog_invalid) AS max_sog_knots
+    sum(sum_sog) FILTER (WHERE in_stream)
+      / nullif(sum(n_sog) FILTER (WHERE in_stream), 0) AS mean_sog_knots,
+    max(max_sog) FILTER (WHERE in_stream) AS max_sog_knots
   FROM frag
   GROUP BY mmsi, frag_no
   HAVING count(*) FILTER (WHERE in_stream) > 0
@@ -209,8 +214,8 @@ pub fn check_against_schema(batches: &[RecordBatch]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::track_points::{self, Params};
-    use arrow::array::{new_null_array, Float64Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray};
+    use crate::reduce::{Dicts, RawPoint, Rules, ThinOpts};
+    use crate::reduce_day::reduce_all;
     use arrow::util::display::array_value_to_string;
     use chrono::TimeZone;
     use datafusion::datasource::MemTable;
@@ -222,41 +227,26 @@ mod tests {
     /// (mmsi, seconds from day 0 start, lat, lon, source)
     type Pt = (i64, i64, Option<f64>, Option<f64>, &'static str);
 
-    fn positions_table(rows: &[Pt]) -> MemTable {
-        let schema = Arc::new(
-            iceberg::arrow::schema_to_arrow_schema(
-                &collect_core::iceberg::table_schemas::positions_schema(),
-            )
-            .unwrap(),
-        );
-        let n = rows.len();
+    fn raw_points(rows: &[Pt]) -> Vec<RawPoint> {
         let base = day(0).timestamp() * 1_000_000;
-        let cols: Vec<Arc<dyn Array>> = schema
-            .fields()
-            .iter()
-            .map(|f| -> Arc<dyn Array> {
-                match f.name().as_str() {
-                    "ts" => Arc::new(
-                        TimestampMicrosecondArray::from_iter_values(
-                            rows.iter().map(|r| base + r.1 * 1_000_000),
-                        )
-                        .with_timezone("+00:00"),
-                    ),
-                    "source" => Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.4))),
-                    "msg_type" => Arc::new(Int32Array::from(vec![1; n])),
-                    "mmsi" => Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.0))),
-                    "latitude" => Arc::new(Float64Array::from_iter(rows.iter().map(|r| r.2))),
-                    "longitude" => Arc::new(Float64Array::from_iter(rows.iter().map(|r| r.3))),
-                    "sog_knots" => Arc::new(Float64Array::from(vec![Some(5.0); n])),
-                    "payload" => Arc::new(StringArray::from_iter_values(
-                        rows.iter().enumerate().map(|(i, r)| format!("{}-{i}", r.4)),
-                    )),
-                    _ => new_null_array(f.data_type(), n),
-                }
+        rows.iter()
+            .map(|r| RawPoint {
+                ts_us: base + r.1 * 1_000_000,
+                mmsi: r.0 as u32,
+                lat_e7: r.2.map(|v| (v * 1e7).round() as i32),
+                lon_e7: r.3.map(|v| (v * 1e7).round() as i32),
+                sog_dk: Some(50),
+                cog_dd: None,
+                heading_dd: None,
+                nav: None,
+                source: if r.4 == "a" { 0 } else { 1 },
+                station: None,
             })
-            .collect();
-        let batch = RecordBatch::try_new(schema.clone(), cols).unwrap();
-        MemTable::try_new(schema, vec![vec![batch]]).unwrap()
+            .collect()
+    }
+
+    fn dicts() -> Dicts {
+        Dicts::new(vec!["a".into(), "b".into()], vec![], vec![])
     }
 
     const DAY: i64 = 86_400;
@@ -283,19 +273,20 @@ mod tests {
     /// (day 0, then day 1 chained onto it).
     async fn run() -> (SessionContext, Vec<RecordBatch>, Vec<RecordBatch>, usize) {
         let ctx = SessionContext::new();
-        ctx.register_table("positions", Arc::new(positions_table(&fixture()))).unwrap();
-        let mut all = Vec::new();
-        for n in 0..2 {
-            let p = Params {
-                day_start: day(n),
-                lookback: Duration::days(2),
-                shards: 1,
-                max_speed_kn: 60.0,
-                gap: Duration::minutes(30),
-            };
-            all.extend(track_points::build_shard(&ctx, &p, 0).await.unwrap());
-        }
-        let n_points: usize = all.iter().map(|b| b.num_rows()).sum();
+        // The reducer sees the whole span at once, so the vessel's point from
+        // the day before feeds the first hop of day 0 just as state would.
+        let all = reduce_all(
+            raw_points(&fixture()),
+            &dicts(),
+            &Default::default(),
+            &Rules::default(),
+            &ThinOpts::off(),
+        )
+        .unwrap();
+        let n_points: usize = all
+            .iter()
+            .map(|b| b.num_rows())
+            .sum::<usize>();
         ctx.register_table(
             "track_points",
             Arc::new(MemTable::try_new(all[0].schema(), vec![all]).unwrap()),

@@ -14,11 +14,19 @@ futures-util.workspace = true
 iceberg.workspace = true
 iceberg-datafusion.workspace = true
 tokio.workspace = true
+parquet.workspace = true
+libc.workspace = true
+zstd = "0.13"
+uuid = { version = "1", features = ["v4"] }
+rand.workspace = true
 collect-core = { path = "../collect-core" }
 collect-maint = { path = "../collect-maint" }
 
 [dev-dependencies]
 tempfile.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+serde_json.workspace = true
 
 [lib]
 name = "ais_tracks"
@@ -27,3 +35,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "ais-tracks"
 path = "src/main.rs"
+
+[[bin]]
+name = "gen-day"
+path = "src/bin/gen_day.rs"

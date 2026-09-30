@@ -1,16 +1,36 @@
-//! `vessels` and `vessel_attributes`: vessel identity derived from the silver
-//! `statics` and `positions` tables.
+//! `vessels` and `vessel_attributes`: vessel identity, kept up to date from
+//! small per-day aggregates instead of by rescanning history.
 //!
 //! Nothing is dropped or de-duplicated. Every distinct value a vessel ever
 //! reported for an identity attribute is kept, with counts, in
-//! `vessel_attributes`; `vessels` holds one row per MMSI with the winning
-//! value of each attribute and boolean flags for anything suspicious (an MMSI
-//! that reports two IMOs, an IMO that fails its check digit, ...). Whoever
-//! consumes the tables decides what to trust.
+//! `vessel_attributes`; `vessels` holds one row per MMSI with the winning value
+//! of each attribute and boolean flags for anything suspicious (an MMSI that
+//! reports two IMOs, an IMO that fails its check digit, ...). Whoever consumes
+//! the tables decides what to trust.
+//!
+//! # How it stays cheap
+//!
+//! Each built day leaves three small tables behind: `vessel_daily` (from the
+//! reduce pass: when each vessel was first and last seen and how many positions
+//! it sent), and `attribute_daily` and `static_daily` (from a scan of just that
+//! day's static reports). The cumulative tables are a fold of those: every
+//! measure is a sum, minimum or maximum, so a new day merges into the existing
+//! tables and the cost follows the number of vessels, not the length of history.
+//!
+//! One merge query does all the work. It reads three views of "parts" (position
+//! parts, static parts, attribute parts) that may be built from the silver
+//! tables directly (the from-scratch oracle), from every daily table (a full
+//! refold), or from the existing cumulative tables plus the new days (an
+//! increment). All three give the same answer, which the tests check.
+//!
+//! Both cumulative tables record `folded_through`, the last day they include,
+//! so a crash between writing them can be told apart from a clean state.
 
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use arrow::array::{Array, ArrayRef, Int64Array, TimestampMicrosecondArray};
+use arrow::compute::cast;
 use arrow::record_batch::RecordBatch;
 use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
@@ -18,6 +38,10 @@ use iceberg::spec::{NestedField, PrimitiveType, Schema};
 
 pub const TABLE_VESSELS: &str = "vessels";
 pub const TABLE_VESSEL_ATTRIBUTES: &str = "vessel_attributes";
+pub const TABLE_VESSEL_DAILY: &str = "vessel_daily";
+pub const TABLE_ATTRIBUTE_DAILY: &str = "attribute_daily";
+pub const TABLE_STATIC_DAILY: &str = "static_daily";
+pub const TABLE_DESTINATION_DAILY: &str = "destination_daily";
 
 /// Attributes tracked per MMSI, as they appear in `vessel_attributes.attribute`.
 pub const ATTRIBUTES: [&str; 6] = [
@@ -37,57 +61,135 @@ fn optional(id: i32, name: &'static str, ty: PrimitiveType) -> Arc<NestedField> 
     Arc::new(NestedField::optional(id, name, ty.into()))
 }
 
-/// Column order here is the column order of [`VESSELS_SQL`]'s result.
-pub fn vessels_schema() -> Schema {
-    let fields = vec![
-        required(1, "mmsi", PrimitiveType::Long),
-        required(2, "mmsi_class", PrimitiveType::String),
-        optional(3, "mid", PrimitiveType::Int),
-        required(4, "vessel_key", PrimitiveType::String),
-        optional(5, "imo_number", PrimitiveType::Int),
-        optional(6, "call_sign", PrimitiveType::String),
-        optional(7, "name", PrimitiveType::String),
-        optional(8, "ship_type", PrimitiveType::String),
-        optional(9, "length_m", PrimitiveType::Int),
-        optional(10, "beam_m", PrimitiveType::Int),
-        optional(11, "ais_class", PrimitiveType::String),
-        optional(12, "first_seen", PrimitiveType::Timestamptz),
-        optional(13, "last_seen", PrimitiveType::Timestamptz),
-        required(14, "n_positions", PrimitiveType::Long),
-        optional(15, "first_static_seen", PrimitiveType::Timestamptz),
-        optional(16, "last_static_seen", PrimitiveType::Timestamptz),
-        required(17, "n_statics", PrimitiveType::Long),
-        required(18, "mmsi_valid", PrimitiveType::Boolean),
-        required(19, "imo_valid", PrimitiveType::Boolean),
-        required(20, "multiple_imos", PrimitiveType::Boolean),
-        required(21, "multiple_names", PrimitiveType::Boolean),
-        required(22, "multiple_call_signs", PrimitiveType::Boolean),
-        required(23, "computed_at", PrimitiveType::Timestamptz),
-    ];
+fn schema(fields: Vec<Arc<NestedField>>, what: &str) -> Schema {
     Schema::builder()
         .with_schema_id(1)
         .with_fields(fields)
         .build()
-        .expect("building vessels schema")
+        .unwrap_or_else(|e| panic!("building {what} schema: {e}"))
 }
 
-/// Column order here is the column order of [`ATTRIBUTES_SQL`]'s result.
+/// Column order here is the column order of [`vessels_merge_sql`]'s result.
+pub fn vessels_schema() -> Schema {
+    schema(
+        vec![
+            required(1, "mmsi", PrimitiveType::Long),
+            required(2, "mmsi_class", PrimitiveType::String),
+            optional(3, "mid", PrimitiveType::Int),
+            required(4, "vessel_key", PrimitiveType::String),
+            optional(5, "imo_number", PrimitiveType::Int),
+            optional(6, "call_sign", PrimitiveType::String),
+            optional(7, "name", PrimitiveType::String),
+            optional(8, "ship_type", PrimitiveType::String),
+            optional(9, "length_m", PrimitiveType::Int),
+            optional(10, "beam_m", PrimitiveType::Int),
+            optional(11, "ais_class", PrimitiveType::String),
+            optional(12, "first_seen", PrimitiveType::Timestamptz),
+            optional(13, "last_seen", PrimitiveType::Timestamptz),
+            required(14, "n_positions", PrimitiveType::Long),
+            optional(15, "first_static_seen", PrimitiveType::Timestamptz),
+            optional(16, "last_static_seen", PrimitiveType::Timestamptz),
+            required(17, "n_statics", PrimitiveType::Long),
+            required(18, "mmsi_valid", PrimitiveType::Boolean),
+            required(19, "imo_valid", PrimitiveType::Boolean),
+            required(20, "multiple_imos", PrimitiveType::Boolean),
+            required(21, "multiple_names", PrimitiveType::Boolean),
+            required(22, "multiple_call_signs", PrimitiveType::Boolean),
+            required(23, "computed_at", PrimitiveType::Timestamptz),
+            required(24, "folded_through", PrimitiveType::Int),
+        ],
+        "vessels",
+    )
+}
+
+/// Column order here is the column order of [`attributes_merge_sql`]'s result.
 pub fn vessel_attributes_schema() -> Schema {
-    let fields = vec![
-        required(1, "mmsi", PrimitiveType::Long),
-        required(2, "attribute", PrimitiveType::String),
-        required(3, "value", PrimitiveType::String),
-        required(4, "n_obs", PrimitiveType::Long),
-        required(5, "first_seen", PrimitiveType::Timestamptz),
-        required(6, "last_seen", PrimitiveType::Timestamptz),
-        required(7, "rank", PrimitiveType::Int),
-        required(8, "is_current", PrimitiveType::Boolean),
-    ];
-    Schema::builder()
-        .with_schema_id(1)
-        .with_fields(fields)
-        .build()
-        .expect("building vessel_attributes schema")
+    schema(
+        vec![
+            required(1, "mmsi", PrimitiveType::Long),
+            required(2, "attribute", PrimitiveType::String),
+            required(3, "value", PrimitiveType::String),
+            required(4, "n_obs", PrimitiveType::Long),
+            required(5, "first_seen", PrimitiveType::Timestamptz),
+            required(6, "last_seen", PrimitiveType::Timestamptz),
+            required(7, "rank", PrimitiveType::Int),
+            required(8, "is_current", PrimitiveType::Boolean),
+            required(9, "folded_through", PrimitiveType::Int),
+            required(10, "computed_at", PrimitiveType::Timestamptz),
+        ],
+        "vessel_attributes",
+    )
+}
+
+/// One row per vessel and day; `ts` is the start of the day (the partition column).
+///
+/// The first block is about identity (every report counts). The rest is the
+/// day's movement, in the terms `voyages` needs: over the day's `track_points`
+/// rows, so a leg lying wholly inside a day can be totalled without reading them.
+pub fn vessel_daily_schema() -> Schema {
+    schema(
+        vec![
+            required(1, "ts", PrimitiveType::Timestamptz),
+            required(2, "mmsi", PrimitiveType::Long),
+            required(3, "first_seen", PrimitiveType::Timestamptz),
+            required(4, "last_seen", PrimitiveType::Timestamptz),
+            required(5, "n_positions", PrimitiveType::Long),
+            optional(6, "first_stream_ts", PrimitiveType::Timestamptz),
+            optional(7, "last_stream_ts", PrimitiveType::Timestamptz),
+            required(8, "n_points", PrimitiveType::Long),
+            required(9, "dist_nm_raw", PrimitiveType::Double),
+            required(10, "dist_nm_clean", PrimitiveType::Double),
+            required(11, "n_gaps", PrimitiveType::Long),
+            required(12, "n_outliers", PrimitiveType::Long),
+            optional(13, "max_sog_knots", PrimitiveType::Double),
+        ],
+        "vessel_daily",
+    )
+}
+
+/// The destinations a vessel declared on a day, with how often and the latest
+/// ETA it gave with them.
+pub fn destination_daily_schema() -> Schema {
+    schema(
+        vec![
+            required(1, "ts", PrimitiveType::Timestamptz),
+            required(2, "mmsi", PrimitiveType::Long),
+            required(3, "destination", PrimitiveType::String),
+            required(4, "n", PrimitiveType::Long),
+            required(5, "last_ts", PrimitiveType::Timestamptz),
+            optional(6, "eta", PrimitiveType::Timestamptz),
+        ],
+        "destination_daily",
+    )
+}
+
+pub fn attribute_daily_schema() -> Schema {
+    schema(
+        vec![
+            required(1, "ts", PrimitiveType::Timestamptz),
+            required(2, "mmsi", PrimitiveType::Long),
+            required(3, "attribute", PrimitiveType::String),
+            required(4, "value", PrimitiveType::String),
+            required(5, "n_obs", PrimitiveType::Long),
+            required(6, "first_seen", PrimitiveType::Timestamptz),
+            required(7, "last_seen", PrimitiveType::Timestamptz),
+        ],
+        "attribute_daily",
+    )
+}
+
+pub fn static_daily_schema() -> Schema {
+    schema(
+        vec![
+            required(1, "ts", PrimitiveType::Timestamptz),
+            required(2, "mmsi", PrimitiveType::Long),
+            required(3, "first_static_seen", PrimitiveType::Timestamptz),
+            required(4, "last_static_seen", PrimitiveType::Timestamptz),
+            required(5, "n_statics", PrimitiveType::Long),
+            optional(6, "ais_class", PrimitiveType::String),
+        ],
+        "static_daily",
+    )
 }
 
 /// IMO check digit: the first six digits weighted 7..2, summed; the last digit
@@ -101,14 +203,29 @@ fn imo_valid(expr: &str) -> String {
     IMO_VALID.replace("{v}", expr)
 }
 
-/// One row per distinct (mmsi, attribute, value) ever reported in `statics`.
-/// Reads the registered `statics` table.
-///
-/// `rank` orders a vessel's candidates for one attribute: for `imo`, a value
-/// that passes the check digit beats one that doesn't; then the most often
-/// reported value wins, then the most recently reported.
-pub fn attributes_sql() -> String {
-    let imo_pref = imo_valid("TRY_CAST(value AS BIGINT)");
+// ---- parts -------------------------------------------------------------------------
+
+/// A vessel's positions summarised: `SELECT` over a table with silver's
+/// `positions` columns, or a day of them.
+pub fn pos_parts_sql(src: &str) -> String {
+    format!(
+        "SELECT mmsi, min(ts) AS first_seen, max(ts) AS last_seen, count(*) AS n_positions \
+         FROM {src} GROUP BY mmsi"
+    )
+}
+
+/// A vessel's static reports summarised, over a table with silver's `statics` columns.
+pub fn sta_parts_sql(src: &str) -> String {
+    format!(
+        "SELECT mmsi, min(ts) AS first_static_seen, max(ts) AS last_static_seen, \
+                count(*) AS n_statics, min(ais_class) AS ais_class \
+         FROM {src} GROUP BY mmsi"
+    )
+}
+
+/// Every distinct value reported for each identity attribute, with counts, over a
+/// table with silver's `statics` columns.
+pub fn attr_parts_sql(src: &str) -> String {
     format!(
         "
 WITH s AS (
@@ -121,7 +238,7 @@ WITH s AS (
          THEN dimension_to_bow + dimension_to_stern END AS length_m,
     CASE WHEN dimension_to_port + dimension_to_starboard > 0
          THEN dimension_to_port + dimension_to_starboard END AS beam_m
-  FROM statics
+  FROM {src}
 ),
 obs AS (
   SELECT mmsi, ts, 'name' AS attribute, name AS value FROM s WHERE name IS NOT NULL
@@ -130,11 +247,34 @@ obs AS (
   UNION ALL SELECT mmsi, ts, 'ship_type', ship_type FROM s WHERE ship_type IS NOT NULL
   UNION ALL SELECT mmsi, ts, 'length_m', CAST(length_m AS VARCHAR) FROM s WHERE length_m IS NOT NULL
   UNION ALL SELECT mmsi, ts, 'beam_m', CAST(beam_m AS VARCHAR) FROM s WHERE beam_m IS NOT NULL
-),
-agg AS (
-  SELECT mmsi, attribute, value, count(*) AS n_obs,
-         min(ts) AS first_seen, max(ts) AS last_seen
-  FROM obs GROUP BY mmsi, attribute, value
+)
+SELECT mmsi, attribute, value, count(*) AS n_obs, min(ts) AS first_seen, max(ts) AS last_seen
+FROM obs GROUP BY mmsi, attribute, value"
+    )
+}
+
+/// The destinations declared, with counts, over a table with silver's `statics`
+/// columns. `@` padding and blanks are not destinations.
+pub fn dest_parts_sql(src: &str) -> String {
+    format!(
+        "SELECT mmsi, dest AS destination, count(*) AS n, max(ts) AS last_ts, max(eta) AS eta \
+         FROM (SELECT mmsi, ts, eta, regexp_replace(trim(destination), '[@ ]+$', '') AS dest \
+               FROM {src} WHERE destination IS NOT NULL) x \
+         WHERE dest <> '' GROUP BY mmsi, dest"
+    )
+}
+
+/// Merges `attr_parts` into one row per (mmsi, attribute, value), ranked. For
+/// `imo`, a value that passes the check digit beats one that does not; then the
+/// most often reported value wins, then the most recent.
+pub fn attributes_merge_sql(folded_through: i32) -> String {
+    let imo_pref = imo_valid("TRY_CAST(value AS BIGINT)");
+    format!(
+        "
+WITH agg AS (
+  SELECT mmsi, attribute, value, sum(n_obs) AS n_obs,
+         min(first_seen) AS first_seen, max(last_seen) AS last_seen
+  FROM attr_parts GROUP BY mmsi, attribute, value
 ),
 scored AS (
   SELECT *, CASE WHEN attribute = 'imo' AND {imo_pref} THEN 1 ELSE 0 END AS pref
@@ -148,26 +288,29 @@ ranked AS (
     ) AS INT) AS rank
   FROM scored
 )
-SELECT mmsi, attribute, value, n_obs, first_seen, last_seen, rank, rank = 1 AS is_current
+SELECT mmsi, attribute, value, n_obs, first_seen, last_seen, rank, rank = 1 AS is_current,
+       CAST({folded_through} AS INT) AS folded_through, now() AS computed_at
 FROM ranked
 ORDER BY mmsi, attribute, rank"
     )
 }
 
-/// One row per MMSI seen in `positions` or `statics`. Reads the registered
-/// `positions`, `statics` and `vessel_attributes` tables.
-pub fn vessels_sql() -> String {
+/// One row per MMSI seen in `pos_parts` or `sta_parts`. Reads those and the
+/// merged `vessel_attributes`.
+pub fn vessels_merge_sql(folded_through: i32) -> String {
     let imo_ok = imo_valid("imo_number");
     format!(
         "
 WITH pos AS (
-  SELECT mmsi, min(ts) AS first_seen, max(ts) AS last_seen, count(*) AS n_positions
-  FROM positions GROUP BY mmsi
+  SELECT mmsi, min(first_seen) AS first_seen, max(last_seen) AS last_seen,
+         sum(n_positions) AS n_positions
+  FROM pos_parts GROUP BY mmsi
 ),
 sta AS (
-  SELECT mmsi, min(ts) AS first_static_seen, max(ts) AS last_static_seen,
-         count(*) AS n_statics, min(ais_class) AS ais_class
-  FROM statics GROUP BY mmsi
+  SELECT mmsi, min(first_static_seen) AS first_static_seen,
+         max(last_static_seen) AS last_static_seen,
+         sum(n_statics) AS n_statics, min(ais_class) AS ais_class
+  FROM sta_parts GROUP BY mmsi
 ),
 cur AS (
   SELECT mmsi,
@@ -226,46 +369,78 @@ SELECT mmsi, mmsi_class,
   mmsi_class <> 'other' AS mmsi_valid,
   COALESCE({imo_ok}, false) AS imo_valid,
   multiple_imos, multiple_names, multiple_call_signs,
-  now() AS computed_at
+  now() AS computed_at,
+  CAST({folded_through} AS INT) AS folded_through
 FROM typed
 ORDER BY mmsi"
     )
 }
 
-/// The two derived tables' rows.
+/// The two cumulative tables' rows.
 pub struct Vessels {
     pub vessels: Vec<RecordBatch>,
     pub attributes: Vec<RecordBatch>,
 }
 
-/// Runs both queries against a context in which `positions` and `statics`
-/// are registered (Iceberg-backed in production, in-memory in tests).
-pub async fn build(ctx: &SessionContext) -> Result<Vessels> {
+fn replace_view(ctx: &SessionContext, name: &str, table: Arc<dyn datafusion::datasource::TableProvider>) -> Result<()> {
+    let _ = ctx.deregister_table(name)?;
+    ctx.register_table(name, table)?;
+    Ok(())
+}
+
+/// Defines the three parts views from the inputs registered under fixed names:
+/// `daily_pos`, `daily_sta` and `daily_attr` (each in the shape of the matching
+/// `*_parts_sql` result), and with `with_prior`, `prior_vessels` and
+/// `prior_attributes` (the existing cumulative tables, which stand for every day
+/// already folded in).
+pub async fn define_parts(ctx: &SessionContext, with_prior: bool) -> Result<()> {
+    let pos = "SELECT mmsi, first_seen, last_seen, n_positions FROM";
+    let sta = "SELECT mmsi, first_static_seen, last_static_seen, n_statics, ais_class FROM";
+    let attr = "SELECT mmsi, attribute, value, n_obs, first_seen, last_seen FROM";
+    for (name, cols) in [("pos_parts", pos), ("sta_parts", sta), ("attr_parts", attr)] {
+        let (daily, prior) = match name {
+            "pos_parts" => ("daily_pos", "prior_vessels"),
+            "sta_parts" => ("daily_sta", "prior_vessels"),
+            _ => ("daily_attr", "prior_attributes"),
+        };
+        let sql = if with_prior {
+            format!("{cols} {daily} UNION ALL {cols} {prior}")
+        } else {
+            format!("{cols} {daily}")
+        };
+        let view = ctx.sql(&sql).await.with_context(|| format!("defining {name}"))?.into_view();
+        replace_view(ctx, name, view)?;
+    }
+    Ok(())
+}
+
+/// Merges the parts views into the cumulative tables' rows, as of
+/// `folded_through` (a day number, days since 1970-01-01).
+pub async fn merge(ctx: &SessionContext, folded_through: i32) -> Result<Vessels> {
     let attributes = ctx
-        .sql(&attributes_sql())
+        .sql(&attributes_merge_sql(folded_through))
         .await
         .context("planning vessel_attributes")?
         .collect()
         .await
         .context("computing vessel_attributes")?;
-
     let schema = match attributes.first() {
         Some(b) => b.schema(),
         None => ctx
-            .sql(&attributes_sql())
+            .sql(&attributes_merge_sql(folded_through))
             .await?
             .schema()
             .as_arrow()
             .clone()
             .into(),
     };
-    ctx.register_table(
+    replace_view(
+        ctx,
         "vessel_attributes",
         Arc::new(MemTable::try_new(schema, vec![attributes.clone()])?),
     )?;
-
     let vessels = ctx
-        .sql(&vessels_sql())
+        .sql(&vessels_merge_sql(folded_through))
         .await
         .context("planning vessels")?
         .collect()
@@ -275,6 +450,134 @@ pub async fn build(ctx: &SessionContext) -> Result<Vessels> {
         vessels,
         attributes,
     })
+}
+
+/// Builds both tables from scratch from silver `positions` and `statics`
+/// registered in `ctx`. Reads all of history, so it is the oracle for the
+/// incremental path and a fallback for small deployments, not the daily route.
+pub async fn build(ctx: &SessionContext) -> Result<Vessels> {
+    for (name, sql) in [
+        ("daily_pos", pos_parts_sql("positions")),
+        ("daily_sta", sta_parts_sql("statics")),
+        ("daily_attr", attr_parts_sql("statics")),
+    ] {
+        let view = ctx.sql(&sql).await.with_context(|| format!("planning {name}"))?.into_view();
+        replace_view(ctx, name, view)?;
+    }
+    define_parts(ctx, false).await?;
+    merge(ctx, 0).await
+}
+
+/// Runs `sql` and returns its result as an in-memory table whose fields carry no
+/// metadata.
+///
+/// Iceberg-backed columns carry a Parquet field id, and the same column has a
+/// different id in different tables. DataFusion refuses to `UNION ALL` inputs
+/// whose same-named fields differ in metadata, so inputs that will be unioned
+/// are materialised through this first. Only small inputs (the prior cumulative
+/// tables and the new days) should be.
+pub async fn materialize(ctx: &SessionContext, sql: &str) -> Result<Arc<MemTable>> {
+    Ok(materialize_batches(ctx, sql).await?.0)
+}
+
+/// [`materialize`], also returning the rows.
+pub async fn materialize_batches(
+    ctx: &SessionContext,
+    sql: &str,
+) -> Result<(Arc<MemTable>, Vec<RecordBatch>)> {
+    let df = ctx.sql(sql).await.with_context(|| format!("planning {sql}"))?;
+    let fields: Vec<Arc<arrow::datatypes::Field>> = df
+        .schema()
+        .as_arrow()
+        .fields()
+        .iter()
+        .map(|f| Arc::new(f.as_ref().clone().with_metadata(Default::default())))
+        .collect();
+    let schema = Arc::new(arrow::datatypes::Schema::new(fields));
+    let batches = df
+        .collect()
+        .await?
+        .into_iter()
+        .map(|b| RecordBatch::try_new(schema.clone(), b.columns().to_vec()))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok((Arc::new(MemTable::try_new(schema, vec![batches.clone()])?), batches))
+}
+
+/// Prepends a `ts` column holding the start of the day to `batch`, in the shape
+/// of a daily table (`schema` is its Iceberg schema).
+pub fn with_day_ts(batch: &RecordBatch, day_start_us: i64, schema: &Schema) -> Result<RecordBatch> {
+    let target = Arc::new(iceberg::arrow::schema_to_arrow_schema(schema)?);
+    let n = batch.num_rows();
+    let mut cols: Vec<ArrayRef> = vec![Arc::new(
+        TimestampMicrosecondArray::from(vec![day_start_us; n]).with_timezone("+00:00"),
+    )];
+    for (c, f) in batch.columns().iter().zip(target.fields().iter().skip(1)) {
+        cols.push(if c.data_type() == f.data_type() {
+            c.clone()
+        } else {
+            cast(c, f.data_type())?
+        });
+    }
+    Ok(RecordBatch::try_new(target, cols)?)
+}
+
+/// One vessel's day as the reducer saw it. `n_reports` counts every report
+/// (duplicates and rows without a position too); the rest is over the rows the
+/// reducer produced, with the definitions `voyages` uses for a leg.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct VesselDay {
+    pub mmsi: u32,
+    pub first_ts_us: i64,
+    pub last_ts_us: i64,
+    pub n_reports: i64,
+    /// First and last positioned, non-duplicate row.
+    pub first_stream_ts_us: Option<i64>,
+    pub last_stream_ts_us: Option<i64>,
+    /// Reports the day's rows stand for.
+    pub n_points: i64,
+    pub dist_nm_raw: f64,
+    pub dist_nm_clean: f64,
+    pub n_gaps: i64,
+    pub n_outliers: i64,
+    pub max_sog_knots: Option<f64>,
+}
+
+/// `vessel_daily` rows for `days`.
+pub fn vessel_daily_batch(day_start_us: i64, days: &[VesselDay]) -> Result<Option<RecordBatch>> {
+    if days.is_empty() {
+        return Ok(None);
+    }
+    let ts = |f: &dyn Fn(&VesselDay) -> i64| -> ArrayRef {
+        Arc::new(TimestampMicrosecondArray::from_iter_values(days.iter().map(f)).with_timezone("+00:00"))
+    };
+    let opt_ts = |f: &dyn Fn(&VesselDay) -> Option<i64>| -> ArrayRef {
+        Arc::new(TimestampMicrosecondArray::from(days.iter().map(f).collect::<Vec<_>>()).with_timezone("+00:00"))
+    };
+    let i64s = |f: &dyn Fn(&VesselDay) -> i64| -> ArrayRef {
+        Arc::new(Int64Array::from_iter_values(days.iter().map(f)))
+    };
+    let f64s = |f: &dyn Fn(&VesselDay) -> f64| -> ArrayRef {
+        Arc::new(arrow::array::Float64Array::from_iter_values(days.iter().map(f)))
+    };
+    let schema = Arc::new(iceberg::arrow::schema_to_arrow_schema(&vessel_daily_schema())?);
+    Ok(Some(RecordBatch::try_new(
+        schema,
+        vec![
+            ts(&|_| day_start_us),
+            i64s(&|d| d.mmsi as i64),
+            ts(&|d| d.first_ts_us),
+            ts(&|d| d.last_ts_us),
+            i64s(&|d| d.n_reports),
+            opt_ts(&|d| d.first_stream_ts_us),
+            opt_ts(&|d| d.last_stream_ts_us),
+            i64s(&|d| d.n_points),
+            f64s(&|d| d.dist_nm_raw),
+            f64s(&|d| d.dist_nm_clean),
+            i64s(&|d| d.n_gaps),
+            i64s(&|d| d.n_outliers),
+            Arc::new(arrow::array::Float64Array::from_iter(days.iter().map(|d| d.max_sog_knots))),
+        ],
+    )?))
 }
 
 #[cfg(test)]
@@ -497,3 +800,4 @@ mod tests {
         }
     }
 }
+
