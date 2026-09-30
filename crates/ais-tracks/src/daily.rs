@@ -8,7 +8,8 @@
 //! and last append the `build_log` row. A day counts as built only once its row
 //! exists. See [`crate::state`] for what the rows record.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -16,6 +17,7 @@ use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
 use collect_core::iceberg::{
     commit_batches, ensure_namespace, ensure_table, table_ident, IcebergConfig, TABLE_POSITIONS,
+    TABLE_STATICS,
 };
 use collect_maint::commit::RestClient;
 use collect_maint::rewrite::live_files;
@@ -25,18 +27,26 @@ use iceberg::Catalog;
 use iceberg_datafusion::IcebergStaticTableProvider;
 
 use crate::carry;
-use crate::output::{commit_day, ensure_day_table, write_day_shard, DayWriter};
+use crate::output::{commit_day, ensure_day_table, ensure_day_table_on, write_day_shard, DayWriter};
 use crate::reduce::StreamState;
 use crate::reduce_day::{self, ReduceOptions};
 use crate::source;
 use crate::state::{
-    build_log_schema, date_to_day, days_from_files, downstream_token, log_batch,
+    build_log_schema, STEP_STATICS_DAILY, STEP_STOPS, STEP_VESSELS, STEP_VESSEL_DAILY, date_to_day, days_from_files, downstream_token, log_batch,
     read_states_before, scan_all, select_days, states_batch, track_points_token,
     vessel_state_schema, DaySelect, Log, LogRow, STEP_STOP_SEGMENTS, STEP_TRACKS,
     STEP_TRACK_POINTS, TABLE_BUILD_LOG, TABLE_VESSEL_STATE,
 };
-use crate::stops::{self, StopParams, TABLE_STOP_SEGMENTS};
+use crate::stops::{self, StopParams, TABLE_STOPS, TABLE_STOP_SEGMENTS};
+use crate::ports::TABLE_REF_PORTS;
 use crate::track_points::TABLE_TRACK_POINTS;
+use crate::vessels::{
+    self, attr_parts_sql, attribute_daily_schema, define_parts, sta_parts_sql, static_daily_schema,
+    vessel_daily_batch, vessel_daily_schema, vessel_attributes_schema, vessels_schema,
+    with_day_ts, TABLE_ATTRIBUTE_DAILY, TABLE_STATIC_DAILY, TABLE_VESSELS, TABLE_VESSEL_ATTRIBUTES,
+    TABLE_VESSEL_DAILY,
+};
+use crate::output::replace_table;
 use crate::tracks::{self, TABLE_TRACKS};
 
 /// Where a run reads and writes. `rest` is present only when writing.
@@ -69,14 +79,44 @@ pub async fn register(
     config: &IcebergConfig,
     base: &str,
 ) -> Result<()> {
+    register_as(ctx, catalog, config, base, base).await
+}
+
+/// Registers an Iceberg table with DataFusion under `alias`.
+pub async fn register_as(
+    ctx: &SessionContext,
+    catalog: &impl Catalog,
+    config: &IcebergConfig,
+    base: &str,
+    alias: &str,
+) -> Result<()> {
     let ident = table_ident(config, base);
     let table = catalog
         .load_table(&ident)
         .await
         .with_context(|| format!("loading table {ident}"))?;
     let provider = IcebergStaticTableProvider::try_new_from_table(table).await?;
-    ctx.register_table(base, Arc::new(provider))?;
+    ctx.register_table(alias, Arc::new(provider))?;
     Ok(())
+}
+
+/// A DataFusion context whose memory is capped at `bytes` and which spills
+/// sorts and aggregates to `spill_dir` rather than growing without bound. (Window
+/// functions and hash joins do not spill, so queries using them must be sized to
+/// fit.)
+pub fn bounded_context(spill_dir: &Path, bytes: usize) -> Result<SessionContext> {
+    use datafusion::execution::memory_pool::FairSpillPool;
+    use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+    use datafusion::prelude::SessionConfig;
+    std::fs::create_dir_all(spill_dir)?;
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_pool(Arc::new(FairSpillPool::new(bytes)))
+        .with_temp_file_path(spill_dir)
+        .build_arc()?;
+    Ok(SessionContext::new_with_config_rt(
+        SessionConfig::new().with_target_partitions(2).with_batch_size(8192),
+        runtime,
+    ))
 }
 
 fn now_us() -> i64 {
@@ -122,6 +162,33 @@ fn log_row(step: &str, day: NaiveDate, token: String, rows: usize) -> LogRow {
     }
 }
 
+/// Writes `batches` as the whole content of `day`'s partition of `base`, creating
+/// the day-partitioned table if needed. Returns the rows written; nothing is
+/// touched when there are none.
+async fn write_day_batches<C: Catalog>(
+    env: &Env<'_, C>,
+    rest: &RestClient,
+    base: &str,
+    schema: iceberg::spec::Schema,
+    day: NaiveDate,
+    batches: &[RecordBatch],
+) -> Result<usize> {
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    if rows == 0 {
+        return Ok(0);
+    }
+    ensure_day_table(env.catalog, env.output, base, schema).await?;
+    let table = env.catalog.load_table(&table_ident(env.output, base)).await?;
+    let days = date_to_day(day);
+    let mut w = DayWriter::new(&table, days, &["mmsi"]).await?;
+    for b in batches {
+        w.write(b).await?;
+    }
+    let files = w.finish().await?;
+    commit_day(env.catalog, rest, env.output, base, days, files, rows).await?;
+    Ok(rows)
+}
+
 /// Writes the vessel states as of the end of `day`.
 async fn write_vessel_state<C: Catalog>(
     env: &Env<'_, C>,
@@ -130,20 +197,9 @@ async fn write_vessel_state<C: Catalog>(
     states: &HashMap<u32, StreamState>,
 ) -> Result<()> {
     let start_us = start_of(day).timestamp_micros();
-    let Some(batch) = states_batch(start_us, states)? else {
-        return Ok(());
-    };
-    ensure_day_table(env.catalog, env.output, TABLE_VESSEL_STATE, vessel_state_schema()).await?;
-    let table = env
-        .catalog
-        .load_table(&table_ident(env.output, TABLE_VESSEL_STATE))
-        .await?;
-    let days = date_to_day(day);
-    let mut w = DayWriter::new(&table, days, &["mmsi"]).await?;
-    w.write(&batch).await?;
-    let rows = w.rows;
-    let files = w.finish().await?;
-    commit_day(env.catalog, rest, env.output, TABLE_VESSEL_STATE, days, files, rows).await?;
+    if let Some(batch) = states_batch(start_us, states)? {
+        write_day_batches(env, rest, TABLE_VESSEL_STATE, vessel_state_schema(), day, &[batch]).await?;
+    }
     Ok(())
 }
 
@@ -281,7 +337,7 @@ pub async fn run_track_points<C: Catalog>(env: &Env<'_, C>, run: &TrackPointsRun
         }
         let (result, manifest) = handle.await?;
         manifest.cleanup();
-        let (mut stats, next) = result?;
+        let (mut stats, next, vessel_days) = result?;
         stats.route_time = route_time;
         println!(
             "{day}: {} reports -> {} rows ({:.1}%), {} vessels; {} duplicates collapsed, {} set aside; {:.0}s, peak memory {:.0} MB",
@@ -313,6 +369,14 @@ pub async fn run_track_points<C: Catalog>(env: &Env<'_, C>, run: &TrackPointsRun
                 env.output.namespace, r.files_added, r.files_removed
             );
             write_vessel_state(env, rest, day, &states).await?;
+            // Per-vessel first/last seen and report count, for `vessels`.
+            if let Some(b) = vessel_daily_batch(start_us, &vessel_days)? {
+                write_day_batches(env, rest, TABLE_VESSEL_DAILY, vessel_daily_schema(), day, &[b]).await?;
+                let row = log_row(STEP_VESSEL_DAILY, day, token.clone(), vessel_days.len());
+                append_log(env, &row).await?;
+                log.insert(row);
+            }
+            // Last, so a day counts as built only once everything it feeds is written.
             let row = log_row(STEP_TRACK_POINTS, day, token, kept_rows);
             append_log(env, &row).await?;
             log.insert(row);
@@ -611,6 +675,612 @@ pub fn count_true(batches: &[RecordBatch], name: &str) -> usize {
         .sum()
 }
 
+// ---- statics-daily ------------------------------------------------------------------
+
+pub struct StaticsRun<'a> {
+    pub select: &'a DaySelect,
+    /// Where the query may spill to disk.
+    pub scratch: &'a Path,
+    pub plan_only: bool,
+}
+
+/// Per-day identity aggregates from that day's static reports: `attribute_daily`
+/// (every distinct value a vessel reported, with counts) and `static_daily`.
+/// Only the day's own static reports are read.
+pub async fn run_statics_daily<C: Catalog>(env: &Env<'_, C>, run: &StaticsRun<'_>) -> Result<Summary> {
+    let ident = table_ident(env.input, TABLE_STATICS);
+    let mut sum = Summary::default();
+    if !env.catalog.table_exists(&ident).await? {
+        println!("no silver statics table; skipping identity aggregates");
+        return Ok(sum);
+    }
+    let statics = env.catalog.load_table(&ident).await?;
+    let silver = days_from_files(&live_files(&statics).await?);
+    let candidates: Vec<NaiveDate> = silver.keys().copied().collect();
+    let (days, force) = select_days(run.select, &candidates, Utc::now().date_naive())?;
+    let mut log = load_log(env).await?;
+
+    for day in days {
+        let n = silver.get(&day).copied().unwrap_or(0);
+        if n == 0 {
+            println!("{day}: no static reports");
+            sum.empty += 1;
+            continue;
+        }
+        let token = format!("rows={n}");
+        if !force && log.is_current(STEP_STATICS_DAILY, day, &token) {
+            println!("{day}: statics up to date");
+            sum.skipped += 1;
+            continue;
+        }
+        if run.plan_only {
+            println!("{day}: would build identity aggregates");
+            sum.built += 1;
+            continue;
+        }
+        let start = start_of(day);
+        let ctx = bounded_context(run.scratch, 1 << 30)?;
+        register(&ctx, env.catalog, env.input, TABLE_STATICS).await?;
+        let view = ctx
+            .sql(&format!(
+                "SELECT * FROM {TABLE_STATICS} WHERE ts >= '{}' AND ts < '{}'",
+                carry::lit(start),
+                carry::lit(start + Duration::days(1))
+            ))
+            .await?
+            .into_view();
+        ctx.register_table("statics_day", view)?;
+        let attr = ctx.sql(&attr_parts_sql("statics_day")).await?.collect().await?;
+        let sta = ctx.sql(&sta_parts_sql("statics_day")).await?.collect().await?;
+        let start_us = start.timestamp_micros();
+        let attr: Vec<RecordBatch> = attr
+            .iter()
+            .map(|b| with_day_ts(b, start_us, &attribute_daily_schema()))
+            .collect::<Result<_>>()?;
+        let sta: Vec<RecordBatch> = sta
+            .iter()
+            .map(|b| with_day_ts(b, start_us, &static_daily_schema()))
+            .collect::<Result<_>>()?;
+        let (n_attr, n_sta) = (
+            attr.iter().map(|b| b.num_rows()).sum::<usize>(),
+            sta.iter().map(|b| b.num_rows()).sum::<usize>(),
+        );
+        println!("{day}: {n} static reports -> {n_sta} vessels, {n_attr} attribute values");
+        if let Some(rest) = env.rest {
+            write_day_batches(env, rest, TABLE_ATTRIBUTE_DAILY, attribute_daily_schema(), day, &attr).await?;
+            write_day_batches(env, rest, TABLE_STATIC_DAILY, static_daily_schema(), day, &sta).await?;
+            let row = log_row(STEP_STATICS_DAILY, day, token, n_sta);
+            append_log(env, &row).await?;
+            log.insert(row);
+        }
+        sum.built += 1;
+    }
+    Ok(sum)
+}
+
+// ---- vessels ------------------------------------------------------------------------
+
+pub struct VesselsRun<'a> {
+    /// Refold from every daily table even if an increment would do.
+    pub full: bool,
+    pub scratch: &'a Path,
+    pub plan_only: bool,
+}
+
+/// What the cumulative tables already hold.
+struct Prior {
+    folded_through: i32,
+    computed_at_us: i64,
+    /// Whether `vessel_attributes` exists. Before any static report arrives it
+    /// is never written, which is the same as being empty.
+    has_attributes: bool,
+}
+
+fn first_i64(batches: &[RecordBatch], col: usize) -> Option<i64> {
+    use arrow::array::Array;
+    let b = batches.first()?;
+    let c = arrow::compute::cast(b.column(col), &arrow::datatypes::DataType::Int64).ok()?;
+    let a = c.as_any().downcast_ref::<arrow::array::Int64Array>()?;
+    (!a.is_empty() && !a.is_null(0)).then(|| a.value(0))
+}
+
+/// What a cumulative table says about how far it is folded: nothing (it does not
+/// exist or has no rows), that it is inconsistent, or `(folded_through, computed_at)`.
+enum Folded {
+    Absent,
+    Broken,
+    At(i64, i64),
+}
+
+async fn read_folded<C: Catalog>(env: &Env<'_, C>, scratch: &Path, base: &str) -> Result<Folded> {
+    let ident = table_ident(env.output, base);
+    if !env.catalog.table_exists(&ident).await? {
+        return Ok(Folded::Absent);
+    }
+    if env.catalog.load_table(&ident).await?.metadata().current_snapshot().is_none() {
+        return Ok(Folded::Absent);
+    }
+    let ctx = bounded_context(scratch, 256 << 20)?;
+    register(&ctx, env.catalog, env.output, base).await?;
+    let b = ctx
+        .sql(&format!(
+            "SELECT min(folded_through), max(folded_through), CAST(max(computed_at) AS BIGINT) FROM {base}"
+        ))
+        .await?
+        .collect()
+        .await?;
+    Ok(match (first_i64(&b, 0), first_i64(&b, 1), first_i64(&b, 2)) {
+        // 0 marks tables built straight from silver (`vessels --from-silver`),
+        // which say nothing about which daily aggregates they include.
+        (Some(lo), Some(hi), Some(at)) if lo == hi && hi != 0 => Folded::At(hi, at),
+        _ => Folded::Broken,
+    })
+}
+
+/// What the cumulative tables say they include, or `None` if there is nothing
+/// safe to increment from: no `vessels`, or the two tables disagree about how
+/// far they are folded (a crash between writing them).
+async fn read_prior<C: Catalog>(env: &Env<'_, C>, scratch: &Path) -> Result<Option<Prior>> {
+    let Folded::At(through, at) = read_folded(env, scratch, TABLE_VESSELS).await? else {
+        return Ok(None);
+    };
+    Ok(match read_folded(env, scratch, TABLE_VESSEL_ATTRIBUTES).await? {
+        Folded::Absent => Some(Prior { folded_through: through as i32, computed_at_us: at, has_attributes: false }),
+        Folded::At(t, a) if t == through => Some(Prior {
+            folded_through: through as i32,
+            computed_at_us: at.min(a),
+            has_attributes: true,
+        }),
+        _ => None,
+    })
+}
+
+/// Registers `alias` as the columns `cols` of a daily table (or an empty table
+/// of the right shape if it does not exist yet), optionally limited to
+/// `[from, to)` days.
+async fn register_daily<C: Catalog>(
+    ctx: &SessionContext,
+    env: &Env<'_, C>,
+    base: &str,
+    schema: &iceberg::spec::Schema,
+    alias: &str,
+    cols: &str,
+    range: Option<(NaiveDate, NaiveDate)>,
+) -> Result<()> {
+    let raw = format!("raw_{base}");
+    if env.catalog.table_exists(&table_ident(env.output, base)).await? {
+        register_as(ctx, env.catalog, env.output, base, &raw).await?;
+    } else {
+        let arrow = Arc::new(iceberg::arrow::schema_to_arrow_schema(schema)?);
+        ctx.register_table(&raw, Arc::new(datafusion::datasource::MemTable::try_new(arrow, vec![vec![]])?))?;
+    }
+    let filter = range
+        .map(|(a, b)| {
+            format!(
+                " WHERE ts >= '{}' AND ts < '{}'",
+                carry::lit(start_of(a)),
+                carry::lit(start_of(b))
+            )
+        })
+        .unwrap_or_default();
+    let sql = format!("SELECT {cols} FROM {raw}{filter}");
+    if range.is_some() {
+        // Feeds a UNION with the prior tables: see `vessels::materialize`.
+        ctx.register_table(alias, vessels::materialize(ctx, &sql).await?)?;
+    } else {
+        ctx.register_table(alias, ctx.sql(&sql).await?.into_view())?;
+    }
+    Ok(())
+}
+
+/// Brings `vessels` and `vessel_attributes` up to date from the daily tables.
+///
+/// Normally that is an increment: the new days merge into the existing tables.
+/// It falls back to refolding every daily table when there is nothing to
+/// increment from, when the two tables disagree about how far they are folded,
+/// when a daily table that was already folded in has been rebuilt since, or
+/// when asked to (`full`).
+pub async fn run_vessels<C: Catalog>(env: &Env<'_, C>, run: &VesselsRun<'_>) -> Result<Summary> {
+    let mut sum = Summary::default();
+    let log = load_log(env).await?;
+    let mut days: BTreeSet<NaiveDate> = log.days(STEP_VESSEL_DAILY).into_iter().collect();
+    days.extend(log.days(STEP_STATICS_DAILY));
+    let Some(&through) = days.iter().max() else {
+        println!("no daily aggregates yet; run track-points (and statics-daily) first");
+        sum.empty += 1;
+        return Ok(sum);
+    };
+    let prior = if run.full { None } else { read_prior(env, run.scratch).await? };
+
+    // Decide how to build.
+    enum Mode {
+        Refold,
+        Increment { after: NaiveDate },
+    }
+    let mode = match &prior {
+        None => Mode::Refold,
+        Some(p) => {
+            let folded = crate::state::day_to_date(p.folded_through);
+            let rebuilt = [STEP_VESSEL_DAILY, STEP_STATICS_DAILY].iter().any(|step| {
+                log.days(step).into_iter().any(|d| {
+                    d <= folded && log.get(step, d).is_some_and(|r| r.built_at_us > p.computed_at_us)
+                })
+            });
+            if rebuilt {
+                Mode::Refold
+            } else if through <= folded {
+                println!("vessels up to date through {folded}");
+                sum.skipped += 1;
+                return Ok(sum);
+            } else {
+                Mode::Increment { after: folded }
+            }
+        }
+    };
+    let (label, range) = match &mode {
+        Mode::Refold => ("refold from every daily table".to_string(), None),
+        Mode::Increment { after } => (
+            format!("increment after {after}"),
+            Some((after.succ_opt().context("date overflow")?, through.succ_opt().context("date overflow")?)),
+        ),
+    };
+    if run.plan_only {
+        println!("would update vessels through {through}: {label}");
+        sum.built += 1;
+        return Ok(sum);
+    }
+
+    let ctx = bounded_context(run.scratch, 1536 << 20)?;
+    register_daily(&ctx, env, TABLE_VESSEL_DAILY, &vessel_daily_schema(), "daily_pos",
+        "mmsi, first_seen, last_seen, n_positions", range).await?;
+    register_daily(&ctx, env, TABLE_STATIC_DAILY, &static_daily_schema(), "daily_sta",
+        "mmsi, first_static_seen, last_static_seen, n_statics, ais_class", range).await?;
+    register_daily(&ctx, env, TABLE_ATTRIBUTE_DAILY, &attribute_daily_schema(), "daily_attr",
+        "mmsi, attribute, value, n_obs, first_seen, last_seen", range).await?;
+    let incremental = matches!(mode, Mode::Increment { .. });
+    if incremental {
+        register_as(&ctx, env.catalog, env.output, TABLE_VESSELS, "raw_prior_vessels").await?;
+        ctx.register_table("prior_vessels", vessels::materialize(&ctx, "SELECT * FROM raw_prior_vessels").await?)?;
+        if prior.as_ref().is_some_and(|p| p.has_attributes) {
+            register_as(&ctx, env.catalog, env.output, TABLE_VESSEL_ATTRIBUTES, "raw_prior_attributes").await?;
+            ctx.register_table("prior_attributes", vessels::materialize(&ctx, "SELECT * FROM raw_prior_attributes").await?)?;
+        } else {
+            let arrow = Arc::new(iceberg::arrow::schema_to_arrow_schema(&vessel_attributes_schema())?);
+            ctx.register_table("prior_attributes", Arc::new(datafusion::datasource::MemTable::try_new(arrow, vec![vec![]])?))?;
+        }
+    }
+    define_parts(&ctx, incremental).await?;
+    let built = vessels::merge(&ctx, date_to_day(through)).await?;
+    carry::check_batches(&vessels_schema(), &built.vessels)?;
+    carry::check_batches(&vessel_attributes_schema(), &built.attributes)?;
+    let n_vessels: usize = built.vessels.iter().map(|b| b.num_rows()).sum();
+    let n_attrs: usize = built.attributes.iter().map(|b| b.num_rows()).sum();
+    println!("vessels through {through} ({label}): {n_vessels} vessels, {n_attrs} attribute values");
+
+    if let Some(rest) = env.rest {
+        // Attributes first: if only one table is replaced the two disagree about
+        // `folded_through`, which the next run reads as "refold".
+        if n_attrs > 0 {
+            replace_table(env.catalog, rest, env.output, TABLE_VESSEL_ATTRIBUTES, vessel_attributes_schema(),
+                &built.attributes, &["mmsi"]).await?;
+        } else {
+            // No static reports yet. There is nothing to write, and refusing to
+            // replace a table with an empty result is right, so leave it.
+            println!("no identity attributes yet (no static reports); vessel_attributes not written");
+        }
+        replace_table(env.catalog, rest, env.output, TABLE_VESSELS, vessels_schema(),
+            &built.vessels, &["mmsi"]).await?;
+        append_log(env, &log_row(STEP_VESSELS, through, label, n_vessels)).await?;
+    }
+    sum.built += 1;
+    Ok(sum)
+}
+
+// ---- stops --------------------------------------------------------------------------
+
+const DAY_US: i64 = 86_400_000_000;
+
+pub struct StopsRun<'a> {
+    /// Refold from every stop segment even if an increment would do.
+    pub full: bool,
+    pub scratch: &'a Path,
+    pub plan_only: bool,
+}
+
+/// Appends several log rows in one commit.
+async fn append_logs<C: Catalog>(env: &Env<'_, C>, rows: &[LogRow]) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    ensure_namespace(env.catalog, env.output).await?;
+    let schema = build_log_schema();
+    let table = ensure_table(env.catalog, env.output, TABLE_BUILD_LOG, schema.clone(), PartitionSpecBuilder::new(schema))
+        .await?;
+    commit_batches(env.catalog, &table, vec![log_batch(rows)?], 3, TABLE_BUILD_LOG).await
+}
+
+/// Replaces `day`'s partition of the stops table (partitioned on `depart_ts`)
+/// with `batches`. An empty `batches` clears the partition.
+async fn replace_stops_day<C: Catalog>(
+    env: &Env<'_, C>,
+    rest: &RestClient,
+    day: NaiveDate,
+    batches: &[RecordBatch],
+) -> Result<usize> {
+    ensure_day_table_on(env.catalog, env.output, TABLE_STOPS, stops::stops_schema(), "depart_ts").await?;
+    let table = env.catalog.load_table(&table_ident(env.output, TABLE_STOPS)).await?;
+    let days = date_to_day(day);
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    let files = if rows == 0 {
+        Vec::new()
+    } else {
+        let mut w = DayWriter::new(&table, days, &["mmsi", "stop_id"]).await?;
+        for b in batches {
+            w.write(b).await?;
+        }
+        w.finish().await?
+    };
+    commit_day(env.catalog, rest, env.output, TABLE_STOPS, days, files, rows).await?;
+    Ok(rows)
+}
+
+/// Splits batches sorted by `depart_ts` into per-day runs.
+fn split_by_depart_day(batches: &[RecordBatch]) -> Result<Vec<(i32, RecordBatch)>> {
+    let mut out: Vec<(i32, RecordBatch)> = Vec::new();
+    for b in batches {
+        let col = arrow::compute::cast(
+            b.column_by_name("depart_ts").context("no depart_ts")?,
+            &arrow::datatypes::DataType::Int64,
+        )?;
+        let ts = col.as_any().downcast_ref::<arrow::array::Int64Array>().context("depart_ts")?;
+        let mut start = 0;
+        while start < b.num_rows() {
+            let day = ts.value(start).div_euclid(DAY_US) as i32;
+            let mut end = start + 1;
+            while end < b.num_rows() && ts.value(end).div_euclid(DAY_US) as i32 == day {
+                end += 1;
+            }
+            out.push((day, b.slice(start, end - start)));
+            start = end;
+        }
+    }
+    Ok(out)
+}
+
+/// Rebuilds every stop from every stop segment, in chunks of vessels so it fits
+/// in memory, and replaces each day partition. The rare path: a first run, a
+/// rebuilt earlier day, or `--full`.
+async fn refold_stops<C: Catalog>(
+    env: &Env<'_, C>,
+    rest: &RestClient,
+    scratch: &Path,
+    seg_days: &[NaiveDate],
+) -> Result<usize> {
+    let seg_table = env.catalog.load_table(&table_ident(env.output, TABLE_STOP_SEGMENTS)).await?;
+    let pieces: u64 = live_files(&seg_table).await?.iter().map(|f| f.records).sum();
+    let chunks = pieces.div_ceil(2_000_000).clamp(1, 256) as u32;
+    ensure_day_table_on(env.catalog, env.output, TABLE_STOPS, stops::stops_schema(), "depart_ts").await?;
+    let stops_ident = table_ident(env.output, TABLE_STOPS);
+    let stops_table = env.catalog.load_table(&stops_ident).await?;
+    let before: BTreeSet<i32> = days_from_files(&live_files(&stops_table).await?)
+        .keys()
+        .map(|d| date_to_day(*d))
+        .collect();
+
+    let mut files: std::collections::BTreeMap<i32, Vec<iceberg::spec::DataFile>> = Default::default();
+    let mut counts: std::collections::BTreeMap<i32, usize> = Default::default();
+    let mut total = 0;
+    for k in 0..chunks {
+        let ctx = bounded_context(scratch, 1536 << 20)?;
+        register(&ctx, env.catalog, env.output, TABLE_STOP_SEGMENTS).await?;
+        register(&ctx, env.catalog, env.output, TABLE_REF_PORTS).await?;
+        let parts = ctx
+            .sql(&format!("SELECT * FROM ({}) WHERE mmsi % {chunks} = {k}", stops::parts_from_segments_sql()))
+            .await?
+            .into_view();
+        ctx.register_table("stop_parts", parts)?;
+        let sql = format!("SELECT * FROM ({}) ORDER BY depart_ts", stops::stops_sql());
+        let out = ctx.sql(&sql).await?.collect().await?;
+        carry::check_batches(&stops::stops_schema(), &out)?;
+        // Group this chunk's rows by the day they end, one writer per day.
+        let mut by_day: std::collections::BTreeMap<i32, Vec<RecordBatch>> = Default::default();
+        for (day, b) in split_by_depart_day(&out)? {
+            by_day.entry(day).or_default().push(b);
+        }
+        for (day, bs) in by_day {
+            let mut w = DayWriter::new(&stops_table, day, &["mmsi", "stop_id"]).await?;
+            for b in &bs {
+                w.write(b).await?;
+            }
+            *counts.entry(day).or_default() += w.rows;
+            total += w.rows;
+            files.entry(day).or_default().extend(w.finish().await?);
+        }
+    }
+    for (day, fs) in std::mem::take(&mut files) {
+        let rows = counts[&day];
+        commit_day(env.catalog, rest, env.output, TABLE_STOPS, day, fs, rows).await?;
+    }
+    // Partitions that no longer hold any stop.
+    for day in before.difference(&counts.keys().copied().collect()) {
+        commit_day(env.catalog, rest, env.output, TABLE_STOPS, *day, Vec::new(), 0).await?;
+    }
+    let _ = seg_days;
+    Ok(total)
+}
+
+/// Folds one new day of stop segments into `stops`: recomputes the stops it
+/// touches from their existing row and today's pieces, and rewrites the two
+/// partitions involved.
+pub async fn increment_stops<C: Catalog>(
+    env: &Env<'_, C>,
+    rest: &RestClient,
+    scratch: &Path,
+    day: NaiveDate,
+) -> Result<usize> {
+    let ctx = bounded_context(scratch, 1 << 30)?;
+    register_as(&ctx, env.catalog, env.output, TABLE_STOP_SEGMENTS, "raw_segments").await?;
+    let (d_prev, d_start, d_end) = (
+        start_of(day.pred_opt().context("date underflow")?),
+        start_of(day),
+        start_of(day.succ_opt().context("date overflow")?),
+    );
+    let range = |a: DateTime<Utc>, b: DateTime<Utc>, col: &str| {
+        format!("{col} >= '{}' AND {col} < '{}'", carry::lit(a), carry::lit(b))
+    };
+    let pieces = vessels::materialize(
+        &ctx,
+        &format!(
+            "SELECT stop_id, mmsi, ts, ts_end, n_points, lat, lon, radius_nm, n_moored, n_anchored \
+             FROM raw_segments WHERE {}",
+            range(d_start, d_end, "ts")
+        ),
+    )
+    .await?;
+    ctx.register_table("day_pieces", pieces)?;
+
+    // Existing rows: only the previous day's partition and today's can hold a
+    // stop that today's pieces touch.
+    let exists = env.catalog.table_exists(&table_ident(env.output, TABLE_STOPS)).await?;
+    if exists {
+        register_as(&ctx, env.catalog, env.output, TABLE_STOPS, "raw_stops").await?;
+    } else {
+        let arrow = Arc::new(iceberg::arrow::schema_to_arrow_schema(&stops::stops_schema())?);
+        ctx.register_table("raw_stops", Arc::new(datafusion::datasource::MemTable::try_new(arrow, vec![vec![]])?))?;
+    }
+    let touched = "stop_id IN (SELECT stop_id FROM day_pieces)";
+    let base = vessels::materialize(
+        &ctx,
+        &format!(
+            "SELECT * EXCEPT (rn) FROM (SELECT b.*, row_number() OVER \
+               (PARTITION BY stop_id ORDER BY depart_ts DESC) AS rn \
+             FROM raw_stops b WHERE {} AND {touched}) WHERE rn = 1",
+            range(d_prev, d_end, "depart_ts")
+        ),
+    )
+    .await?;
+    ctx.register_table("stop_base", base)?;
+    let (_, keep_batches) = vessels::materialize_batches(
+        &ctx,
+        &format!(
+            "SELECT * FROM raw_stops WHERE {} AND NOT ({touched})",
+            range(d_prev, d_start, "depart_ts")
+        ),
+    )
+    .await?;
+
+    let parts = ctx.sql(&stops::parts_with_base_sql()).await?.into_view();
+    ctx.register_table("stop_parts", parts)?;
+    register(&ctx, env.catalog, env.output, TABLE_REF_PORTS).await?;
+    let merged = stops::build_stops(&ctx).await?;
+    carry::check_batches(&stops::stops_schema(), &merged)?;
+
+    // Today's partition first, then remove the moved stops from yesterday's:
+    // a crash in between leaves a stop in both, which the next run resolves.
+    let rows = replace_stops_day(env, rest, day, &merged).await?;
+    if exists {
+        replace_stops_day(env, rest, day.pred_opt().context("date underflow")?, &keep_batches).await?;
+    }
+    Ok(rows)
+}
+
+/// Brings `stops` up to date from the stop segments: an increment for each new
+/// day, or a refold when there is nothing to increment from or an already
+/// folded day's segments were rebuilt.
+pub async fn run_stops<C: Catalog>(env: &Env<'_, C>, run: &StopsRun<'_>) -> Result<Summary> {
+    let mut sum = Summary::default();
+    let mut log = load_log(env).await?;
+    let seg_days = log.days(STEP_STOP_SEGMENTS);
+    if seg_days.is_empty() {
+        println!("no stop segments yet; run stop-segments first");
+        sum.empty += 1;
+        return Ok(sum);
+    }
+    anyhow::ensure!(
+        env.catalog.table_exists(&table_ident(env.output, TABLE_REF_PORTS)).await?,
+        "run `ports load` first"
+    );
+    let token_of = |log: &Log, d: NaiveDate| format!("seg={}", log.get(STEP_STOP_SEGMENTS, d).map_or(0, |r| r.built_at_us));
+    let current = |log: &Log, d: NaiveDate| log.is_current(STEP_STOPS, d, &token_of(log, d));
+    let folded: Vec<NaiveDate> = seg_days.iter().copied().filter(|d| current(&log, *d)).collect();
+    let todo: Vec<NaiveDate> = seg_days.iter().copied().filter(|d| !current(&log, *d)).collect();
+    let stale = todo.iter().any(|d| log.get(STEP_STOPS, *d).is_some());
+    let out_of_order = matches!((folded.last(), todo.first()), (Some(f), Some(t)) if t < f);
+
+    enum Mode {
+        Refold,
+        Increment,
+    }
+    let (mode, why) = if run.full {
+        (Mode::Refold, "asked to")
+    } else if folded.is_empty() {
+        (Mode::Refold, "nothing folded yet")
+    } else if stale {
+        (Mode::Refold, "a folded day's stop segments were rebuilt")
+    } else if out_of_order {
+        (Mode::Refold, "a day before the latest folded one is new")
+    } else if todo.is_empty() {
+        println!("stops up to date through {}", folded.last().expect("non-empty"));
+        sum.skipped += 1;
+        return Ok(sum);
+    } else {
+        (Mode::Increment, "new days")
+    };
+
+    if run.plan_only {
+        match mode {
+            Mode::Refold => println!("would refold stops from every stop segment ({why})"),
+            Mode::Increment => println!("would fold {} new day(s) into stops: {}..{}", todo.len(), todo[0], todo[todo.len() - 1]),
+        }
+        sum.built += 1;
+        return Ok(sum);
+    }
+    let Some(rest) = env.rest else {
+        // Dry run: say what is there to do.
+        println!(
+            "would {} ({} of {} days to fold)",
+            match mode {
+                Mode::Refold => "refold stops",
+                Mode::Increment => "fold new days into stops",
+            },
+            todo.len(),
+            seg_days.len()
+        );
+        sum.built += 1;
+        return Ok(sum);
+    };
+
+    match mode {
+        Mode::Refold => {
+            let n = refold_stops(env, rest, run.scratch, &seg_days).await?;
+            println!("stops refolded from {} days of stop segments ({why}): {n} stops", seg_days.len());
+            let rows: Vec<LogRow> = seg_days
+                .iter()
+                .map(|d| log_row_with(STEP_STOPS, *d, token_of(&log, *d), 0))
+                .collect();
+            append_logs(env, &rows).await?;
+            for r in rows {
+                log.insert(r);
+            }
+        }
+        Mode::Increment => {
+            for d in todo {
+                let n = increment_stops(env, rest, run.scratch, d).await?;
+                println!("{d}: folded into stops ({n} stops touched)");
+                let row = log_row(STEP_STOPS, d, token_of(&log, d), n);
+                append_log(env, &row).await?;
+                log.insert(row);
+            }
+        }
+    }
+    sum.built += 1;
+    Ok(sum)
+}
+
+fn log_row_with(step: &str, day: NaiveDate, token: String, rows: usize) -> LogRow {
+    log_row(step, day, token, rows)
+}
+
 // ---- all three -----------------------------------------------------------------------
 
 pub struct DailyRun<'a> {
@@ -622,7 +1292,8 @@ pub struct DailyRun<'a> {
     pub plan_only: bool,
 }
 
-/// `track-points`, then `tracks`, then `stop-segments` for the same selection.
+/// `track-points`, `statics-daily`, `tracks` and `stop-segments` for the same
+/// selection, then `vessels`.
 pub async fn run_daily<C: Catalog>(env: &Env<'_, C>, run: &DailyRun<'_>) -> Result<Summary> {
     let mut total = Summary::default();
     println!("== track-points");
@@ -636,8 +1307,14 @@ pub async fn run_daily<C: Catalog>(env: &Env<'_, C>, run: &DailyRun<'_>) -> Resu
         },
     )
     .await?;
+    println!("== statics-daily");
+    total += run_statics_daily(
+        env,
+        &StaticsRun { select: run.select, scratch: &run.opts.scratch, plan_only: run.plan_only },
+    )
+    .await?;
     if run.plan_only {
-        println!("(tracks and stop-segments are planned once track-points has run)");
+        println!("(tracks, stop-segments and vessels are planned once track-points has run)");
         return Ok(total);
     }
     println!("== tracks");
@@ -658,6 +1335,22 @@ pub async fn run_daily<C: Catalog>(env: &Env<'_, C>, run: &DailyRun<'_>) -> Resu
             tuning: run.stops,
             plan_only: false,
         },
+    )
+    .await?;
+    if env.catalog.table_exists(&table_ident(env.output, TABLE_REF_PORTS)).await? {
+        println!("== stops");
+        total += run_stops(
+            env,
+            &StopsRun { full: false, scratch: &run.opts.scratch, plan_only: false },
+        )
+        .await?;
+    } else {
+        println!("== stops (skipped: run `ports load` first)");
+    }
+    println!("== vessels");
+    total += run_vessels(
+        env,
+        &VesselsRun { full: false, scratch: &run.opts.scratch, plan_only: false },
     )
     .await?;
     Ok(total)

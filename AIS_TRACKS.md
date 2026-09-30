@@ -31,7 +31,7 @@ Flags are also listed in [CLI_REFERENCE.md](CLI_REFERENCE.md#ais-tracks).
 - [The tables and how they connect](#the-tables-and-how-they-connect)
 - [Quick start](#quick-start)
 - [Namespaces and table names](#namespaces-and-table-names)
-- [Commands](#commands): [`vessels`](#vessels), [`ports load`](#ports-load),
+- [Commands](#commands): [`statics-daily` and `vessels`](#statics-daily-and-vessels), [`ports load`](#ports-load),
   [`track-points`](#track-points), [`tracks`](#tracks),
   [`stop-segments`](#stop-segments), [`stops`](#stops), [`voyages`](#voyages), and [`daily` and catch-up](#daily-and-catch-up)
 - [Operating it](#operating-it)
@@ -66,13 +66,15 @@ Flags are also listed in [CLI_REFERENCE.md](CLI_REFERENCE.md#ais-tracks).
 
 | Table | One row per | Built | Partitioned |
 |-------|-------------|-------|-------------|
-| `vessel_attributes` | value a vessel ever reported for an identity attribute | rebuilt each run | none |
-| `vessels` | MMSI | rebuilt each run | none |
+| `vessel_attributes` | value a vessel ever reported for an identity attribute | folded in daily | none |
+| `vessels` | MMSI | folded in daily | none |
+| `vessel_daily` | vessel and day: first/last seen, reports | daily (from `track-points`) | day of `ts` |
+| `attribute_daily`, `static_daily` | vessel and day: what its static reports said | daily (`statics-daily`) | day of `ts` |
 | `ref_ports` | port, per World Port Index release | appended per release | none |
 | `track_points` | kept report (each stands for one or more `positions` rows) | daily | day of `ts` |
 | `tracks` | continuous segment, per UTC day | daily | day of `ts` (first row) |
 | `stop_segments` | stationary run, per UTC day | daily | day of `ts` (first point) |
-| `stops` | stop (the day pieces merged) | rebuilt each run | none |
+| `stops` | stop (the day pieces merged) | folded in daily | day of `depart_ts` |
 | `voyages` | leg between stops | rebuilt each run | none |
 | `vessel_state` | vessel's last positioned report, as of the end of a built day | daily | day it is as of |
 | `build_log` | step and day built, with what it was built from | appended after each build | none |
@@ -150,15 +152,37 @@ per experiment).
 All commands accept the catalog and namespace flags above, and are dry runs
 unless `--apply` is given.
 
-### `vessels`
+### `statics-daily` and `vessels`
 
 ```bash
-ais-tracks $CAT vessels [--apply]
+ais-tracks $CAT statics-daily --catch-up --apply
+ais-tracks $CAT vessels [--full] [--from-silver] [--plan] [--apply]
 ```
 
-Vessel identity from `statics` and `positions`, as two tables replaced
-atomically on every run (one `replace` snapshot, so readers never see a partial
-table).
+Vessel identity from static and position reports, kept up to date without
+rescanning history. Each built day leaves three small tables behind:
+
+- **`vessel_daily`**, from the reduce pass (so no extra scan): when each vessel
+  was first and last heard that day and how many reports it sent, duplicates
+  and position-less reports included.
+- **`attribute_daily`** and **`static_daily`**, from `statics-daily`, which reads
+  only that day's static reports: every distinct value a vessel reported for
+  each identity attribute with counts, and its static-report summary.
+
+`vessels` and `vessel_attributes` are a fold of those. Every measure is a sum,
+minimum or maximum, so a new day merges into the existing tables: the cost
+follows the number of vessels, not the length of history. Both tables record
+`folded_through`, the last day they include. `vessels` falls back to refolding
+every daily table when there is nothing to increment from, when the two tables
+disagree about how far they are folded (a crash between writing them), when a
+daily table that was already folded in has been rebuilt since (late data), or
+with `--full`. `--from-silver` builds from the whole silver tables instead: it
+reads all of history, so it is for small deployments and for checking the
+incremental result (which the tests do). Reports with an implausible MMSI are
+set aside by `track-points` and are not counted.
+
+Nothing is dropped or de-duplicated in the merge, and the two routes give the
+same answer.
 
 **`vessel_attributes`** keeps every distinct value a vessel ever reported for
 an identity attribute, so nothing is decided away:
@@ -168,6 +192,7 @@ an identity attribute, so nothing is decided away:
 | `mmsi`, `attribute`, `value` | `attribute` is one of `name`, `call_sign`, `imo`, `ship_type`, `length_m`, `beam_m` |
 | `n_obs`, `first_seen`, `last_seen` | how often and when it was reported |
 | `rank`, `is_current` | rank 1 is the current value: for `imo`, one that passes its check digit beats one that does not; then the most often reported value; then the most recent |
+| `folded_through`, `computed_at` | the last day folded in, and when |
 
 `@` padding and blank strings count as "not reported". Length is bow + stern
 and beam is port + starboard, from the reported dimensions.
@@ -179,15 +204,16 @@ and beam is port + starboard, from the reported dimensions.
 | `mmsi`, `mmsi_class`, `mid` | class is `ship`, `handheld`, `distress_beacon`, `craft_associated`, `aton`, `sar_aircraft`, `group`, `coast_station`, or `other`; `mid` is the maritime identification digits (flag-state code) where the class has one |
 | `vessel_key` | `imo:N` when the IMO is valid, else `mmsi:N` |
 | `imo_number`, `call_sign`, `name`, `ship_type`, `length_m`, `beam_m`, `ais_class` | current values |
-| `first_seen`, `last_seen`, `n_positions` | from `positions` |
-| `first_static_seen`, `last_static_seen`, `n_statics` | from `statics` |
+| `first_seen`, `last_seen`, `n_positions` | from position reports |
+| `first_static_seen`, `last_static_seen`, `n_statics` | from static reports |
 | `mmsi_valid`, `imo_valid` | class is not `other`; IMO passes its check digit |
 | `multiple_imos`, `multiple_names`, `multiple_call_signs` | more than one distinct value was reported |
-| `computed_at` | |
+| `computed_at`, `folded_through` | when, and the last day folded in |
 
 Type 24 messages arrive in two halves (name; then type, call sign and
 dimensions). Each attribute is resolved independently across all rows, so the
-halves combine without special handling.
+halves combine without special handling. Before any static report arrives,
+`vessel_attributes` is not written and `vessels` holds positions only.
 
 ### `ports load`
 
@@ -330,13 +356,23 @@ Duplicates and `is_spike` fixes are ignored, not deleted.
 ### `stops`
 
 ```bash
-ais-tracks $CAT stops [--apply]
+ais-tracks $CAT stops [--full] [--plan] [--apply]
 ```
 
-One row per stop: all `stop_segments` merged by `stop_id`, then matched to the
+One row per stop: the `stop_segments` of a stop merged, then matched to the
 nearest port in the latest `ref_ports` release within a radius set by the
 port's harbour size (Large 15 nm, Medium 10, Small 6, Very Small or unknown 4).
-Rebuilt in full on each run.
+
+It folds in only the days not yet folded. The table is partitioned by the day
+a stop **ends**, so a stop that has finished never moves again, and a stop that
+is still going advances one partition a day. Folding day D reads only D's pieces
+and the rows of the stops they touch, recomputes those stops from the existing
+row plus today's piece, matches ports for them, and rewrites two partitions: D
+(the touched stops) and D-1 (without the stops that moved on). Rerunning a day
+is harmless: a stop's existing row is left alone if it already includes the
+piece. A first run, `--full`, or a rebuilt earlier day's segments, instead
+refold every stop from all the segments, in chunks of vessels so it fits in
+memory.
 
 | Column | Meaning |
 |--------|---------|
@@ -344,14 +380,15 @@ Rebuilt in full on each run.
 | `n_segments`, `n_points` | how many day pieces and points |
 | `lat`, `lon`, `radius_nm` | centroid, and the largest piece radius |
 | `n_moored`, `n_anchored` | |
-| `is_current` | the vessel has not been seen since the stop ended |
 | `port_id`, `port_name`, `port_unlocode`, `port_country`, `port_distance_nm` | the nearest port in range |
 | `port2_id`, `port2_distance_nm` | the runner-up |
 | `wpi_release` | the release matched against |
 | `computed_at` | |
 
-A stop with no port in range (an anchorage, an offshore platform) keeps null
-port columns. The `port_*` columns describe proximity, not a port call: check
+There is no "vessel is still here" flag: it would go stale the moment the
+vessel moved on. `voyages` derives it from when the vessel was last seen. A stop
+with no port in range (an anchorage, an offshore platform) keeps null port
+columns. The `port_*` columns describe proximity, not a port call: check
 `duration_s`, `n_moored` and `n_anchored` if you need to tell a berth from an
 anchorage.
 
@@ -463,8 +500,9 @@ one `--keep-interval-s` to that; this is tested (`tests/pipeline.rs`).
 
 ## `daily` and catch-up
 
-`track-points`, `tracks` and `stop-segments` take the same day selection, and
-`daily` runs the three in order for it:
+`track-points`, `statics-daily`, `tracks` and `stop-segments` take the same day
+selection, and `daily` runs them in order for it (then `stops`, if `ref_ports`
+is loaded, and `vessels`):
 
 | Flag | Meaning |
 |------|---------|
@@ -509,9 +547,9 @@ Exit code `2` means nothing needed building, which suits a scheduler.
 missing input is reported by name ("run track-points first").
 
 **Daily runs.** Schedule `daily --catch-up --apply` after the day ends. It builds
-yesterday, and rebuilds any earlier day whose silver data changed, with
-everything else skipped. Follow it with `stops` and `voyages` (still full
-rebuilds).
+yesterday, folds it into `stops` and `vessels`, and rebuilds any earlier day
+whose silver data changed, with everything else skipped. Only `voyages` is
+still a full rebuild; run it after.
 
 **Reruns and backfills.** Rerunning a day replaces only that day's partition,
 and `--catch-up` works out what needs it. With explicit `--from/--to`, rebuilding
@@ -523,8 +561,10 @@ previous day's state in memory; a run that starts mid-history reads it from
 
 **Memory.** `track-points` holds one bucket at a time (`--target-bucket-rows`);
 `tracks` and `stop-segments` split each day's vessels into `--shards` chunks
-by `mmsi % shards` and hold one chunk. `stops` and `voyages` read `track_points`,
-`tracks` and `stop_segments` in full, so their cost grows with history.
+by `mmsi % shards` and hold one chunk. `voyages` reads `track_points`, `tracks` and `stops` in full, so its cost grows
+with history. `stops` and `vessels` cost about a day plus the number of vessels;
+their refold paths are history-linear but rare, and run with spillable, capped
+memory (sorts and aggregates spill; window functions do not).
 
 **Maintenance.** The daily tables write a few files per day. Compact them like
 any other table, pointing `ais-compact` at the output namespace:
@@ -606,7 +646,7 @@ WHERE v.multiple_imos ORDER BY v.mmsi, a.rank;
 - **`vessel_key` and identity are not time-aware.** One row per MMSI with the
   candidate history in `vessel_attributes`; there are no intervals for
   identity changes, and `mid` is not yet mapped to a country name.
-- **`stops` and `voyages` are full rebuilds**, not incremental.
+- **`voyages` is a full rebuild**, not incremental.
 - **Port matching is proximity, not a port-call record.** Radii are fixed by
   harbour size, and unmatched stops keep null ports.
 - **`declared_matches_dest` is text matching.** Declared destinations are free

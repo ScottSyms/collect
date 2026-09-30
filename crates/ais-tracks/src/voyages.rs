@@ -127,11 +127,17 @@ ordered AS (
     CAST(row_number() OVER w AS INT) AS stop_no
   FROM stops WINDOW w AS (PARTITION BY mmsi ORDER BY arrive_ts)
 ),
+-- A vessel has moved on from its last stop if it was seen after the stop ended.
+moved AS (
+  SELECT o.stop_id, coalesce(b.last_ts > o.depart_ts, false) AS moved_on
+  FROM ordered o LEFT JOIN bounds b ON o.mmsi = b.mmsi
+),
 legs0 AS (
   -- between consecutive stops, and after the last one if the vessel moved on
-  SELECT mmsi, stop_id AS origin_stop_id, next_stop_id AS dest_stop_id,
-         depart_ts, next_arrive_ts AS arrive_ts
-  FROM ordered WHERE next_stop_id IS NOT NULL OR NOT is_current
+  SELECT ordered.mmsi, ordered.stop_id AS origin_stop_id, ordered.next_stop_id AS dest_stop_id,
+         ordered.depart_ts, ordered.next_arrive_ts AS arrive_ts
+  FROM ordered JOIN moved ON ordered.stop_id = moved.stop_id
+  WHERE ordered.next_stop_id IS NOT NULL OR moved.moved_on
   UNION ALL
   -- before the first stop, if the vessel was seen moving first
   SELECT o.mmsi, CAST(NULL AS VARCHAR) AS origin_stop_id, o.stop_id AS dest_stop_id,

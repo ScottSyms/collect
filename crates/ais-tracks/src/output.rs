@@ -123,6 +123,27 @@ pub async fn ensure_day_table(
     ensure_table(catalog, config, base_name, schema, spec).await
 }
 
+/// Like [`ensure_day_table`], partitioned by day of the named timestamp column.
+pub async fn ensure_day_table_on(
+    catalog: &impl Catalog,
+    config: &IcebergConfig,
+    base_name: &str,
+    schema: Schema,
+    column: &str,
+) -> Result<Table> {
+    ensure_namespace(catalog, config).await?;
+    anyhow::ensure!(
+        schema.as_struct().fields().iter().any(|f| f.name == column),
+        "schema has no '{column}' field"
+    );
+    let spec = PartitionSpecBuilder::new(schema.clone()).add_partition_field(
+        column,
+        format!("{column}_day"),
+        iceberg::spec::Transform::Day,
+    )?;
+    ensure_table(catalog, config, base_name, schema, spec).await
+}
+
 /// The Iceberg partition value for a day: days since 1970-01-01.
 pub fn day_partition(days_since_epoch: i32) -> Struct {
     Struct::from_iter([Some(Literal::int(days_since_epoch))])
@@ -179,6 +200,10 @@ pub async fn commit_day(
             created: remove.is_empty(),
         };
 
+        // Clearing a partition that is already empty changes nothing.
+        if remove.is_empty() && added.is_empty() {
+            return Ok(report);
+        }
         if remove.is_empty() || table.metadata().current_snapshot().is_none() {
             let txn = Transaction::new(&table);
             let txn = txn.fast_append().add_data_files(added.clone()).apply(txn)?;

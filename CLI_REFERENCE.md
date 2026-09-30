@@ -353,14 +353,15 @@ to the output namespace. `--iceberg-table-prefix` applies to the input only.
 
 | Subcommand | Flags | What it does |
 |---|---|---|
-| `vessels` | `--apply` | Rebuilds `vessels` and `vessel_attributes` from `statics` and `positions` |
+| `statics-daily` | the day selection flags, `--scratch`, `--apply` | Per-day identity aggregates from that day's static reports (`attribute_daily`, `static_daily`) |
+| `vessels` | `--full`, `--from-silver`, `--scratch`, `--plan`, `--apply` | Folds new days' `vessel_daily`, `attribute_daily` and `static_daily` into `vessels` and `vessel_attributes` (refolds all when needed). `--from-silver` rebuilds from the whole silver tables instead |
 | `ports load` | `--file <csv>`, `--release <label>`, `--apply` | Appends a World Port Index (Pub 150) release to `ref_ports`; a label can be loaded once |
 | `track-points` | `--from <date>` (alias `--day`), `--to <date>`, `--lookback-days` (1), `--buckets`, `--target-bucket-rows` (3000000), `--scratch`, `--keep-scratch`, `--no-thin`, `--keep-distance-nm` (0.1), `--keep-interval-s` (120), `--keep-turn-deg` (15), `--keep-speed-kn` (2), `--max-speed-kn` (60), `--gap-minutes` (30), `--apply` | Reads a day of silver `positions`, reduces it with bounded memory (duplicates, movement, outlier flags, optional thinning) and writes one row per kept report to `track_points`, per UTC day partition |
 | `tracks` | `--from`, `--to`, `--shards` (4), `--apply` | Continuous segments per day, chained across midnight by `track_id` |
 | `stop-segments` | `--from`, `--to`, `--shards` (4), `--slow-kn` (0.5), `--smooth-minutes` (10), `--resume-nm` (1.0), `--min-stop-minutes` (30), `--apply` | Stationary runs per day, chained across midnight by `stop_id` |
-| `stops` | `--apply` | Merges `stop_segments` into stops and matches the nearest port |
+| `stops` | `--full`, `--scratch`, `--plan`, `--apply` | Folds newly built `stop_segments` days into `stops` (partitioned by the day a stop ends) and matches the nearest port; refolds all when needed |
 | `voyages` | `--no-declared`, `--apply` | Legs between consecutive stops, with distance and declared destination |
-| `daily` | the flags of `track-points`, plus `--shards` (4) and the `stop-segments` flags | `track-points`, `tracks` and `stop-segments` in order for the same days; with `--catch-up`, only what needs building |
+| `daily` | the flags of `track-points`, plus `--shards` (4) and the `stop-segments` flags | `track-points`, `statics-daily`, `tracks`, `stop-segments`, then `stops` (if `ref_ports` is loaded) and `vessels`; with `--catch-up`, only what needs building |
 | `reduce-day` | `--day`, `--source-dir`, `--out-dir`, `--scratch`, `--buckets`, `--target-bucket-rows` (3000000), `--no-thin`, `--keep-distance-nm` (0.1), `--keep-interval-s` (120), `--keep-turn-deg` (15), `--keep-speed-kn` (2), `--max-speed-kn` (60), `--gap-minutes` (30) | Memory-bounded reduction of one day of raw reports: routes to on-disk vessel buckets, flags and optionally thins. Dry run unless `--out-dir` is given; needs no catalog with `--source-dir`. See [AIS_TRACKS.md](AIS_TRACKS.md#running-at-scale-reduce-day) |
 
 Notes:

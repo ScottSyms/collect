@@ -198,6 +198,7 @@ async fn run(m: Mode) -> Built {
     register(&ctx, "tracks", &tracks_out);
     register(&ctx, "stop_segments", &seg_out);
 
+    stops::define_parts_from_segments(&ctx).await.unwrap();
     let st = stops::build_stops(&ctx).await.unwrap();
     carry::check_batches(&stops::stops_schema(), &st).unwrap();
     register(&ctx, "stops", &st);
@@ -234,7 +235,7 @@ async fn check_all(m: Mode) {
     // Stops: Alpha, then Beta across midnight, matched to their ports.
     let r = rows(
         &b.ctx,
-        "SELECT arrive_ts, depart_ts, n_segments, port_name, port_unlocode, is_current, port_distance_nm
+        "SELECT arrive_ts, depart_ts, n_segments, port_name, port_unlocode, port_distance_nm
          FROM stops WHERE mmsi = 366000001 ORDER BY arrive_ts",
     )
     .await;
@@ -242,12 +243,11 @@ async fn check_all(m: Mode) {
     near(&r[0][0], 0, tol_s);
     near(&r[0][1], 6 * H, tol_s);
     assert_eq!((r[0][3].as_str(), r[0][4].as_str()), ("Alpha", "AA ALP"));
-    assert!(num(&r[0][6]) < 0.1);
+    assert!(num(&r[0][5]) < 0.1);
     near(&r[1][0], 11 * H, tol_s);
     near(&r[1][1], 27 * H, tol_s);
     assert_eq!(r[1][2], "2", "day 0 and day 1 pieces merge: {r:?}");
     assert_eq!(r[1][3], "Beta");
-    assert_eq!(r[1][5], "false");
     let ids = rows(&b.ctx, "SELECT port2_id FROM stops WHERE mmsi = 366000001 ORDER BY arrive_ts").await;
     assert_eq!(ids[0][0], "3", "runner-up is kept");
 

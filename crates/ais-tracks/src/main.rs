@@ -11,7 +11,7 @@ use ais_tracks::ports::{self, TABLE_REF_PORTS};
 use ais_tracks::reduce::{Rules, ThinOpts};
 use ais_tracks::reduce_day::{self, ReduceOptions};
 use ais_tracks::source;
-use ais_tracks::stops::{self, TABLE_STOPS, TABLE_STOP_SEGMENTS};
+use ais_tracks::stops::TABLE_STOPS;
 use ais_tracks::tracks::TABLE_TRACKS;
 use ais_tracks::voyages::{self, TABLE_VOYAGES};
 use ais_tracks::vessels::{
@@ -55,7 +55,9 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Rebuild `vessels` and `vessel_attributes` from `statics` and `positions`.
-    Vessels(ApplyArgs),
+    Vessels(VesselsArgs),
+    /// Per-day identity aggregates from each day's static reports (feeds `vessels`).
+    StaticsDaily(StaticsDailyArgs),
     /// Reduce each day of `positions` with bounded memory (duplicates,
     /// movement, outlier flags, optional thinning) into `track_points`, one
     /// day partition at a time.
@@ -68,8 +70,9 @@ enum Command {
     /// Find where vessels were stationary, one day at a time (run
     /// track-points first; build days in order).
     StopSegments(StopSegmentsArgs),
-    /// Merge stop segments into one row per stop and match them to ports.
-    Stops(ApplyArgs),
+    /// Merge stop segments into one row per stop and match them to ports:
+    /// folds in only the days not yet folded.
+    Stops(StopsArgs),
     /// Build the legs between consecutive stops.
     Voyages(VoyagesArgs),
     /// Route and reduce one day of raw reports with bounded memory: duplicates,
@@ -86,8 +89,20 @@ enum Command {
 }
 
 #[derive(Args, Debug)]
-struct ApplyArgs {
-    /// Write the tables. Without it, compute and report only.
+struct StopsArgs {
+    /// Refold every stop segment instead of folding in only the new days.
+    #[arg(long)]
+    full: bool,
+
+    /// Where queries may spill to disk.
+    #[arg(long, default_value_os_t = std::env::temp_dir().join("ais-tracks"))]
+    scratch: std::path::PathBuf,
+
+    /// Say what would be done, without doing it.
+    #[arg(long)]
+    plan: bool,
+
+    /// Write the table. Without it, report only.
     #[arg(long)]
     apply: bool,
 }
@@ -324,6 +339,45 @@ struct DailyArgs {
 }
 
 #[derive(Args, Debug)]
+struct VesselsArgs {
+    /// Build from the whole silver `positions` and `statics` tables instead of
+    /// the daily aggregates. Reads all of history, so it is for small
+    /// deployments and for checking the incremental result.
+    #[arg(long)]
+    from_silver: bool,
+
+    /// Refold every daily aggregate instead of adding only the new days.
+    #[arg(long, conflicts_with = "from_silver")]
+    full: bool,
+
+    /// Where queries may spill to disk.
+    #[arg(long, default_value_os_t = std::env::temp_dir().join("ais-tracks"))]
+    scratch: std::path::PathBuf,
+
+    /// Say what would be done, without doing it.
+    #[arg(long)]
+    plan: bool,
+
+    /// Write the tables. Without it, compute and report only.
+    #[arg(long)]
+    apply: bool,
+}
+
+#[derive(Args, Debug)]
+struct StaticsDailyArgs {
+    #[command(flatten)]
+    days: DaysArgs,
+
+    /// Where queries may spill to disk.
+    #[arg(long, default_value_os_t = std::env::temp_dir().join("ais-tracks"))]
+    scratch: std::path::PathBuf,
+
+    /// Write the partitions. Without it, compute and report only.
+    #[arg(long)]
+    apply: bool,
+}
+
+#[derive(Args, Debug)]
 struct PortsArgs {
     #[command(subcommand)]
     command: PortsCommand,
@@ -425,7 +479,7 @@ async fn reduce_day_cmd(cli: &Cli, a: &ReduceDayArgs) -> Result<i32> {
         Ok(())
     };
     let result = reduce_day::reduce_buckets(&manifest, &opts, &Default::default(), &mut sink)
-        .map(|(stats, _states)| stats);
+        .map(|(stats, _states, _days)| stats);
     if let Some(w) = writer {
         w.close()?;
     }
@@ -509,14 +563,14 @@ async fn run() -> Result<i32> {
     let catalog = open_catalog(&input).await?;
 
     match &cli.command {
-        Command::Vessels(a) => {
+        Command::Vessels(a) if a.from_silver => {
             let ctx = SessionContext::new();
             register(&ctx, &catalog, &input, TABLE_STATICS).await?;
             register(&ctx, &catalog, &input, TABLE_POSITIONS).await?;
             let built = vessels::build(&ctx).await?;
             let n_vessels: usize = built.vessels.iter().map(|b| b.num_rows()).sum();
             let n_attrs: usize = built.attributes.iter().map(|b| b.num_rows()).sum();
-            println!("{n_vessels} vessels, {n_attrs} attribute values");
+            println!("{n_vessels} vessels, {n_attrs} attribute values (from all of silver)");
             if !a.apply {
                 println!("dry run; pass --apply to write to namespace '{}'", output.namespace);
                 return Ok(exitcode::SUCCESS);
@@ -547,6 +601,26 @@ async fn run() -> Result<i32> {
                     if r.created { " (created)" } else { "" }
                 );
             }
+        }
+        Command::Vessels(a) => {
+            let rest = connect_if_writing(a.apply, a.plan, &output).await?;
+            let env = Env { catalog: &catalog, input: &input, output: &output, rest: rest.as_ref() };
+            let sum = daily::run_vessels(
+                &env,
+                &daily::VesselsRun { full: a.full, scratch: &a.scratch, plan_only: a.plan },
+            )
+            .await?;
+            return Ok(finish(sum, a.apply, &output.namespace));
+        }
+        Command::StaticsDaily(a) => {
+            let rest = connect_if_writing(a.apply, a.days.plan, &output).await?;
+            let env = Env { catalog: &catalog, input: &input, output: &output, rest: rest.as_ref() };
+            let sum = daily::run_statics_daily(
+                &env,
+                &daily::StaticsRun { select: &a.days.select(), scratch: &a.scratch, plan_only: a.days.plan },
+            )
+            .await?;
+            return Ok(finish(sum, a.apply, &output.namespace));
         }
         Command::TrackPoints(a) => {
             let rest = connect_if_writing(a.apply, a.days.plan, &output).await?;
@@ -650,48 +724,14 @@ async fn run() -> Result<i32> {
             return Ok(finish(sum, a.apply, &output.namespace));
         }
         Command::Stops(a) => {
-            let ctx = SessionContext::new();
-            register(&ctx, &catalog, &output, TABLE_STOP_SEGMENTS)
-                .await
-                .context("run stop-segments first")?;
-            register(&ctx, &catalog, &output, TABLE_TRACKS)
-                .await
-                .context("run tracks first")?;
-            register(&ctx, &catalog, &output, TABLE_REF_PORTS)
-                .await
-                .context("run `ports load` first")?;
-            let built = stops::build_stops(&ctx).await?;
-            ais_tracks::carry::check_batches(&stops::stops_schema(), &built)?;
-            let n: usize = built.iter().map(|b| b.num_rows()).sum();
-            let matched: usize = built
-                .iter()
-                .filter_map(|b| b.column_by_name("port_id"))
-                .map(|c| c.len() - c.null_count())
-                .sum();
-            println!("{n} stops, {matched} matched to a port");
-            if !a.apply {
-                println!("dry run; pass --apply to write to namespace '{}'", output.namespace);
-                return Ok(exitcode::SUCCESS);
-            }
-            let rest = RestClient::connect(&output).await?;
-            let r = replace_table(
-                &catalog,
-                &rest,
-                &output,
-                TABLE_STOPS,
-                stops::stops_schema(),
-                &built,
-                &["mmsi", "stop_id"],
+            let rest = connect_if_writing(a.apply, a.plan, &output).await?;
+            let env = Env { catalog: &catalog, input: &input, output: &output, rest: rest.as_ref() };
+            let sum = daily::run_stops(
+                &env,
+                &daily::StopsRun { full: a.full, scratch: &a.scratch, plan_only: a.plan },
             )
             .await?;
-            println!(
-                "{}.{TABLE_STOPS}: {} rows, {} files written, {} replaced{}",
-                output.namespace,
-                r.rows,
-                r.files_added,
-                r.files_removed,
-                if r.created { " (created)" } else { "" }
-            );
+            return Ok(finish(sum, a.apply, &output.namespace));
         }
         Command::Voyages(a) => {
             let ctx = SessionContext::new();

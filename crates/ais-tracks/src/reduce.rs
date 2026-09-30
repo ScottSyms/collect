@@ -249,6 +249,9 @@ pub struct Reduced {
     /// Raw rows that no kept row could absorb (a vessel-day with no stream row
     /// at all). Kept so `sum(n_raw) + unaccounted_raw == input rows`.
     pub unaccounted_raw: usize,
+    /// When the vessel was first and last heard that day and how many reports
+    /// it sent, every one counted (duplicates and rows without a position too).
+    pub summary: Option<crate::vessels::VesselDay>,
 }
 
 fn key32(v: Option<i32>) -> i64 {
@@ -335,6 +338,12 @@ pub fn reduce_vessel(
         };
     }
     pts.sort_by(|a, b| cmp_points(a, b, dicts));
+    let summary = Some(crate::vessels::VesselDay {
+        mmsi: pts[0].mmsi,
+        first_ts_us: pts[0].ts_us,
+        last_ts_us: pts[n - 1].ts_us,
+        n_reports: n as i64,
+    });
 
     // Duplicate groups: consecutive rows with identical content.
     let mut dup_rank = vec![1i32; n];
@@ -502,6 +511,7 @@ pub fn reduce_vessel(
             rows,
             state,
             unaccounted_raw: 0,
+            summary,
         };
     }
 
@@ -691,6 +701,7 @@ pub fn reduce_vessel(
         rows,
         state,
         unaccounted_raw,
+        summary,
     }
 }
 

@@ -9,7 +9,7 @@ mod support;
 
 use std::sync::Arc;
 
-use ais_tracks::daily::{self, register, DailyRun, Env, StopTuning, Summary};
+use ais_tracks::daily::{self, register, register_as, DailyRun, Env, StopTuning, Summary};
 use ais_tracks::output::{commit_day, ensure_day_table, DayWriter};
 use ais_tracks::reduce::{Dicts, RawPoint};
 use ais_tracks::reduce_day::ReduceOptions;
@@ -20,7 +20,7 @@ use collect_maint::commit::RestClient;
 use datafusion::prelude::SessionContext;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::Catalog;
-use support::scenario::{day, raw_points, scenario, silver_batch, NAVS};
+use support::scenario::{day, raw_points, scenario, silver_batch, statics_batch, Static, NAVS};
 use support::MockCatalog;
 
 struct Rig {
@@ -54,6 +54,9 @@ async fn rig() -> Rig {
     ensure_day_table(&cat, &input, "positions", collect_core::iceberg::table_schemas::positions_schema())
         .await
         .unwrap();
+    ensure_day_table(&cat, &input, "statics", collect_core::iceberg::table_schemas::statics_schema())
+        .await
+        .unwrap();
     let scratch = dir.path().join("scratch");
     Rig {
         cat,
@@ -80,6 +83,47 @@ impl Rig {
         let rows = w.rows;
         let files = w.finish().await.unwrap();
         commit_day(&self.cat, &self.rest, &self.input, "positions", idx, files, rows).await.unwrap();
+    }
+
+    /// Writes `rows` as the whole of silver statics day `d`.
+    async fn put_statics_day(&self, d: i64, rows: &[Static]) {
+        let idx = date_to_day(day(d).date_naive());
+        let t = self.cat.load_table(&table_ident(&self.input, "statics")).await.unwrap();
+        let mut w = DayWriter::new(&t, idx, &["mmsi"]).await.unwrap();
+        w.write(&statics_batch(d, rows)).await.unwrap();
+        let n = w.rows;
+        let files = w.finish().await.unwrap();
+        commit_day(&self.cat, &self.rest, &self.input, "statics", idx, files, n).await.unwrap();
+    }
+
+    /// The vessels tables as text, without the columns that legitimately differ.
+    async fn vessels_text(&self, from_silver: bool) -> (String, String) {
+        let ctx = SessionContext::new();
+        let (v, a) = if from_silver {
+            register(&ctx, &self.cat, &self.input, "positions").await.unwrap();
+            register(&ctx, &self.cat, &self.input, "statics").await.unwrap();
+            let built = ais_tracks::vessels::build(&ctx).await.unwrap();
+            let c2 = SessionContext::new();
+            c2.register_table("v", Arc::new(datafusion::datasource::MemTable::try_new(built.vessels[0].schema(), vec![built.vessels]).unwrap())).unwrap();
+            c2.register_table("a", Arc::new(datafusion::datasource::MemTable::try_new(built.attributes[0].schema(), vec![built.attributes]).unwrap())).unwrap();
+            return (Self::text(&c2, "v", "mmsi").await, Self::text(&c2, "a", "mmsi, attribute, rank").await);
+        } else {
+            register_as(&ctx, &self.cat, &self.output, "vessels", "v").await.unwrap();
+            register_as(&ctx, &self.cat, &self.output, "vessel_attributes", "a").await.unwrap();
+            ("v", "a")
+        };
+        (Self::text(&ctx, v, "mmsi").await, Self::text(&ctx, a, "mmsi, attribute, rank").await)
+    }
+
+    async fn text(ctx: &SessionContext, table: &str, order: &str) -> String {
+        let b = ctx
+            .sql(&format!("SELECT * EXCEPT (computed_at, folded_through) FROM {table} ORDER BY {order}"))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        arrow::util::pretty::pretty_format_batches(&b).unwrap().to_string()
     }
 
     /// Adds `points` to silver day `d` as a new file, like data arriving late.
@@ -172,7 +216,7 @@ async fn daily_builds_skips_and_ripples_late_data_only_as_far_as_it_matters() {
 
     // ---- first run: everything is built --------------------------------
     let s = r.daily(&catch_up(), false).await;
-    assert_eq!((s.built, s.skipped), (6, 0), "2 days x 3 steps: {s:?}");
+    assert_eq!((s.built, s.skipped), (7, 0), "2 days x 3 steps, plus the vessels fold: {s:?}");
 
     // Every silver report is represented in track_points.
     let represented = r.number("track_points", "SELECT sum(n_raw) FROM track_points").await;
@@ -190,7 +234,7 @@ async fn daily_builds_skips_and_ripples_late_data_only_as_far_as_it_matters() {
 
     // ---- nothing changed: nothing is rebuilt -----------------------------
     let s = r.daily(&catch_up(), false).await;
-    assert_eq!((s.built, s.skipped), (0, 6), "{s:?}");
+    assert_eq!((s.built, s.skipped), (0, 7), "{s:?}");
 
     // ---- --plan reports without building ---------------------------------
     let before = r.log().await.get("track_points", day(0).date_naive()).unwrap().built_at_us;
@@ -208,7 +252,7 @@ async fn daily_builds_skips_and_ripples_late_data_only_as_far_as_it_matters() {
         log0.get("track_points", day(1).date_naive()).unwrap().built_at_us,
     );
     let s = r.daily(&catch_up(), false).await;
-    assert_eq!((s.built, s.skipped), (6, 0), "the change reaches day 1 through vessel state: {s:?}");
+    assert_eq!((s.built, s.skipped), (7, 0), "the change reaches day 1 through vessel state; vessels refolds: {s:?}");
     let log = r.log().await;
     assert!(log.get("track_points", day(0).date_naive()).unwrap().built_at_us > tp0);
     assert!(log.get("track_points", day(1).date_naive()).unwrap().built_at_us > tp1);
@@ -236,15 +280,17 @@ async fn daily_builds_skips_and_ripples_late_data_only_as_far_as_it_matters() {
     );
     // tracks and stop_segments chain their ids from the previous day's build,
     // so they are conservatively rebuilt for both days.
-    assert_eq!((s.built, s.skipped), (5, 1), "{s:?}");
+    // 1 track_points day, 2 tracks, 2 stop-segments, and a vessels refold because
+    // day 0's aggregates were rebuilt.
+    assert_eq!((s.built, s.skipped), (6, 1), "{s:?}");
     let represented = r.number("track_points", "SELECT sum(n_raw) FROM track_points").await;
     assert_eq!(represented as usize, n0 + n1 + 2);
 
     // ---- an explicit range rebuilds whatever the log says ------------------
     let forced = DaySelect { from: Some(day(1).date_naive()), ..Default::default() };
     let s = r.daily(&forced, false).await;
-    assert_eq!((s.built, s.skipped), (3, 0), "{s:?}");
-    let _ = Arc::new(0); // keep Arc imported for future assertions
+    // 3 daily steps for day 1, plus a vessels refold for its rebuilt aggregates.
+    assert_eq!((s.built, s.skipped), (4, 0), "{s:?}");
 }
 
 const PORTS_CSV: &str = "OID_,World Port Index Number,Region Name,Main Port Name,Alternate Port Name,UN/LOCODE,Country Code,Harbor Size,Harbor Type,Harbor Use,Channel Depth (m),Maximum Vessel Draft (m),Tidal Range (m),Latitude,Longitude
@@ -283,9 +329,10 @@ async fn stops_and_voyages_are_written_then_replaced_whole() {
     // Build stops from the real tables, and write them twice.
     let build = || async {
         let ctx = SessionContext::new();
-        for t in ["stop_segments", "tracks", "ref_ports", "track_points"] {
+        for t in ["stop_segments", "ref_ports"] {
             register(&ctx, &r.cat, &r.output, t).await.unwrap();
         }
+        stops::define_parts_from_segments(&ctx).await.unwrap();
         let built = stops::build_stops(&ctx).await.unwrap();
         ais_tracks::carry::check_batches(&stops::stops_schema(), &built).unwrap();
         built
@@ -323,4 +370,208 @@ async fn stops_and_voyages_are_written_then_replaced_whole() {
         )
         .await;
     assert!((nm - 60.0).abs() < 8.0, "Alpha to Beta is about 60 nm, got {nm}");
+}
+
+fn statics_for(d: i64) -> Vec<Static> {
+    vec![
+        (366000001, 10 + d, Some(9811000), Some("ALPHA1"), Some("ALPHA SHIP@@"), Some("Cargo"), Some(200), Some(50), Some(15), Some(15), "Class A"),
+        (366000001, 20 + d, Some(9811000), Some("ALPHA1"), Some("ALPHA SHIP@@"), Some("Cargo"), Some(200), Some(50), Some(15), Some(15), "Class A"),
+        (366000002, 30 + d, None, None, Some("RUNNER"), Some("Tanker"), None, None, None, None, "Class A"),
+    ]
+}
+
+/// A third day for the scenario: the second day's reports, a day later.
+fn day_two() -> Vec<RawPoint> {
+    two_days()
+        .1
+        .into_iter()
+        .map(|mut p| {
+            p.ts_us += 86_400_000_000;
+            p
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn vessels_are_folded_incrementally_and_always_match_a_rebuild_from_silver() {
+    let r = rig().await;
+    let (d0, d1) = two_days();
+    r.put_silver_day(0, &d0).await;
+    r.put_silver_day(1, &d1).await;
+    r.put_statics_day(0, &statics_for(0)).await;
+    r.put_statics_day(1, &statics_for(1)).await;
+
+    // First build: nothing to increment from, so it folds every daily table.
+    let s = r.daily(&catch_up(), false).await;
+    assert_eq!(s.built, 2 + 2 + 2 + 2 + 1, "track-points, statics-daily, tracks, stop-segments, vessels: {s:?}");
+    let log = r.log().await;
+    let last = log.days("vessels").into_iter().max().unwrap();
+    assert!(log.get("vessels", last).unwrap().input_token.starts_with("refold"));
+    assert_eq!(last, day(1).date_naive());
+    assert_eq!(r.number("vessels", "SELECT max(folded_through) FROM vessels").await as i32, date_to_day(day(1).date_naive()));
+
+    let out = r.vessels_text(false).await;
+    let oracle = r.vessels_text(true).await;
+    assert_eq!(out.0, oracle.0, "vessels equal a rebuild from silver");
+    assert_eq!(out.1, oracle.1, "attributes equal a rebuild from silver");
+    let total = (d0.len() + d1.len()) as f64;
+    let counted = r.number("vessels", "SELECT sum(n_positions) FROM vessels").await;
+    assert_eq!(counted, total, "every silver report is counted once");
+    assert!(out.0.contains("ALPHA SHIP") && out.0.contains("imo:9811000"));
+
+    // Nothing new: vessels are up to date.
+    let s = r.daily(&catch_up(), false).await;
+    assert_eq!((s.built, s.skipped), (0, 2 + 2 + 2 + 2 + 1), "{s:?}");
+
+    // A new day is merged into the tables instead of refolding.
+    let d2 = day_two();
+    r.put_silver_day(2, &d2).await;
+    r.put_statics_day(2, &statics_for(2)).await;
+    let s = r.daily(&catch_up(), false).await;
+    assert!(s.built >= 5, "{s:?}");
+    let log = r.log().await;
+    let last = log.days("vessels").into_iter().max().unwrap();
+    assert_eq!(last, day(2).date_naive());
+    assert!(
+        log.get("vessels", last).unwrap().input_token.starts_with("increment"),
+        "got {:?}",
+        log.get("vessels", last).unwrap().input_token
+    );
+    let out = r.vessels_text(false).await;
+    let oracle = r.vessels_text(true).await;
+    assert_eq!(out.0, oracle.0, "after an increment: vessels");
+    assert_eq!(out.1, oracle.1, "after an increment: attributes");
+    let counted = r.number("vessels", "SELECT sum(n_positions) FROM vessels").await;
+    assert_eq!(counted, (d0.len() + d1.len() + d2.len()) as f64);
+
+    // Late data for an already folded day forces a refold, and still matches.
+    let late = extra_point(366000002, 100, 30.0, 40.0, 12.0, 1);
+    r.append_silver(0, &[late]).await;
+    r.daily(&catch_up(), false).await;
+    let log = r.log().await;
+    let last = log.days("vessels").into_iter().max().unwrap();
+    assert!(
+        log.get("vessels", last).unwrap().input_token.starts_with("refold"),
+        "got {:?}",
+        log.get("vessels", last).unwrap().input_token
+    );
+    let out = r.vessels_text(false).await;
+    let oracle = r.vessels_text(true).await;
+    assert_eq!(out.0, oracle.0, "after a refold: vessels");
+    assert_eq!(out.1, oracle.1, "after a refold: attributes");
+    let counted = r.number("vessels", "SELECT sum(n_positions) FROM vessels").await;
+    assert_eq!(counted, (d0.len() + d1.len() + d2.len() + 1) as f64);
+}
+
+/// Reference ports appended the way `ports load` does.
+async fn load_ports(r: &Rig) {
+    use ais_tracks::ports::{load_csv, ref_ports_schema};
+    let csv = r._dir.path().join("pub150.csv");
+    std::fs::write(&csv, PORTS_CSV).unwrap();
+    let batches = load_csv(csv.to_str().unwrap(), "2026-03-01").await.unwrap();
+    let schema = ref_ports_schema();
+    let table = collect_core::iceberg::ensure_table(
+        &r.cat,
+        &r.output,
+        "ref_ports",
+        schema.clone(),
+        iceberg::spec::PartitionSpecBuilder::new(schema),
+    )
+    .await
+    .unwrap();
+    collect_core::iceberg::commit_batches(&r.cat, &table, batches, 3, "ref_ports").await.unwrap();
+}
+
+const STOP_COLS: &str = "stop_id, mmsi, arrive_ts, depart_ts, n_segments, n_points, round(lat, 9) AS lat, \
+     round(lon, 9) AS lon, radius_nm, n_moored, n_anchored, port_id, port_name, \
+     round(port_distance_nm, 6) AS port_distance_nm";
+
+async fn text_of(ctx: &SessionContext, table: &str) -> String {
+    let b = ctx
+        .sql(&format!("SELECT {STOP_COLS} FROM {table} ORDER BY stop_id"))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    arrow::util::pretty::pretty_format_batches(&b).unwrap().to_string()
+}
+
+impl Rig {
+    /// The `stops` table as text.
+    async fn stops_text(&self) -> String {
+        let ctx = SessionContext::new();
+        register_as(&ctx, &self.cat, &self.output, "stops", "s").await.unwrap();
+        text_of(&ctx, "s").await
+    }
+
+    /// What a full rebuild from every stop segment gives, as text.
+    async fn full_stops_text(&self) -> String {
+        use ais_tracks::stops;
+        let ctx = SessionContext::new();
+        register(&ctx, &self.cat, &self.output, "stop_segments").await.unwrap();
+        register(&ctx, &self.cat, &self.output, "ref_ports").await.unwrap();
+        stops::define_parts_from_segments(&ctx).await.unwrap();
+        let built = stops::build_stops(&ctx).await.unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_table(
+            "f",
+            Arc::new(datafusion::datasource::MemTable::try_new(built[0].schema(), vec![built]).unwrap()),
+        )
+        .unwrap();
+        text_of(&ctx, "f").await
+    }
+
+    async fn stops_log_token(&self, d: i64) -> String {
+        self.log().await.get("stops", day(d).date_naive()).unwrap().input_token.clone()
+    }
+}
+
+#[tokio::test]
+async fn stops_are_folded_day_by_day_and_always_match_a_full_build() {
+    let r = rig().await;
+    load_ports(&r).await;
+    let (d0, d1) = two_days();
+
+    // Day 0 alone: nothing to increment from, so stops are refolded.
+    r.put_silver_day(0, &d0).await;
+    r.daily(&catch_up(), false).await;
+    let after0 = r.stops_text().await;
+    assert_eq!(after0, r.full_stops_text().await, "after day 0");
+    assert!(after0.contains("Alpha"), "{after0}");
+
+    // Day 1 is folded in: the Beta stop began on day 0 and ends on day 1, so it
+    // moves from day 0's partition to day 1's.
+    r.put_silver_day(1, &d1).await;
+    let s = r.daily(&catch_up(), false).await;
+    assert!(s.built >= 5, "{s:?}");
+    let after1 = r.stops_text().await;
+    assert_eq!(after1, r.full_stops_text().await, "after folding day 1");
+    let beta = r.number("stops", "SELECT count(*) FROM stops WHERE port_name = 'Beta'").await;
+    assert_eq!(beta, 1.0, "the stop that crossed midnight is one row, not two");
+    let segs = r.number("stops", "SELECT max(n_segments) FROM stops WHERE port_name = 'Beta'").await;
+    assert_eq!(segs, 2.0, "it holds both day pieces");
+    assert!(r.stops_log_token(1).await.starts_with("seg="));
+    // No log row was needed to say it was an increment: day 0's row is untouched.
+    let up_to_date = r.daily(&catch_up(), false).await;
+    assert_eq!(up_to_date.built, 0, "{up_to_date:?}");
+
+    // Folding a day again changes nothing.
+    let env = r.env();
+    ais_tracks::daily::increment_stops(&env, &r.rest, &r.scratch, day(1).date_naive()).await.unwrap();
+    assert_eq!(r.stops_text().await, after1, "rerunning a day is harmless");
+
+    // Day 2 (day 1's reports a day later).
+    r.put_silver_day(2, &day_two()).await;
+    r.daily(&catch_up(), false).await;
+    let after2 = r.stops_text().await;
+    assert_eq!(after2, r.full_stops_text().await, "after folding day 2");
+    assert_ne!(after2, after1);
+
+    // Late data for day 0 rebuilds its segments, so stops are refolded from all of them.
+    let before = r.stops_log_token(0).await;
+    r.append_silver(0, &[extra_point(366000001, 3600, 10.0, 20.0, 0.1, 0)]).await;
+    r.daily(&catch_up(), false).await;
+    assert_ne!(r.stops_log_token(0).await, before, "day 0 was folded again");
+    assert_eq!(r.stops_text().await, r.full_stops_text().await, "after a refold");
 }

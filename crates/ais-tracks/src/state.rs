@@ -49,6 +49,10 @@ pub const TABLE_BUILD_LOG: &str = "build_log";
 pub const STEP_TRACK_POINTS: &str = "track_points";
 pub const STEP_TRACKS: &str = "tracks";
 pub const STEP_STOP_SEGMENTS: &str = "stop_segments";
+pub const STEP_VESSEL_DAILY: &str = "vessel_daily";
+pub const STEP_STATICS_DAILY: &str = "statics_daily";
+pub const STEP_VESSELS: &str = "vessels";
+pub const STEP_STOPS: &str = "stops";
 
 fn required(id: i32, name: &'static str, ty: PrimitiveType) -> Arc<NestedField> {
     Arc::new(NestedField::required(id, name, ty.into()))

@@ -6,6 +6,8 @@ use std::sync::Arc;
 
 use ais_tracks::reduce::{Dicts, RawPoint};
 use arrow::array::{new_null_array, Array, Float64Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray};
+
+const DAY_US: i64 = 86_400_000_000;
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Duration, TimeZone, Utc};
 
@@ -122,3 +124,50 @@ pub fn silver_batch(points: &[RawPoint], dicts: &Dicts) -> RecordBatch {
         .collect();
     RecordBatch::try_new(schema, cols).unwrap()
 }
+
+/// (mmsi, seconds from the start of day `d`, imo, call sign, name, ship type, bow, stern, port, starboard, class)
+pub type Static = (i64, i64, Option<i32>, Option<&'static str>, Option<&'static str>, Option<&'static str>,
+              Option<i32>, Option<i32>, Option<i32>, Option<i32>, &'static str);
+
+pub fn statics_batch(d: i64, rows: &[Static]) -> RecordBatch {
+    let schema = Arc::new(
+        iceberg::arrow::schema_to_arrow_schema(&collect_core::iceberg::table_schemas::statics_schema())
+            .unwrap(),
+    );
+    let n = rows.len();
+    let cols: Vec<Arc<dyn Array>> = schema
+        .fields()
+        .iter()
+        .map(|f| -> Arc<dyn Array> {
+            let s = |g: &dyn Fn(&Static) -> Option<&'static str>| -> Arc<dyn Array> {
+                Arc::new(StringArray::from_iter(rows.iter().map(g)))
+            };
+            let i = |g: &dyn Fn(&Static) -> Option<i32>| -> Arc<dyn Array> {
+                Arc::new(Int32Array::from_iter(rows.iter().map(g)))
+            };
+            match f.name().as_str() {
+                "ts" => Arc::new(
+                    TimestampMicrosecondArray::from_iter_values(
+                        rows.iter().map(|r| (day(0).timestamp() * 1_000_000) + d * DAY_US + r.1 * 1_000_000),
+                    )
+                    .with_timezone("+00:00"),
+                ),
+                "source" => Arc::new(StringArray::from(vec!["a"; n])),
+                "msg_type" => Arc::new(Int32Array::from(vec![5; n])),
+                "mmsi" => Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.0))),
+                "ais_class" => s(&|r| Some(r.10)),
+                "imo_number" => i(&|r| r.2),
+                "call_sign" => s(&|r| r.3),
+                "name" => s(&|r| r.4),
+                "ship_type" => s(&|r| r.5),
+                "dimension_to_bow" => i(&|r| r.6),
+                "dimension_to_stern" => i(&|r| r.7),
+                "dimension_to_port" => i(&|r| r.8),
+                "dimension_to_starboard" => i(&|r| r.9),
+                _ => new_null_array(f.data_type(), n),
+            }
+        })
+        .collect();
+    RecordBatch::try_new(schema, cols).unwrap()
+}
+

@@ -17,6 +17,7 @@ use crate::reduce::{
 };
 use crate::router::{read_bucket_into, Manifest, Router};
 use crate::source::BatchStream;
+use crate::vessels::VesselDay;
 
 /// Rows converted to Arrow and handed to the sink at a time.
 const OUT_CHUNK_ROWS: usize = 65_536;
@@ -119,14 +120,15 @@ pub async fn route_day(
 /// [`crate::reduce::thin_points_schema`] form. `prev` holds each vessel's stream
 /// state from the day before, where known.
 ///
-/// Returns the stats and each reduced vessel's stream state at the end of the
-/// day, to carry into the next one.
+/// Returns the stats, each reduced vessel's stream state at the end of the day
+/// (to carry into the next one), and each vessel's day summary (for
+/// `vessel_daily`).
 pub fn reduce_buckets(
     m: &Manifest,
     opts: &ReduceOptions,
     prev: &HashMap<u32, StreamState>,
     sink: &mut dyn FnMut(RecordBatch) -> Result<()>,
-) -> Result<(ReduceStats, HashMap<u32, StreamState>)> {
+) -> Result<(ReduceStats, HashMap<u32, StreamState>, Vec<VesselDay>)> {
     let started = Instant::now();
     let mut st = ReduceStats {
         buckets: m.buckets,
@@ -137,6 +139,7 @@ pub fn reduce_buckets(
         ..Default::default()
     };
     let mut next: HashMap<u32, StreamState> = HashMap::new();
+    let mut vessel_days: Vec<VesselDay> = Vec::new();
     let mut chunk: Vec<OutRow> = Vec::with_capacity(OUT_CHUNK_ROWS);
     let flush = |chunk: &mut Vec<OutRow>, sink: &mut dyn FnMut(RecordBatch) -> Result<()>| {
         if !chunk.is_empty() {
@@ -169,6 +172,7 @@ pub fn reduce_buckets(
             if let Some(state) = r.state {
                 next.insert(mmsi, state);
             }
+            vessel_days.extend(r.summary);
             for row in &r.rows {
                 st.kept += 1;
                 st.represented += row.n_raw as u64;
@@ -190,7 +194,7 @@ pub fn reduce_buckets(
     }
     flush(&mut chunk, sink)?;
     st.reduce_time = started.elapsed();
-    Ok((st, next))
+    Ok((st, next, vessel_days))
 }
 
 /// Carries `next` (the end-of-day states just computed) into `prev`, dropping
@@ -249,6 +253,43 @@ pub fn reduce_all_with_state(
         vec![to_batch(&rows, dicts)?]
     };
     Ok((batches, next))
+}
+
+/// What [`reduce_all_with_state`] produces for a day, plus the per-vessel day
+/// summaries `vessel_daily` is made from.
+pub struct InMemoryReduced {
+    pub batches: Vec<RecordBatch>,
+    pub days: Vec<VesselDay>,
+}
+
+/// Reduces `points` in memory like [`reduce_all`], also returning the per-vessel
+/// day summaries. For tests and small inputs.
+pub fn reduce_buckets_in_memory(
+    mut points: Vec<RawPoint>,
+    dicts: &crate::reduce::Dicts,
+    rules: &Rules,
+    thin: &ThinOpts,
+) -> InMemoryReduced {
+    points.sort_by_key(|p| p.mmsi);
+    let (mut rows, mut days) = (Vec::new(), Vec::new());
+    let mut i = 0;
+    while i < points.len() {
+        let mmsi = points[i].mmsi;
+        let mut j = i;
+        while j < points.len() && points[j].mmsi == mmsi {
+            j += 1;
+        }
+        let r = reduce_vessel(points[i..j].to_vec(), dicts, None, rules, thin);
+        days.extend(r.summary);
+        rows.extend(r.rows);
+        i = j;
+    }
+    let batches = if rows.is_empty() {
+        Vec::new()
+    } else {
+        vec![to_batch(&rows, dicts).expect("valid batch")]
+    };
+    InMemoryReduced { batches, days }
 }
 
 /// Peak resident memory of this process so far, in bytes.
