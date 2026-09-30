@@ -348,6 +348,77 @@ Every stretch of a vessel's observed life belongs to exactly one leg:
 
 `--no-declared` skips the scan of the `statics` table.
 
+## Running at scale: `reduce-day`
+
+The SQL steps above sort and window a whole day in DataFusion, which does not
+fit in memory at hundreds of millions of reports a day. `reduce-day` is the
+memory-bounded route to the same annotations, with optional thinning:
+
+```bash
+# See what thinning would keep on a real day (writes nothing):
+ais-tracks $CAT reduce-day --day 2026-03-10
+
+# Write the reduced rows as Parquet, or work from a local directory:
+ais-tracks reduce-day --source-dir ./silver --day 2026-03-10 --out-dir ./out
+```
+
+It makes one sequential pass over the day, writing each report to one of a few
+hundred scratch files chosen by a hash of the MMSI (a fixed-width 31-byte
+record, zstd-compressed, no payload text). Then it loads one bucket at a time,
+sorts it, and reduces each vessel in a single pass. Memory is one bucket plus a
+small output chunk, whatever the size of the day, and silver need not be sorted
+or compacted. Reports with an implausible MMSI (zero, more than nine digits) are
+set aside and counted, so a bogus id cannot form a giant fake vessel.
+
+The reducer computes what `track-points` computes (duplicate ranks, movement,
+gap / jump / spike / invalid flags) and a test holds the two to row-for-row
+agreement on randomised days when thinning is off. With thinning on (the
+default), only some rows are kept, and each kept row carries what it stands for:
+
+| Keep a row when | Flag | Default |
+|---|---|---|
+| it is the vessel's first or last positioned row of the day | | |
+| the silence before it exceeds the gap limit, or it is the row just before one | `--gap-minutes` | 30 |
+| it is a jump, spike or invalid value, or is next to one | `--max-speed-kn` | 60 |
+| the vessel moved this far since the last kept row | `--keep-distance-nm` | 0.1 |
+| this long has passed since the last kept row | `--keep-interval-s` | 120 |
+| the course changed this much while moving | `--keep-turn-deg` | 15 |
+| the speed changed this much | `--keep-speed-kn` | 2 |
+| the navigation status changed | | |
+
+`--no-thin` keeps every row. On a kept row `dist_nm` is the summed raw hop
+distance since the previous kept row, so distance totals stay exact; `dt_s` is
+the time since the previous kept row; `n_raw` is the number of reports it stands
+for; `n_collapsed_dups`, `n_no_position` and `n_outliers_raw` split that count;
+`sum_speed` / `n_speed` give a count-weighted mean speed; `max_dev_nm` is how far
+a collapsed report was from the kept one; `keep_reason` is a bitmask. Duplicates
+(the same message heard by another receiver) are collapsed into the kept row and
+counted, not kept; they are only detected within the day.
+
+The report printed at the end shows how many rows each policy keeps and why, and
+checks that `represented` equals `routed`. Run it dry on a real day first: how
+much thinning saves depends on your traffic mix (many reports are duplicates
+from overlapping receivers, and moored vessels are already sparse).
+
+Measured on synthetic days from `gen-day` (a mix of moored, underway and class B
+vessels, 40% of reports duplicated across receivers), release build, one machine:
+
+| Reports | Buckets | Kept | Time | Peak memory | Scratch |
+|---|---|---|---|---|---|
+| 2.4 M | 1 | 26.9% | 3 s | 302 MB | 0.05 GB |
+| 61 M | 21 | 27.1% | 44 s | 335 MB | 1.3 GB |
+| 183 M | 61 | 27.1% | 131 s | 431 MB | 3.8 GB |
+
+Memory stays flat as the day grows because it is set by the bucket size
+(`--target-bucket-rows`, default 3 million reports, about 56 bytes each while
+loaded), not by the day. Scratch is about 21 bytes per report, so a 500 M report
+day needs roughly 10 GB. These are synthetic numbers; the retention on real
+traffic will differ. `gen-day --out DIR --rows N` writes such a day.
+
+Not yet wired into the Iceberg pipeline: the reduced rows are not yet written to
+a table, and `tracks`, `stops` and `voyages` still read `track_points`. The
+downstream SQL needs to weight by `n_raw` before it can read thinned rows.
+
 ## Operating it
 
 **Order.** `ports load` once per release. Then `track-points`, `tracks` and

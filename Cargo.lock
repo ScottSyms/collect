@@ -69,8 +69,12 @@ dependencies = [
  "futures-util",
  "iceberg",
  "iceberg-datafusion",
+ "libc",
+ "parquet",
+ "rand 0.8.6",
  "tempfile",
  "tokio",
+ "zstd",
 ]
 
 [[package]]

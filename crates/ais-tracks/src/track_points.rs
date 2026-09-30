@@ -22,11 +22,7 @@ use iceberg::spec::{NestedField, PrimitiveType, Schema};
 
 pub const TABLE_TRACK_POINTS: &str = "track_points";
 
-/// Earth radius in nautical miles (mean).
-const EARTH_RADIUS_NM: f64 = 3440.065;
-
-/// Two positions this far apart within the same second count as a jump.
-const SAME_SECOND_JUMP_NM: f64 = 0.05;
+use crate::params::{EARTH_RADIUS_NM, SAME_SECOND_JUMP_NM};
 
 /// The silver columns carried through, in silver order.
 const POSITION_COLUMNS: [&str; 20] = [

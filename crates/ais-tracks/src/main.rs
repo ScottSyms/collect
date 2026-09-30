@@ -6,6 +6,9 @@ use anyhow::{Context, Result};
 use ais_tracks::output::{commit_day, ensure_day_table, replace_table, write_day_shard};
 use ais_tracks::track_points::{self, FlagCounts, Params, TABLE_TRACK_POINTS};
 use ais_tracks::ports::{self, TABLE_REF_PORTS};
+use ais_tracks::reduce::{Rules, ThinOpts};
+use ais_tracks::reduce_day::{self, ReduceOptions};
+use ais_tracks::source;
 use ais_tracks::stops::{self, StopParams, TABLE_STOPS, TABLE_STOP_SEGMENTS};
 use ais_tracks::tracks::{self, TABLE_TRACKS};
 use ais_tracks::voyages::{self, TABLE_VOYAGES};
@@ -68,6 +71,11 @@ enum Command {
     Stops(ApplyArgs),
     /// Build the legs between consecutive stops.
     Voyages(VoyagesArgs),
+    /// Route and reduce one day of raw reports with bounded memory: duplicates,
+    /// movement and outlier flags, and optional thinning. Reads the silver
+    /// `positions` table, or `--source-dir`; writes Parquet under `--out-dir`,
+    /// or with no `--out-dir` only reports what would be kept.
+    ReduceDay(ReduceDayArgs),
     /// Print shell completions to stdout.
     Completions { shell: clap_complete::Shell },
 }
@@ -214,6 +222,156 @@ struct VoyagesArgs {
     apply: bool,
 }
 
+#[derive(Args, Debug)]
+struct ReduceDayArgs {
+    /// The UTC day to reduce, YYYY-MM-DD.
+    #[arg(long, value_parser = clap::value_parser!(NaiveDate))]
+    day: NaiveDate,
+
+    /// Read Parquet files under this directory instead of the silver table (no
+    /// catalog needed).
+    #[arg(long)]
+    source_dir: Option<std::path::PathBuf>,
+
+    /// Write the reduced rows as a Parquet file under this directory.
+    #[arg(long)]
+    out_dir: Option<std::path::PathBuf>,
+
+    /// Scratch space for the bucket files (about 15 bytes per raw report,
+    /// compressed).
+    #[arg(long, default_value_os_t = std::env::temp_dir().join("ais-tracks"))]
+    scratch: std::path::PathBuf,
+
+    /// Keep the scratch files afterwards.
+    #[arg(long)]
+    keep_scratch: bool,
+
+    /// Number of buckets. Default: about one per --target-bucket-rows reports.
+    #[arg(long)]
+    buckets: Option<usize>,
+
+    /// Reports per bucket to aim for; a bucket is held in memory (about 56
+    /// bytes per report) while it is reduced.
+    #[arg(long, default_value_t = 3_000_000)]
+    target_bucket_rows: u64,
+
+    /// Keep every row instead of thinning (the output then equals
+    /// `track-points`).
+    #[arg(long)]
+    no_thin: bool,
+
+    /// Keep a row when the vessel has moved this far (nautical miles) since the
+    /// last kept row.
+    #[arg(long, default_value_t = 0.1)]
+    keep_distance_nm: f64,
+
+    /// Keep a row when this many seconds have passed since the last kept row.
+    #[arg(long, default_value_t = 120.0)]
+    keep_interval_s: f64,
+
+    /// Keep a row when the course changed by this many degrees while moving.
+    #[arg(long, default_value_t = 15.0)]
+    keep_turn_deg: f64,
+
+    /// Keep a row when the speed changed by this many knots.
+    #[arg(long, default_value_t = 2.0)]
+    keep_speed_kn: f64,
+
+    /// Implied speed above which a point is a speed jump.
+    #[arg(long, default_value_t = 60.0)]
+    max_speed_kn: f64,
+
+    /// A longer silence than this many minutes marks a gap.
+    #[arg(long, default_value_t = 30)]
+    gap_minutes: i64,
+}
+
+async fn reduce_day_cmd(cli: &Cli, a: &ReduceDayArgs) -> Result<i32> {
+    let (start_us, end_us) = source::day_bounds_us(a.day);
+    let opts = ReduceOptions {
+        rules: Rules {
+            max_speed_kn: a.max_speed_kn,
+            gap_s: (a.gap_minutes * 60) as f64,
+        },
+        thin: if a.no_thin {
+            ThinOpts::off()
+        } else {
+            ThinOpts {
+                off: false,
+                keep_distance_nm: a.keep_distance_nm,
+                keep_interval_s: a.keep_interval_s,
+                keep_turn_deg: a.keep_turn_deg,
+                keep_speed_kn: a.keep_speed_kn,
+            }
+        },
+        buckets: a.buckets,
+        target_bucket_rows: a.target_bucket_rows,
+        scratch: a.scratch.clone(),
+    };
+
+    let (stream, est) = match &a.source_dir {
+        Some(dir) => source::parquet_dir_day(dir, start_us, end_us).await?,
+        None => {
+            cli.iceberg.validate()?;
+            anyhow::ensure!(
+                cli.iceberg.is_iceberg_mode(),
+                "give --source-dir, or --iceberg-catalog-uri to read the silver table"
+            );
+            let input = IcebergConfig::from(&cli.iceberg);
+            let catalog = open_catalog(&input).await?;
+            let table = catalog
+                .load_table(&table_ident(&input, TABLE_POSITIONS))
+                .await
+                .context("loading the silver positions table")?;
+            source::iceberg_day(&table, start_us, end_us).await?
+        }
+    };
+    println!("{}: about {est} reports", a.day);
+
+    let label = reduce_day::scratch_label(a.day);
+    let started = std::time::Instant::now();
+    let manifest = reduce_day::route_day(stream, est, start_us, end_us, &label, &opts).await?;
+    let route_time = started.elapsed();
+    println!("routing done in {:.1}s; peak memory so far {:.0} MB", route_time.as_secs_f64(), reduce_day::peak_rss_bytes() as f64 / 1e6);
+
+    let mut writer: Option<parquet::arrow::ArrowWriter<std::fs::File>> = None;
+    let mut sink = |batch: arrow::record_batch::RecordBatch| -> Result<()> {
+        if let Some(dir) = &a.out_dir {
+            if writer.is_none() {
+                std::fs::create_dir_all(dir)?;
+                let props = parquet::file::properties::WriterProperties::builder()
+                    .set_compression(parquet::basic::Compression::ZSTD(
+                        parquet::basic::ZstdLevel::try_new(3)?,
+                    ))
+                    .set_max_row_group_size(128 * 1024)
+                    .build();
+                let file = std::fs::File::create(dir.join(format!("thin-{}.parquet", a.day)))?;
+                writer = Some(parquet::arrow::ArrowWriter::try_new(file, batch.schema(), Some(props))?);
+            }
+            writer.as_mut().expect("writer").write(&batch)?;
+        }
+        Ok(())
+    };
+    let result = reduce_day::reduce_buckets(&manifest, &opts, &Default::default(), &mut sink);
+    if let Some(w) = writer {
+        w.close()?;
+    }
+    if !a.keep_scratch {
+        manifest.cleanup();
+    }
+    let mut stats = result?;
+    stats.route_time = route_time;
+    print!("{}", stats.report(opts.thin.off));
+    match &a.out_dir {
+        Some(d) => println!("wrote {}", d.join(format!("thin-{}.parquet", a.day)).display()),
+        None => println!("dry run; pass --out-dir to write the reduced rows"),
+    }
+    if stats.routed == 0 {
+        return Ok(exitcode::NOTHING_TO_DO);
+    }
+    Ok(exitcode::SUCCESS)
+}
+
 #[tokio::main]
 async fn main() {
     match run().await {
@@ -247,6 +405,9 @@ async fn run() -> Result<i32> {
     if let Command::Completions { shell } = &cli.command {
         collect_core::print_completions::<Cli>(*shell, "ais-tracks");
         return Ok(exitcode::SUCCESS);
+    }
+    if let Command::ReduceDay(a) = &cli.command {
+        return reduce_day_cmd(&cli, a).await;
     }
     cli.iceberg.validate()?;
     anyhow::ensure!(
@@ -748,7 +909,7 @@ async fn run() -> Result<i32> {
                 if r.created { " (created)" } else { "" }
             );
         }
-        Command::Completions { .. } => unreachable!(),
+        Command::ReduceDay(_) | Command::Completions { .. } => unreachable!(),
     }
     Ok(exitcode::SUCCESS)
 }

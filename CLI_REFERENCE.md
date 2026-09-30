@@ -360,6 +360,7 @@ to the output namespace. `--iceberg-table-prefix` applies to the input only.
 | `stop-segments` | `--from`, `--to`, `--shards` (4), `--slow-kn` (0.5), `--smooth-minutes` (10), `--resume-nm` (1.0), `--min-stop-minutes` (30), `--apply` | Stationary runs per day, chained across midnight by `stop_id` |
 | `stops` | `--apply` | Merges `stop_segments` into stops and matches the nearest port |
 | `voyages` | `--no-declared`, `--apply` | Legs between consecutive stops, with distance and declared destination |
+| `reduce-day` | `--day`, `--source-dir`, `--out-dir`, `--scratch`, `--buckets`, `--target-bucket-rows` (3000000), `--no-thin`, `--keep-distance-nm` (0.1), `--keep-interval-s` (120), `--keep-turn-deg` (15), `--keep-speed-kn` (2), `--max-speed-kn` (60), `--gap-minutes` (30) | Memory-bounded reduction of one day of raw reports: routes to on-disk vessel buckets, flags and optionally thins. Dry run unless `--out-dir` is given; needs no catalog with `--source-dir`. See [AIS_TRACKS.md](AIS_TRACKS.md#running-at-scale-reduce-day) |
 
 Notes:
 
