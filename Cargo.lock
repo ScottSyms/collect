@@ -60,6 +60,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrow",
+ "async-trait",
+ "axum",
  "chrono",
  "clap",
  "clap_complete",
@@ -72,6 +74,7 @@ dependencies = [
  "libc",
  "parquet",
  "rand 0.8.6",
+ "serde_json",
  "tempfile",
  "tokio",
  "uuid",

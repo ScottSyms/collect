@@ -5,88 +5,20 @@
 //! (arrives 11:00), lies there across midnight until 03:00 the next day, then
 //! sails on and is last seen underway. Vessel 366000002 never stops.
 
+mod support;
+
 use std::sync::Arc;
 
-use ais_tracks::reduce::{Dicts, RawPoint, Rules, ThinOpts};
-use ais_tracks::reduce_day::reduce_all;
+use support::scenario::{day, raw_points, scenario, NAVS, H};
+
+use ais_tracks::reduce::{Dicts, Rules, ThinOpts};
 use ais_tracks::{carry, ports, stops, tracks, voyages};
 use arrow::array::{new_null_array, Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray};
 use arrow::record_batch::RecordBatch;
 use arrow::util::display::array_value_to_string;
-use chrono::{DateTime, Duration, TimeZone, Utc};
+use chrono::{DateTime, Duration};
 use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
-
-/// Longitude degrees per second at 12 knots, at latitude 10 degrees.
-const DEG_PER_S: f64 = 12.0 / 3600.0 / 59.09;
-const H: i64 = 3600;
-
-fn day(n: i64) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 3, 10, 0, 0, 0).unwrap() + Duration::days(n)
-}
-
-/// (mmsi, seconds from day 0, lat, lon, sog, nav_status)
-type Pt = (i64, i64, f64, f64, f64, &'static str);
-
-/// `step` is the reporting interval in seconds.
-fn scenario(step: i64) -> Vec<Pt> {
-    let mut v = Vec::new();
-    let jitter = |i: i64| if i % 2 == 0 { 0.0005 } else { -0.0005 };
-    // Alpha, 00:00-06:00
-    let (mut t, mut i) = (0, 0);
-    while t <= 6 * H {
-        v.push((366000001, t, 10.0 + jitter(i), 20.0 + jitter(i + 1), 0.1, "moored"));
-        t += step;
-        i += 1;
-    }
-    // Underway 06:00-11:00
-    let mut t = 6 * H + step;
-    while t < 11 * H {
-        v.push((366000001, t, 10.0, 20.0 + (t - 6 * H) as f64 * DEG_PER_S, 12.0, "under way using engine"));
-        t += step;
-    }
-    let beta = 20.0 + 5.0 * H as f64 * DEG_PER_S;
-    // Beta, 11:00 until 03:00 the next day
-    let (mut t, mut i) = (11 * H, 0);
-    while t <= 27 * H {
-        v.push((366000001, t, 10.0 + jitter(i), beta + jitter(i + 1), 0.05, "moored"));
-        t += step;
-        i += 1;
-    }
-    // Underway again 27:00-33:00, then last seen
-    let mut t = 27 * H + step;
-    while t < 33 * H {
-        v.push((366000001, t, 10.0, beta + (t - 27 * H) as f64 * DEG_PER_S, 12.0, "under way using engine"));
-        t += step;
-    }
-    // Vessel 2 keeps moving throughout
-    let mut t = 0;
-    while t <= 1000 * 60 {
-        v.push((366000002, t, 30.0, 40.0 + t as f64 * DEG_PER_S, 12.0, "under way using engine"));
-        t += step;
-    }
-    v
-}
-
-const NAVS: [&str; 2] = ["moored", "under way using engine"];
-
-fn raw_points(rows: &[Pt]) -> Vec<RawPoint> {
-    let base = day(0).timestamp() * 1_000_000;
-    rows.iter()
-        .map(|r| RawPoint {
-            ts_us: base + r.1 * 1_000_000,
-            mmsi: r.0 as u32,
-            lat_e7: Some((r.2 * 1e7).round() as i32),
-            lon_e7: Some((r.3 * 1e7).round() as i32),
-            sog_dk: Some((r.4 * 10.0).round() as i16),
-            cog_dd: Some(900),
-            heading_dd: None,
-            nav: Some(NAVS.iter().position(|n| *n == r.5).unwrap() as u16),
-            source: 0,
-            station: None,
-        })
-        .collect()
-}
 
 /// (mmsi, hours after day 0, destination)
 fn statics_table(rows: &[(i64, f64, &str)]) -> MemTable {

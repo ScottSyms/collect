@@ -16,13 +16,14 @@ options as the other binaries. New to the project? [TUTORIAL.md](TUTORIAL.md)
 covers Iceberg output first; this page is a reference for this one binary.
 Flags are also listed in [CLI_REFERENCE.md](CLI_REFERENCE.md#ais-tracks).
 
-> **Status.** The SQL and the reducer are covered by tests on synthetic data,
-> including a two-day run through every table with thinning on and off, and the
-> reducer is held to row-for-row agreement with the original SQL. The day writer
-> is tested against a real Iceberg table on the local filesystem. What has not
-> been exercised is a live catalog: the silver scan (`positions`), the
-> previous-day state read, and the commits. They reuse the commit code of
-> [`ais-compact`](AIS_COMPACT.md); try `--apply` on a scratch namespace first.
+> **Status.** Tested on synthetic data at every level: the SQL, the reducer
+> (held to row-for-row agreement with the original SQL), the whole chain with
+> thinning on and off, and the daily flow end to end against real Iceberg tables
+> on the local filesystem (a test catalog and a small stand-in for the REST
+> commit endpoint), covering first builds, reruns, late data and forced ranges.
+> What has not been exercised is a live REST/S3 catalog such as RustFS or
+> Lakekeeper: the commits reuse [`ais-compact`](AIS_COMPACT.md)'s code, but try
+> `--apply` on a scratch namespace first.
 
 ## Contents
 
@@ -32,7 +33,7 @@ Flags are also listed in [CLI_REFERENCE.md](CLI_REFERENCE.md#ais-tracks).
 - [Namespaces and table names](#namespaces-and-table-names)
 - [Commands](#commands): [`vessels`](#vessels), [`ports load`](#ports-load),
   [`track-points`](#track-points), [`tracks`](#tracks),
-  [`stop-segments`](#stop-segments), [`stops`](#stops), [`voyages`](#voyages)
+  [`stop-segments`](#stop-segments), [`stops`](#stops), [`voyages`](#voyages), and [`daily` and catch-up](#daily-and-catch-up)
 - [Operating it](#operating-it)
 - [Querying the results](#querying-the-results)
 - [Limits and known gaps](#limits-and-known-gaps)
@@ -73,6 +74,8 @@ Flags are also listed in [CLI_REFERENCE.md](CLI_REFERENCE.md#ais-tracks).
 | `stop_segments` | stationary run, per UTC day | daily | day of `ts` (first point) |
 | `stops` | stop (the day pieces merged) | rebuilt each run | none |
 | `voyages` | leg between stops | rebuilt each run | none |
+| `vessel_state` | vessel's last positioned report, as of the end of a built day | daily | day it is as of |
+| `build_log` | step and day built, with what it was built from | appended after each build | none |
 
 ```
 statics ─────────────────────────────► vessel_attributes ─► vessels
@@ -111,6 +114,16 @@ ais-tracks $CAT --output-namespace curated stop-segments  $D --apply
 # Rebuilt from the above
 ais-tracks $CAT --output-namespace curated stops   --apply
 ais-tracks $CAT --output-namespace curated voyages --apply
+```
+
+Or let it work out what needs doing, and do only that:
+
+```bash
+# Build every completed day that is new or whose input changed since:
+ais-tracks $CAT --output-namespace curated daily --catch-up --apply
+
+# Just say which days that would be, and why:
+ais-tracks $CAT --output-namespace curated daily --catch-up --plan
 ```
 
 Drop `--apply` from any line to see what it would do first.
@@ -448,23 +461,65 @@ with the unthinned answer. Stop and leg boundaries blur by up to about half the
 speed-smoothing window (5 minutes) with dense reports, and thinning adds up to
 one `--keep-interval-s` to that; this is tested (`tests/pipeline.rs`).
 
+## `daily` and catch-up
+
+`track-points`, `tracks` and `stop-segments` take the same day selection, and
+`daily` runs the three in order for it:
+
+| Flag | Meaning |
+|------|---------|
+| `--from D [--to D]` | exactly these days, always rebuilt |
+| `--catch-up` | the days that have input and need building (below), up to yesterday |
+| `--full` | with `--catch-up`, rebuild every day in range whatever the log says |
+| `--include-today` | with `--catch-up`, include today (UTC), which is still filling |
+| `--plan` | say which days would be built, and why, without building |
+
+Two small tables make this work:
+
+- **`vessel_state`** holds each vessel's last positioned report as of the end of
+  each built day. The next day reads that one small partition instead of
+  scanning the previous day's output.
+- **`build_log`** gets one row per step and day, appended *after* the day's data
+  is committed, so a day counts as built only once its row exists. A crash in
+  between just means the day is rebuilt, which is safe because a rebuild
+  replaces the day's partition. Each row records an `input_token` for what the
+  day was built from.
+
+A day is rebuilt when the token it would have now differs from the logged one.
+For `track_points` the token is the day's silver row count plus a digest of the
+vessel states it starts from, so late data in silver triggers a rebuild, and a
+rebuilt earlier day triggers the next one **only if some vessel's end-of-day
+position actually changed**: a late report that leaves every vessel's last
+position alone does not ripple forward. For `tracks` and `stop_segments` the
+token is the `track_points` build they read plus the previous day's build of the
+same step, because their ids chain across midnight; they are rebuilt whenever
+either neighbour was, which is conservative but simple. (Snapshot summaries would
+be the usual place for this, but they describe the whole table.)
+
+Days are built in date order. Days with no input are reported and skipped.
+`--plan` cannot say which later days a rebuilt day will ripple into, since that
+depends on the states it produces; it marks them "follows a rebuilt day".
+
+Exit code `2` means nothing needed building, which suits a scheduler.
+
 ## Operating it
 
-**Order.** `ports load` once per release. Then `track-points`, `tracks` and
-`stop-segments` for each day in date order, then `stops` and `voyages`. A
+**Order.** `ports load` once per release. Then, per day, `track-points`,
+`tracks`, `stop-segments` (or just `daily`), then `stops` and `voyages`. A
 missing input is reported by name ("run track-points first").
 
-**Daily runs.** After a day is complete, run the three daily steps for it, then
-`stops` and `voyages`. Days that are not over yet can be built (`track-points` prints a
-note) and are rebuilt when run again.
+**Daily runs.** Schedule `daily --catch-up --apply` after the day ends. It builds
+yesterday, and rebuilds any earlier day whose silver data changed, with
+everything else skipped. Follow it with `stops` and `voyages` (still full
+rebuilds).
 
-**Reruns and backfills.** Rerunning a day replaces only that day's partition.
-Because `tracks` and `stop_segments` inherit ids from the previous day,
-rebuilding an earlier day means rebuilding the days after it, or their chains
-will point at stale ids. A run of consecutive days carries the previous day's
-state in memory; a run that starts mid-history reads it from the table. Where
-the previous day is absent, the piece is flagged (`chain_broken`) rather than
-guessed.
+**Reruns and backfills.** Rerunning a day replaces only that day's partition,
+and `--catch-up` works out what needs it. With explicit `--from/--to`, rebuilding
+an earlier day means rebuilding the days after it, or their chains will point at
+stale ids (`--catch-up` does this for you). A run of consecutive days carries the
+previous day's state in memory; a run that starts mid-history reads it from
+`vessel_state`. Where the previous day is absent, the piece is flagged
+(`chain_broken`) rather than guessed.
 
 **Memory.** `track-points` holds one bucket at a time (`--target-bucket-rows`);
 `tracks` and `stop-segments` split each day's vessels into `--shards` chunks
