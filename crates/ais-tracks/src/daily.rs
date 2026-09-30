@@ -20,7 +20,6 @@ use collect_core::iceberg::{
     TABLE_STATICS,
 };
 use collect_maint::commit::RestClient;
-use collect_maint::rewrite::live_files;
 use datafusion::prelude::SessionContext;
 use iceberg::spec::PartitionSpecBuilder;
 use iceberg::Catalog;
