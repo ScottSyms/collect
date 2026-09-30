@@ -41,6 +41,7 @@ pub const TABLE_VESSEL_ATTRIBUTES: &str = "vessel_attributes";
 pub const TABLE_VESSEL_DAILY: &str = "vessel_daily";
 pub const TABLE_ATTRIBUTE_DAILY: &str = "attribute_daily";
 pub const TABLE_STATIC_DAILY: &str = "static_daily";
+pub const TABLE_DESTINATION_DAILY: &str = "destination_daily";
 
 /// Attributes tracked per MMSI, as they appear in `vessel_attributes.attribute`.
 pub const ATTRIBUTES: [&str; 6] = [
@@ -121,6 +122,10 @@ pub fn vessel_attributes_schema() -> Schema {
 }
 
 /// One row per vessel and day; `ts` is the start of the day (the partition column).
+///
+/// The first block is about identity (every report counts). The rest is the
+/// day's movement, in the terms `voyages` needs: over the day's `track_points`
+/// rows, so a leg lying wholly inside a day can be totalled without reading them.
 pub fn vessel_daily_schema() -> Schema {
     schema(
         vec![
@@ -129,8 +134,32 @@ pub fn vessel_daily_schema() -> Schema {
             required(3, "first_seen", PrimitiveType::Timestamptz),
             required(4, "last_seen", PrimitiveType::Timestamptz),
             required(5, "n_positions", PrimitiveType::Long),
+            optional(6, "first_stream_ts", PrimitiveType::Timestamptz),
+            optional(7, "last_stream_ts", PrimitiveType::Timestamptz),
+            required(8, "n_points", PrimitiveType::Long),
+            required(9, "dist_nm_raw", PrimitiveType::Double),
+            required(10, "dist_nm_clean", PrimitiveType::Double),
+            required(11, "n_gaps", PrimitiveType::Long),
+            required(12, "n_outliers", PrimitiveType::Long),
+            optional(13, "max_sog_knots", PrimitiveType::Double),
         ],
         "vessel_daily",
+    )
+}
+
+/// The destinations a vessel declared on a day, with how often and the latest
+/// ETA it gave with them.
+pub fn destination_daily_schema() -> Schema {
+    schema(
+        vec![
+            required(1, "ts", PrimitiveType::Timestamptz),
+            required(2, "mmsi", PrimitiveType::Long),
+            required(3, "destination", PrimitiveType::String),
+            required(4, "n", PrimitiveType::Long),
+            required(5, "last_ts", PrimitiveType::Timestamptz),
+            optional(6, "eta", PrimitiveType::Timestamptz),
+        ],
+        "destination_daily",
     )
 }
 
@@ -221,6 +250,17 @@ obs AS (
 )
 SELECT mmsi, attribute, value, count(*) AS n_obs, min(ts) AS first_seen, max(ts) AS last_seen
 FROM obs GROUP BY mmsi, attribute, value"
+    )
+}
+
+/// The destinations declared, with counts, over a table with silver's `statics`
+/// columns. `@` padding and blanks are not destinations.
+pub fn dest_parts_sql(src: &str) -> String {
+    format!(
+        "SELECT mmsi, dest AS destination, count(*) AS n, max(ts) AS last_ts, max(eta) AS eta \
+         FROM (SELECT mmsi, ts, eta, regexp_replace(trim(destination), '[@ ]+$', '') AS dest \
+               FROM {src} WHERE destination IS NOT NULL) x \
+         WHERE dest <> '' GROUP BY mmsi, dest"
     )
 }
 
@@ -481,14 +521,25 @@ pub fn with_day_ts(batch: &RecordBatch, day_start_us: i64, schema: &Schema) -> R
     Ok(RecordBatch::try_new(target, cols)?)
 }
 
-/// One vessel's day as the reducer saw it: every report counts, duplicates and
-/// rows without a position included.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// One vessel's day as the reducer saw it. `n_reports` counts every report
+/// (duplicates and rows without a position too); the rest is over the rows the
+/// reducer produced, with the definitions `voyages` uses for a leg.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct VesselDay {
     pub mmsi: u32,
     pub first_ts_us: i64,
     pub last_ts_us: i64,
     pub n_reports: i64,
+    /// First and last positioned, non-duplicate row.
+    pub first_stream_ts_us: Option<i64>,
+    pub last_stream_ts_us: Option<i64>,
+    /// Reports the day's rows stand for.
+    pub n_points: i64,
+    pub dist_nm_raw: f64,
+    pub dist_nm_clean: f64,
+    pub n_gaps: i64,
+    pub n_outliers: i64,
+    pub max_sog_knots: Option<f64>,
 }
 
 /// `vessel_daily` rows for `days`.
@@ -499,15 +550,32 @@ pub fn vessel_daily_batch(day_start_us: i64, days: &[VesselDay]) -> Result<Optio
     let ts = |f: &dyn Fn(&VesselDay) -> i64| -> ArrayRef {
         Arc::new(TimestampMicrosecondArray::from_iter_values(days.iter().map(f)).with_timezone("+00:00"))
     };
+    let opt_ts = |f: &dyn Fn(&VesselDay) -> Option<i64>| -> ArrayRef {
+        Arc::new(TimestampMicrosecondArray::from(days.iter().map(f).collect::<Vec<_>>()).with_timezone("+00:00"))
+    };
+    let i64s = |f: &dyn Fn(&VesselDay) -> i64| -> ArrayRef {
+        Arc::new(Int64Array::from_iter_values(days.iter().map(f)))
+    };
+    let f64s = |f: &dyn Fn(&VesselDay) -> f64| -> ArrayRef {
+        Arc::new(arrow::array::Float64Array::from_iter_values(days.iter().map(f)))
+    };
     let schema = Arc::new(iceberg::arrow::schema_to_arrow_schema(&vessel_daily_schema())?);
     Ok(Some(RecordBatch::try_new(
         schema,
         vec![
             ts(&|_| day_start_us),
-            Arc::new(Int64Array::from_iter_values(days.iter().map(|d| d.mmsi as i64))),
+            i64s(&|d| d.mmsi as i64),
             ts(&|d| d.first_ts_us),
             ts(&|d| d.last_ts_us),
-            Arc::new(Int64Array::from_iter_values(days.iter().map(|d| d.n_reports))),
+            i64s(&|d| d.n_reports),
+            opt_ts(&|d| d.first_stream_ts_us),
+            opt_ts(&|d| d.last_stream_ts_us),
+            i64s(&|d| d.n_points),
+            f64s(&|d| d.dist_nm_raw),
+            f64s(&|d| d.dist_nm_clean),
+            i64s(&|d| d.n_gaps),
+            i64s(&|d| d.n_outliers),
+            Arc::new(arrow::array::Float64Array::from_iter(days.iter().map(|d| d.max_sog_knots))),
         ],
     )?))
 }

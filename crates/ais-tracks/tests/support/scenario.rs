@@ -127,7 +127,7 @@ pub fn silver_batch(points: &[RawPoint], dicts: &Dicts) -> RecordBatch {
 
 /// (mmsi, seconds from the start of day `d`, imo, call sign, name, ship type, bow, stern, port, starboard, class)
 pub type Static = (i64, i64, Option<i32>, Option<&'static str>, Option<&'static str>, Option<&'static str>,
-              Option<i32>, Option<i32>, Option<i32>, Option<i32>, &'static str);
+              Option<i32>, Option<i32>, Option<i32>, Option<i32>, &'static str, Option<&'static str>);
 
 pub fn statics_batch(d: i64, rows: &[Static]) -> RecordBatch {
     let schema = Arc::new(
@@ -164,6 +164,7 @@ pub fn statics_batch(d: i64, rows: &[Static]) -> RecordBatch {
                 "dimension_to_stern" => i(&|r| r.7),
                 "dimension_to_port" => i(&|r| r.8),
                 "dimension_to_starboard" => i(&|r| r.9),
+                "destination" => s(&|r| r.11),
                 _ => new_null_array(f.data_type(), n),
             }
         })
@@ -171,3 +172,117 @@ pub fn statics_batch(d: i64, rows: &[Static]) -> RecordBatch {
     RecordBatch::try_new(schema, cols).unwrap()
 }
 
+
+
+// ---- a fleet -------------------------------------------------------------------------------
+
+/// Four ports 60 nautical miles apart along latitude 10 degrees.
+pub const FLEET_PORT_LONS: [f64; 4] = [20.0, 21.01535, 22.0307, 23.04605];
+pub const FLEET_DEST: [&str; 4] = ["ALPHA@@", "BETA@@", "GAMMA@@", "DELTA@@"];
+pub const FLEET_PORTS_CSV: &str = "OID_,World Port Index Number,Region Name,Main Port Name,Alternate Port Name,UN/LOCODE,Country Code,Harbor Size,Harbor Type,Harbor Use,Channel Depth (m),Maximum Vessel Draft (m),Tidal Range (m),Latitude,Longitude
+1,1.0,Test,Alpha,,AA ALP,Aland,Large,Coastal (Natural),Unknown,,,,10.0,20.0
+2,2.0,Test,Beta,,BB BET,Bland,Medium,Coastal (Natural),Unknown,,,,10.0,21.01535
+3,3.0,Test,Gamma,,CC GAM,Cland,Large,Coastal (Natural),Unknown,,,,10.0,22.0307
+4,4.0,Test,Delta,,DD DEL,Dland,Medium,Coastal (Natural),Unknown,,,,10.0,23.04605
+";
+
+/// One stretch of a vessel's life.
+#[derive(Clone, Copy, Debug)]
+pub enum Seg {
+    /// Lie at a port (by index) for some hours, reporting.
+    Berth(usize, f64),
+    /// Sail from where it is to a port at 12 knots.
+    Sail(usize),
+    /// Report nothing for some hours, staying put.
+    Silent(f64),
+    /// Sail east at 12 knots for some hours without going anywhere.
+    Cruise(f64),
+}
+
+#[derive(Clone, Debug)]
+pub struct FleetVessel {
+    pub mmsi: i64,
+    /// Seconds after the start of day 0 that its first report is made.
+    pub start_s: i64,
+    pub start_lon: f64,
+    pub segs: Vec<Seg>,
+    /// Declare this destination while sailing, whatever the real one.
+    pub declares: Option<usize>,
+}
+
+pub fn fleet_vessels() -> Vec<FleetVessel> {
+    use Seg::*;
+    let v = |mmsi, start_s, start_lon, segs, declares| FleetVessel { mmsi, start_s, start_lon, segs, declares };
+    vec![
+        // A long passage through four ports, with a long stay at the second.
+        v(366000001, 0, 20.0, vec![Berth(0, 5.0), Sail(1), Berth(1, 30.0), Sail(2), Berth(2, 4.0), Sail(3), Berth(3, 20.0)], None),
+        // Shuttles between two ports, so several stops and legs fall in one day,
+        // and declares the wrong destination.
+        v(366000002, 0, 20.0, vec![
+            Berth(0, 1.0), Sail(1), Berth(1, 2.0), Sail(0), Berth(0, 1.5), Sail(1), Berth(1, 2.0), Sail(0),
+            Berth(0, 1.0), Sail(1), Berth(1, 2.0), Sail(0), Berth(0, 2.0),
+        ], Some(0)),
+        // First seen part-way along a passage.
+        v(366000003, 0, 20.5, vec![Sail(1), Berth(1, 50.0), Sail(0)], None),
+        // Never stops.
+        v(366000004, 0, 30.0, vec![Cruise(90.0)], None),
+        // First seen already berthed, on day 1.
+        v(366000005, 34 * 3600, 22.0307, vec![Berth(2, 40.0), Sail(3)], None),
+        // Goes quiet while berthed for 30 hours, then sails.
+        v(366000006, 0, 20.0, vec![Berth(0, 3.0), Sail(1), Berth(1, 1.0), Silent(30.0), Sail(2), Berth(2, 10.0)], None),
+    ]
+}
+
+/// The fleet's reports every `step` seconds over `days` days, and the
+/// destinations the vessels declare (mmsi, seconds from day 0, index into
+/// [`FLEET_DEST`]).
+pub fn fleet(step: i64, days: i64) -> (Vec<Pt>, Vec<(i64, i64, usize)>) {
+    let horizon = days * 86_400;
+    let (mut pts, mut dests) = (Vec::new(), Vec::new());
+    for v in fleet_vessels() {
+        let (mut t, mut lon, mut i) = (v.start_s, v.start_lon, 0i64);
+        let jitter = |i: i64| if i % 2 == 0 { 0.0005 } else { -0.0005 };
+        for seg in &v.segs {
+            match *seg {
+                Seg::Berth(p, hours) => {
+                    lon = FLEET_PORT_LONS[p];
+                    let end = t + (hours * 3600.0) as i64;
+                    while t < end && t < horizon {
+                        pts.push((v.mmsi, t, 10.0 + jitter(i), lon + jitter(i + 1), 0.1, "moored"));
+                        t += step;
+                        i += 1;
+                    }
+                    t = end;
+                }
+                Seg::Sail(p) => {
+                    let target = FLEET_PORT_LONS[p];
+                    let dur = ((target - lon).abs() * 59.09 / 12.0 * 3600.0) as i64;
+                    let (t0, lon0) = (t, lon);
+                    while t < t0 + dur && t < horizon {
+                        let frac = (t - t0) as f64 / dur as f64;
+                        pts.push((v.mmsi, t, 10.0, lon0 + (target - lon0) * frac, 12.0, "under way using engine"));
+                        if (t - t0) % 3600 < step {
+                            dests.push((v.mmsi, t, v.declares.unwrap_or(p)));
+                        }
+                        t += step;
+                    }
+                    t = t0 + dur;
+                    lon = target;
+                }
+                Seg::Silent(hours) => t += (hours * 3600.0) as i64,
+                Seg::Cruise(hours) => {
+                    let end = t + (hours * 3600.0) as i64;
+                    while t < end && t < horizon {
+                        lon += DEG_PER_S * step as f64;
+                        pts.push((v.mmsi, t, 10.0, lon, 12.0, "under way using engine"));
+                        t += step;
+                    }
+                    t = end;
+                }
+            }
+        }
+    }
+    pts.retain(|p| p.1 < horizon);
+    pts.sort_by_key(|p| (p.1, p.0));
+    (pts, dests)
+}

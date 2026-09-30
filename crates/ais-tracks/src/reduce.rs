@@ -338,12 +338,13 @@ pub fn reduce_vessel(
         };
     }
     pts.sort_by(|a, b| cmp_points(a, b, dicts));
-    let summary = Some(crate::vessels::VesselDay {
+    let base_summary = crate::vessels::VesselDay {
         mmsi: pts[0].mmsi,
         first_ts_us: pts[0].ts_us,
         last_ts_us: pts[n - 1].ts_us,
         n_reports: n as i64,
-    });
+        ..Default::default()
+    };
 
     // Duplicate groups: consecutive rows with identical content.
     let mut dup_rank = vec![1i32; n];
@@ -507,6 +508,7 @@ pub fn reduce_vessel(
                 r
             })
             .collect();
+        let summary = Some(day_summary(base_summary, &rows));
         return Reduced {
             rows,
             state,
@@ -697,12 +699,44 @@ pub fn reduce_vessel(
             None => unaccounted_raw = pending.n_raw as usize,
         }
     }
+    let summary = Some(day_summary(base_summary, &rows));
     Reduced {
         rows,
         state,
         unaccounted_raw,
         summary,
     }
+}
+
+/// Fills in the movement part of a vessel's day from the rows produced for it,
+/// using the same definitions `voyages` applies to a leg: distance counts only
+/// positioned, non-duplicate rows that do not follow a reporting gap (and, for
+/// the clean total, are not speed jumps).
+fn day_summary(
+    mut d: crate::vessels::VesselDay,
+    rows: &[OutRow],
+) -> crate::vessels::VesselDay {
+    for r in rows {
+        d.n_points += r.n_raw as i64;
+        d.n_outliers += r.n_outliers_raw as i64;
+        d.n_gaps += i64::from(r.gap_before);
+        if r.has_position && r.dup_rank == 1 {
+            d.first_stream_ts_us = Some(d.first_stream_ts_us.map_or(r.ts_us, |t| t.min(r.ts_us)));
+            d.last_stream_ts_us = Some(d.last_stream_ts_us.map_or(r.ts_us, |t| t.max(r.ts_us)));
+            if let Some(m) = r.max_sog {
+                d.max_sog_knots = Some(d.max_sog_knots.map_or(m, |x| x.max(m)));
+            }
+            if !r.gap_before {
+                if let Some(x) = r.dist_nm {
+                    d.dist_nm_raw += x;
+                    if !r.is_speed_jump {
+                        d.dist_nm_clean += x;
+                    }
+                }
+            }
+        }
+    }
+    d
 }
 
 // ---- output table ------------------------------------------------------------

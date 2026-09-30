@@ -14,13 +14,16 @@ use ais_tracks::output::{commit_day, ensure_day_table, DayWriter};
 use ais_tracks::reduce::{Dicts, RawPoint};
 use ais_tracks::reduce_day::ReduceOptions;
 use ais_tracks::state::{self, date_to_day, DaySelect, Log};
+use arrow::record_batch::RecordBatch;
 use chrono::Duration;
 use collect_core::iceberg::{ensure_namespace, table_ident, IcebergConfig};
 use collect_maint::commit::RestClient;
 use datafusion::prelude::SessionContext;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::Catalog;
-use support::scenario::{day, raw_points, scenario, silver_batch, statics_batch, Static, NAVS};
+use support::scenario::{
+    day, fleet, raw_points, scenario, silver_batch, statics_batch, Static, FLEET_DEST, FLEET_PORTS_CSV, NAVS,
+};
 use support::MockCatalog;
 
 struct Rig {
@@ -374,9 +377,9 @@ async fn stops_and_voyages_are_written_then_replaced_whole() {
 
 fn statics_for(d: i64) -> Vec<Static> {
     vec![
-        (366000001, 10 + d, Some(9811000), Some("ALPHA1"), Some("ALPHA SHIP@@"), Some("Cargo"), Some(200), Some(50), Some(15), Some(15), "Class A"),
-        (366000001, 20 + d, Some(9811000), Some("ALPHA1"), Some("ALPHA SHIP@@"), Some("Cargo"), Some(200), Some(50), Some(15), Some(15), "Class A"),
-        (366000002, 30 + d, None, None, Some("RUNNER"), Some("Tanker"), None, None, None, None, "Class A"),
+        (366000001, 10 + d, Some(9811000), Some("ALPHA1"), Some("ALPHA SHIP@@"), Some("Cargo"), Some(200), Some(50), Some(15), Some(15), "Class A", None),
+        (366000001, 20 + d, Some(9811000), Some("ALPHA1"), Some("ALPHA SHIP@@"), Some("Cargo"), Some(200), Some(50), Some(15), Some(15), "Class A", None),
+        (366000002, 30 + d, None, None, Some("RUNNER"), Some("Tanker"), None, None, None, None, "Class A", None),
     ]
 }
 
@@ -465,9 +468,13 @@ async fn vessels_are_folded_incrementally_and_always_match_a_rebuild_from_silver
 
 /// Reference ports appended the way `ports load` does.
 async fn load_ports(r: &Rig) {
+    load_ports_csv(r, PORTS_CSV).await;
+}
+
+async fn load_ports_csv(r: &Rig, text: &str) {
     use ais_tracks::ports::{load_csv, ref_ports_schema};
     let csv = r._dir.path().join("pub150.csv");
-    std::fs::write(&csv, PORTS_CSV).unwrap();
+    std::fs::write(&csv, text).unwrap();
     let batches = load_csv(csv.to_str().unwrap(), "2026-03-01").await.unwrap();
     let schema = ref_ports_schema();
     let table = collect_core::iceberg::ensure_table(
@@ -574,4 +581,178 @@ async fn stops_are_folded_day_by_day_and_always_match_a_full_build() {
     r.daily(&catch_up(), false).await;
     assert_ne!(r.stops_log_token(0).await, before, "day 0 was folded again");
     assert_eq!(r.stops_text().await, r.full_stops_text().await, "after a refold");
+}
+
+// ---- voyages -----------------------------------------------------------------------------
+
+const FLEET_STEP: i64 = 30;
+
+/// Every column that must match exactly. The destination stop's position and its
+/// distance to the port are left out: a leg records them as the stop stood on the
+/// day the leg ended, and a stop that carries on is refined afterwards.
+const VOYAGE_COLS: &str = "voyage_id, mmsi, depart_ts, arrive_ts, round(duration_s, 3) AS duration_s, \
+    origin_known, dest_known, is_open, origin_stop_id, dest_stop_id, \
+    round(origin_lat, 9) AS origin_lat, round(origin_lon, 9) AS origin_lon, origin_port_id, \
+    origin_port_name, origin_unlocode, origin_country, round(origin_port_distance_nm, 6) AS origin_port_distance_nm, \
+    dest_port_id, dest_port_name, dest_unlocode, dest_country, \
+    round(distance_nm_raw, 6) AS distance_nm_raw, round(distance_nm_clean, 6) AS distance_nm_clean, \
+    round(avg_speed_kn, 6) AS avg_speed_kn, round(max_sog_knots, 6) AS max_sog_knots, \
+    n_points, n_gaps, n_outliers, declared_destination, n_declared_destinations, declared_eta, \
+    declared_matches_dest";
+
+fn fleet_day_points(k: i64) -> Vec<RawPoint> {
+    let (pts, _) = fleet(FLEET_STEP, 4);
+    raw_points(&pts.into_iter().filter(|p| p.1 >= k * 86_400 && p.1 < (k + 1) * 86_400).collect::<Vec<_>>())
+}
+
+fn fleet_day_statics(k: i64) -> Vec<Static> {
+    let (pts, dests) = fleet(FLEET_STEP, 4);
+    let mut seen: Vec<i64> = pts.iter().filter(|p| p.1 / 86_400 == k).map(|p| p.0).collect();
+    seen.sort();
+    seen.dedup();
+    let mut rows: Vec<Static> = seen
+        .iter()
+        .map(|m| {
+            let name: &'static str = Box::leak(format!("SHIP {m}").into_boxed_str());
+            (*m, 60, None, None, Some(name), None, None, None, None, None, "Class A", None)
+        })
+        .collect();
+    for (m, t, d) in dests.into_iter().filter(|d| d.1 / 86_400 == k) {
+        rows.push((m, t % 86_400, None, None, None, None, None, None, None, None, "Class A", Some(FLEET_DEST[d])));
+    }
+    rows
+}
+
+impl Rig {
+    async fn has(&self, base: &str) -> bool {
+        self.cat.table_exists(&table_ident(&self.output, base)).await.unwrap()
+    }
+
+    /// `voyages` and `open_voyages` together, every column.
+    async fn voyages_batches(&self) -> Vec<RecordBatch> {
+        let ctx = SessionContext::new();
+        let mut parts = Vec::new();
+        for (base, alias) in [("voyages", "v"), ("open_voyages", "o")] {
+            if !self.has(base).await {
+                continue;
+            }
+            let raw = format!("raw_{alias}");
+            register_as(&ctx, &self.cat, &self.output, base, &raw).await.unwrap();
+            let t = ais_tracks::vessels::materialize(&ctx, &format!("SELECT * FROM {raw}")).await.unwrap();
+            ctx.register_table(alias, t).unwrap();
+            parts.push(format!("SELECT * FROM {alias}"));
+        }
+        if parts.is_empty() {
+            return Vec::new();
+        }
+        ctx.sql(&parts.join(" UNION ALL ")).await.unwrap().collect().await.unwrap()
+    }
+
+    /// The full computation over all of stops, track_points and statics.
+    async fn oracle_batches(&self) -> Vec<RecordBatch> {
+        let ctx = SessionContext::new();
+        register(&ctx, &self.cat, &self.output, "stops").await.unwrap();
+        register(&ctx, &self.cat, &self.output, "track_points").await.unwrap();
+        register(&ctx, &self.cat, &self.input, "statics").await.unwrap();
+        ais_tracks::voyages::build(&ctx, true).await.unwrap()
+    }
+}
+
+/// The incremental voyages must equal the full computation: exactly, except for
+/// the destination stop's position, which must agree closely.
+async fn assert_voyages_match(r: &Rig, what: &str) {
+    let (inc, ora) = (r.voyages_batches().await, r.oracle_batches().await);
+    assert!(!ora.is_empty(), "{what}: the full computation produced nothing");
+    assert!(!inc.is_empty(), "{what}: the incremental tables are empty");
+    let ctx = SessionContext::new();
+    for (name, b) in [("inc", inc), ("ora", ora)] {
+        ctx.register_table(name, Arc::new(datafusion::datasource::MemTable::try_new(b[0].schema(), vec![b]).unwrap()))
+            .unwrap();
+    }
+    let text = |t: &'static str| {
+        let ctx = ctx.clone();
+        async move {
+            let b = ctx
+                .sql(&format!("SELECT {VOYAGE_COLS} FROM {t} ORDER BY mmsi, depart_ts"))
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            arrow::util::pretty::pretty_format_batches(&b).unwrap().to_string()
+        }
+    };
+    assert_same_text(&text("inc").await, &text("ora").await, what);
+    let far = ctx
+        .sql(
+            "SELECT count(*) FROM inc i JOIN ora o ON i.voyage_id = o.voyage_id
+             WHERE abs(coalesce(i.dest_lat - o.dest_lat, 0)) > 0.02
+                OR abs(coalesce(i.dest_lon - o.dest_lon, 0)) > 0.02
+                OR abs(coalesce(i.dest_port_distance_nm - o.dest_port_distance_nm, 0)) > 0.5
+                OR (i.dest_lat IS NULL) <> (o.dest_lat IS NULL)",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let far = arrow::compute::cast(far[0].column(0), &arrow::datatypes::DataType::Int64).unwrap();
+    assert_eq!(far.as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().value(0), 0, "{what}: destination stop far off");
+}
+
+fn assert_same_text(got: &str, want: &str, what: &str) {
+    if got == want {
+        return;
+    }
+    let (g, w): (Vec<_>, Vec<_>) = (got.lines().collect(), want.lines().collect());
+    let at = g.iter().zip(&w).position(|(a, b)| a != b).unwrap_or(g.len().min(w.len()));
+    panic!(
+        "{what}: incremental ({} lines) differs from the full computation ({} lines), first at line {at}:\n  got:  {}\n  want: {}",
+        g.len(),
+        w.len(),
+        g.get(at).unwrap_or(&"<none>"),
+        w.get(at).unwrap_or(&"<none>"),
+    );
+}
+
+#[tokio::test]
+async fn voyages_are_folded_day_by_day_and_always_equal_the_full_computation() {
+    let r = rig().await;
+    load_ports_csv(&r, FLEET_PORTS_CSV).await;
+
+    let mut day0_built = 0;
+    for k in 0..4 {
+        r.put_silver_day(k, &fleet_day_points(k)).await;
+        r.put_statics_day(k, &fleet_day_statics(k)).await;
+        r.daily(&catch_up(), false).await;
+        assert_voyages_match(&r, &format!("after day {k}")).await;
+        if k == 0 {
+            day0_built = r.log().await.get("voyages", day(0).date_naive()).unwrap().built_at_us;
+        }
+    }
+    // Day 0 was built once and never replayed: days 1-3 were increments.
+    assert_eq!(r.log().await.get("voyages", day(0).date_naive()).unwrap().built_at_us, day0_built);
+
+    // What the scenario is meant to exercise happened.
+    let n = |sql: &str| {
+        let sql = sql.to_string();
+        let r = &r;
+        async move { r.number("voyages", &sql).await }
+    };
+    assert!(n("SELECT count(*) FROM voyages WHERE mmsi = 366000002").await >= 6.0, "the shuttle made many legs");
+    assert!(n("SELECT count(*) FROM voyages WHERE mmsi = 366000003 AND NOT origin_known").await >= 1.0, "first seen at sea");
+    assert!(n("SELECT count(*) FROM voyages WHERE declared_matches_dest = false").await >= 1.0, "a wrong declaration is caught");
+    assert!(n("SELECT count(*) FROM voyages WHERE declared_matches_dest = true").await >= 1.0);
+    let open = r.number("open_voyages", "SELECT count(*) FROM open_voyages").await;
+    assert!(open >= 2.0, "the cruiser and others are still under way: {open}");
+
+    // Nothing changed: nothing is rebuilt.
+    let s = r.daily(&catch_up(), false).await;
+    assert_eq!(s.built, 0, "{s:?}");
+
+    // Late data for day 1 replays the voyages and still agrees.
+    let late = extra_point(366000004, 86_400 + 5_000, 10.0, 30.5, 12.0, 1);
+    r.append_silver(1, &[late]).await;
+    r.daily(&catch_up(), false).await;
+    assert_voyages_match(&r, "after late data").await;
 }

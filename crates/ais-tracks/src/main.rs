@@ -6,14 +6,10 @@ use anyhow::{Context, Result};
 use ais_tracks::daily::{self, register, DailyRun, Env, StopSegmentsRun, StopTuning, TrackPointsRun, TracksRun};
 use ais_tracks::output::replace_table;
 use ais_tracks::state::DaySelect;
-use ais_tracks::track_points::TABLE_TRACK_POINTS;
 use ais_tracks::ports::{self, TABLE_REF_PORTS};
 use ais_tracks::reduce::{Rules, ThinOpts};
 use ais_tracks::reduce_day::{self, ReduceOptions};
 use ais_tracks::source;
-use ais_tracks::stops::TABLE_STOPS;
-use ais_tracks::tracks::TABLE_TRACKS;
-use ais_tracks::voyages::{self, TABLE_VOYAGES};
 use ais_tracks::vessels::{
     self, TABLE_VESSELS, TABLE_VESSEL_ATTRIBUTES,
 };
@@ -74,7 +70,8 @@ enum Command {
     /// folds in only the days not yet folded.
     Stops(StopsArgs),
     /// Build the legs between consecutive stops.
-    Voyages(VoyagesArgs),
+    /// Same as `stops`: voyages are folded together with stops, day by day.
+    Voyages(StopsArgs),
     /// Route and reduce one day of raw reports with bounded memory: duplicates,
     /// movement and outlier flags, and optional thinning. Reads the silver
     /// `positions` table, or `--source-dir`; writes Parquet under `--out-dir`,
@@ -400,17 +397,6 @@ enum PortsCommand {
     },
 }
 
-#[derive(Args, Debug)]
-struct VoyagesArgs {
-    /// Skip comparing with declared destinations. This avoids scanning the
-    /// whole `statics` table.
-    #[arg(long)]
-    no_declared: bool,
-
-    /// Write the table. Without it, compute and report only.
-    #[arg(long)]
-    apply: bool,
-}
 
 #[derive(Args, Debug)]
 struct ReduceDayArgs {
@@ -734,42 +720,15 @@ async fn run() -> Result<i32> {
             return Ok(finish(sum, a.apply, &output.namespace));
         }
         Command::Voyages(a) => {
-            let ctx = SessionContext::new();
-            for name in [TABLE_STOPS, TABLE_TRACKS, TABLE_TRACK_POINTS] {
-                register(&ctx, &catalog, &output, name)
-                    .await
-                    .with_context(|| format!("{name} is missing; build it first"))?;
-            }
-            if !a.no_declared {
-                register(&ctx, &catalog, &input, TABLE_STATICS).await?;
-            }
-            let built = voyages::build(&ctx, !a.no_declared).await?;
-            ais_tracks::carry::check_batches(&voyages::voyages_schema(), &built)?;
-            let n: usize = built.iter().map(|b| b.num_rows()).sum();
-            println!("{n} voyages");
-            if !a.apply {
-                println!("dry run; pass --apply to write to namespace '{}'", output.namespace);
-                return Ok(exitcode::SUCCESS);
-            }
-            let rest = RestClient::connect(&output).await?;
-            let r = replace_table(
-                &catalog,
-                &rest,
-                &output,
-                TABLE_VOYAGES,
-                voyages::voyages_schema(),
-                &built,
-                &["mmsi", "voyage_id"],
+            // Voyages are folded together with stops.
+            let rest = connect_if_writing(a.apply, a.plan, &output).await?;
+            let env = Env { catalog: &catalog, input: &input, output: &output, rest: rest.as_ref() };
+            let sum = daily::run_stops(
+                &env,
+                &daily::StopsRun { full: a.full, scratch: &a.scratch, plan_only: a.plan },
             )
             .await?;
-            println!(
-                "{}.{TABLE_VOYAGES}: {} rows, {} files written, {} replaced{}",
-                output.namespace,
-                r.rows,
-                r.files_added,
-                r.files_removed,
-                if r.created { " (created)" } else { "" }
-            );
+            return Ok(finish(sum, a.apply, &output.namespace));
         }
         Command::ReduceDay(_) | Command::Completions { .. } => unreachable!(),
     }

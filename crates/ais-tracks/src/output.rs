@@ -329,3 +329,39 @@ impl DayWriter {
         self.writer.close().await.context("close")
     }
 }
+
+
+/// Replaces `base_name`'s contents with `batches`, like [`replace_table`], but an
+/// empty result is a valid answer: it clears the table. For tables that hold a
+/// current picture (say, the legs still under way) rather than accumulated history.
+pub async fn replace_table_or_clear(
+    catalog: &impl Catalog,
+    rest: &RestClient,
+    config: &IcebergConfig,
+    base_name: &str,
+    schema: Schema,
+    batches: &[RecordBatch],
+    bloom: &[&str],
+) -> Result<WriteReport> {
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    if rows > 0 {
+        return replace_table(catalog, rest, config, base_name, schema, batches, bloom).await;
+    }
+    ensure_namespace(catalog, config).await?;
+    let spec = PartitionSpecBuilder::new(schema.clone());
+    let ident = table_ident(config, base_name);
+    ensure_table(catalog, config, base_name, schema, spec).await?;
+    for attempt in 1..=MAX_COMMIT_ATTEMPTS {
+        let table = catalog.load_table(&ident).await?;
+        let remove: HashSet<String> = live_files(&table).await?.into_iter().map(|f| f.path).collect();
+        if remove.is_empty() {
+            return Ok(WriteReport::default());
+        }
+        let prepared = prepare_replace(&table, &remove, Vec::new()).await?;
+        if rest.commit(&ident, &prepared.requirements, &prepared.updates).await? {
+            return Ok(WriteReport { rows: 0, files_added: 0, files_removed: remove.len(), created: false });
+        }
+        eprintln!("  {base_name}: table changed during clear, retrying ({attempt}/{MAX_COMMIT_ATTEMPTS})");
+    }
+    bail!("{base_name}: gave up after {MAX_COMMIT_ATTEMPTS} conflicting commits")
+}

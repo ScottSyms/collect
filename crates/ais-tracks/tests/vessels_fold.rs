@@ -32,22 +32,22 @@ fn statics_for_day(d: i64) -> Vec<Static> {
     match d {
         0 => vec![
             // a ship whose type 24 arrives in halves, with a padded name
-            (366123456, 10, None, None, Some("EVER GIVEN@@@"), None, None, None, None, None, "Class A"),
-            (366123456, 11, None, Some("KABC@@"), None, Some("Cargo"), Some(300), Some(100), Some(20), Some(40), "Class A"),
+            (366123456, 10, None, None, Some("EVER GIVEN@@@"), None, None, None, None, None, "Class A", None),
+            (366123456, 11, None, Some("KABC@@"), None, Some("Cargo"), Some(300), Some(100), Some(20), Some(40), "Class A", None),
             // two IMOs, the more frequent one invalid
-            (211000001, 5, Some(1234568), None, Some("TWO IMOS"), None, None, None, None, None, "Class A"),
-            (211000001, 9, Some(1234568), None, Some("TWO IMOS"), None, None, None, None, None, "Class A"),
+            (211000001, 5, Some(1234568), None, Some("TWO IMOS"), None, None, None, None, None, "Class A", None),
+            (211000001, 9, Some(1234568), None, Some("TWO IMOS"), None, None, None, None, None, "Class A", None),
             // a placeholder name and "no IMO"
-            (538000002, 1, Some(0), None, Some("@@@@@@@@"), None, None, None, None, None, "Class B"),
+            (538000002, 1, Some(0), None, Some("@@@@@@@@"), None, None, None, None, None, "Class B", None),
         ],
         1 => vec![
-            (366123456, 20, None, None, Some("EVER GIVEN@@@"), None, None, None, None, None, "Class A"),
-            (211000001, 30, Some(1234567), None, Some("TWO IMOS"), None, None, None, None, None, "Class A"),
-            (992471234, 40, None, None, Some("BUOY 7"), Some("AtoN"), None, None, None, None, "Class A"),
+            (366123456, 20, None, None, Some("EVER GIVEN@@@"), None, None, None, None, None, "Class A", None),
+            (211000001, 30, Some(1234567), None, Some("TWO IMOS"), None, None, None, None, None, "Class A", None),
+            (992471234, 40, None, None, Some("BUOY 7"), Some("AtoN"), None, None, None, None, "Class A", None),
         ],
         _ => vec![
-            (366123456, 50, None, None, Some("EVER GIVN"), None, None, None, None, None, "Class A"),
-            (211000001, 60, Some(1234567), None, Some("TWO IMOS"), None, None, None, None, None, "Class A"),
+            (366123456, 50, None, None, Some("EVER GIVN"), None, None, None, None, None, "Class A", None),
+            (211000001, 60, Some(1234567), None, Some("TWO IMOS"), None, None, None, None, None, "Class A", None),
         ],
     }
 }

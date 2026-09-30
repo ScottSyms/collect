@@ -32,21 +32,24 @@ use crate::reduce::StreamState;
 use crate::reduce_day::{self, ReduceOptions};
 use crate::source;
 use crate::state::{
-    build_log_schema, STEP_STATICS_DAILY, STEP_STOPS, STEP_VESSELS, STEP_VESSEL_DAILY, date_to_day, days_from_files, downstream_token, log_batch,
+    build_log_schema, STEP_STATICS_DAILY, STEP_STOPS, STEP_VESSELS, STEP_VESSEL_DAILY, STEP_VOYAGES, date_to_day, days_from_files, downstream_token, log_batch,
     read_states_before, scan_all, select_days, states_batch, track_points_token,
     vessel_state_schema, DaySelect, Log, LogRow, STEP_STOP_SEGMENTS, STEP_TRACKS,
     STEP_TRACK_POINTS, TABLE_BUILD_LOG, TABLE_VESSEL_STATE,
 };
 use crate::stops::{self, StopParams, TABLE_STOPS, TABLE_STOP_SEGMENTS};
 use crate::ports::TABLE_REF_PORTS;
+use crate::legs::{self, voyage_state_schema, TABLE_OPEN_VOYAGES, TABLE_VOYAGE_STATE};
+use crate::voyages::{voyages_schema, TABLE_VOYAGES};
 use crate::track_points::TABLE_TRACK_POINTS;
 use crate::vessels::{
-    self, attr_parts_sql, attribute_daily_schema, define_parts, sta_parts_sql, static_daily_schema,
+    self, attr_parts_sql, attribute_daily_schema, define_parts, dest_parts_sql, destination_daily_schema,
+    sta_parts_sql, static_daily_schema,
     vessel_daily_batch, vessel_daily_schema, vessel_attributes_schema, vessels_schema,
-    with_day_ts, TABLE_ATTRIBUTE_DAILY, TABLE_STATIC_DAILY, TABLE_VESSELS, TABLE_VESSEL_ATTRIBUTES,
+    with_day_ts, TABLE_ATTRIBUTE_DAILY, TABLE_DESTINATION_DAILY, TABLE_STATIC_DAILY, TABLE_VESSELS, TABLE_VESSEL_ATTRIBUTES,
     TABLE_VESSEL_DAILY,
 };
-use crate::output::replace_table;
+use crate::output::{replace_table, replace_table_or_clear};
 use crate::tracks::{self, TABLE_TRACKS};
 
 /// Where a run reads and writes. `rest` is present only when writing.
@@ -732,7 +735,12 @@ pub async fn run_statics_daily<C: Catalog>(env: &Env<'_, C>, run: &StaticsRun<'_
         ctx.register_table("statics_day", view)?;
         let attr = ctx.sql(&attr_parts_sql("statics_day")).await?.collect().await?;
         let sta = ctx.sql(&sta_parts_sql("statics_day")).await?.collect().await?;
+        let dest = ctx.sql(&dest_parts_sql("statics_day")).await?.collect().await?;
         let start_us = start.timestamp_micros();
+        let dest: Vec<RecordBatch> = dest
+            .iter()
+            .map(|b| with_day_ts(b, start_us, &destination_daily_schema()))
+            .collect::<Result<_>>()?;
         let attr: Vec<RecordBatch> = attr
             .iter()
             .map(|b| with_day_ts(b, start_us, &attribute_daily_schema()))
@@ -749,6 +757,7 @@ pub async fn run_statics_daily<C: Catalog>(env: &Env<'_, C>, run: &StaticsRun<'_
         if let Some(rest) = env.rest {
             write_day_batches(env, rest, TABLE_ATTRIBUTE_DAILY, attribute_daily_schema(), day, &attr).await?;
             write_day_batches(env, rest, TABLE_STATIC_DAILY, static_daily_schema(), day, &sta).await?;
+            write_day_batches(env, rest, TABLE_DESTINATION_DAILY, destination_daily_schema(), day, &dest).await?;
             let row = log_row(STEP_STATICS_DAILY, day, token, n_sta);
             append_log(env, &row).await?;
             log.insert(row);
@@ -978,8 +987,6 @@ pub async fn run_vessels<C: Catalog>(env: &Env<'_, C>, run: &VesselsRun<'_>) -> 
 
 // ---- stops --------------------------------------------------------------------------
 
-const DAY_US: i64 = 86_400_000_000;
-
 pub struct StopsRun<'a> {
     /// Refold from every stop segment even if an increment would do.
     pub full: bool,
@@ -999,114 +1006,42 @@ async fn append_logs<C: Catalog>(env: &Env<'_, C>, rows: &[LogRow]) -> Result<()
     commit_batches(env.catalog, &table, vec![log_batch(rows)?], 3, TABLE_BUILD_LOG).await
 }
 
-/// Replaces `day`'s partition of the stops table (partitioned on `depart_ts`)
-/// with `batches`. An empty `batches` clears the partition.
+/// Replaces `day`'s partition of `base`, partitioned by day of `column`, with
+/// `batches`. An empty `batches` clears the partition.
+async fn replace_day_partition<C: Catalog>(
+    env: &Env<'_, C>,
+    rest: &RestClient,
+    base: &str,
+    schema: iceberg::spec::Schema,
+    column: &str,
+    day: NaiveDate,
+    batches: &[RecordBatch],
+) -> Result<usize> {
+    ensure_day_table_on(env.catalog, env.output, base, schema, column).await?;
+    let table = env.catalog.load_table(&table_ident(env.output, base)).await?;
+    let days = date_to_day(day);
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    let files = if rows == 0 {
+        Vec::new()
+    } else {
+        let mut w = DayWriter::new(&table, days, &["mmsi"]).await?;
+        for b in batches {
+            w.write(b).await?;
+        }
+        w.finish().await?
+    };
+    commit_day(env.catalog, rest, env.output, base, days, files, rows).await?;
+    Ok(rows)
+}
+
+/// Replaces `day`'s partition of the stops table (partitioned on `depart_ts`).
 async fn replace_stops_day<C: Catalog>(
     env: &Env<'_, C>,
     rest: &RestClient,
     day: NaiveDate,
     batches: &[RecordBatch],
 ) -> Result<usize> {
-    ensure_day_table_on(env.catalog, env.output, TABLE_STOPS, stops::stops_schema(), "depart_ts").await?;
-    let table = env.catalog.load_table(&table_ident(env.output, TABLE_STOPS)).await?;
-    let days = date_to_day(day);
-    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    let files = if rows == 0 {
-        Vec::new()
-    } else {
-        let mut w = DayWriter::new(&table, days, &["mmsi", "stop_id"]).await?;
-        for b in batches {
-            w.write(b).await?;
-        }
-        w.finish().await?
-    };
-    commit_day(env.catalog, rest, env.output, TABLE_STOPS, days, files, rows).await?;
-    Ok(rows)
-}
-
-/// Splits batches sorted by `depart_ts` into per-day runs.
-fn split_by_depart_day(batches: &[RecordBatch]) -> Result<Vec<(i32, RecordBatch)>> {
-    let mut out: Vec<(i32, RecordBatch)> = Vec::new();
-    for b in batches {
-        let col = arrow::compute::cast(
-            b.column_by_name("depart_ts").context("no depart_ts")?,
-            &arrow::datatypes::DataType::Int64,
-        )?;
-        let ts = col.as_any().downcast_ref::<arrow::array::Int64Array>().context("depart_ts")?;
-        let mut start = 0;
-        while start < b.num_rows() {
-            let day = ts.value(start).div_euclid(DAY_US) as i32;
-            let mut end = start + 1;
-            while end < b.num_rows() && ts.value(end).div_euclid(DAY_US) as i32 == day {
-                end += 1;
-            }
-            out.push((day, b.slice(start, end - start)));
-            start = end;
-        }
-    }
-    Ok(out)
-}
-
-/// Rebuilds every stop from every stop segment, in chunks of vessels so it fits
-/// in memory, and replaces each day partition. The rare path: a first run, a
-/// rebuilt earlier day, or `--full`.
-async fn refold_stops<C: Catalog>(
-    env: &Env<'_, C>,
-    rest: &RestClient,
-    scratch: &Path,
-    seg_days: &[NaiveDate],
-) -> Result<usize> {
-    let seg_table = env.catalog.load_table(&table_ident(env.output, TABLE_STOP_SEGMENTS)).await?;
-    let pieces: u64 = live_files(&seg_table).await?.iter().map(|f| f.records).sum();
-    let chunks = pieces.div_ceil(2_000_000).clamp(1, 256) as u32;
-    ensure_day_table_on(env.catalog, env.output, TABLE_STOPS, stops::stops_schema(), "depart_ts").await?;
-    let stops_ident = table_ident(env.output, TABLE_STOPS);
-    let stops_table = env.catalog.load_table(&stops_ident).await?;
-    let before: BTreeSet<i32> = days_from_files(&live_files(&stops_table).await?)
-        .keys()
-        .map(|d| date_to_day(*d))
-        .collect();
-
-    let mut files: std::collections::BTreeMap<i32, Vec<iceberg::spec::DataFile>> = Default::default();
-    let mut counts: std::collections::BTreeMap<i32, usize> = Default::default();
-    let mut total = 0;
-    for k in 0..chunks {
-        let ctx = bounded_context(scratch, 1536 << 20)?;
-        register(&ctx, env.catalog, env.output, TABLE_STOP_SEGMENTS).await?;
-        register(&ctx, env.catalog, env.output, TABLE_REF_PORTS).await?;
-        let parts = ctx
-            .sql(&format!("SELECT * FROM ({}) WHERE mmsi % {chunks} = {k}", stops::parts_from_segments_sql()))
-            .await?
-            .into_view();
-        ctx.register_table("stop_parts", parts)?;
-        let sql = format!("SELECT * FROM ({}) ORDER BY depart_ts", stops::stops_sql());
-        let out = ctx.sql(&sql).await?.collect().await?;
-        carry::check_batches(&stops::stops_schema(), &out)?;
-        // Group this chunk's rows by the day they end, one writer per day.
-        let mut by_day: std::collections::BTreeMap<i32, Vec<RecordBatch>> = Default::default();
-        for (day, b) in split_by_depart_day(&out)? {
-            by_day.entry(day).or_default().push(b);
-        }
-        for (day, bs) in by_day {
-            let mut w = DayWriter::new(&stops_table, day, &["mmsi", "stop_id"]).await?;
-            for b in &bs {
-                w.write(b).await?;
-            }
-            *counts.entry(day).or_default() += w.rows;
-            total += w.rows;
-            files.entry(day).or_default().extend(w.finish().await?);
-        }
-    }
-    for (day, fs) in std::mem::take(&mut files) {
-        let rows = counts[&day];
-        commit_day(env.catalog, rest, env.output, TABLE_STOPS, day, fs, rows).await?;
-    }
-    // Partitions that no longer hold any stop.
-    for day in before.difference(&counts.keys().copied().collect()) {
-        commit_day(env.catalog, rest, env.output, TABLE_STOPS, *day, Vec::new(), 0).await?;
-    }
-    let _ = seg_days;
-    Ok(total)
+    replace_day_partition(env, rest, TABLE_STOPS, stops::stops_schema(), "depart_ts", day, batches).await
 }
 
 /// Folds one new day of stop segments into `stops`: recomputes the stops it
@@ -1184,9 +1119,32 @@ pub async fn increment_stops<C: Catalog>(
     Ok(rows)
 }
 
-/// Brings `stops` up to date from the stop segments: an increment for each new
-/// day, or a refold when there is nothing to increment from or an already
-/// folded day's segments were rebuilt.
+/// Removes every row of `stops`, partition by partition.
+async fn clear_stops<C: Catalog>(env: &Env<'_, C>, rest: &RestClient) -> Result<()> {
+    let ident = table_ident(env.output, TABLE_STOPS);
+    if !env.catalog.table_exists(&ident).await? {
+        return Ok(());
+    }
+    let table = env.catalog.load_table(&ident).await?;
+    for day in days_from_files(&live_files(&table).await?).keys() {
+        commit_day(env.catalog, rest, env.output, TABLE_STOPS, date_to_day(*day), Vec::new(), 0).await?;
+    }
+    Ok(())
+}
+
+/// Brings `stops`, `voyages` and `open_voyages` up to date from the stop
+/// segments, one day at a time.
+///
+/// The two are folded together because a day's voyage step needs `stops` as it
+/// stood when that day was folded in: the stops that arrived or carried on that
+/// day, in that day's partition. (A stop that carries on into the next day moves
+/// to the next day's partition, so `stops` cannot be read back day by day
+/// afterwards.)
+///
+/// Normally that is an increment for each new day. It replays every day from the
+/// start, clearing `stops` first, when there is nothing to increment from, when an
+/// already folded day's stop segments were rebuilt, or when the voyage state is
+/// missing or out of step.
 pub async fn run_stops<C: Catalog>(env: &Env<'_, C>, run: &StopsRun<'_>) -> Result<Summary> {
     let mut sum = Summary::default();
     let mut log = load_log(env).await?;
@@ -1206,79 +1164,196 @@ pub async fn run_stops<C: Catalog>(env: &Env<'_, C>, run: &StopsRun<'_>) -> Resu
     let todo: Vec<NaiveDate> = seg_days.iter().copied().filter(|d| !current(&log, *d)).collect();
     let stale = todo.iter().any(|d| log.get(STEP_STOPS, *d).is_some());
     let out_of_order = matches!((folded.last(), todo.first()), (Some(f), Some(t)) if t < f);
+    let through = voyage_state_through(env, run.scratch).await?;
+    let out_of_step = folded.last().map(|d| date_to_day(*d)) != through;
 
     enum Mode {
-        Refold,
+        Replay,
         Increment,
     }
     let (mode, why) = if run.full {
-        (Mode::Refold, "asked to")
+        (Mode::Replay, "asked to")
     } else if folded.is_empty() {
-        (Mode::Refold, "nothing folded yet")
+        (Mode::Replay, "nothing folded yet")
     } else if stale {
-        (Mode::Refold, "a folded day's stop segments were rebuilt")
+        (Mode::Replay, "a folded day's stop segments were rebuilt")
     } else if out_of_order {
-        (Mode::Refold, "a day before the latest folded one is new")
+        (Mode::Replay, "a day before the latest folded one is new")
+    } else if out_of_step {
+        (Mode::Replay, "the voyage state is missing or out of step")
     } else if todo.is_empty() {
-        println!("stops up to date through {}", folded.last().expect("non-empty"));
+        println!("stops and voyages up to date through {}", folded.last().expect("non-empty"));
         sum.skipped += 1;
         return Ok(sum);
     } else {
         (Mode::Increment, "new days")
     };
+    let replay = matches!(mode, Mode::Replay);
+    let work: Vec<NaiveDate> = if replay { seg_days.clone() } else { todo };
 
-    if run.plan_only {
-        match mode {
-            Mode::Refold => println!("would refold stops from every stop segment ({why})"),
-            Mode::Increment => println!("would fold {} new day(s) into stops: {}..{}", todo.len(), todo[0], todo[todo.len() - 1]),
-        }
-        sum.built += 1;
-        return Ok(sum);
-    }
-    let Some(rest) = env.rest else {
-        // Dry run: say what is there to do.
+    if run.plan_only || env.rest.is_none() {
         println!(
-            "would {} ({} of {} days to fold)",
-            match mode {
-                Mode::Refold => "refold stops",
-                Mode::Increment => "fold new days into stops",
-            },
-            todo.len(),
-            seg_days.len()
+            "would {} stops and voyages over {} day(s) {}",
+            if replay { "replay" } else { "fold into" },
+            work.len(),
+            if replay { format!("({why})") } else { format!("({}..{})", work[0], work[work.len() - 1]) },
         );
         sum.built += 1;
         return Ok(sum);
-    };
-
-    match mode {
-        Mode::Refold => {
-            let n = refold_stops(env, rest, run.scratch, &seg_days).await?;
-            println!("stops refolded from {} days of stop segments ({why}): {n} stops", seg_days.len());
-            let rows: Vec<LogRow> = seg_days
-                .iter()
-                .map(|d| log_row_with(STEP_STOPS, *d, token_of(&log, *d), 0))
-                .collect();
-            append_logs(env, &rows).await?;
-            for r in rows {
-                log.insert(r);
-            }
-        }
-        Mode::Increment => {
-            for d in todo {
-                let n = increment_stops(env, rest, run.scratch, d).await?;
-                println!("{d}: folded into stops ({n} stops touched)");
-                let row = log_row(STEP_STOPS, d, token_of(&log, d), n);
-                append_log(env, &row).await?;
-                log.insert(row);
-            }
-        }
     }
-    sum.built += 1;
+    let rest = env.rest.expect("checked");
+
+    if replay {
+        println!("replaying stops and voyages over {} days ({why})", work.len());
+        // Mark every day as not folded first, so a crash part-way is repaired by
+        // the next run instead of being mistaken for a finished one.
+        let marks: Vec<LogRow> = seg_days.iter().map(|d| log_row(STEP_STOPS, *d, "replaying".to_string(), 0)).collect();
+        append_logs(env, &marks).await?;
+        for r in marks {
+            log.insert(r);
+        }
+        clear_stops(env, rest).await?;
+    }
+    for (i, d) in work.iter().copied().enumerate() {
+        let n_stops = increment_stops(env, rest, run.scratch, d).await?;
+        // A previous run may have written this day's voyage state and stopped
+        // before logging it: the closed legs and the state are then in place.
+        let already = !replay && through == Some(date_to_day(d));
+        let (n_closed, n_open) = if already {
+            (0, 0)
+        } else {
+            voyage_day(env, rest, run.scratch, d, !(replay && i == 0)).await?
+        };
+        println!("{d}: {n_stops} stops folded; {n_closed} legs closed, {n_open} under way");
+        let stops_row = log_row(STEP_STOPS, d, token_of(&log, d), n_stops);
+        let voyages_row = log_row(STEP_VOYAGES, d, token_of(&log, d), n_closed);
+        append_logs(env, &[voyages_row.clone(), stops_row.clone()]).await?;
+        log.insert(voyages_row);
+        log.insert(stops_row);
+        sum.built += 1;
+    }
     Ok(sum)
 }
 
-fn log_row_with(step: &str, day: NaiveDate, token: String, rows: usize) -> LogRow {
-    log_row(step, day, token, rows)
+// ---- voyages (folded with stops, above) -----------------------------------------------
+
+/// Registers the Iceberg table `base` as `alias`, or an empty table of `schema`'s
+/// shape if it does not exist yet.
+async fn register_or_empty<C: Catalog>(
+    ctx: &SessionContext,
+    env: &Env<'_, C>,
+    base: &str,
+    alias: &str,
+    schema: &iceberg::spec::Schema,
+) -> Result<()> {
+    if env.catalog.table_exists(&table_ident(env.output, base)).await? {
+        register_as(ctx, env.catalog, env.output, base, alias).await
+    } else {
+        let arrow = Arc::new(iceberg::arrow::schema_to_arrow_schema(schema)?);
+        ctx.register_table(alias, Arc::new(datafusion::datasource::MemTable::try_new(arrow, vec![vec![]])?))?;
+        Ok(())
+    }
+}
+
+/// Registers `alias` as `SELECT cols FROM raw_alias WHERE range` over `raw_alias`.
+async fn view_of(ctx: &SessionContext, alias: &str, cols: &str, filter: &str) -> Result<()> {
+    let raw = format!("raw_{alias}");
+    let _ = ctx.deregister_table(alias)?;
+    let view = ctx.sql(&format!("SELECT {cols} FROM {raw} WHERE {filter}")).await?.into_view();
+    ctx.register_table(alias, view)?;
+    Ok(())
+}
+
+/// Advances the voyage state one day and writes what the day produced. With
+/// `prior_state` false the vessels start from nothing (the first day of a replay).
+async fn voyage_day<C: Catalog>(
+    env: &Env<'_, C>,
+    rest: &RestClient,
+    scratch: &Path,
+    day: NaiveDate,
+    prior_state: bool,
+) -> Result<(usize, usize)> {
+    let ctx = bounded_context(scratch, 1 << 30)?;
+    let start = start_of(day);
+    let end = start + Duration::days(1);
+    let in_day = |col: &str| format!("{col} >= '{}' AND {col} < '{}'", carry::lit(start), carry::lit(end));
+
+    if prior_state {
+        register_or_empty(&ctx, env, TABLE_VOYAGE_STATE, "raw_leg_state", &voyage_state_schema()).await?;
+        view_of(&ctx, "leg_state", "*", "true").await?;
+    } else {
+        let arrow = Arc::new(iceberg::arrow::schema_to_arrow_schema(&voyage_state_schema())?);
+        ctx.register_table("leg_state", Arc::new(datafusion::datasource::MemTable::try_new(arrow, vec![vec![]])?))?;
+    }
+    register_as(&ctx, env.catalog, env.output, TABLE_STOPS, "raw_leg_stops").await?;
+    view_of(&ctx, "leg_stops", "*", &in_day("depart_ts")).await?;
+    register_as(&ctx, env.catalog, env.output, TABLE_VESSEL_DAILY, "raw_leg_daily").await?;
+    view_of(&ctx, "leg_daily", "*", &in_day("ts")).await?;
+    register_as(&ctx, env.catalog, env.output, TABLE_TRACK_POINTS, "raw_leg_points").await?;
+    view_of(
+        &ctx,
+        "leg_points",
+        "mmsi, ts, dist_nm, has_position, is_duplicate, gap_before, is_speed_jump, max_sog, n_raw, n_outliers_raw",
+        &in_day("ts"),
+    )
+    .await?;
+
+    let adv = legs::advance_day(&ctx, start.timestamp_micros(), date_to_day(day)).await?;
+
+    // Declared destinations for the legs that closed, from the daily counts of
+    // every day they spanned.
+    let mut closed_rows = Vec::new();
+    if let Some(min_depart) = adv.closed.iter().map(|c| c.depart_ts).min() {
+        let from = Utc.timestamp_micros(min_depart).single().context("time")?;
+        let from = start_of(from.date_naive());
+        register_or_empty(&ctx, env, TABLE_DESTINATION_DAILY, "raw_destination_daily", &destination_daily_schema()).await?;
+        let _ = ctx.deregister_table("destination_daily")?;
+        let view = ctx
+            .sql(&format!(
+                "SELECT * FROM raw_destination_daily WHERE ts >= '{}' AND ts < '{}'",
+                carry::lit(from),
+                carry::lit(end)
+            ))
+            .await?
+            .into_view();
+        ctx.register_table("destination_daily", view)?;
+        closed_rows = legs::finish_closed(&ctx, &adv.closed).await?;
+        carry::check_batches(&voyages_schema(), &closed_rows)?;
+    }
+    let n_closed: usize = closed_rows.iter().map(|b| b.num_rows()).sum();
+    let open_rows = legs::open_voyages(&ctx, &adv.states).await?;
+    carry::check_batches(&voyages_schema(), &open_rows)?;
+    let n_open: usize = open_rows.iter().map(|b| b.num_rows()).sum();
+
+    // Closed legs first (a partition replace, so idempotent), then the state that
+    // says the day is folded in, then the legs still under way.
+    replace_day_partition(env, rest, TABLE_VOYAGES, voyages_schema(), "arrive_ts", day, &closed_rows).await?;
+    if adv.states.iter().map(|b| b.num_rows()).sum::<usize>() > 0 {
+        replace_table(env.catalog, rest, env.output, TABLE_VOYAGE_STATE, voyage_state_schema(), &adv.states, &["mmsi"]).await?;
+    }
+    replace_table_or_clear(env.catalog, rest, env.output, TABLE_OPEN_VOYAGES, voyages_schema(), &open_rows, &["mmsi"]).await?;
+    Ok((n_closed, n_open))
+}
+
+/// The `through` day recorded in `voyage_state`, if the table is consistent.
+async fn voyage_state_through<C: Catalog>(env: &Env<'_, C>, scratch: &Path) -> Result<Option<i32>> {
+    let ident = table_ident(env.output, TABLE_VOYAGE_STATE);
+    if !env.catalog.table_exists(&ident).await?
+        || env.catalog.load_table(&ident).await?.metadata().current_snapshot().is_none()
+    {
+        return Ok(None);
+    }
+    let ctx = bounded_context(scratch, 256 << 20)?;
+    register(&ctx, env.catalog, env.output, TABLE_VOYAGE_STATE).await?;
+    let b = ctx
+        .sql(&format!("SELECT min(through), max(through) FROM {TABLE_VOYAGE_STATE}"))
+        .await?
+        .collect()
+        .await?;
+    Ok(match (first_i64(&b, 0), first_i64(&b, 1)) {
+        (Some(lo), Some(hi)) if lo == hi => Some(hi as i32),
+        _ => None,
+    })
 }
 
 // ---- all three -----------------------------------------------------------------------
@@ -1338,7 +1413,7 @@ pub async fn run_daily<C: Catalog>(env: &Env<'_, C>, run: &DailyRun<'_>) -> Resu
     )
     .await?;
     if env.catalog.table_exists(&table_ident(env.output, TABLE_REF_PORTS)).await? {
-        println!("== stops");
+        println!("== stops and voyages");
         total += run_stops(
             env,
             &StopsRun { full: false, scratch: &run.opts.scratch, plan_only: false },

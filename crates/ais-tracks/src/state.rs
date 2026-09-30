@@ -53,6 +53,7 @@ pub const STEP_VESSEL_DAILY: &str = "vessel_daily";
 pub const STEP_STATICS_DAILY: &str = "statics_daily";
 pub const STEP_VESSELS: &str = "vessels";
 pub const STEP_STOPS: &str = "stops";
+pub const STEP_VOYAGES: &str = "voyages";
 
 fn required(id: i32, name: &'static str, ty: PrimitiveType) -> Arc<NestedField> {
     Arc::new(NestedField::required(id, name, ty.into()))

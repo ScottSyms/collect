@@ -33,7 +33,7 @@ Flags are also listed in [CLI_REFERENCE.md](CLI_REFERENCE.md#ais-tracks).
 - [Namespaces and table names](#namespaces-and-table-names)
 - [Commands](#commands): [`statics-daily` and `vessels`](#statics-daily-and-vessels), [`ports load`](#ports-load),
   [`track-points`](#track-points), [`tracks`](#tracks),
-  [`stop-segments`](#stop-segments), [`stops`](#stops), [`voyages`](#voyages), and [`daily` and catch-up](#daily-and-catch-up)
+  [`stop-segments`](#stop-segments), [`stops` and `voyages`](#stops-and-voyages), and [`daily` and catch-up](#daily-and-catch-up)
 - [Operating it](#operating-it)
 - [Querying the results](#querying-the-results)
 - [Limits and known gaps](#limits-and-known-gaps)
@@ -75,7 +75,10 @@ Flags are also listed in [CLI_REFERENCE.md](CLI_REFERENCE.md#ais-tracks).
 | `tracks` | continuous segment, per UTC day | daily | day of `ts` (first row) |
 | `stop_segments` | stationary run, per UTC day | daily | day of `ts` (first point) |
 | `stops` | stop (the day pieces merged) | folded in daily | day of `depart_ts` |
-| `voyages` | leg between stops | rebuilt each run | none |
+| `voyages` | leg that has ended | folded in with `stops` | day of `arrive_ts` |
+| `open_voyages` | leg still under way | replaced each run | none |
+| `voyage_state` | vessel: where its current leg began and its totals so far (internal) | replaced each run | none |
+| `destination_daily` | vessel and day: destinations it declared | daily (`statics-daily`) | day of `ts` |
 | `vessel_state` | vessel's last positioned report, as of the end of a built day | daily | day it is as of |
 | `build_log` | step and day built, with what it was built from | appended after each build | none |
 
@@ -113,9 +116,8 @@ ais-tracks $CAT --output-namespace curated track-points   $D --apply
 ais-tracks $CAT --output-namespace curated tracks         $D --apply
 ais-tracks $CAT --output-namespace curated stop-segments  $D --apply
 
-# Rebuilt from the above
-ais-tracks $CAT --output-namespace curated stops   --apply
-ais-tracks $CAT --output-namespace curated voyages --apply
+# Folded in from the above (stops and voyages together)
+ais-tracks $CAT --output-namespace curated stops   --apply   # folds voyages in too
 ```
 
 Or let it work out what needs doing, and do only that:
@@ -353,17 +355,18 @@ Duplicates and `is_spike` fixes are ignored, not deleted.
 | `--resume-nm` | `1.0` | after a gap, still stopped if within this distance of where it was |
 | `--min-stop-minutes` | `30` | ignore shorter runs, except those touching midnight (they may continue); `0` keeps every run |
 
-### `stops`
+### `stops` and `voyages`
 
 ```bash
-ais-tracks $CAT stops [--full] [--plan] [--apply]
+ais-tracks $CAT stops [--full] [--plan] [--apply]     # `voyages` is the same command
 ```
 
 One row per stop: the `stop_segments` of a stop merged, then matched to the
 nearest port in the latest `ref_ports` release within a radius set by the
 port's harbour size (Large 15 nm, Medium 10, Small 6, Very Small or unknown 4).
 
-It folds in only the days not yet folded. The table is partitioned by the day
+It folds in only the days not yet folded, and it folds `voyages` in with them,
+day by day (see below). The table is partitioned by the day
 a stop **ends**, so a stop that has finished never moves again, and a stop that
 is still going advances one partition a day. Folding day D reads only D's pieces
 and the rows of the stops they touch, recomputes those stops from the existing
@@ -392,21 +395,21 @@ columns. The `port_*` columns describe proximity, not a port call: check
 `duration_s`, `n_moored` and `n_anchored` if you need to tell a berth from an
 anchorage.
 
-### `voyages`
+#### Voyages
 
-```bash
-ais-tracks $CAT voyages [--no-declared] [--apply]
-```
-
-The legs between a vessel's consecutive stops, rebuilt in full on each run.
-Every stretch of a vessel's observed life belongs to exactly one leg:
+The legs between a vessel's consecutive stops. Every stretch of a vessel's
+observed life belongs to exactly one leg:
 
 - the leg **before its first stop** (`origin_known` false), when it was first
   seen moving;
 - the legs **between stops**;
-- the leg **after its last stop**, once it has moved on (`is_open` true,
+- the leg **after its last stop**, once it has moved on (`open_voyages`,
   destination unknown);
 - for a vessel that **never stopped**, one leg with neither end known.
+
+Legs that have ended are in `voyages`, written once into the partition of the day
+they end and never changed. Legs still under way are in `open_voyages`, replaced
+each run. Both have the same columns.
 
 | Column | Meaning |
 |--------|---------|
@@ -414,95 +417,44 @@ Every stretch of a vessel's observed life belongs to exactly one leg:
 | `origin_known`, `dest_known`, `is_open` | how much of the leg is certain |
 | `origin_stop_id`, `dest_stop_id` | |
 | `origin_lat/lon`, `origin_port_*`, `dest_lat/lon`, `dest_port_*` | the stops' centroids and matched ports |
-| `distance_nm_raw`, `distance_nm_clean`, `avg_speed_kn`, `max_sog_knots` | from `track_points`, so exact for the leg; raw and clean as in `tracks` |
+| `distance_nm_raw`, `distance_nm_clean`, `avg_speed_kn`, `max_sog_knots` | over the points between the leg's ends; raw and clean as in `tracks` |
 | `n_points`, `n_gaps`, `n_outliers` | |
-| `declared_destination`, `n_declared_destinations`, `declared_eta` | the destination vessels reported most often during the leg (trailing `@` padding removed), how many different ones there were, and the latest ETA reported for it |
+| `declared_destination`, `n_declared_destinations`, `declared_eta` | the destination vessels reported most often while the leg lasted, how many different ones there were, and the latest ETA reported for it |
 | `declared_matches_dest` | text heuristic comparing the declared destination with the reached port's UN/LOCODE and name; null when either side is missing. A hint, not a verdict |
 | `computed_at` | |
 
-`--no-declared` skips the scan of the `statics` table.
+**How it stays cheap.** Each vessel keeps a small state row in `voyage_state`:
+where its current leg began, the last stop it left, and the leg's totals so far.
+A day then does only what it changes. A vessel with no stop that day adds the
+day's totals (`vessel_daily`) to its running totals and no point is read. A
+vessel that reaches a new stop closes its leg there; one that leaves a stop
+starts a leg; one seen for the first time starts a leg at its first positioned
+row. Those legs begin or end part-way through the day, so their totals need that
+day's points split at the exact times, which is one query over one day of
+`track_points`, for those vessels only. Every point is read once, on its own
+day, however long the leg. The results are exactly the ones a query over all of
+history gives (the tests compare them after every day).
 
-## Running at scale: `reduce-day`
+Two things follow from folding a day at a time:
 
-The SQL steps above sort and window a whole day in DataFusion, which does not
-fit in memory at hundreds of millions of reports a day. `reduce-day` is the
-memory-bounded route to the same annotations, with optional thinning:
+- **A leg's destination stop is described as it stood when the leg ended.** Its
+  identity (`dest_stop_id`, `dest_port_*`) is exact, but `dest_lat`, `dest_lon`
+  and `dest_port_distance_nm` come from the stop's first day, and a stop that
+  carries on is refined afterwards. Join `stops` on `dest_stop_id` for the
+  final figures.
+- **Declared destinations are counted per day**, the departure and arrival days
+  in full, from `destination_daily`, and only for legs that have ended:
+  `open_voyages` has none. Late static reports for a day that a leg has already
+  been closed over do not refresh it.
 
-```bash
-# See what thinning would keep on a real day (writes nothing):
-ais-tracks $CAT reduce-day --day 2026-03-10
-
-# Write the reduced rows as Parquet, or work from a local directory:
-ais-tracks reduce-day --source-dir ./silver --day 2026-03-10 --out-dir ./out
-```
-
-It makes one sequential pass over the day, writing each report to one of a few
-hundred scratch files chosen by a hash of the MMSI (a fixed-width 31-byte
-record, zstd-compressed, no payload text). Then it loads one bucket at a time,
-sorts it, and reduces each vessel in a single pass. Memory is one bucket plus a
-small output chunk, whatever the size of the day, and silver need not be sorted
-or compacted. Reports with an implausible MMSI (zero, more than nine digits) are
-set aside and counted, so a bogus id cannot form a giant fake vessel.
-
-The reducer computes what `track-points` computes (duplicate ranks, movement,
-gap / jump / spike / invalid flags) and a test holds the two to row-for-row
-agreement on randomised days when thinning is off. With thinning on (the
-default), only some rows are kept, and each kept row carries what it stands for:
-
-| Keep a row when | Flag | Default |
-|---|---|---|
-| it is the vessel's first or last positioned row of the day | | |
-| the silence before it exceeds the gap limit, or it is the row just before one | `--gap-minutes` | 30 |
-| it is a jump, spike or invalid value, or is next to one | `--max-speed-kn` | 60 |
-| the vessel moved this far since the last kept row | `--keep-distance-nm` | 0.1 |
-| this long has passed since the last kept row | `--keep-interval-s` | 120 |
-| the course changed this much while moving | `--keep-turn-deg` | 15 |
-| the speed changed this much | `--keep-speed-kn` | 2 |
-| the navigation status changed | | |
-
-`--no-thin` keeps every row. On a kept row `dist_nm` is the summed raw hop
-distance since the previous kept row, so distance totals stay exact; `dt_s` is
-the time since the previous kept row; `n_raw` is the number of reports it stands
-for; `n_collapsed_dups`, `n_no_position` and `n_outliers_raw` split that count;
-`sum_speed` / `n_speed` give a count-weighted mean speed; `max_dev_nm` is how far
-a collapsed report was from the kept one; `keep_reason` is a bitmask. Duplicates
-(the same message heard by another receiver) are collapsed into the kept row and
-counted, not kept; they are only detected within the day.
-
-The report printed at the end shows how many rows each policy keeps and why, and
-checks that `represented` equals `routed`. Run it dry on a real day first: how
-much thinning saves depends on your traffic mix (many reports are duplicates
-from overlapping receivers, and moored vessels are already sparse).
-
-Measured on synthetic days from `gen-day` (a mix of moored, underway and class B
-vessels, 40% of reports duplicated across receivers), release build, one machine:
-
-| Reports | Buckets | Kept | Time | Peak memory | Scratch |
-|---|---|---|---|---|---|
-| 2.4 M | 1 | 26.9% | 3 s | 302 MB | 0.05 GB |
-| 61 M | 21 | 27.1% | 44 s | 335 MB | 1.3 GB |
-| 183 M | 61 | 27.1% | 131 s | 431 MB | 3.8 GB |
-
-Memory stays flat as the day grows because it is set by the bucket size
-(`--target-bucket-rows`, default 3 million reports, about 56 bytes each while
-loaded), not by the day. Scratch is about 21 bytes per report, so a 500 M report
-day needs roughly 10 GB. These are synthetic numbers; the retention on real
-traffic will differ. `gen-day --out DIR --rows N` writes such a day.
-
-`reduce-day` is the same reduction as `track-points`, but reads a local
-directory if you want, and writes a Parquet file rather than an Iceberg table:
-use it to tune the thinning on a real day before running `track-points`. The
-downstream tables read thinned rows: `tracks`, `stop-segments` and `voyages`
-weight by `n_raw` and use the carried sums, so counts, sums and distances agree
-with the unthinned answer. Stop and leg boundaries blur by up to about half the
-speed-smoothing window (5 minutes) with dense reports, and thinning adds up to
-one `--keep-interval-s` to that; this is tested (`tests/pipeline.rs`).
+A first run, `--full`, or a rebuilt earlier day **replays**: it clears `stops` and
+folds every day from the start again through the same code.
 
 ## `daily` and catch-up
 
 `track-points`, `statics-daily`, `tracks` and `stop-segments` take the same day
-selection, and `daily` runs them in order for it (then `stops`, if `ref_ports`
-is loaded, and `vessels`):
+selection, and `daily` runs them in order for it (then `stops` and `voyages`
+together, if `ref_ports` is loaded, and `vessels`):
 
 | Flag | Meaning |
 |------|---------|
@@ -548,8 +500,7 @@ missing input is reported by name ("run track-points first").
 
 **Daily runs.** Schedule `daily --catch-up --apply` after the day ends. It builds
 yesterday, folds it into `stops` and `vessels`, and rebuilds any earlier day
-whose silver data changed, with everything else skipped. Only `voyages` is
-still a full rebuild; run it after.
+whose silver data changed, with everything else skipped. Nothing in the chain is a full rebuild any more.
 
 **Reruns and backfills.** Rerunning a day replaces only that day's partition,
 and `--catch-up` works out what needs it. With explicit `--from/--to`, rebuilding
@@ -561,10 +512,9 @@ previous day's state in memory; a run that starts mid-history reads it from
 
 **Memory.** `track-points` holds one bucket at a time (`--target-bucket-rows`);
 `tracks` and `stop-segments` split each day's vessels into `--shards` chunks
-by `mmsi % shards` and hold one chunk. `voyages` reads `track_points`, `tracks` and `stops` in full, so its cost grows
-with history. `stops` and `vessels` cost about a day plus the number of vessels;
-their refold paths are history-linear but rare, and run with spillable, capped
-memory (sorts and aggregates spill; window functions do not).
+by `mmsi % shards` and hold one chunk. `stops`, `voyages` and `vessels` cost about a day plus the number of vessels.
+Their replay and refold paths are history-linear but rare, and run with capped
+memory (sorts and aggregates spill to `--scratch`; window functions do not).
 
 **Maintenance.** The daily tables write a few files per day. Compact them like
 any other table, pointing `ais-compact` at the output namespace:
@@ -646,7 +596,6 @@ WHERE v.multiple_imos ORDER BY v.mmsi, a.rank;
 - **`vessel_key` and identity are not time-aware.** One row per MMSI with the
   candidate history in `vessel_attributes`; there are no intervals for
   identity changes, and `mid` is not yet mapped to a country name.
-- **`voyages` is a full rebuild**, not incremental.
 - **Port matching is proximity, not a port-call record.** Radii are fixed by
   harbour size, and unmatched stops keep null ports.
 - **`declared_matches_dest` is text matching.** Declared destinations are free
