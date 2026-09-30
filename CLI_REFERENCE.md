@@ -355,7 +355,7 @@ to the output namespace. `--iceberg-table-prefix` applies to the input only.
 |---|---|---|
 | `vessels` | `--apply` | Rebuilds `vessels` and `vessel_attributes` from `statics` and `positions` |
 | `ports load` | `--file <csv>`, `--release <label>`, `--apply` | Appends a World Port Index (Pub 150) release to `ref_ports`; a label can be loaded once |
-| `track-points` | `--from <date>` (alias `--day`), `--to <date>`, `--shards` (4), `--lookback-days` (2), `--max-speed-kn` (60), `--gap-minutes` (30), `--apply` | One row per `positions` row with duplicate, movement and outlier columns, per UTC day partition |
+| `track-points` | `--from <date>` (alias `--day`), `--to <date>`, `--lookback-days` (1), `--buckets`, `--target-bucket-rows` (3000000), `--scratch`, `--keep-scratch`, `--no-thin`, `--keep-distance-nm` (0.1), `--keep-interval-s` (120), `--keep-turn-deg` (15), `--keep-speed-kn` (2), `--max-speed-kn` (60), `--gap-minutes` (30), `--apply` | Reads a day of silver `positions`, reduces it with bounded memory (duplicates, movement, outlier flags, optional thinning) and writes one row per kept report to `track_points`, per UTC day partition |
 | `tracks` | `--from`, `--to`, `--shards` (4), `--apply` | Continuous segments per day, chained across midnight by `track_id` |
 | `stop-segments` | `--from`, `--to`, `--shards` (4), `--slow-kn` (0.5), `--smooth-minutes` (10), `--resume-nm` (1.0), `--min-stop-minutes` (30), `--apply` | Stationary runs per day, chained across midnight by `stop_id` |
 | `stops` | `--apply` | Merges `stop_segments` into stops and matches the nearest port |

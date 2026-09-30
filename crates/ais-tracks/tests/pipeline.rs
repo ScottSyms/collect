@@ -7,17 +7,19 @@
 
 use std::sync::Arc;
 
-use ais_tracks::{carry, ports, stops, track_points, tracks, voyages};
-use arrow::array::{new_null_array, Array, Float64Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray};
+use ais_tracks::reduce::{Dicts, RawPoint, Rules, ThinOpts};
+use ais_tracks::reduce_day::reduce_all;
+use ais_tracks::{carry, ports, stops, tracks, voyages};
+use arrow::array::{new_null_array, Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray};
 use arrow::record_batch::RecordBatch;
 use arrow::util::display::array_value_to_string;
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
 
-const TEN_MIN: i64 = 600;
-/// Longitude degrees covered in ten minutes at 12 knots, at latitude 10 degrees.
-const STEP: f64 = 2.0 / 59.09;
+/// Longitude degrees per second at 12 knots, at latitude 10 degrees.
+const DEG_PER_S: f64 = 12.0 / 3600.0 / 59.09;
+const H: i64 = 3600;
 
 fn day(n: i64) -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 3, 10, 0, 0, 0).unwrap() + Duration::days(n)
@@ -26,68 +28,64 @@ fn day(n: i64) -> DateTime<Utc> {
 /// (mmsi, seconds from day 0, lat, lon, sog, nav_status)
 type Pt = (i64, i64, f64, f64, f64, &'static str);
 
-fn scenario() -> Vec<Pt> {
+/// `step` is the reporting interval in seconds.
+fn scenario(step: i64) -> Vec<Pt> {
     let mut v = Vec::new();
-    let h = |hours: f64| (hours * 3600.0) as i64;
     let jitter = |i: i64| if i % 2 == 0 { 0.0005 } else { -0.0005 };
     // Alpha, 00:00-06:00
-    for i in 0..=36 {
-        v.push((366000001, i * TEN_MIN, 10.0 + jitter(i), 20.0 + jitter(i + 1), 0.1, "moored"));
+    let (mut t, mut i) = (0, 0);
+    while t <= 6 * H {
+        v.push((366000001, t, 10.0 + jitter(i), 20.0 + jitter(i + 1), 0.1, "moored"));
+        t += step;
+        i += 1;
     }
-    // Underway 06:10-10:50
-    for i in 1..=29 {
-        v.push((366000001, h(6.0) + i * TEN_MIN, 10.0, 20.0 + i as f64 * STEP, 12.0, "under way using engine"));
+    // Underway 06:00-11:00
+    let mut t = 6 * H + step;
+    while t < 11 * H {
+        v.push((366000001, t, 10.0, 20.0 + (t - 6 * H) as f64 * DEG_PER_S, 12.0, "under way using engine"));
+        t += step;
     }
-    let beta = 20.0 + 30.0 * STEP;
+    let beta = 20.0 + 5.0 * H as f64 * DEG_PER_S;
     // Beta, 11:00 until 03:00 the next day
-    for i in 0..=96 {
-        v.push((366000001, h(11.0) + i * TEN_MIN, 10.0 + jitter(i), beta + jitter(i + 1), 0.05, "moored"));
+    let (mut t, mut i) = (11 * H, 0);
+    while t <= 27 * H {
+        v.push((366000001, t, 10.0 + jitter(i), beta + jitter(i + 1), 0.05, "moored"));
+        t += step;
+        i += 1;
     }
-    // Underway again 27:10-33:00, then last seen
-    for i in 1..=35 {
-        v.push((366000001, h(27.0) + i * TEN_MIN, 10.0, beta + i as f64 * STEP, 12.0, "under way using engine"));
+    // Underway again 27:00-33:00, then last seen
+    let mut t = 27 * H + step;
+    while t < 33 * H {
+        v.push((366000001, t, 10.0, beta + (t - 27 * H) as f64 * DEG_PER_S, 12.0, "under way using engine"));
+        t += step;
     }
     // Vessel 2 keeps moving throughout
-    for i in 0..=100 {
-        v.push((366000002, i * TEN_MIN, 30.0, 40.0 + i as f64 * STEP, 12.0, "under way using engine"));
+    let mut t = 0;
+    while t <= 1000 * 60 {
+        v.push((366000002, t, 30.0, 40.0 + t as f64 * DEG_PER_S, 12.0, "under way using engine"));
+        t += step;
     }
     v
 }
 
-fn positions_table(rows: &[Pt]) -> MemTable {
-    let schema = Arc::new(
-        iceberg::arrow::schema_to_arrow_schema(
-            &collect_core::iceberg::table_schemas::positions_schema(),
-        )
-        .unwrap(),
-    );
-    let n = rows.len();
+const NAVS: [&str; 2] = ["moored", "under way using engine"];
+
+fn raw_points(rows: &[Pt]) -> Vec<RawPoint> {
     let base = day(0).timestamp() * 1_000_000;
-    let cols: Vec<Arc<dyn Array>> = schema
-        .fields()
-        .iter()
-        .map(|f| -> Arc<dyn Array> {
-            match f.name().as_str() {
-                "ts" => Arc::new(
-                    TimestampMicrosecondArray::from_iter_values(
-                        rows.iter().map(|r| base + r.1 * 1_000_000),
-                    )
-                    .with_timezone("+00:00"),
-                ),
-                "source" => Arc::new(StringArray::from(vec!["a"; n])),
-                "msg_type" => Arc::new(Int32Array::from(vec![1; n])),
-                "mmsi" => Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.0))),
-                "latitude" => Arc::new(Float64Array::from_iter_values(rows.iter().map(|r| r.2))),
-                "longitude" => Arc::new(Float64Array::from_iter_values(rows.iter().map(|r| r.3))),
-                "sog_knots" => Arc::new(Float64Array::from_iter_values(rows.iter().map(|r| r.4))),
-                "nav_status" => Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.5))),
-                "payload" => Arc::new(StringArray::from_iter_values((0..n).map(|i| format!("p{i}")))),
-                _ => new_null_array(f.data_type(), n),
-            }
+    rows.iter()
+        .map(|r| RawPoint {
+            ts_us: base + r.1 * 1_000_000,
+            mmsi: r.0 as u32,
+            lat_e7: Some((r.2 * 1e7).round() as i32),
+            lon_e7: Some((r.3 * 1e7).round() as i32),
+            sog_dk: Some((r.4 * 10.0).round() as i16),
+            cog_dd: Some(900),
+            heading_dd: None,
+            nav: Some(NAVS.iter().position(|n| *n == r.5).unwrap() as u16),
+            source: 0,
+            station: None,
         })
-        .collect();
-    let batch = RecordBatch::try_new(schema.clone(), cols).unwrap();
-    MemTable::try_new(schema, vec![vec![batch]]).unwrap()
+        .collect()
 }
 
 /// (mmsi, hours after day 0, destination)
@@ -163,17 +161,42 @@ fn num(s: &str) -> f64 {
     s.parse().unwrap()
 }
 
+#[derive(Clone, Copy)]
+struct Mode {
+    /// Seconds between reports.
+    step: i64,
+    thin: bool,
+}
+
+/// How far a stop boundary and a leg's distance may be off.
+///
+/// Stops use speed smoothed over a 10-minute window, so with dense reports a
+/// boundary blurs by up to half the window (5 minutes) either way; thinning
+/// keeps a row only every couple of minutes and adds a little more. With
+/// sparse reports no window holds a neighbour, so boundaries are exact. The
+/// berth in this scenario jitters by about 0.085 nm per report, so each minute
+/// of blur at a boundary adds distance to the leg: (seconds, nautical miles,
+/// knots).
+fn tolerances(m: Mode) -> (f64, f64, f64) {
+    match (m.step >= 600, m.thin) {
+        (true, _) => (0.5, 1.5, 0.5),
+        (false, false) => (330.0, 8.0, 1.0),
+        (false, true) => (450.0, 8.0, 1.0),
+    }
+}
+
 struct Built {
     ctx: SessionContext,
     n_positions: usize,
-    n_points: usize,
+    /// Rows in `track_points`, and the reports they stand for.
+    kept: usize,
+    represented: usize,
 }
 
-async fn run() -> Built {
+async fn run(m: Mode) -> Built {
     let ctx = SessionContext::new();
-    let pts = scenario();
+    let pts = scenario(m.step);
     let n_positions = pts.len();
-    ctx.register_table("positions", Arc::new(positions_table(&pts))).unwrap();
     ctx.register_table(
         "statics",
         Arc::new(statics_table(&[
@@ -190,22 +213,26 @@ async fn run() -> Built {
     let p = ports::load_csv(path.to_str().unwrap(), "2026-03-01").await.unwrap();
     register(&ctx, "ref_ports", &p);
 
-    // track_points, day by day
+    // track_points: reduce day 0, then day 1 carrying each vessel's state, as
+    // the daily job does.
+    let dicts = Dicts::new(vec!["a".into()], vec![], NAVS.iter().map(|s| s.to_string()).collect());
+    let thin = if m.thin { ThinOpts::default() } else { ThinOpts::off() };
+    let raw = raw_points(&pts);
+    let boundary = day(1).timestamp() * 1_000_000;
+    let (d0, d1): (Vec<_>, Vec<_>) = raw.into_iter().partition(|r| r.ts_us < boundary);
     let mut all = Vec::new();
-    for n in 0..2 {
-        let params = track_points::Params {
-            day_start: day(n),
-            lookback: Duration::days(2),
-            shards: 2,
-            max_speed_kn: 60.0,
-            gap: Duration::minutes(30),
-        };
-        for shard in 0..params.shards {
-            all.extend(track_points::build_shard(&ctx, &params, shard).await.unwrap());
-        }
-    }
-    let n_points = all.iter().map(|b| b.num_rows()).sum();
+    let (b0, state) = ais_tracks::reduce_day::reduce_all_with_state(
+        d0, &dicts, &Default::default(), &Rules::default(), &thin,
+    )
+    .unwrap();
+    all.extend(b0);
+    let (b1, _) = ais_tracks::reduce_day::reduce_all_with_state(d1, &dicts, &state, &Rules::default(), &thin)
+        .unwrap();
+    all.extend(b1);
+    let kept = all.iter().map(|b| b.num_rows()).sum();
     register(&ctx, "track_points", &all);
+    let sums = rows(&ctx, "SELECT sum(n_raw) FROM track_points").await;
+    let represented = sums[0][0].parse::<f64>().unwrap() as usize;
 
     // tracks and stop_segments, chained day to day
     let mut tracks_out = Vec::new();
@@ -246,18 +273,33 @@ async fn run() -> Built {
     let v = voyages::build(&ctx, true).await.unwrap();
     carry::check_batches(&voyages::voyages_schema(), &v).unwrap();
     register(&ctx, "voyages", &v);
-    Built { ctx, n_positions, n_points }
+    Built { ctx, n_positions, kept, represented }
 }
 
-#[tokio::test]
-async fn nothing_is_lost_between_positions_and_track_points() {
-    let b = run().await;
-    assert_eq!(b.n_points, b.n_positions);
+fn secs(iso: &str) -> f64 {
+    DateTime::parse_from_rfc3339(iso).unwrap().timestamp() as f64
 }
 
-#[tokio::test]
-async fn a_stop_across_midnight_is_one_stop_matched_to_its_port() {
-    let b = run().await;
+fn near(iso: &str, seconds_from_day0: i64, tol_s: f64) {
+    let want = day(0).timestamp() as f64 + seconds_from_day0 as f64;
+    let got = secs(iso);
+    assert!((got - want).abs() <= tol_s, "{iso}: {got} is not within {tol_s} s of {want}");
+}
+
+/// Every claim about the pipeline, for one reporting interval and thinning mode.
+async fn check_all(m: Mode) {
+    let (tol_s, tol_nm, tol_kn) = tolerances(m);
+    let b = run(m).await;
+
+    // Nothing is lost: thinned rows stand for every report.
+    assert_eq!(b.represented, b.n_positions, "reports represented");
+    if m.thin {
+        assert!(b.kept < b.n_positions * 2 / 5, "thinning kept {} of {}", b.kept, b.n_positions);
+    } else {
+        assert_eq!(b.kept, b.n_positions);
+    }
+
+    // Stops: Alpha, then Beta across midnight, matched to their ports.
     let r = rows(
         &b.ctx,
         "SELECT arrive_ts, depart_ts, n_segments, port_name, port_unlocode, is_current, port_distance_nm
@@ -265,27 +307,19 @@ async fn a_stop_across_midnight_is_one_stop_matched_to_its_port() {
     )
     .await;
     assert_eq!(r.len(), 2, "Alpha and Beta: {r:?}");
-    // Alpha
-    assert!(r[0][0].starts_with("2026-03-10T00:00:00"), "{:?}", r[0]);
-    assert!(r[0][1].starts_with("2026-03-10T06:00:00"), "{:?}", r[0]);
-    assert_eq!(r[0][3], "Alpha");
-    assert_eq!(r[0][4], "AA ALP");
+    near(&r[0][0], 0, tol_s);
+    near(&r[0][1], 6 * H, tol_s);
+    assert_eq!((r[0][3].as_str(), r[0][4].as_str()), ("Alpha", "AA ALP"));
     assert!(num(&r[0][6]) < 0.1);
-    // Beta spans two day pieces yet is one stop, and the vessel left it.
-    assert!(r[1][0].starts_with("2026-03-10T11:00:00"), "{:?}", r[1]);
-    assert!(r[1][1].starts_with("2026-03-11T03:00:00"), "{:?}", r[1]);
-    assert_eq!(r[1][2], "2", "day 0 and day 1 pieces merge");
+    near(&r[1][0], 11 * H, tol_s);
+    near(&r[1][1], 27 * H, tol_s);
+    assert_eq!(r[1][2], "2", "day 0 and day 1 pieces merge: {r:?}");
     assert_eq!(r[1][3], "Beta");
     assert_eq!(r[1][5], "false");
-    // Harbour size decides the match radius: Very Small Gamma is 3 nm from
-    // Alpha, but Alpha is nearer.
     let ids = rows(&b.ctx, "SELECT port2_id FROM stops WHERE mmsi = 366000001 ORDER BY arrive_ts").await;
     assert_eq!(ids[0][0], "3", "runner-up is kept");
-}
 
-#[tokio::test]
-async fn a_vessel_that_never_stops_has_no_stops_and_one_open_leg() {
-    let b = run().await;
+    // A vessel that never stops.
     assert!(rows(&b.ctx, "SELECT 1 FROM stops WHERE mmsi = 366000002").await.is_empty());
     let r = rows(
         &b.ctx,
@@ -294,12 +328,9 @@ async fn a_vessel_that_never_stops_has_no_stops_and_one_open_leg() {
     .await;
     assert_eq!(r.len(), 1);
     assert_eq!(&r[0][..3], ["false", "false", "true"]);
-    assert_eq!(r[0][3], "100", "every point after the first belongs to the leg");
-}
+    assert_eq!(r[0][3], format!("{}", 1000 * 60 / m.step), "every report after the first belongs to the leg");
 
-#[tokio::test]
-async fn voyages_link_the_stops_with_distance_and_declared_destination() {
-    let b = run().await;
+    // Voyages: distance, speed, and declared destination.
     let r = rows(
         &b.ctx,
         "SELECT origin_port_name, dest_port_name, distance_nm_clean, avg_speed_kn, is_open,
@@ -310,15 +341,47 @@ async fn voyages_link_the_stops_with_distance_and_declared_destination() {
     assert_eq!(r.len(), 2, "Alpha->Beta and the open leg after Beta: {r:?}");
     assert_eq!((r[0][0].as_str(), r[0][1].as_str()), ("Alpha", "Beta"));
     let nm = num(&r[0][2]);
-    assert!((nm - 60.0).abs() < 1.5, "distance {nm}");
+    assert!((nm - 60.0).abs() < tol_nm, "distance {nm}");
     let kn = num(&r[0][3]);
-    assert!((kn - 12.0).abs() < 0.5, "speed {kn}");
+    assert!((kn - 12.0).abs() < tol_kn, "speed {kn}");
     assert_eq!(r[0][4], "false");
     assert_eq!(r[0][5], "BETA", "padding removed; the most reported value wins");
     assert_eq!(r[0][6], "true");
     assert_eq!(r[0][7], "2");
-    // After Beta: origin known, nowhere reached yet.
     assert_eq!(r[1][0], "Beta");
     assert_eq!(r[1][1], "NULL");
     assert_eq!(r[1][4], "true");
+}
+
+#[tokio::test]
+async fn sparse_reports_unthinned() {
+    check_all(Mode { step: 600, thin: false }).await;
+}
+
+#[tokio::test]
+async fn dense_reports_unthinned() {
+    check_all(Mode { step: 10, thin: false }).await;
+}
+
+#[tokio::test]
+async fn dense_reports_thinned_give_the_same_answers() {
+    check_all(Mode { step: 10, thin: true }).await;
+}
+
+#[tokio::test]
+async fn thinning_changes_the_size_not_the_story() {
+    // Same distances and counts from the tracks table, thinned or not.
+    let off = run(Mode { step: 10, thin: false }).await;
+    let on = run(Mode { step: 10, thin: true }).await;
+    let q = "SELECT sum(n_rows), sum(n_stream), sum(n_duplicates), sum(n_outliers), sum(distance_nm_raw), \
+             min(min_lat), max(max_lat) FROM tracks";
+    let (a, b) = (rows(&off.ctx, q).await, rows(&on.ctx, q).await);
+    for c in 0..4 {
+        assert_eq!(a[0][c], b[0][c], "column {c}: {a:?} vs {b:?}");
+    }
+    let (da, db) = (num(&a[0][4]), num(&b[0][4]));
+    assert!((da - db).abs() < 1e-6 * da.max(1.0), "raw distance {da} vs {db}");
+    assert!((num(&a[0][5]) - num(&b[0][5])).abs() < 0.01);
+    assert!((num(&a[0][6]) - num(&b[0][6])).abs() < 0.01);
+    assert!(on.kept < off.kept / 2);
 }

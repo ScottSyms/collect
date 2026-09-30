@@ -118,12 +118,15 @@ pub async fn route_day(
 /// Reduces every bucket, calling `sink` with batches in
 /// [`crate::reduce::thin_points_schema`] form. `prev` holds each vessel's stream
 /// state from the day before, where known.
+///
+/// Returns the stats and each reduced vessel's stream state at the end of the
+/// day, to carry into the next one.
 pub fn reduce_buckets(
     m: &Manifest,
     opts: &ReduceOptions,
     prev: &HashMap<u32, StreamState>,
     sink: &mut dyn FnMut(RecordBatch) -> Result<()>,
-) -> Result<ReduceStats> {
+) -> Result<(ReduceStats, HashMap<u32, StreamState>)> {
     let started = Instant::now();
     let mut st = ReduceStats {
         buckets: m.buckets,
@@ -133,6 +136,7 @@ pub fn reduce_buckets(
         scratch_bytes: m.bytes_on_disk,
         ..Default::default()
     };
+    let mut next: HashMap<u32, StreamState> = HashMap::new();
     let mut chunk: Vec<OutRow> = Vec::with_capacity(OUT_CHUNK_ROWS);
     let flush = |chunk: &mut Vec<OutRow>, sink: &mut dyn FnMut(RecordBatch) -> Result<()>| {
         if !chunk.is_empty() {
@@ -162,6 +166,9 @@ pub fn reduce_buckets(
             let r = reduce_vessel(std::mem::take(&mut group), &m.dicts, prev.get(&mmsi).copied(), &opts.rules, &opts.thin);
             st.vessels += 1;
             st.unaccounted += r.unaccounted_raw as u64;
+            if let Some(state) = r.state {
+                next.insert(mmsi, state);
+            }
             for row in &r.rows {
                 st.kept += 1;
                 st.represented += row.n_raw as u64;
@@ -183,7 +190,65 @@ pub fn reduce_buckets(
     }
     flush(&mut chunk, sink)?;
     st.reduce_time = started.elapsed();
-    Ok(st)
+    Ok((st, next))
+}
+
+/// Carries `next` (the end-of-day states just computed) into `prev`, dropping
+/// entries older than `keep_after_us`: a vessel silent that long starts a fresh
+/// segment anyway.
+pub fn merge_states(
+    prev: &mut HashMap<u32, StreamState>,
+    next: HashMap<u32, StreamState>,
+    keep_after_us: i64,
+) {
+    prev.extend(next);
+    prev.retain(|_, s| s.ts_us >= keep_after_us);
+}
+
+/// Reduces `points` (any number of vessels, any order) entirely in memory, with
+/// no router. For small inputs and tests; use [`route_day`] and
+/// [`reduce_buckets`] for a real day.
+pub fn reduce_all(
+    points: Vec<RawPoint>,
+    dicts: &crate::reduce::Dicts,
+    prev: &HashMap<u32, StreamState>,
+    rules: &Rules,
+    thin: &ThinOpts,
+) -> Result<Vec<RecordBatch>> {
+    Ok(reduce_all_with_state(points, dicts, prev, rules, thin)?.0)
+}
+
+/// [`reduce_all`], also returning each vessel's end-of-input stream state.
+pub fn reduce_all_with_state(
+    mut points: Vec<RawPoint>,
+    dicts: &crate::reduce::Dicts,
+    prev: &HashMap<u32, StreamState>,
+    rules: &Rules,
+    thin: &ThinOpts,
+) -> Result<(Vec<RecordBatch>, HashMap<u32, StreamState>)> {
+    points.sort_by_key(|p| p.mmsi);
+    let mut rows: Vec<OutRow> = Vec::new();
+    let mut next = HashMap::new();
+    let mut i = 0;
+    while i < points.len() {
+        let mmsi = points[i].mmsi;
+        let mut j = i;
+        while j < points.len() && points[j].mmsi == mmsi {
+            j += 1;
+        }
+        let r = reduce_vessel(points[i..j].to_vec(), dicts, prev.get(&mmsi).copied(), rules, thin);
+        if let Some(state) = r.state {
+            next.insert(mmsi, state);
+        }
+        rows.extend(r.rows);
+        i = j;
+    }
+    let batches = if rows.is_empty() {
+        Vec::new()
+    } else {
+        vec![to_batch(&rows, dicts)?]
+    };
+    Ok((batches, next))
 }
 
 /// Peak resident memory of this process so far, in bytes.

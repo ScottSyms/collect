@@ -156,11 +156,10 @@ metrics AS (
     sum(tp.dist_nm) FILTER (WHERE tp.has_position AND NOT tp.is_duplicate
                               AND NOT tp.gap_before AND NOT tp.is_speed_jump)
       AS distance_nm_clean,
-    max(tp.sog_knots) FILTER (WHERE tp.has_position AND NOT tp.is_duplicate
-                                AND NOT tp.is_sog_invalid) AS max_sog_knots,
-    count(*) AS n_points,
+    max(tp.max_sog) FILTER (WHERE tp.has_position AND NOT tp.is_duplicate) AS max_sog_knots,
+    CAST(sum(tp.n_raw) AS BIGINT) AS n_points,
     count(*) FILTER (WHERE tp.gap_before) AS n_gaps,
-    count(*) FILTER (WHERE tp.is_outlier) AS n_outliers
+    CAST(sum(tp.n_outliers_raw) AS BIGINT) AS n_outliers
   FROM legs l JOIN track_points tp
     ON tp.mmsi = l.mmsi AND tp.ts > l.depart_ts AND (l.arrive_ts IS NULL OR tp.ts <= l.arrive_ts)
   GROUP BY l.voyage_id

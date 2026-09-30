@@ -16,10 +16,13 @@ options as the other binaries. New to the project? [TUTORIAL.md](TUTORIAL.md)
 covers Iceberg output first; this page is a reference for this one binary.
 Flags are also listed in [CLI_REFERENCE.md](CLI_REFERENCE.md#ais-tracks).
 
-> **Status.** The SQL is covered by tests on synthetic data, including a
-> two-day run through every table. The Iceberg write paths reuse the commit
-> code of [`ais-compact`](AIS_COMPACT.md), but have not yet been exercised
-> against a live catalog: try `--apply` on a scratch namespace first.
+> **Status.** The SQL and the reducer are covered by tests on synthetic data,
+> including a two-day run through every table with thinning on and off, and the
+> reducer is held to row-for-row agreement with the original SQL. The day writer
+> is tested against a real Iceberg table on the local filesystem. What has not
+> been exercised is a live catalog: the silver scan (`positions`), the
+> previous-day state read, and the commits. They reuse the commit code of
+> [`ais-compact`](AIS_COMPACT.md); try `--apply` on a scratch namespace first.
 
 ## Contents
 
@@ -38,13 +41,16 @@ Flags are also listed in [CLI_REFERENCE.md](CLI_REFERENCE.md#ais-tracks).
 
 ## Design rules
 
-- **Annotate, never drop.** `track_points` has exactly one row per silver
-  `positions` row. Duplicates, outliers and gaps are marked in columns, not
-  removed, so a later run (downsampling, cleaning) decides what to discard:
-  `WHERE NOT is_duplicate AND NOT is_spike`. The summary tables (`tracks`,
-  `stops`, `voyages`) count what they cover, give distances and bounding boxes
-  both raw and with outliers left out, and say when something is uncertain
-  rather than guessing.
+- **Annotate first, thin only by rule.** Silver keeps every report. `track_points`
+  is built from it by one streaming pass that flags duplicates, gaps, jumps,
+  spikes and invalid values, and then keeps only the rows movement makes
+  worth keeping (`--no-thin` keeps all). Every kept row carries how many
+  reports it stands for and the sums needed to use it, flagged rows and their
+  neighbours are always kept, and `sum(n_raw)` equals the reports read, so
+  nothing disappears unaccounted. The summary tables (`tracks`, `stops`,
+  `voyages`) count what they cover, give distances and bounding boxes both raw
+  and with outliers left out, and say when something is uncertain rather than
+  guessing.
 - **Movement first.** Stops and voyages come from where a vessel actually was.
   What it *declared* (destination, nav status) is kept beside that as evidence,
   never used in place of it.
@@ -62,7 +68,7 @@ Flags are also listed in [CLI_REFERENCE.md](CLI_REFERENCE.md#ais-tracks).
 | `vessel_attributes` | value a vessel ever reported for an identity attribute | rebuilt each run | none |
 | `vessels` | MMSI | rebuilt each run | none |
 | `ref_ports` | port, per World Port Index release | appended per release | none |
-| `track_points` | silver `positions` row | daily | day of `ts` |
+| `track_points` | kept report (each stands for one or more `positions` rows) | daily | day of `ts` |
 | `tracks` | continuous segment, per UTC day | daily | day of `ts` (first row) |
 | `stop_segments` | stationary run, per UTC day | daily | day of `ts` (first point) |
 | `stops` | stop (the day pieces merged) | rebuilt each run | none |
@@ -199,30 +205,46 @@ for two different terminals); matching treats each row as its own candidate.
 ais-tracks $CAT track-points --from 2026-03-01 [--to 2026-03-31] [--apply]
 ```
 
-Each silver `positions` row, one for one, with every silver column unchanged
-and these added. Partitioned by day on `ts`, sorted by `mmsi, ts`.
+Reads a day of silver `positions` and writes the reduced, annotated rows to
+`track_points`, partitioned by day on `ts`. It is the memory-bounded reducer
+described under [Running at scale](#running-at-scale-reduce-day): one pass routes the day's
+reports to on-disk vessel buckets, then each bucket is reduced in turn, and the
+rows stream into one Parquet writer and one Iceberg snapshot per day. Peak
+memory is one bucket, not the day.
+
+Each vessel's stream continues from the day before: when the previous day is
+built in the same run its end-of-day state is carried in memory, otherwise it
+is read from the table (`--lookback-days`, default 1). A run for one day
+replaces only that day's partition.
 
 | Column | Meaning |
 |--------|---------|
+| `ts`, `mmsi`, `source`, `station`, `latitude`, `longitude`, `sog_knots`, `cog`, `heading_true`, `nav_status` | the report kept, as received |
 | `has_position` | latitude and longitude present and in range |
-| `dup_rank`, `n_dups`, `is_duplicate` | rows with the same mmsi, ts, position, sog, cog, heading and nav status are the same message heard more than once (different `source`, `station` or `payload`). Rank 1 is the first, ordered by source, station, payload |
-| `prev_ts`, `dt_s`, `dist_nm`, `implied_speed_kn` | movement since the vessel's previous *stream* point: the previous row that has a position and is not a duplicate. Null for duplicates and rows without a position |
-| `gap_before` | first stream point, or `dt_s` above `--gap-minutes` |
+| `dup_rank`, `n_dups`, `is_duplicate` | Rows with the same mmsi, ts, position, sog, cog, heading and nav status are the same message heard more than once (different `source` / `station`). Rank 1 is the first. With thinning on, duplicates are collapsed into the kept row and counted in `n_collapsed_dups`, so `is_duplicate` is false on every kept row |
+| `prev_ts`, `dt_s`, `dist_nm`, `implied_speed_kn` | Movement since the previous *kept* row: `dt_s` is the time since it, `dist_nm` the summed distance of every hop since it (so distance totals are exact, thinned or not), `implied_speed_kn` the speed of this row's own hop |
+| `gap_before` | first stream row, or `dt_s` above `--gap-minutes` |
 | `is_speed_jump` | implied speed above `--max-speed-kn`, or two positions more than 0.05 nm apart in the same second |
-| `is_spike` | a jump *into* the point and a jump *out* of it: an isolated bad fix |
-| `is_sog_invalid`, `is_cog_invalid`, `is_heading_invalid` | value outside the AIS range |
-| `is_outlier` | `is_spike`, or any invalid sog, cog or heading |
+| `is_spike` | a jump *into* the row and a jump *out* of it: an isolated bad fix |
+| `is_sog_invalid`, `is_cog_invalid`, `is_heading_invalid`, `is_outlier` | value outside the AIS range; `is_outlier` is a spike or any invalid value |
+| `n_raw` | reports this row stands for, itself included |
+| `n_collapsed_dups`, `n_no_position`, `n_outliers_raw` | how many of those were duplicates, had no usable position, or were outliers |
+| `sum_speed`, `n_speed` | for a count-weighted mean speed (reported speed when valid, else implied) |
+| `sum_sog`, `n_sog`, `max_sog` | the same for valid reported speed only |
+| `max_dev_nm` | the farthest a collapsed report was from this row |
+| `max_hop_speed_kn` | the fastest hop among the reports it stands for |
+| `keep_reason` | bitmask of why the row was kept (see the table below) |
 
 The return leg after a spike is flagged `is_speed_jump` but not `is_spike`,
 because it is measured from the bad point; the spike is the row to discard.
+"Stream" rows are those with a position that are the first of their message;
+duplicates and rows without a position are never kept, only counted.
 
-| Flag | Default | Meaning |
-|------|---------|---------|
-| `--from`, `--to` | | first and last UTC day (inclusive); `--day` is an alias for `--from` |
-| `--shards` | `4` | split each day's vessels by `mmsi % shards` to bound memory; output is identical for any value |
-| `--lookback-days` | `2` | how far back to look for a vessel's previous point |
-| `--max-speed-kn` | `60` | implied speed above which a point is a jump |
-| `--gap-minutes` | `30` | a longer silence sets `gap_before` |
+Flags are `--no-thin`, `--keep-distance-nm`, `--keep-interval-s`,
+`--keep-turn-deg`, `--keep-speed-kn`, `--max-speed-kn`, `--gap-minutes`,
+`--buckets`, `--target-bucket-rows`, `--scratch` and `--keep-scratch` (the same
+as `reduce-day`, below). Without `--apply` it reduces and reports without
+writing.
 
 ### `tracks`
 
@@ -243,18 +265,20 @@ If the previous day's partition is missing the piece gets an id of its own and
 |--------|---------|
 | `ts`, `ts_end`, `duration_s`, `mmsi`, `track_id` | the piece and its chain |
 | `continues_previous`, `chain_broken` | see above |
-| `n_rows`, `n_stream`, `n_duplicates`, `n_no_position` | every `track_points` row in the piece is counted; `n_stream` are the positioned, non-duplicate ones |
+| `n_rows`, `n_stream`, `n_duplicates`, `n_no_position` | every report in the piece is counted (through `n_raw`), thinned or not; `n_stream` are the positioned, non-duplicate ones |
 | `n_jumps`, `n_spikes`, `n_outliers` | flag counts |
 | `start_lat/lon`, `end_lat/lon` | first and last positioned point |
 | `distance_nm_raw` | sum of hops between positioned points, outliers included |
 | `distance_nm_clean` | the same leaving out every hop flagged `is_speed_jump` (a spike removes both its legs, so it slightly undercounts) |
-| `min/max_lat/lon`, `clean_*` | bounding box over all positioned points, and over those not flagged `is_outlier` |
+| `min/max_lat/lon`, `clean_*` | bounding box over the kept positioned points, and over those not flagged `is_outlier` (with thinning it can miss a collapsed report by up to `--keep-distance-nm`) |
 | `bbox_wraps` | longitude span over 180°: the piece probably crosses the antimeridian, so min/max longitude are not a usable box |
 | `mean_sog_knots`, `max_sog_knots` | reported speed, leaving out invalid values |
 
 Rows in a stretch with no positioned point of their own (a position-less
 message between two gaps) fall in no piece. The run prints how many; the
-`track_points` rows are untouched. Flags: `--from`, `--to`, `--shards`.
+`track_points` rows are untouched. `tracks` reads the thinned rows and weights
+by `n_raw`, so it gives the same counts and distances thinned or not. Flags:
+`--from`, `--to`, `--shards`.
 
 ### `stop-segments`
 
@@ -415,9 +439,14 @@ loaded), not by the day. Scratch is about 21 bytes per report, so a 500 M report
 day needs roughly 10 GB. These are synthetic numbers; the retention on real
 traffic will differ. `gen-day --out DIR --rows N` writes such a day.
 
-Not yet wired into the Iceberg pipeline: the reduced rows are not yet written to
-a table, and `tracks`, `stops` and `voyages` still read `track_points`. The
-downstream SQL needs to weight by `n_raw` before it can read thinned rows.
+`reduce-day` is the same reduction as `track-points`, but reads a local
+directory if you want, and writes a Parquet file rather than an Iceberg table:
+use it to tune the thinning on a real day before running `track-points`. The
+downstream tables read thinned rows: `tracks`, `stop-segments` and `voyages`
+weight by `n_raw` and use the carried sums, so counts, sums and distances agree
+with the unthinned answer. Stop and leg boundaries blur by up to about half the
+speed-smoothing window (5 minutes) with dense reports, and thinning adds up to
+one `--keep-interval-s` to that; this is tested (`tests/pipeline.rs`).
 
 ## Operating it
 
@@ -437,10 +466,10 @@ state in memory; a run that starts mid-history reads it from the table. Where
 the previous day is absent, the piece is flagged (`chain_broken`) rather than
 guessed.
 
-**Memory.** Each day is split into `--shards` chunks by `mmsi % shards`, and
-each chunk is held in memory while it is written. Raise `--shards` for busy
-days. `stops` and `voyages` read `track_points`, `tracks` and `stop_segments`
-in full, so their cost grows with history.
+**Memory.** `track-points` holds one bucket at a time (`--target-bucket-rows`);
+`tracks` and `stop-segments` split each day's vessels into `--shards` chunks
+by `mmsi % shards` and hold one chunk. `stops` and `voyages` read `track_points`,
+`tracks` and `stop_segments` in full, so their cost grows with history.
 
 **Maintenance.** The daily tables write a few files per day. Compact them like
 any other table, pointing `ais-compact` at the output namespace:
@@ -512,6 +541,8 @@ WHERE v.multiple_imos ORDER BY v.mmsi, a.rank;
   Inspect `radius_nm`, `duration_s` and the nav-status counts before trusting a
   stop as a port call. A short stop split across midnight can be missed on one
   side.
+- **Duplicates are collapsed within a day only**, so a report whose twin is in the
+  neighbouring day is counted twice.
 - **The last point of a day cannot be tested for a jump out**, so it is never
   flagged `is_spike`; the same goes for the newest data in an open day.
 - **A vessel silent for longer than `--lookback-days`** starts with a null

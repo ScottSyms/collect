@@ -17,6 +17,7 @@ tokio.workspace = true
 parquet.workspace = true
 libc.workspace = true
 zstd = "0.13"
+uuid = { version = "1", features = ["v4"] }
 rand.workspace = true
 collect-core = { path = "../collect-core" }
 collect-maint = { path = "../collect-maint" }

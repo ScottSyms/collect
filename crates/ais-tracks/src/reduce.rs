@@ -234,6 +234,11 @@ pub struct OutRow {
     pub max_dev_nm: f64,
     pub max_hop_speed_kn: Option<f64>,
     pub keep_reason: u16,
+    /// Sum and count of valid reported speeds over the stream rows this row
+    /// stands for, and the largest of them.
+    pub sum_sog: f64,
+    pub n_sog: i32,
+    pub max_sog: Option<f64>,
 }
 
 #[derive(Debug, Default)]
@@ -444,6 +449,18 @@ pub fn reduce_vessel(
             max_dev_nm: 0.0,
             max_hop_speed_kn: hop.implied_speed_kn,
             keep_reason: 0,
+            sum_sog: 0.0,
+            n_sog: 0,
+            max_sog: None,
+        }
+    };
+
+    // A valid reported speed, as `tracks` averages it.
+    let valid_sog = |k: usize, r: &OutRow| -> Option<f64> {
+        if r.is_sog_invalid {
+            None
+        } else {
+            pts[k].sog()
         }
     };
 
@@ -469,7 +486,14 @@ pub fn reduce_vessel(
                 }
                 r.n_collapsed_dups = i32::from(dup_rank[k] > 1);
                 r.n_no_position = i32::from(!has_pos[k]);
-                r.n_outliers_raw = i32::from(r.is_outlier || r.is_speed_jump);
+                r.n_outliers_raw = i32::from(r.is_outlier);
+                if stream_pos[k].is_some() {
+                    if let Some(v) = valid_sog(k, &r) {
+                        r.sum_sog = v;
+                        r.n_sog = 1;
+                        r.max_sog = Some(v);
+                    }
+                }
                 r.keep_reason = KEEP_FIRST | KEEP_LAST;
                 r
             })
@@ -528,6 +552,9 @@ pub fn reduce_vessel(
         has_dist: bool,
         max_hop: Option<f64>,
         collapsed: Vec<(f64, f64)>,
+        sum_sog: f64,
+        n_sog: i32,
+        max_sog: Option<f64>,
     }
     struct LastKept {
         ts_us: i64,
@@ -571,8 +598,13 @@ pub fn reduce_vessel(
         if let Some(v) = hops[j].implied_speed_kn {
             pending.max_hop = Some(pending.max_hop.map_or(v, |m| m.max(v)));
         }
-        if flagged[j] || row.is_outlier {
+        if row.is_outlier {
             pending.outliers += 1;
+        }
+        if let Some(v) = valid_sog(k, &row) {
+            pending.sum_sog += v;
+            pending.n_sog += 1;
+            pending.max_sog = Some(pending.max_sog.map_or(v, |m| m.max(v)));
         }
 
         let mut reason = static_reason[j];
@@ -626,6 +658,9 @@ pub fn reduce_vessel(
             .map(|&(a, b)| haversine_nm(lat, lon, a, b))
             .fold(0.0, f64::max);
         row.keep_reason = reason;
+        row.sum_sog = pending.sum_sog;
+        row.n_sog = pending.n_sog;
+        row.max_sog = pending.max_sog;
         last = Some(LastKept {
             ts_us: q.ts_us,
             lat,
@@ -708,6 +743,9 @@ pub fn thin_points_schema() -> Schema {
         required(32, "max_dev_nm", Double),
         optional(33, "max_hop_speed_kn", Double),
         required(34, "keep_reason", Int),
+        required(35, "sum_sog", Double),
+        required(36, "n_sog", Int),
+        optional(37, "max_sog", Double),
     ];
     Schema::builder()
         .with_schema_id(1)
@@ -773,6 +811,9 @@ pub fn to_batch(rows: &[OutRow], dicts: &Dicts) -> Result<RecordBatch> {
         f64s(&|r| Some(r.max_dev_nm)),
         f64s(&|r| r.max_hop_speed_kn),
         i32s(&|r| r.keep_reason as i32),
+        f64s(&|r| Some(r.sum_sog)),
+        i32s(&|r| r.n_sog),
+        f64s(&|r| r.max_sog),
     ];
     let schema = Arc::new(iceberg::arrow::schema_to_arrow_schema(&thin_points_schema())?);
     Ok(RecordBatch::try_new(schema, cols)?)
@@ -914,6 +955,42 @@ mod tests {
         let ra = reduce_vessel(a, &dicts(), None, &Rules::default(), &ThinOpts::default());
         let rb = reduce_vessel(b, &dicts(), None, &Rules::default(), &ThinOpts::default());
         assert_eq!(ra.rows, rb.rows);
+    }
+
+    #[test]
+    fn thinning_conserves_counts_and_sums() {
+        let mut v = sailing(400);
+        v[50].lat_e7 = Some(200_000_000); // spike
+        v[80].sog_dk = Some(1023); // invalid speed
+        v[120].cog_dd = Some(3600); // invalid course
+        v[130].lat_e7 = None;
+        v[130].lon_e7 = None;
+        v.push(v[200].clone()); // duplicate
+        v.last_mut().unwrap().source = 1;
+        let off = reduce_vessel(v.clone(), &dicts(), None, &Rules::default(), &ThinOpts::off());
+        let on = reduce_vessel(v, &dicts(), None, &Rules::default(), &ThinOpts::default());
+        assert!(on.rows.len() < off.rows.len() / 2);
+        macro_rules! total {
+            ($r:expr, $f:ident) => {
+                $r.rows.iter().map(|x| x.$f as f64).sum::<f64>()
+            };
+        }
+        for (name, a, b) in [
+            ("n_raw", total!(off, n_raw), total!(on, n_raw)),
+            ("dups", total!(off, n_collapsed_dups), total!(on, n_collapsed_dups)),
+            ("no position", total!(off, n_no_position), total!(on, n_no_position)),
+            ("outliers", total!(off, n_outliers_raw), total!(on, n_outliers_raw)),
+            ("n_sog", total!(off, n_sog), total!(on, n_sog)),
+            ("sum_sog", total!(off, sum_sog), total!(on, sum_sog)),
+        ] {
+            assert!((a - b).abs() < 1e-6, "{name}: {a} vs {b}");
+        }
+        let max = |r: &Reduced| r.rows.iter().filter_map(|x| x.max_sog).fold(0.0, f64::max);
+        assert_eq!(max(&off), max(&on));
+        // Jumps and spikes are never collapsed, so their counts are exact.
+        let flag = |r: &Reduced, f: fn(&OutRow) -> bool| r.rows.iter().filter(|x| f(x)).count();
+        assert_eq!(flag(&off, |x| x.is_spike), flag(&on, |x| x.is_spike));
+        assert_eq!(flag(&off, |x| x.is_speed_jump), flag(&on, |x| x.is_speed_jump));
     }
 
     #[test]

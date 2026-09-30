@@ -139,19 +139,20 @@ pub fn segments_sql(p: &StopParams, shard: u32) -> String {
         "
 WITH pts AS (
   SELECT mmsi, ts, latitude, longitude, sog_knots, source, nav_status, prev_ts, dist_nm,
-         gap_before,
-         coalesce(CASE WHEN is_sog_invalid THEN NULL ELSE sog_knots END, implied_speed_kn)
-           AS speed_kn
+         gap_before, sum_speed, n_speed, max_dev_nm,
+         -- how many positioned reports this row stands for (1 when unthinned)
+         (n_raw - n_collapsed_dups - n_no_position) AS w
   FROM track_points
   WHERE ts >= '{ds}' AND ts < '{de}' AND mmsi % {n} = {shard}
     AND has_position AND NOT is_duplicate AND NOT is_spike
 ),
 smooth AS (
   SELECT pts.*,
-    avg(speed_kn) OVER (PARTITION BY mmsi ORDER BY ts
-      RANGE BETWEEN INTERVAL '{half} seconds' PRECEDING
-                AND INTERVAL '{half} seconds' FOLLOWING) AS speed_smooth
+    sum(sum_speed) OVER sw / nullif(sum(n_speed) OVER sw, 0) AS speed_smooth
   FROM pts
+  WINDOW sw AS (PARTITION BY mmsi ORDER BY ts
+    RANGE BETWEEN INTERVAL '{half} seconds' PRECEDING
+              AND INTERVAL '{half} seconds' FOLLOWING)
 ),
 marked AS (
   SELECT smooth.*,
@@ -175,25 +176,26 @@ runs AS (
 ),
 slowrows AS (
   SELECT runs.*,
-    avg(latitude) OVER cw AS c_lat,
-    degrees(atan2(avg(sin(radians(longitude))) OVER cw,
-                  avg(cos(radians(longitude))) OVER cw)) AS c_lon
+    sum(latitude * w) OVER cw / sum(w) OVER cw AS c_lat,
+    degrees(atan2(sum(sin(radians(longitude)) * w) OVER cw,
+                  sum(cos(radians(longitude)) * w) OVER cw)) AS c_lon
   FROM runs WHERE is_slow
   WINDOW cw AS (PARTITION BY mmsi, run_no)
 ),
 agg AS (
   SELECT mmsi, run_no,
     min(ts) AS ts, max(ts) AS ts_end,
-    CAST(count(*) AS INT) AS n_points,
+    CAST(sum(w) AS INT) AS n_points,
     bool_or(rn = 1) AS at_day_start,
     bool_or(rn = n_rows) AS open_at_day_end,
     first_value(prev_ts {first}) AS first_prev_ts,
     first_value(displaced {first}) AS first_displaced,
     max(c_lat) AS lat, max(c_lon) AS lon,
-    max({dev}) AS radius_nm,
-    CAST(count(*) FILTER (WHERE nav_status ILIKE '%moored%') AS INT) AS n_moored,
-    CAST(count(*) FILTER (WHERE nav_status ILIKE '%anchor%') AS INT) AS n_anchored,
-    avg(speed_kn) AS mean_speed_kn
+    -- a thinned row also covers reports up to max_dev_nm away from it
+    max({dev} + max_dev_nm) AS radius_nm,
+    CAST(coalesce(sum(w) FILTER (WHERE nav_status ILIKE '%moored%'), 0) AS INT) AS n_moored,
+    CAST(coalesce(sum(w) FILTER (WHERE nav_status ILIKE '%anchor%'), 0) AS INT) AS n_anchored,
+    sum(sum_speed) / nullif(sum(n_speed), 0) AS mean_speed_kn
   FROM slowrows
   GROUP BY mmsi, run_no
 )

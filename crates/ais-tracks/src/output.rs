@@ -213,3 +213,94 @@ pub async fn commit_day(
     discard(&catalog.load_table(&ident).await?, &added).await;
     bail!("{base_name}: gave up after {MAX_COMMIT_ATTEMPTS} conflicting commits")
 }
+
+/// Writes one day's batches into that day's partition as they arrive, rolling
+/// to a new file at the target size. Nothing is visible until the files it
+/// returns are passed to [`commit_day`].
+///
+/// [`write_day_shard`] needs the whole shard in one batch; this takes any
+/// number of small ones, so a day can be streamed through in bounded memory.
+pub struct DayWriter {
+    writer: Box<dyn iceberg::writer::IcebergWriter>,
+    target: std::sync::Arc<arrow::datatypes::Schema>,
+    pub rows: usize,
+}
+
+impl DayWriter {
+    pub async fn new(table: &Table, days_since_epoch: i32, bloom: &[&str]) -> Result<Self> {
+        use iceberg::spec::{DataFileFormat, PartitionKey};
+        use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+        use iceberg::writer::file_writer::location_generator::{
+            DefaultFileNameGenerator, DefaultLocationGenerator,
+        };
+        use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+        use iceberg::writer::file_writer::ParquetWriterBuilder;
+        use iceberg::writer::IcebergWriterBuilder;
+        use parquet::basic::{Compression, ZstdLevel};
+        use parquet::file::properties::WriterProperties;
+        use parquet::schema::types::ColumnPath;
+
+        let metadata = table.metadata();
+        let schema = metadata.current_schema();
+        let location_gen = DefaultLocationGenerator::new(metadata.clone())?;
+        let name_gen = DefaultFileNameGenerator::new(
+            format!("reduce-{}", uuid::Uuid::new_v4().simple()),
+            Some("iceberg".to_string()),
+            DataFileFormat::Parquet,
+        );
+        let mut props = WriterProperties::builder()
+            .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
+            .set_max_row_group_size(collect_maint::rewrite::MAX_ROW_GROUP_ROWS);
+        for col in bloom {
+            if schema.field_by_name(col).is_some() {
+                props = props.set_column_bloom_filter_enabled(ColumnPath::from(*col), true);
+            }
+        }
+        let rolling = RollingFileWriterBuilder::new(
+            ParquetWriterBuilder::new(props.build(), schema.clone()),
+            TARGET_FILE_BYTES as usize,
+            table.file_io().clone(),
+            location_gen,
+            name_gen,
+        );
+        let key = PartitionKey::new(
+            metadata.default_partition_spec().as_ref().clone(),
+            schema.clone(),
+            day_partition(days_since_epoch),
+        );
+        let writer = DataFileWriterBuilder::new(rolling)
+            .build(Some(key))
+            .await
+            .context("build writer")?;
+        Ok(Self {
+            writer: Box::new(writer),
+            target: std::sync::Arc::new(iceberg::arrow::schema_to_arrow_schema(schema)?),
+            rows: 0,
+        })
+    }
+
+    /// Writes one batch (columns in the table's order; types are cast to it).
+    pub async fn write(&mut self, batch: &RecordBatch) -> Result<()> {
+        let cols = batch
+            .columns()
+            .iter()
+            .zip(self.target.fields())
+            .map(|(c, f)| {
+                if c.data_type() == f.data_type() {
+                    Ok(c.clone())
+                } else {
+                    arrow::compute::cast(c, f.data_type()).map_err(anyhow::Error::from)
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let projected = RecordBatch::try_new(self.target.clone(), cols)?;
+        self.rows += projected.num_rows();
+        self.writer.write(projected).await.context("write")?;
+        Ok(())
+    }
+
+    /// Closes the writer and returns the files, ready for [`commit_day`].
+    pub async fn finish(mut self) -> Result<Vec<DataFile>> {
+        self.writer.close().await.context("close")
+    }
+}

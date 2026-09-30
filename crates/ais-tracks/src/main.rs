@@ -3,10 +3,10 @@
 //! Every command is a dry run unless `--apply` is given.
 
 use anyhow::{Context, Result};
-use ais_tracks::output::{commit_day, ensure_day_table, replace_table, write_day_shard};
-use ais_tracks::track_points::{self, FlagCounts, Params, TABLE_TRACK_POINTS};
+use ais_tracks::output::{commit_day, ensure_day_table, replace_table, write_day_shard, DayWriter};
+use ais_tracks::track_points::TABLE_TRACK_POINTS;
 use ais_tracks::ports::{self, TABLE_REF_PORTS};
-use ais_tracks::reduce::{Rules, ThinOpts};
+use ais_tracks::reduce::{Rules, StreamState, ThinOpts};
 use ais_tracks::reduce_day::{self, ReduceOptions};
 use ais_tracks::source;
 use ais_tracks::stops::{self, StopParams, TABLE_STOPS, TABLE_STOP_SEGMENTS};
@@ -26,6 +26,7 @@ use collect_maint::commit::RestClient;
 use datafusion::prelude::SessionContext;
 use iceberg::Catalog;
 use iceberg_datafusion::IcebergStaticTableProvider;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 #[derive(Parser, Debug)]
@@ -56,8 +57,9 @@ struct Cli {
 enum Command {
     /// Rebuild `vessels` and `vessel_attributes` from `statics` and `positions`.
     Vessels(ApplyArgs),
-    /// Annotate each `positions` row (duplicates, movement, outlier flags),
-    /// one day partition at a time.
+    /// Reduce each day of `positions` with bounded memory (duplicates,
+    /// movement, outlier flags, optional thinning) into `track_points`, one
+    /// day partition at a time.
     TrackPoints(TrackPointsArgs),
     /// Roll `track_points` up into continuous track segments, one day at a
     /// time. Days must be built in order (run track-points first).
@@ -87,6 +89,83 @@ struct ApplyArgs {
     apply: bool,
 }
 
+/// How a day of raw reports is routed and reduced; shared by `reduce-day` and
+/// `track-points`.
+#[derive(Args, Debug, Clone)]
+struct ReduceTuning {
+    /// Scratch space for the bucket files (about 21 bytes per raw report,
+    /// compressed).
+    #[arg(long, default_value_os_t = std::env::temp_dir().join("ais-tracks"))]
+    scratch: std::path::PathBuf,
+
+    /// Keep the scratch files afterwards.
+    #[arg(long)]
+    keep_scratch: bool,
+
+    /// Number of buckets. Default: about one per --target-bucket-rows reports.
+    #[arg(long)]
+    buckets: Option<usize>,
+
+    /// Reports per bucket to aim for; a bucket is held in memory (about 56
+    /// bytes per report) while it is reduced.
+    #[arg(long, default_value_t = 3_000_000)]
+    target_bucket_rows: u64,
+
+    /// Keep every row instead of thinning.
+    #[arg(long)]
+    no_thin: bool,
+
+    /// Keep a row when the vessel has moved this far (nautical miles) since the
+    /// last kept row.
+    #[arg(long, default_value_t = 0.1)]
+    keep_distance_nm: f64,
+
+    /// Keep a row when this many seconds have passed since the last kept row.
+    #[arg(long, default_value_t = 120.0)]
+    keep_interval_s: f64,
+
+    /// Keep a row when the course changed by this many degrees while moving.
+    #[arg(long, default_value_t = 15.0)]
+    keep_turn_deg: f64,
+
+    /// Keep a row when the speed changed by this many knots.
+    #[arg(long, default_value_t = 2.0)]
+    keep_speed_kn: f64,
+
+    /// Implied speed above which a point is a speed jump.
+    #[arg(long, default_value_t = 60.0)]
+    max_speed_kn: f64,
+
+    /// A longer silence than this many minutes marks a gap.
+    #[arg(long, default_value_t = 30)]
+    gap_minutes: i64,
+}
+
+impl ReduceTuning {
+    fn options(&self) -> ReduceOptions {
+        ReduceOptions {
+            rules: Rules {
+                max_speed_kn: self.max_speed_kn,
+                gap_s: (self.gap_minutes * 60) as f64,
+            },
+            thin: if self.no_thin {
+                ThinOpts::off()
+            } else {
+                ThinOpts {
+                    off: false,
+                    keep_distance_nm: self.keep_distance_nm,
+                    keep_interval_s: self.keep_interval_s,
+                    keep_turn_deg: self.keep_turn_deg,
+                    keep_speed_kn: self.keep_speed_kn,
+                }
+            },
+            buckets: self.buckets,
+            target_bucket_rows: self.target_bucket_rows,
+            scratch: self.scratch.clone(),
+        }
+    }
+}
+
 #[derive(Args, Debug)]
 struct TrackPointsArgs {
     /// First UTC day to build (YYYY-MM-DD).
@@ -97,24 +176,15 @@ struct TrackPointsArgs {
     #[arg(long, value_parser = clap::value_parser!(NaiveDate))]
     to: Option<NaiveDate>,
 
-    /// Split each day's vessels into this many independent chunks to bound
-    /// memory. Output is identical for any value.
-    #[arg(long, default_value_t = 4)]
-    shards: u32,
-
-    /// How many days before each day to search for a vessel's previous point.
-    #[arg(long, default_value_t = 2)]
+    /// How many days before each day to look for a vessel's previous point
+    /// when the day before is not being built in the same run.
+    #[arg(long, default_value_t = 1)]
     lookback_days: i64,
 
-    /// Implied speed above which a point is flagged as a speed jump.
-    #[arg(long, default_value_t = 60.0)]
-    max_speed_kn: f64,
+    #[command(flatten)]
+    tuning: ReduceTuning,
 
-    /// A gap longer than this many minutes marks `gap_before`.
-    #[arg(long, default_value_t = 30)]
-    gap_minutes: i64,
-
-    /// Write the partitions. Without it, compute and report only.
+    /// Write the partitions. Without it, reduce and report only.
     #[arg(long)]
     apply: bool,
 }
@@ -237,77 +307,13 @@ struct ReduceDayArgs {
     #[arg(long)]
     out_dir: Option<std::path::PathBuf>,
 
-    /// Scratch space for the bucket files (about 15 bytes per raw report,
-    /// compressed).
-    #[arg(long, default_value_os_t = std::env::temp_dir().join("ais-tracks"))]
-    scratch: std::path::PathBuf,
-
-    /// Keep the scratch files afterwards.
-    #[arg(long)]
-    keep_scratch: bool,
-
-    /// Number of buckets. Default: about one per --target-bucket-rows reports.
-    #[arg(long)]
-    buckets: Option<usize>,
-
-    /// Reports per bucket to aim for; a bucket is held in memory (about 56
-    /// bytes per report) while it is reduced.
-    #[arg(long, default_value_t = 3_000_000)]
-    target_bucket_rows: u64,
-
-    /// Keep every row instead of thinning (the output then equals
-    /// `track-points`).
-    #[arg(long)]
-    no_thin: bool,
-
-    /// Keep a row when the vessel has moved this far (nautical miles) since the
-    /// last kept row.
-    #[arg(long, default_value_t = 0.1)]
-    keep_distance_nm: f64,
-
-    /// Keep a row when this many seconds have passed since the last kept row.
-    #[arg(long, default_value_t = 120.0)]
-    keep_interval_s: f64,
-
-    /// Keep a row when the course changed by this many degrees while moving.
-    #[arg(long, default_value_t = 15.0)]
-    keep_turn_deg: f64,
-
-    /// Keep a row when the speed changed by this many knots.
-    #[arg(long, default_value_t = 2.0)]
-    keep_speed_kn: f64,
-
-    /// Implied speed above which a point is a speed jump.
-    #[arg(long, default_value_t = 60.0)]
-    max_speed_kn: f64,
-
-    /// A longer silence than this many minutes marks a gap.
-    #[arg(long, default_value_t = 30)]
-    gap_minutes: i64,
+    #[command(flatten)]
+    tuning: ReduceTuning,
 }
 
 async fn reduce_day_cmd(cli: &Cli, a: &ReduceDayArgs) -> Result<i32> {
     let (start_us, end_us) = source::day_bounds_us(a.day);
-    let opts = ReduceOptions {
-        rules: Rules {
-            max_speed_kn: a.max_speed_kn,
-            gap_s: (a.gap_minutes * 60) as f64,
-        },
-        thin: if a.no_thin {
-            ThinOpts::off()
-        } else {
-            ThinOpts {
-                off: false,
-                keep_distance_nm: a.keep_distance_nm,
-                keep_interval_s: a.keep_interval_s,
-                keep_turn_deg: a.keep_turn_deg,
-                keep_speed_kn: a.keep_speed_kn,
-            }
-        },
-        buckets: a.buckets,
-        target_bucket_rows: a.target_bucket_rows,
-        scratch: a.scratch.clone(),
-    };
+    let opts = a.tuning.options();
 
     let (stream, est) = match &a.source_dir {
         Some(dir) => source::parquet_dir_day(dir, start_us, end_us).await?,
@@ -352,11 +358,12 @@ async fn reduce_day_cmd(cli: &Cli, a: &ReduceDayArgs) -> Result<i32> {
         }
         Ok(())
     };
-    let result = reduce_day::reduce_buckets(&manifest, &opts, &Default::default(), &mut sink);
+    let result = reduce_day::reduce_buckets(&manifest, &opts, &Default::default(), &mut sink)
+        .map(|(stats, _states)| stats);
     if let Some(w) = writer {
         w.close()?;
     }
-    if !a.keep_scratch {
+    if !a.tuning.keep_scratch {
         manifest.cleanup();
     }
     let mut stats = result?;
@@ -466,84 +473,124 @@ async fn run() -> Result<i32> {
             }
         }
         Command::TrackPoints(a) => {
-            anyhow::ensure!(a.shards >= 1, "--shards must be at least 1");
             let to = a.to.unwrap_or(a.from);
             anyhow::ensure!(to >= a.from, "--to is before --from");
-            let ctx = SessionContext::new();
-            register(&ctx, &catalog, &input, TABLE_POSITIONS).await?;
+            anyhow::ensure!(a.lookback_days >= 1, "--lookback-days must be at least 1");
+            let opts = a.tuning.options();
+            let positions = catalog
+                .load_table(&table_ident(&input, TABLE_POSITIONS))
+                .await
+                .context("loading the silver positions table")?;
             let rest = if a.apply {
                 Some(RestClient::connect(&output).await?)
             } else {
                 None
             };
-            let table = if a.apply {
-                Some(
-                    ensure_day_table(
-                        &catalog,
-                        &output,
-                        TABLE_TRACK_POINTS,
-                        track_points::track_points_schema(),
-                    )
-                    .await?,
+            if a.apply {
+                ensure_day_table(
+                    &catalog,
+                    &output,
+                    TABLE_TRACK_POINTS,
+                    ais_tracks::reduce::thin_points_schema(),
                 )
-            } else {
-                None
-            };
+                .await?;
+            }
+            let tp_ident = table_ident(&output, TABLE_TRACK_POINTS);
             let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch");
             let today = Utc::now().date_naive();
+            let lookback_us = a.lookback_days * 86_400_000_000;
+
+            // Where each vessel's stream left off. Carried in memory from the
+            // day just built, else read from the table.
+            let mut states: HashMap<u32, StreamState> = HashMap::new();
+            let mut states_after: Option<NaiveDate> = None;
             let mut built_any = false;
             let mut day = a.from;
             while day <= to {
                 if day >= today {
                     eprintln!("note: {day} is not over yet; it will be rebuilt as data arrives");
                 }
-                let params = Params {
-                    day_start: Utc.from_utc_datetime(&day.and_hms_opt(0, 0, 0).expect("midnight")),
-                    lookback: Duration::days(a.lookback_days),
-                    shards: a.shards,
-                    max_speed_kn: a.max_speed_kn,
-                    gap: Duration::minutes(a.gap_minutes),
-                };
-                let mut counts = FlagCounts::new();
-                let mut files = Vec::new();
-                for shard in 0..a.shards {
-                    let batches = track_points::build_shard(&ctx, &params, shard).await?;
-                    counts.add(&batches)?;
-                    if let Some(table) = &table {
-                        let days = day.signed_duration_since(epoch).num_days() as i32;
-                        files.extend(write_day_shard(table, days, &batches, &["mmsi"]).await?);
+                let (start_us, end_us) = source::day_bounds_us(day);
+                let days = day.signed_duration_since(epoch).num_days() as i32;
+                if states_after.and_then(|d| d.succ_opt()) != Some(day) {
+                    states.clear();
+                    if catalog.table_exists(&tp_ident).await? {
+                        let t = catalog.load_table(&tp_ident).await?;
+                        states = source::thin_states(&t, start_us - lookback_us, start_us).await?;
                     }
                 }
-                if counts.rows == 0 {
+
+                let label = reduce_day::scratch_label(day);
+                let started = std::time::Instant::now();
+                let (stream, est) = source::iceberg_day(&positions, start_us, end_us).await?;
+                let manifest = reduce_day::route_day(stream, est, start_us, end_us, &label, &opts).await?;
+                let route_time = started.elapsed();
+
+                // Reduce on a blocking thread and stream the batches to the
+                // writer through a small channel, so memory stays bounded.
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<arrow::record_batch::RecordBatch>(4);
+                let (opts2, prev) = (opts.clone(), states.clone());
+                let handle = tokio::task::spawn_blocking(move || {
+                    let mut sink = |b| {
+                        tx.blocking_send(b)
+                            .map_err(|_| anyhow::anyhow!("the writer stopped"))
+                    };
+                    let r = reduce_day::reduce_buckets(&manifest, &opts2, &prev, &mut sink);
+                    (r, manifest)
+                });
+                let mut writer = if a.apply {
+                    let t = catalog.load_table(&tp_ident).await?;
+                    Some(DayWriter::new(&t, days, &["mmsi"]).await?)
+                } else {
+                    None
+                };
+                while let Some(batch) = rx.recv().await {
+                    if let Some(w) = writer.as_mut() {
+                        w.write(&batch).await?;
+                    }
+                }
+                let (result, manifest) = handle.await?;
+                if !a.tuning.keep_scratch {
+                    manifest.cleanup();
+                }
+                let (mut stats, next) = result?;
+                stats.route_time = route_time;
+
+                if stats.routed == 0 {
                     println!("{day}: no positions; leaving the partition untouched");
+                    states_after = None;
                     day = day.succ_opt().expect("date overflow");
                     continue;
                 }
                 built_any = true;
-                let summary: Vec<String> = counts
-                    .counts
-                    .iter()
-                    .filter(|(_, n)| *n > 0)
-                    .map(|(name, n)| format!("{name}={n}"))
-                    .collect();
-                println!("{day}: {} rows; {}", counts.rows, summary.join(" "));
-                if let Some(rest) = &rest {
-                    let days = day.signed_duration_since(epoch).num_days() as i32;
-                    let r = commit_day(
-                        &catalog,
-                        rest,
-                        &output,
-                        TABLE_TRACK_POINTS,
-                        days,
-                        files,
-                        counts.rows,
-                    )
-                    .await?;
+                println!(
+                    "{day}: {} reports -> {} rows ({:.1}%), {} vessels; {} duplicates collapsed, {} set aside; {:.0}s, peak memory {:.0} MB",
+                    stats.routed,
+                    stats.kept,
+                    100.0 * stats.retention(),
+                    stats.vessels,
+                    stats.collapsed_dups,
+                    stats.quarantined,
+                    started.elapsed().as_secs_f64(),
+                    reduce_day::peak_rss_bytes() as f64 / 1e6,
+                );
+                if stats.unaccounted > 0 {
+                    println!(
+                        "  {} reports belong to vessels with no positioned report that day and are not represented",
+                        stats.unaccounted
+                    );
+                }
+                if let (Some(w), Some(rest)) = (writer, &rest) {
+                    let rows = w.rows;
+                    let files = w.finish().await?;
+                    let r = commit_day(&catalog, rest, &output, TABLE_TRACK_POINTS, days, files, rows).await?;
                     println!(
                         "  {}.{TABLE_TRACK_POINTS}: {} files written, {} replaced",
                         output.namespace, r.files_added, r.files_removed
                     );
                 }
+                reduce_day::merge_states(&mut states, next, end_us - lookback_us);
+                states_after = Some(day);
                 day = day.succ_opt().expect("date overflow");
             }
             if !a.apply {
