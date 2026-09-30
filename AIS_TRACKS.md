@@ -68,6 +68,8 @@ Flags are also listed in [CLI_REFERENCE.md](CLI_REFERENCE.md#ais-tracks).
 
 ## The tables and how they connect
 
+Every column, with types and nullability, is listed in [SCHEMAS.md](SCHEMAS.md#3-derived-ais-tracks).
+
 | Table | One row per | Built | Partitioned |
 |-------|-------------|-------|-------------|
 | `vessel_attributes` | value a vessel ever reported for an identity attribute | folded in daily | none |

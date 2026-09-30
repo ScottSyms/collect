@@ -22,7 +22,9 @@ one binary.
 ## What it produces
 
 Sibling hive-partitioned datasets under the output root — `positions/` and
-`statics/` (below), plus `meteo/` and `binary/` from [Type 8](#type-8-binary-broadcast).
+`statics/` (below), `meteo/` and `binary/` from [Type 8](#type-8-binary-broadcast),
+`atons/` (Type 21) and the `other/` catch-all. Every column of every table is
+described in [SCHEMAS.md](SCHEMAS.md).
 The output is **not partitioned by source** — every source that falls in a
 time partition is decoded into it together, so downstream queries see one
 unified dataset — but each row keeps its origin in a `source` column:
@@ -32,6 +34,7 @@ unified dataset — but each row keeps its origin in a `source` column:
 <output>/statics/year=YYYY/month=MM/day=DD/stat-....parquet
 <output>/meteo/year=YYYY/month=MM/day=DD/met-....parquet
 <output>/binary/year=YYYY/month=MM/day=DD/bin-....parquet
+<output>/atons/year=YYYY/month=MM/day=DD/aton-....parquet
 <output>/other/year=YYYY/month=MM/day=DD/oth-....parquet (type catch-all)
 ```
 
@@ -39,22 +42,21 @@ unified dataset — but each row keeps its origin in a `source` column:
 from the input's `source=` partition segment (raw bronze). Either input layout
 works.
 
-**`positions`** — one row per position report (AIS types 1–3, 18, 19, 27):
+**`positions`** — one row per position report (AIS types 1–3, 9, 18, 19, 27, plus type 4 base-station reports):
 
 | Column | Type | Notes |
 |--------|------|-------|
 | `ts` | timestamp (ms, UTC) | the row's corrected bronze timestamp |
 | `source` | utf8 | origin feed label (from the input's `source` column, or its `source=` partition when reading raw bronze) |
-| `msg_type` | uint8 | the AIS message type that produced the row (1/2/3/18/19/27) |
-| `station` | utf8, nullable | source/base station from the NMEA tag block `s:` field, if present |
+| `msg_type` | uint8 | the AIS message type that produced the row (1/2/3/4/9/18/19/27) |
 | `mmsi` | uint32 | |
-| `ais_class` | utf8 | `Class A` / `Class B` |
+| `ais_class` | utf8 | `Class A` / `Class B`; `Base Station` for type 4 (which has no speed/course and an empty `nav_status`) |
 | `latitude`, `longitude` | float64, nullable | WGS-84 degrees |
 | `sog_knots` | float64, nullable | speed over ground |
 | `cog` | float64, nullable | course over ground, degrees |
 | `heading_true` | float64, nullable | |
 | `rot` | float64, nullable | rate of turn |
-| `altitude_m` | float64, nullable | SAR aircraft altitude |
+| `altitude_m` | float64, nullable | SAR aircraft (type 9) altitude; null otherwise |
 | `h3` | uint64 (local) / bigint (Iceberg) | H3 cell at resolution 10 (signed long in Iceberg; no unsigned integer types) |
 | `hilbert` | uint64 (local) / bigint (Iceberg) | Hilbert curve index of the position on a 31-bit-per-axis equirectangular lat/lon grid (~2 cm resolution); a spatial sort/clustering key, not an S2 cell id (signed long in Iceberg) |
 | `nav_status` | utf8 | e.g. `under way using engine` |
@@ -73,22 +75,31 @@ works.
 | `mmsi` | uint32 | |
 | `imo_number` | uint32, nullable | |
 | `call_sign`, `name` | utf8, nullable | |
-| `ship_type` | utf8 | |
+| `ship_type` | utf8 | category text (`cargo`, `tanker`, `fishing`, `tug`, …), not the numeric code |
 | `dimension_to_bow/stern/port/starboard` | uint16, nullable | metres |
 | `draught_m` | float64, nullable | metres |
 | `destination` | utf8, nullable | |
-| `eta` | timestamp (ms, UTC), nullable | |
+| `eta` | timestamp (ms, UTC), nullable | AIS ETA has no year; the decoder supplies one, so treat the year as unreliable |
 | `mothership_mmsi` | uint32, nullable | |
 | `payload` | utf8 | the original NMEA sentence that produced this row |
 
 **`meteo`** and **`binary`** — decoded from Type 8 Binary Broadcast messages;
 see [Type 8](#type-8-binary-broadcast) below.
 
+**`atons`** — one row per aid-to-navigation report (Type 21): the usual `ts`,
+`source`, `station`, `payload`, `msg_type` (21) and `mmsi`; `ais_class` (`AtoN`);
+`aid_type` (text, e.g. `light without sectors`); `name` (padding stripped);
+`name_extension` (**always null** from `ais-parse`); `latitude`, `longitude`,
+`h3`, `hilbert`; `dimension_to_bow/stern/port/starboard`; `off_position`,
+`virtual_aid`, `assigned_mode`, `raim`; and `high_accuracy` (**always false**
+from `ais-parse`, which does not read that flag for AtoNs).
+
 Sentences that decode to any other message class (Types 6, 10–17, 20, 22, 23,
 25, 26 — binary addressed messages, safety broadcasts, interrogations, DGNSS,
 data link management, channel management, group assignments, etc.) are written
-to the `other` Iceberg table with schema `(ts, source, station, msg_type,
-payload)`. Unparseable payloads (`$PGHP` wrappers, corrupt sentences) are
+to the `other` table (Parquet and Iceberg) with schema `(ts, source, station,
+msg_type, payload)`, where `msg_type` is a text label (`Type6`, `Type12`, …, or
+`Unknown`), not a number. Unparseable payloads (`$PGHP` wrappers, corrupt sentences) are
 counted as `unparsed` — the bronze data still holds them, nothing is lost.
 
 ## Type 8 Binary Broadcast

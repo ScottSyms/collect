@@ -32,6 +32,7 @@ register or fully decode into Apache Iceberg as they ingest — see
 | Doc | Covers |
 |---|---|
 | [TUTORIAL.md](TUTORIAL.md) | Staged walkthrough: local storage → partitioning → S3 → Iceberg |
+| [SCHEMAS.md](SCHEMAS.md) | Column-by-column reference for every table the programs write |
 | [CLI_REFERENCE.md](CLI_REFERENCE.md) | Every flag/env var, exit codes, health signals, metrics, delivery guarantees |
 | [COLLECT_FILE.md](COLLECT_FILE.md) / [COLLECT_SOCKET.md](COLLECT_SOCKET.md) / [COLLECT_KAFKA.md](COLLECT_KAFKA.md) / [COLLECT_AISSTREAM.md](COLLECT_AISSTREAM.md) | Per-collector usage and behavior |
 | [AIS_PARSE.md](AIS_PARSE.md) / [AISSTREAM_PARSE.md](AISSTREAM_PARSE.md) | Decoded (silver) table schemas, incremental/idempotent decoding |

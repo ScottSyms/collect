@@ -39,7 +39,7 @@ cargo run -p aisstream-parse -- \
 
 ## Output Tables
 
-Five sibling Hive-partitioned datasets under the output root. Each is
+Six sibling Hive-partitioned datasets under the output root. Each is
 partitioned by time only (not by source).
 
 ```
@@ -57,9 +57,9 @@ partitioned by time only (not by source).
 |--------|------|-------|
 | `ts` | timestamp (ms UTC) | message timestamp |
 | `source` | utf8 | origin feed label |
-| `msg_type` | uint8 | AIS message type (1/2/3/18) |
+| `msg_type` | uint8 | AIS message type (1/2/3/4/9/18/19): Class A position, base station, SAR aircraft, Class B, extended Class B. Type 27 (long range) goes to `other`. |
 | `mmsi` | uint32 | |
-| `ais_class` | utf8 | `Class A` / `Class B` |
+| `ais_class` | utf8 | `Class A` / `Class B` / `Base Station` |
 | `latitude` / `longitude` | float64, nullable | WGS-84 degrees |
 | `sog_knots` | float64, nullable | speed over ground |
 | `cog` | float64, nullable | course over ground |
@@ -72,7 +72,12 @@ partitioned by time only (not by source).
 | `high_accuracy` | boolean | position accuracy flag |
 | `raim` | boolean | |
 | `special_manoeuvre` | boolean, nullable | |
-| `station` | utf8, nullable | source/base station |
+| `station` | utf8, nullable | always null: the JSON envelope carries no tag block |
+
+Class B and SAR rows are written with `nav_status` `under way using engine`
+(they transmit none); base stations use the empty string. Unlike `ais-parse`,
+the local Parquet output has **no `payload` column** (in Iceberg it is a
+nullable column).
 
 ### statics
 
@@ -89,7 +94,7 @@ partitioned by time only (not by source).
 | `dimension_to_bow/stern/port/starboard` | uint16, nullable | metres |
 | `draught_m` | float64, nullable | metres |
 | `destination` | utf8, nullable | |
-| `eta` | timestamp (ms UTC), nullable | |
+| `eta` | timestamp (ms UTC), nullable | no year on the wire; the current year at parse time is used, so re-parsing old data later gives the wrong year |
 | `mothership_mmsi` | uint32, nullable | |
 | `station` | utf8, nullable | |
 
@@ -136,7 +141,23 @@ Other Type 8 messages retained as generic header + hex payload:
 | `assigned_mode` | boolean | |
 | `high_accuracy` | boolean | |
 | `raim` | boolean | |
-| `station` | utf8, nullable | |
+| `station` | utf8, nullable | always null |
+
+### other
+
+Messages with no typed decoder (long-range type 27, safety, addressed and
+single/multi-slot binary, interrogation, channel management, …).
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `ts` | timestamp (ms UTC) | |
+| `source` | utf8 | |
+| `msg_type` | utf8 | the AISStream message-type **name**, e.g. `SafetyBroadcastMessage`, not a number |
+| `payload` | utf8 | the original JSON document |
+
+The local Parquet `other` has no `station` column; the Iceberg table does (always null).
+
+Full column-by-column reference for every table: [SCHEMAS.md](SCHEMAS.md).
 
 ## CLI Reference
 
