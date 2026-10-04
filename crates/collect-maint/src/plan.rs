@@ -18,15 +18,9 @@ pub const COMPACT_PREFIX: &str = "compact-";
 /// only those the table has (so `raw`, which has no `mmsi`, sorts by `ts`).
 pub const DEFAULT_SORT: [&str; 2] = ["mmsi", "ts"];
 
-/// Columns that get parquet bloom filters when present.
-pub const BLOOM_COLUMNS: [&str; 6] = [
-    "mmsi",
-    "station",
-    "source",
-    "imo_number",
-    "call_sign",
-    "name",
-];
+/// Columns that get parquet bloom filters when present. `station` and `source`
+/// are near-constant, so a filter on them only adds size.
+pub const BLOOM_COLUMNS: [&str; 4] = ["mmsi", "imo_number", "call_sign", "name"];
 
 pub fn sort_columns(schema: &Schema, overrides: &[String]) -> Result<Vec<String>> {
     if overrides.is_empty() {

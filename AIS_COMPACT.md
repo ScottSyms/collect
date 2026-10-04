@@ -110,8 +110,11 @@ Steps, per table:
    are *closed* and *need work* (below).
 3. **Rewrite each partition.** Read its files, sort all rows, and write new
    files with zstd compression, row groups of at most 128Ki rows, and bloom
-   filters on `mmsi`, `station`, `source`, `imo_number`, `call_sign` and
-   `name` (those the table has).
+   filters on `mmsi`, `imo_number`, `call_sign` and `name` (those the table
+   has). Filters are sized per row group (32Ki distinct values; 1% false
+   positives on `mmsi`, 5% elsewhere) rather than parquet's 1M-value default,
+   which cost about 1 MB per column per row group. `station` and `source` get
+   none: they are near-constant, so a filter only adds size.
 4. **Commit** the swap as one Iceberg `replace` snapshot: old files out, new
    files in.
 5. **Consolidate manifests** (optional): merge the many small data manifests

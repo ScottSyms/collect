@@ -23,8 +23,9 @@ use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::Catalog;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
-use parquet::schema::types::ColumnPath;
 use std::sync::Arc;
+
+use crate::output::{sort_by_mmsi_ts, with_bloom_filters, SORT_CHUNK_ROWS};
 
 const FLUSH_BATCH_ROWS: usize = 8192;
 
@@ -270,7 +271,7 @@ impl PositionsWriter {
         self.special_manoeuvre.append_option(row.special_manoeuvre);
         self.station.append_option(row.station.as_deref());
         self.payload.append_option(payload);
-        if self.ts.len() >= FLUSH_BATCH_ROWS {
+        if self.ts.len() >= SORT_CHUNK_ROWS {
             self.flush()?;
         }
         Ok(())
@@ -304,6 +305,7 @@ impl PositionsWriter {
         ];
         let batch =
             RecordBatch::try_new(self.schema.clone(), columns).context("assembling positions batch")?;
+        let batch = sort_by_mmsi_ts(batch)?;
         self.batches.push(batch);
         Ok(())
     }
@@ -386,7 +388,7 @@ impl StaticsWriter {
         self.mothership_mmsi.append_option(row.mothership_mmsi);
         self.station.append_option(row.station.as_deref());
         self.payload.append_option(payload);
-        if self.ts.len() >= FLUSH_BATCH_ROWS {
+        if self.ts.len() >= SORT_CHUNK_ROWS {
             self.flush()?;
         }
         Ok(())
@@ -419,6 +421,7 @@ impl StaticsWriter {
         ];
         let batch =
             RecordBatch::try_new(self.schema.clone(), columns).context("assembling statics batch")?;
+        let batch = sort_by_mmsi_ts(batch)?;
         self.batches.push(batch);
         Ok(())
     }
@@ -925,16 +928,12 @@ pub async fn write_table_batches(
     // row group (payload strings and bloom filters included) before flushing
     // it. A smaller cap bounds per-writer memory for slightly more metadata.
     const MAX_ROW_GROUP_ROWS: usize = 128 * 1024;
-    let props = WriterProperties::builder()
-        .set_max_row_group_size(MAX_ROW_GROUP_ROWS)
-        .set_compression(Compression::ZSTD(level))
-        .set_column_bloom_filter_enabled(ColumnPath::from("mmsi"), true)
-        .set_column_bloom_filter_enabled(ColumnPath::from("station"), true)
-        .set_column_bloom_filter_enabled(ColumnPath::from("source"), true)
-        .set_column_bloom_filter_enabled(ColumnPath::from("imo_number"), true)
-        .set_column_bloom_filter_enabled(ColumnPath::from("call_sign"), true)
-        .set_column_bloom_filter_enabled(ColumnPath::from("name"), true)
-        .build();
+    let props = with_bloom_filters(
+        WriterProperties::builder()
+            .set_max_row_group_size(MAX_ROW_GROUP_ROWS)
+            .set_compression(Compression::ZSTD(level)),
+    )
+    .build();
 
     let parquet_writer_builder =
         ParquetWriterBuilder::new(props, iceberg_schema.clone());

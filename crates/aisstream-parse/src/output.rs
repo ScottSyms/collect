@@ -17,6 +17,54 @@ use std::sync::Arc;
 
 const FLUSH_BATCH_ROWS: usize = 8192;
 
+/// Rows per sorted chunk. Matches the parquet row-group cap so each row group
+/// holds one `(mmsi, ts)`-sorted run: a vessel's rows are adjacent, which
+/// shrinks lat/lon/h3/hilbert sharply and makes the row-group `mmsi` min/max
+/// statistics selective. Bounded, unlike sorting the whole partition.
+pub(crate) const SORT_CHUNK_ROWS: usize = 128 * 1024;
+
+/// Sort a batch by `(mmsi, ts)`.
+pub(crate) fn sort_by_mmsi_ts(batch: RecordBatch) -> Result<RecordBatch> {
+    use arrow::compute::{lexsort_to_indices, take_record_batch, SortColumn};
+    let schema = batch.schema();
+    let sort_columns = ["mmsi", "ts"]
+        .into_iter()
+        .map(|name| {
+            Ok(SortColumn {
+                values: batch.column(schema.index_of(name)?).clone(),
+                options: None,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let indices = lexsort_to_indices(&sort_columns, None).context("sorting by mmsi, ts")?;
+    take_record_batch(&batch, &indices).context("reordering batch by mmsi, ts")
+}
+
+/// Bloom filters for the point-lookup columns. The parquet default sizes every
+/// filter for 1M distinct values (~1 MB per row group per column regardless of
+/// real cardinality), which made them about half of each file. Row groups hold
+/// at most 128K rows, so 32K distinct values is generous. `source` and
+/// `station` are near-constant and gain nothing from a filter.
+pub(crate) fn with_bloom_filters(
+    mut builder: parquet::file::properties::WriterPropertiesBuilder,
+) -> parquet::file::properties::WriterPropertiesBuilder {
+    use parquet::schema::types::ColumnPath;
+    const NDV: u64 = 32 * 1024;
+    for (name, fpp) in [
+        ("mmsi", 0.01),
+        ("imo_number", 0.05),
+        ("call_sign", 0.05),
+        ("name", 0.05),
+    ] {
+        let col = ColumnPath::from(name);
+        builder = builder
+            .set_column_bloom_filter_enabled(col.clone(), true)
+            .set_column_bloom_filter_ndv(col.clone(), NDV)
+            .set_column_bloom_filter_fpp(col, fpp);
+    }
+    builder
+}
+
 static FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn unique_file_name(prefix: &str) -> String {
@@ -26,22 +74,17 @@ fn unique_file_name(prefix: &str) -> String {
 }
 
 fn writer_props(compression_level: i32) -> Result<WriterProperties> {
-    use parquet::schema::types::ColumnPath;
     let level = ZstdLevel::try_new(compression_level).context("invalid zstd level")?;
     // Parquet's default row group is 1M rows, and the writer buffers a whole
     // row group (payload strings and bloom filters included) before flushing
     // it. A smaller cap bounds per-writer memory for slightly more metadata.
     const MAX_ROW_GROUP_ROWS: usize = 128 * 1024;
-    Ok(WriterProperties::builder()
-        .set_max_row_group_size(MAX_ROW_GROUP_ROWS)
-        .set_compression(Compression::ZSTD(level))
-        .set_column_bloom_filter_enabled(ColumnPath::from("mmsi"), true)
-        .set_column_bloom_filter_enabled(ColumnPath::from("station"), true)
-        .set_column_bloom_filter_enabled(ColumnPath::from("source"), true)
-        .set_column_bloom_filter_enabled(ColumnPath::from("imo_number"), true)
-        .set_column_bloom_filter_enabled(ColumnPath::from("call_sign"), true)
-        .set_column_bloom_filter_enabled(ColumnPath::from("name"), true)
-        .build())
+    Ok(with_bloom_filters(
+        WriterProperties::builder()
+            .set_max_row_group_size(MAX_ROW_GROUP_ROWS)
+            .set_compression(Compression::ZSTD(level)),
+    )
+    .build())
 }
 
 fn ts_field(name: &str, nullable: bool) -> Field {
@@ -310,7 +353,7 @@ impl PositionsWriter {
         self.raim.append_value(row.raim);
         self.special_manoeuvre.append_option(row.special_manoeuvre);
         self.station.append_option(row.station.as_deref());
-        if self.ts.len() >= FLUSH_BATCH_ROWS {
+        if self.ts.len() >= SORT_CHUNK_ROWS {
             self.flush()?;
         }
         Ok(())
@@ -343,6 +386,7 @@ impl PositionsWriter {
         ];
         let batch = RecordBatch::try_new(self.sink.schema.clone(), columns)
             .context("assembling positions batch")?;
+        let batch = sort_by_mmsi_ts(batch)?;
         self.sink.write_batch(batch)
     }
 
@@ -419,7 +463,7 @@ impl StaticsWriter {
         self.eta.append_option(row.eta_ms);
         self.mothership_mmsi.append_option(row.mothership_mmsi);
         self.station.append_option(row.station.as_deref());
-        if self.ts.len() >= FLUSH_BATCH_ROWS {
+        if self.ts.len() >= SORT_CHUNK_ROWS {
             self.flush()?;
         }
         Ok(())
@@ -451,6 +495,7 @@ impl StaticsWriter {
         ];
         let batch = RecordBatch::try_new(self.sink.schema.clone(), columns)
             .context("assembling statics batch")?;
+        let batch = sort_by_mmsi_ts(batch)?;
         self.sink.write_batch(batch)
     }
 

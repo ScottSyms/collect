@@ -23,6 +23,8 @@ use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use std::sync::Arc;
 
+use crate::output::{sort_by_mmsi_ts, with_bloom_filters, SORT_CHUNK_ROWS};
+
 const FLUSH_BATCH_ROWS: usize = 8192;
 
 fn ts_field(name: &str, nullable: bool) -> Field {
@@ -34,22 +36,17 @@ fn ts_field(name: &str, nullable: bool) -> Field {
 }
 
 fn writer_props(compression_level: i32) -> Result<WriterProperties> {
-    use parquet::schema::types::ColumnPath;
     let level = ZstdLevel::try_new(compression_level).context("invalid zstd level")?;
     // Parquet's default row group is 1M rows, and the writer buffers a whole
     // row group (payload strings and bloom filters included) before flushing
     // it. A smaller cap bounds per-writer memory for slightly more metadata.
     const MAX_ROW_GROUP_ROWS: usize = 128 * 1024;
-    Ok(WriterProperties::builder()
-        .set_max_row_group_size(MAX_ROW_GROUP_ROWS)
-        .set_compression(Compression::ZSTD(level))
-        .set_column_bloom_filter_enabled(ColumnPath::from("mmsi"), true)
-        .set_column_bloom_filter_enabled(ColumnPath::from("station"), true)
-        .set_column_bloom_filter_enabled(ColumnPath::from("source"), true)
-        .set_column_bloom_filter_enabled(ColumnPath::from("imo_number"), true)
-        .set_column_bloom_filter_enabled(ColumnPath::from("call_sign"), true)
-        .set_column_bloom_filter_enabled(ColumnPath::from("name"), true)
-        .build())
+    Ok(with_bloom_filters(
+        WriterProperties::builder()
+            .set_max_row_group_size(MAX_ROW_GROUP_ROWS)
+            .set_compression(Compression::ZSTD(level)),
+    )
+    .build())
 }
 
 fn positions_schema() -> Arc<Schema> {
@@ -285,7 +282,7 @@ impl IcebergPositionsWriter {
         self.special_manoeuvre.append_option(row.special_manoeuvre);
         self.station.append_option(row.station.as_deref());
         self.payload.append_value(payload);
-        if self.ts.len() >= FLUSH_BATCH_ROWS {
+        if self.ts.len() >= SORT_CHUNK_ROWS {
             self.flush_batch()?;
         }
         Ok(())
@@ -319,6 +316,7 @@ impl IcebergPositionsWriter {
         ];
         let batch = RecordBatch::try_new(self.schema.clone(), columns)
             .context("assembling positions batch")?;
+        let batch = sort_by_mmsi_ts(batch)?;
         self.batches.push(batch);
         // Rebuild the finished builders for the next round
         self.ts = TimestampMillisecondBuilder::new().with_timezone("UTC");
@@ -425,7 +423,7 @@ impl IcebergStaticsWriter {
         self.mothership_mmsi.append_option(row.mothership_mmsi);
         self.station.append_option(row.station.as_deref());
         self.payload.append_value(payload);
-        if self.ts.len() >= FLUSH_BATCH_ROWS {
+        if self.ts.len() >= SORT_CHUNK_ROWS {
             self.flush_batch()?;
         }
         Ok(())
@@ -458,6 +456,7 @@ impl IcebergStaticsWriter {
         ];
         let batch = RecordBatch::try_new(self.schema.clone(), columns)
             .context("assembling statics batch")?;
+        let batch = sort_by_mmsi_ts(batch)?;
         self.batches.push(batch);
         self.ts = TimestampMillisecondBuilder::new().with_timezone("UTC");
         self.source = StringBuilder::new();

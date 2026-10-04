@@ -19,7 +19,7 @@ use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use parquet::basic::{Compression, ZstdLevel};
-use parquet::file::properties::WriterProperties;
+use parquet::file::properties::{WriterProperties, WriterPropertiesBuilder};
 use parquet::schema::types::ColumnPath;
 
 /// Row-group cap, matching `ais-parse`'s `writer_props`.
@@ -107,6 +107,28 @@ pub fn sort_batches(batches: &[RecordBatch], columns: &[String]) -> Result<Recor
     Ok(take_record_batch(&all, &indices)?)
 }
 
+/// Enables bloom filters on `columns`, sized for one row group. The parquet
+/// default sizes every filter for 1M distinct values (~1 MB per row group per
+/// column whatever the real cardinality), which made filters a large share of
+/// each file. A row group holds at most [`MAX_ROW_GROUP_ROWS`] rows, so 32K
+/// distinct values is generous; `mmsi` gets a tighter false-positive rate
+/// because it is the main point-lookup key.
+pub fn with_bloom_filters<'a>(
+    mut builder: WriterPropertiesBuilder,
+    columns: impl IntoIterator<Item = &'a str>,
+) -> WriterPropertiesBuilder {
+    const NDV: u64 = 32 * 1024;
+    for name in columns {
+        let col = ColumnPath::from(name);
+        let fpp = if name == "mmsi" { 0.01 } else { 0.05 };
+        builder = builder
+            .set_column_bloom_filter_enabled(col.clone(), true)
+            .set_column_bloom_filter_ndv(col.clone(), NDV)
+            .set_column_bloom_filter_fpp(col, fpp);
+    }
+    builder
+}
+
 /// Writes `batch` (already sorted) into one partition as rolling zstd files of
 /// about `target_bytes` each with row groups capped at [`MAX_ROW_GROUP_ROWS`] and bloom
 /// filters on `bloom_columns`. The partition value comes from the input files
@@ -126,14 +148,12 @@ pub async fn write_partition(
         Some("iceberg".to_string()),
         DataFileFormat::Parquet,
     );
-    let mut props = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
-        .set_max_row_group_size(MAX_ROW_GROUP_ROWS);
-    for col in bloom_columns {
-        if schema.field_by_name(col).is_some() {
-            props = props.set_column_bloom_filter_enabled(ColumnPath::from(*col), true);
-        }
-    }
+    let props = with_bloom_filters(
+        WriterProperties::builder()
+            .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
+            .set_max_row_group_size(MAX_ROW_GROUP_ROWS),
+        bloom_columns.iter().copied().filter(|c| schema.field_by_name(c).is_some()),
+    );
     let rolling = RollingFileWriterBuilder::new(
         ParquetWriterBuilder::new(props.build(), schema.clone()),
         target_bytes as usize,

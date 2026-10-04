@@ -263,7 +263,6 @@ impl DayWriter {
         use iceberg::writer::IcebergWriterBuilder;
         use parquet::basic::{Compression, ZstdLevel};
         use parquet::file::properties::WriterProperties;
-        use parquet::schema::types::ColumnPath;
 
         let metadata = table.metadata();
         let schema = metadata.current_schema();
@@ -273,14 +272,12 @@ impl DayWriter {
             Some("iceberg".to_string()),
             DataFileFormat::Parquet,
         );
-        let mut props = WriterProperties::builder()
-            .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
-            .set_max_row_group_size(collect_maint::rewrite::MAX_ROW_GROUP_ROWS);
-        for col in bloom {
-            if schema.field_by_name(col).is_some() {
-                props = props.set_column_bloom_filter_enabled(ColumnPath::from(*col), true);
-            }
-        }
+        let props = collect_maint::rewrite::with_bloom_filters(
+            WriterProperties::builder()
+                .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
+                .set_max_row_group_size(collect_maint::rewrite::MAX_ROW_GROUP_ROWS),
+            bloom.iter().copied().filter(|c| schema.field_by_name(c).is_some()),
+        );
         let rolling = RollingFileWriterBuilder::new(
             ParquetWriterBuilder::new(props.build(), schema.clone()),
             TARGET_FILE_BYTES as usize,
