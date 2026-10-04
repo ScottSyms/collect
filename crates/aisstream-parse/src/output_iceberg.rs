@@ -21,11 +21,10 @@ use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::Catalog;
-use parquet::basic::{Compression, ZstdLevel};
-use parquet::file::properties::WriterProperties;
+use parquet::basic::ZstdLevel;
 use std::sync::Arc;
 
-use crate::output::{sort_by_mmsi_ts, with_bloom_filters, SORT_CHUNK_ROWS};
+use crate::output::{base_props, sort_by_mmsi_ts, with_bloom_filters, SORT_CHUNK_ROWS};
 
 const FLUSH_BATCH_ROWS: usize = 8192;
 
@@ -924,16 +923,7 @@ pub async fn write_table_batches(
     );
 
     let level = ZstdLevel::try_new(compression_level).context("invalid zstd level")?;
-    // Parquet's default row group is 1M rows, and the writer buffers a whole
-    // row group (payload strings and bloom filters included) before flushing
-    // it. A smaller cap bounds per-writer memory for slightly more metadata.
-    const MAX_ROW_GROUP_ROWS: usize = 128 * 1024;
-    let props = with_bloom_filters(
-        WriterProperties::builder()
-            .set_max_row_group_size(MAX_ROW_GROUP_ROWS)
-            .set_compression(Compression::ZSTD(level)),
-    )
-    .build();
+    let props = with_bloom_filters(base_props(level)).build();
 
     let parquet_writer_builder =
         ParquetWriterBuilder::new(props, iceberg_schema.clone());

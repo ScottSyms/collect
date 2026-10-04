@@ -53,7 +53,7 @@ partitioned by time only (not by source).
 
 ### File layout
 
-`positions` and `statics` files are written in row groups of 128Ki rows, each
+`positions` and `statics` files are written in row groups of 512Ki rows, each
 sorted by `(mmsi, ts)`, so a vessel's rows are adjacent within a row group
 (this shrinks the coordinate and `mmsi` columns and makes row-group `mmsi`
 min/max statistics selective). The sort is per row group, not per file, so

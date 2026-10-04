@@ -27,11 +27,29 @@ use std::sync::Arc;
 /// ArrowWriter (which itself accumulates batches into row groups).
 const FLUSH_BATCH_ROWS: usize = 8192;
 
-/// Rows per sorted chunk. Matches the parquet row-group cap so each row group
-/// holds one `(mmsi, ts)`-sorted run: a vessel's rows are adjacent, which
-/// shrinks lat/lon/h3/hilbert sharply and makes the row-group `mmsi` min/max
-/// statistics selective. Bounded, unlike sorting the whole partition.
-pub(crate) const SORT_CHUNK_ROWS: usize = 128 * 1024;
+/// Parquet row-group cap, which is also the sort window. The writer buffers a
+/// whole row group (payload strings and bloom filters included) before
+/// flushing it, so this bounds per-writer memory. A bigger window groups more
+/// of each vessel's rows together: sorting by `(mmsi, ts)` per row group
+/// shrinks lat/lon/h3/hilbert/mmsi sharply and makes the row-group `mmsi`
+/// min/max statistics selective, while staying bounded unlike a sort of the
+/// whole partition.
+pub(crate) const MAX_ROW_GROUP_ROWS: usize = 512 * 1024;
+
+/// Rows buffered by the positions and statics writers before they are sorted
+/// and handed to the parquet writer: one row group.
+pub(crate) const SORT_CHUNK_ROWS: usize = MAX_ROW_GROUP_ROWS;
+
+/// Writer properties shared by every output path. `ts` keeps parquet's default
+/// (dictionary with plain fallback): measured on a sorted 8M-row partition it
+/// cost 2.3 B/row, against 3.2 for `DELTA_BINARY_PACKED` and 3.1 for
+/// `BYTE_STREAM_SPLIT`. Once rows are grouped by vessel, `ts` jumps backwards
+/// at every vessel boundary, which defeats delta encoding.
+pub(crate) fn base_props(level: ZstdLevel) -> parquet::file::properties::WriterPropertiesBuilder {
+    WriterProperties::builder()
+        .set_max_row_group_size(MAX_ROW_GROUP_ROWS)
+        .set_compression(Compression::ZSTD(level))
+}
 
 /// Sort a batch by `(mmsi, ts)`.
 pub(crate) fn sort_by_mmsi_ts(batch: RecordBatch) -> Result<RecordBatch> {
@@ -85,16 +103,7 @@ fn unique_file_name(prefix: &str) -> String {
 
 fn writer_props(compression_level: i32) -> Result<WriterProperties> {
     let level = ZstdLevel::try_new(compression_level).context("invalid zstd level")?;
-    // Parquet's default row group is 1M rows, and the writer buffers a whole
-    // row group (payload strings and bloom filters included) before flushing
-    // it. A smaller cap bounds per-writer memory for slightly more metadata.
-    const MAX_ROW_GROUP_ROWS: usize = 128 * 1024;
-    Ok(with_bloom_filters(
-        WriterProperties::builder()
-            .set_max_row_group_size(MAX_ROW_GROUP_ROWS)
-            .set_compression(Compression::ZSTD(level)),
-    )
-    .build())
+    Ok(with_bloom_filters(base_props(level)).build())
 }
 
 fn ts_field(name: &str, nullable: bool) -> Field {
