@@ -181,21 +181,28 @@ Don't run two instances against the same output concurrently (use
 
 ## Multi-part messages
 
-When processing raw bronze data via `--consolidate-ais` on the collector or on
-ais-parse itself, the `AisConsolidator` explicitly reassembles multi-part
-fragments into single sentences **before** they reach the NMEA parser. This
-reduces `Incomplete` results and produces cleaner output. The consolidator
-handles `$PGHP` timestamp lines, tag-block `c:` carry-forward, and `s:`
-station preservation, with an 8K-group buffer and oldest-first eviction.
+`ais-parse` reassembles multi-part fragments into single sentences **before**
+they reach the NMEA parser (`--consolidate-ais`, on by default; the collectors
+have the same flag, off by default, for doing it at ingest). Sentences that
+were already combined at ingest pass through unchanged. The `AisConsolidator`
+also handles `$PGHP` timestamp lines (with `--process-timestamps`), tag-block
+`c:` carry-forward and `s:` station preservation, with an 8K-group buffer and
+oldest-first eviction. A reassembled message takes the timestamp and station of
+its first fragment.
 
-Without `--consolidate-ais`, raw un-normalized bronze data also works: the
-parser buffers `Incomplete` fragments internally and completes them when the
-matching part arrives (rows within a partition file are time-ordered, so pairs
-almost always meet). Fragments whose partner never arrives are counted
-`incomplete`.
+Pass `--consolidate-ais=false` (or `CONSOLIDATE_AIS=false`) to skip it and leave
+fragments to the parser, which buffers `Incomplete` fragments and completes them
+when the matching part arrives. Fragments whose partner never arrives are
+counted `incomplete`.
 
-When a partition pools several sources, fragment state is reset at each source
-boundary so multi-part sequence ids can't collide across sources.
+**Determinism.** Messages that need pairing state are decoded in row order by a
+single decoder per partition; only stateless messages are decoded in parallel.
+That covers multi-part fragments left over after consolidation and Type 24
+Class B statics, whose parts A and B are separate messages paired by MMSI.
+Output is therefore identical from run to run, whatever the thread count.
+Earlier versions kept that state per rayon thread, so which halves met depended
+on scheduling and a few percent of statics were lost at random. The decoder is
+reset at each source boundary so sequence ids can't collide across sources.
 
 ## Usage
 
@@ -230,7 +237,7 @@ cargo run -p ais-parse -- --input-s3-bucket normalized-ais --output-s3-bucket si
 | `--concurrency` | cores, clamped `[1, 8]` | partitions decoded in parallel (env `CONCURRENCY`) |
 | `--download-concurrency` | `4` | concurrent S3 downloads per partition; lower if MinIO is overloaded (env `DOWNLOAD_CONCURRENCY`) |
 | `--output-prefix` | `ais` | output file name prefix (added before tree suffix, env `OUTPUT_PREFIX`) |
-| `--consolidate-ais` | *(off)* | reassemble fragmented NMEA sentences before decoding (env `CONSOLIDATE_AIS`) |
+| `--consolidate-ais[=false]` | `true` | reassemble fragmented NMEA sentences before decoding; `=false` turns it off (env `CONSOLIDATE_AIS`) |
 | `--process-timestamps` | *(off)* | correct row timestamps from `$PGHP`/tag-block `c:` capture timestamps (env `PROCESS_TIMESTAMPS`) |
 | `--fail-fast` | *(off)* | abort the run on the first partition failure instead of skipping it and continuing (env `FAIL_FAST`) |
 | `--max-partition-failures` | `5` | abort the run once this many partitions have failed and been skipped (env `MAX_PARTITION_FAILURES`) |

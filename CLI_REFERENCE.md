@@ -285,7 +285,7 @@ don't.
 | `--download-concurrency <n>` | `DOWNLOAD_CONCURRENCY` | `4` | Concurrent S3 downloads per partition |
 | `--output-prefix <prefix>` | `OUTPUT_PREFIX` | `ais` / `aisstream` | Prepended to output file names |
 | `--scratch-dir <dir>` | `SCRATCH_DIR` | system temp | Set to `/dev/shm` or a ramdisk for faster I/O |
-| `--consolidate-ais` *(ais-parse only)* | `CONSOLIDATE_AIS` | off | |
+| `--consolidate-ais[=false]` *(ais-parse only)* | `CONSOLIDATE_AIS` | on | Reassemble multi-part sentences before decoding; `=false` to disable |
 | `--process-timestamps` *(ais-parse only)* | `PROCESS_TIMESTAMPS` | off | |
 | `--dry-run` | `DRY_RUN` | off | List matching partitions, touch nothing |
 | `-q, --quiet` | `QUIET` | | |

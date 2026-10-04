@@ -253,13 +253,80 @@ fn tag_field<'a>(tag_body: &'a str, key: &str) -> Option<&'a str> {
     None
 }
 
+/// Decode one payload using this thread's parser, which keeps multi-part and
+/// Type 24 pairing state between calls. Only deterministic when every call for
+/// a stream comes from one thread in order; the parallel parse path uses
+/// [`decode_stateless`] plus a [`StatefulDecoder`] instead.
 pub fn decode_payload(ts_ms: i64, source: &str, payload: &str) -> Decoded {
+    PARSER.with(|pcell| {
+        let mut parser = pcell.borrow_mut();
+        decode_core(&mut parser, ts_ms, source, payload, true)
+            .expect("stateful decode always yields a result")
+    })
+}
+
+/// Decode a payload that needs no pairing state, so it is safe to call from any
+/// thread in any order. Returns `None` for messages that do need state (any
+/// fragment of a multi-part sentence, and Type 24 Class B static data, whose
+/// parts A and B are separate messages paired by MMSI); feed those to a
+/// [`StatefulDecoder`] in stream order.
+pub fn decode_stateless(ts_ms: i64, source: &str, payload: &str) -> Option<Decoded> {
+    PARSER.with(|pcell| {
+        let mut parser = pcell.borrow_mut();
+        // Nothing stateful is parsed here, but clear anyway so no leftovers
+        // from an earlier call on this thread can ever pair with this one.
+        parser.reset();
+        decode_core(&mut parser, ts_ms, source, payload, false)
+    })
+}
+
+/// Sequential decoder for the messages [`decode_stateless`] declines. Owns its
+/// own parser, so results depend only on the order rows are fed in, not on
+/// which thread runs it.
+pub struct StatefulDecoder {
+    parser: NmeaParser,
+}
+
+impl Default for StatefulDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StatefulDecoder {
+    pub fn new() -> Self {
+        StatefulDecoder { parser: NmeaParser::new() }
+    }
+
+    /// Forget buffered fragments, e.g. at a source boundary.
+    pub fn reset(&mut self) {
+        self.parser.reset();
+    }
+
+    pub fn decode(&mut self, ts_ms: i64, source: &str, payload: &str) -> Decoded {
+        decode_core(&mut self.parser, ts_ms, source, payload, true)
+            .expect("stateful decode always yields a result")
+    }
+}
+
+/// Shared decode body. With `allow_state == false` it returns `None` instead
+/// of parsing a message that needs pairing state.
+fn decode_core(
+    parser: &mut NmeaParser,
+    ts_ms: i64,
+    source: &str,
+    payload: &str,
+    allow_state: bool,
+) -> Option<Decoded> {
     let (tag_body, sentence) = split_tag_block(payload.trim());
     if sentence.is_empty() {
-        return Decoded::Failed;
+        return Some(Decoded::Failed);
     }
     let station = tag_field(tag_body, "s").map(str::to_string);
     let src: Arc<str> = Arc::from(source);
+
+    let fragments = extract_ais_payload(sentence).map(|p| p.fragment_count);
+    let fragmented = fragments.is_some_and(|n| n > 1);
 
     let peeked_type = match extract_ais_payload(sentence) {
         Some(p) if p.fragment_count == 1 => Bits::from_armored(p.armored, p.fill_bits)
@@ -274,45 +341,44 @@ pub fn decode_payload(ts_ms: i64, source: &str, payload: &str) -> Decoded {
         _ => None,
     };
     let peeked_type = match peeked_type {
-        Some((_, Some(decoded))) => return decoded,
+        Some((_, Some(decoded))) => return Some(decoded),
         Some((t, None)) => Some(t),
         None => None,
     };
 
-    PARSER.with(|pcell| {
-        let mut parser = pcell.borrow_mut();
-        match parser.parse_sentence(sentence) {
-            Ok(ParsedMessage::VesselDynamicData(vdd)) => Decoded::Position(Box::new(position_row(
-                ts_ms, &src, station, peeked_type, vdd,
-            ))),
-            Ok(ParsedMessage::VesselStaticData(vsd)) => Decoded::Static(Box::new(static_row(
-                ts_ms, &src, station, peeked_type, vsd,
-            ))),
-            Ok(ParsedMessage::StandardSarAircraftPositionReport(sar)) => {
-                Decoded::Position(Box::new(from_sar_aircraft(
-                    ts_ms, &src, station, peeked_type, sar,
-                )))
-            }
-            Ok(ParsedMessage::BaseStationReport(br)) => {
-                Decoded::Position(Box::new(base_station_row(
-                    ts_ms, &src, station, peeked_type, br,
-                )))
-            }
-            Ok(ParsedMessage::AidToNavigationReport(aid)) => {
-                Decoded::Aton(Box::new(from_aid_to_navigation(
-                    ts_ms, &src, station, aid,
-                )))
-            }
-            Ok(ParsedMessage::Incomplete) => Decoded::Incomplete,
-            Ok(_) => Decoded::Other(Box::new(OtherRow {
-                ts_ms,
-                source: src.clone(),
-                station,
-                msg_type: peeked_type.unwrap_or(0),
-                payload_raw: payload.to_string(),
-            })),
-            Err(_) => Decoded::Failed,
+    if !allow_state && (fragmented || peeked_type == Some(24)) {
+        return None;
+    }
+    // Only Type 5 is ever split across sentences among the static messages, so a
+    // static that completes from fragments is Type 5 even though a fragment
+    // alone can't be peeked.
+    let static_hint = peeked_type.or(fragmented.then_some(5));
+
+    Some(match parser.parse_sentence(sentence) {
+        Ok(ParsedMessage::VesselDynamicData(vdd)) => Decoded::Position(Box::new(position_row(
+            ts_ms, &src, station, peeked_type, vdd,
+        ))),
+        Ok(ParsedMessage::VesselStaticData(vsd)) => Decoded::Static(Box::new(static_row(
+            ts_ms, &src, station, static_hint, vsd,
+        ))),
+        Ok(ParsedMessage::StandardSarAircraftPositionReport(sar)) => Decoded::Position(Box::new(
+            from_sar_aircraft(ts_ms, &src, station, peeked_type, sar),
+        )),
+        Ok(ParsedMessage::BaseStationReport(br)) => Decoded::Position(Box::new(
+            base_station_row(ts_ms, &src, station, peeked_type, br),
+        )),
+        Ok(ParsedMessage::AidToNavigationReport(aid)) => {
+            Decoded::Aton(Box::new(from_aid_to_navigation(ts_ms, &src, station, aid)))
         }
+        Ok(ParsedMessage::Incomplete) => Decoded::Incomplete,
+        Ok(_) => Decoded::Other(Box::new(OtherRow {
+            ts_ms,
+            source: src.clone(),
+            station,
+            msg_type: peeked_type.unwrap_or(0),
+            payload_raw: payload.to_string(),
+        })),
+        Err(_) => Decoded::Failed,
     })
 }
 
@@ -369,7 +435,12 @@ fn static_row(
         station,
         msg_type,
         mmsi: vsd.mmsi,
-        ais_class: Cow::Owned(vsd.ais_type.to_string()),
+        // The parser tags Type 5 as Class B; Type 5 is the Class A static report.
+        ais_class: if msg_type == 5 {
+            Cow::Borrowed("Class A")
+        } else {
+            Cow::Owned(vsd.ais_type.to_string())
+        },
         imo_number: vsd.imo_number,
         call_sign: vsd.call_sign,
         name: vsd.name,
@@ -755,7 +826,8 @@ mod tests {
             Decoded::Static(row) => {
                 assert_eq!(row.mmsi, 369_190_000);
                 assert!(row.name.is_some());
-                assert!(matches!(row.msg_type, 5 | 24), "got {}", row.msg_type);
+                assert_eq!(row.msg_type, 5);
+                assert_eq!(row.ais_class, "Class A");
             }
             _ => panic!("second fragment should complete the static message"),
         }
@@ -933,5 +1005,72 @@ mod tests {
             decode_type8(0, "s", None, &bits),
             Decoded::Binary(_)
         ));
+    }
+
+    const T24_A: &str = "!BSVDM,1,1,,A,H3mNwQ0I84p<t00000000000000,2*0E";
+    const T24_B: &str = "!BSVDM,1,1,,B,H3mNwQ4NC=D6DBP<9BA0000H<720,0*25";
+    const T5_1: &str = "!AIVDM,2,1,3,B,55P5TL01VIaAL@7WKO@mBplU@<PDhh000000001S;AJ::4A80?4i@E53,0*3E";
+    const T5_2: &str = "!AIVDM,2,2,3,B,1@0000000000000,2*55";
+    const T5_COMBINED: &str = "!AIVDM,1,1,,B,55P5TL01VIaAL@7WKO@mBplU@<PDhh000000001S;AJ::4A80?4i@E531@0000000000000,2*4D";
+
+    #[test]
+    fn stateless_declines_messages_that_need_pairing_state() {
+        assert!(decode_stateless(0, "s", T5_1).is_none());
+        assert!(decode_stateless(0, "s", T5_2).is_none());
+        assert!(decode_stateless(0, "s", T24_A).is_none());
+        assert!(decode_stateless(0, "s", T24_B).is_none());
+        let position = "!AIVDM,1,1,,A,13aEOK?P00PD2wVMdLDRhgvL289?,0*26";
+        assert!(matches!(
+            decode_stateless(0, "s", position),
+            Some(Decoded::Position(_)) | Some(Decoded::Failed)
+        ));
+    }
+
+    #[test]
+    fn stateless_never_leaks_state_between_calls() {
+        // A fragment seen statelessly must not pair with a later one.
+        let _ = decode_stateless(0, "s", T5_1);
+        assert!(decode_stateless(0, "s", T5_2).is_none());
+    }
+
+    #[test]
+    fn stateful_decoder_pairs_type_24_parts_in_order() {
+        let mut d = StatefulDecoder::new();
+        assert!(matches!(d.decode(0, "s", T24_A), Decoded::Incomplete | Decoded::Static(_)));
+        match d.decode(0, "s", T24_B) {
+            Decoded::Static(row) => {
+                assert_eq!(row.mmsi, 257_408_900);
+                assert_eq!(row.msg_type, 24);
+                assert_eq!(row.ais_class, "Class B");
+                assert!(row.name.is_some());
+            }
+            _ => panic!("part B should complete the Type 24 pair"),
+        }
+    }
+
+    #[test]
+    fn stateful_decoder_reset_drops_buffered_fragments() {
+        let mut d = StatefulDecoder::new();
+        assert!(matches!(d.decode(0, "a", T5_1), Decoded::Incomplete));
+        d.reset();
+        assert!(!matches!(d.decode(0, "b", T5_2), Decoded::Static(_)));
+    }
+
+    #[test]
+    fn type_5_is_labelled_class_a_from_any_talker() {
+        // Combined single sentence, and the same message from a base-station talker.
+        for sentence in [
+            T5_COMBINED.to_string(),
+            T5_COMBINED.replace("!AIVDM", "!BSVDM").replace("*4D", "*54"),
+        ] {
+            let mut d = StatefulDecoder::new();
+            match d.decode(0, "s", &sentence) {
+                Decoded::Static(row) => {
+                    assert_eq!(row.msg_type, 5);
+                    assert_eq!(row.ais_class, "Class A");
+                }
+                _ => panic!("expected a static row"),
+            }
+        }
     }
 }

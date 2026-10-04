@@ -22,9 +22,14 @@ pub struct AisPayload<'a> {
 /// Returns `None` for anything that isn't a well-formed AIVDM/AIVDO sentence.
 pub fn extract_ais_payload(sentence: &str) -> Option<AisPayload<'_>> {
     let sentence = sentence.trim();
-    let body = sentence
-        .strip_prefix("!AIVDM")
-        .or_else(|| sentence.strip_prefix("!AIVDO"))?;
+    // Any two-letter talker: `!AIVDM` from vessels, `!BSVDM` from base
+    // stations, `!SAVDM` from satellite feeds, and so on.
+    let rest = sentence.strip_prefix('!')?;
+    let id = rest.get(..5)?;
+    if !(id.ends_with("VDM") || id.ends_with("VDO")) || !id.is_char_boundary(2) {
+        return None;
+    }
+    let body = &rest[5..];
     // body now starts with the comma after the sentence id.
     let mut fields = body.split(',');
     // The strip left a leading empty field before the first comma-separated
@@ -283,5 +288,19 @@ mod tests {
         let bits = b.into_bits();
         assert_eq!(bits.hex_from(0), "F0A");
         assert_eq!(bits.hex_from(4), "0A");
+    }
+
+    #[test]
+    fn accepts_any_two_letter_talker() {
+        for talker in ["AI", "BS", "SA", "AB"] {
+            for kind in ["VDM", "VDO"] {
+                let sentence = format!("!{talker}{kind},1,1,,A,13aEOK?P00PD2wVMdLDRhgvL289?,0*26");
+                let p = extract_ais_payload(&sentence).unwrap_or_else(|| panic!("{sentence}"));
+                assert_eq!(p.fragment_count, 1);
+                assert_eq!(p.armored, "13aEOK?P00PD2wVMdLDRhgvL289?");
+            }
+        }
+        assert!(extract_ais_payload("!GPGGA,1,1,,A,xxxx,0*00").is_none());
+        assert!(extract_ais_payload("!VDM,1,1,,A,xxxx,0*00").is_none());
     }
 }

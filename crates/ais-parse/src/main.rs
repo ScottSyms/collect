@@ -30,7 +30,7 @@ use output_iceberg::{
 
 use ais_parse::{decode, output, output_iceberg, stats};
 
-use decode::{decode_payload, AtonRow, BinaryRow, Decoded, MeteoRow, OtherRow, PositionRow, StaticRow};
+use decode::{decode_stateless, StatefulDecoder, AtonRow, BinaryRow, Decoded, MeteoRow, OtherRow, PositionRow, StaticRow};
 use output::{AtonWriter, BinaryWriter, MeteoWriter, OtherWriter, PositionsWriter, StaticsWriter};
 use stats::ParseStats;
 
@@ -210,9 +210,17 @@ struct Args {
     #[arg(long, env = "SCRATCH_DIR")]
     scratch_dir: Option<PathBuf>,
 
-    /// Apply AIS multipart consolidation before decoding (reassembles
-    /// fragmented NMEA sentences into single sentences before parsing).
-    #[arg(long, env = "CONSOLIDATE_AIS", value_parser = clap::builder::FalseyValueParser::new())]
+    /// Reassemble fragmented NMEA sentences into single sentences before
+    /// parsing. On by default; pass `--consolidate-ais=false` (or set
+    /// CONSOLIDATE_AIS=false) to leave fragments to the parser instead.
+    #[arg(
+        long,
+        env = "CONSOLIDATE_AIS",
+        default_value_t = true,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::FalseyValueParser::new()
+    )]
     consolidate_ais: bool,
 
     /// Process $PGHP timestamp lines and tag-block c: carry-forward to
@@ -1324,8 +1332,15 @@ fn process_partition(
     let mut seen: HashSet<DedupKey> = HashSet::new();
 
     let remove_after = files.is_scratch();
+    let mut stateful = StatefulDecoder::new();
+    let mut last_source: Option<String> = None;
     for file in files {
         let file = file.context("downloading input partition from S3")?;
+        // Fragment and Type 24 state is per source: ids can collide across sources.
+        if last_source.as_deref() != Some(file.partition.source.as_str()) {
+            stateful.reset();
+            last_source = Some(file.partition.source.clone());
+        }
         process_parquet_file(
             &file.path,
             &file.partition.source,
@@ -1340,6 +1355,7 @@ fn process_partition(
             },
             batch_size,
             &mut seen,
+            &mut stateful,
             consolidate_ais,
             process_timestamps,
         )
@@ -1599,8 +1615,15 @@ fn process_partition_iceberg(
     let mut seen: HashSet<DedupKey> = HashSet::new();
 
     let remove_after = files.is_scratch();
+    let mut stateful = StatefulDecoder::new();
+    let mut last_source: Option<String> = None;
     for file in files {
         let file = file.context("downloading input partition from S3")?;
+        // Fragment and Type 24 state is per source: ids can collide across sources.
+        if last_source.as_deref() != Some(file.partition.source.as_str()) {
+            stateful.reset();
+            last_source = Some(file.partition.source.clone());
+        }
         process_parquet_file(
             &file.path,
             &file.partition.source,
@@ -1608,6 +1631,7 @@ fn process_partition_iceberg(
             &mut writers,
             batch_size,
             &mut seen,
+            &mut stateful,
             consolidate_ais,
             process_timestamps,
         )
@@ -1638,6 +1662,7 @@ fn process_parquet_file<W: WriterSet>(
     writers: &mut W,
     batch_size: usize,
     seen: &mut HashSet<DedupKey>,
+    stateful: &mut StatefulDecoder,
     consolidate_ais: bool,
     process_timestamps: bool,
 ) -> Result<()> {
@@ -1699,47 +1724,50 @@ fn process_parquet_file<W: WriterSet>(
             })
             .collect();
 
-        let (decoded, payloads): (Vec<(usize, Decoded)>, Vec<String>) = if let Some(c) =
-            &mut consolidator
-        {
-            let mut rows: Vec<(i64, String, String)> = Vec::new();
+        // (ts, source, payload) for every row to decode. With consolidation on,
+        // multi-part sentences have already been merged (sequentially) here.
+        let mut consolidated: Vec<(i64, String, String)> = Vec::new();
+        if let Some(c) = &mut consolidator {
             for i in 0..n {
                 let ts = ts_col.value(i);
                 let src = sources[i];
                 let raw = payload_col.value(i);
                 for (new_ts, new_payload) in c.transform(raw, ts) {
-                    rows.push((new_ts, src.to_string(), new_payload));
+                    consolidated.push((new_ts, src.to_string(), new_payload));
                 }
             }
-            let payloads: Vec<String> = rows.iter().map(|(_, _, p)| p.clone()).collect();
-            let decoded: Vec<(usize, Decoded)> = rows
-                .into_par_iter()
-                .enumerate()
-                .map(|(idx, (ts, src, payload))| (idx, decode_payload(ts, &src, &payload)))
-                .collect();
-            (decoded, payloads)
+        }
+        let inputs: Vec<(i64, &str, &str)> = if consolidator.is_some() {
+            consolidated
+                .iter()
+                .map(|(ts, src, payload)| (*ts, src.as_str(), payload.as_str()))
+                .collect()
         } else {
-            let payloads: Vec<String> = (0..n).map(|i| payload_col.value(i).to_string()).collect();
-            let decoded: Vec<(usize, Decoded)> = (0..n)
-                .into_par_iter()
-                .map(|i| {
-                    (
-                        i,
-                        decode_payload(ts_col.value(i), sources[i], payload_col.value(i)),
-                    )
-                })
-                .collect();
-            (decoded, payloads)
+            (0..n)
+                .map(|i| (ts_col.value(i), sources[i], payload_col.value(i)))
+                .collect()
         };
+        // Stateless messages decode in parallel. Anything needing pairing state
+        // (multi-part fragments, Type 24 parts A/B) comes back `None` and is
+        // decoded below in row order by one decoder, so the result never
+        // depends on how rayon schedules threads.
+        let decoded: Vec<Option<Decoded>> = inputs
+            .par_iter()
+            .map(|&(ts, src, payload)| decode_stateless(ts, src, payload))
+            .collect();
 
         stats.rows_in += n as u64;
-        for (i, (_, result)) in decoded.into_iter().enumerate() {
+        for (i, result) in decoded.into_iter().enumerate() {
+            let result = result.unwrap_or_else(|| {
+                let (ts, src, payload) = inputs[i];
+                stateful.decode(ts, src, payload)
+            });
             match result {
                 Decoded::Position(row) => {
                     let key = DedupKey(0, row.ts_ms, row.mmsi, 0, row.msg_type);
                     if seen.insert(key) {
                         stats.positions_out += 1;
-                        writers.write_position(&row, &payloads[i])?;
+                        writers.write_position(&row, inputs[i].2)?;
                     } else {
                         stats.rows_deduped += 1;
                     }
@@ -1748,7 +1776,7 @@ fn process_parquet_file<W: WriterSet>(
                     let key = DedupKey(1, row.ts_ms, row.mmsi, 0, 0);
                     if seen.insert(key) {
                         stats.statics_out += 1;
-                        writers.write_static(&row, &payloads[i])?;
+                        writers.write_static(&row, inputs[i].2)?;
                     } else {
                         stats.rows_deduped += 1;
                     }
@@ -1763,7 +1791,7 @@ fn process_parquet_file<W: WriterSet>(
                     );
                     if seen.insert(key) {
                         stats.meteo_out += 1;
-                        writers.write_meteo(*row, &payloads[i])?;
+                        writers.write_meteo(*row, inputs[i].2)?;
                     } else {
                         stats.rows_deduped += 1;
                     }
@@ -1778,7 +1806,7 @@ fn process_parquet_file<W: WriterSet>(
                     );
                     if seen.insert(key) {
                         stats.binary_out += 1;
-                        writers.write_binary(*row, &payloads[i])?;
+                        writers.write_binary(*row, inputs[i].2)?;
                     } else {
                         stats.rows_deduped += 1;
                     }
@@ -1787,7 +1815,7 @@ fn process_parquet_file<W: WriterSet>(
                     let key = DedupKey(4, row.ts_ms, row.mmsi, 0, row.msg_type);
                     if seen.insert(key) {
                         stats.atons_out += 1;
-                        writers.write_aton(*row, &payloads[i])?;
+                        writers.write_aton(*row, inputs[i].2)?;
                     } else {
                         stats.rows_deduped += 1;
                     }
@@ -1805,7 +1833,7 @@ fn process_parquet_file<W: WriterSet>(
     // Flush any buffered AIS fragments at end-of-file.
     if let Some(c) = &mut consolidator {
         for (ts, payload) in c.flush() {
-            match decode_payload(ts, path_source, &payload) {
+            match stateful.decode(ts, path_source, &payload) {
                 Decoded::Position(row) => {
                     let key = DedupKey(0, row.ts_ms, row.mmsi, 0, row.msg_type);
                     if seen.insert(key) {
