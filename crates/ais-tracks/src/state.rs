@@ -34,11 +34,11 @@ use arrow::compute::cast;
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use chrono::NaiveDate;
-use collect_maint::rewrite::LiveFile;
+use collect_maint::rewrite::{live_files, LiveFile};
 use futures_util::{StreamExt, TryStreamExt};
 use iceberg::arrow::ArrowReaderBuilder;
 use iceberg::expr::Reference;
-use iceberg::spec::{Datum, NestedField, PrimitiveLiteral, PrimitiveType, Schema};
+use iceberg::spec::{Datum, NestedField, PrimitiveLiteral, PrimitiveType, Schema, Transform};
 use iceberg::table::Table;
 
 use crate::reduce::StreamState;
@@ -226,22 +226,61 @@ pub async fn scan_all(
 
 // ---- silver days --------------------------------------------------------------
 
+/// What a table's partition values count: the collectors and parsers
+/// partition silver tables by `hour(ts)` (or `day(ts)`), and ais-tracks writes
+/// its own tables by `day(ts)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartitionUnit {
+    Day,
+    Hour,
+}
+
+impl PartitionUnit {
+    /// The unit of the first field of `table`'s default partition spec. Any
+    /// other transform can't be mapped to days without reading the data.
+    pub fn of(table: &Table) -> Result<Self> {
+        let spec = table.metadata().default_partition_spec();
+        match spec.fields().first().map(|f| f.transform) {
+            Some(Transform::Day) => Ok(Self::Day),
+            Some(Transform::Hour) => Ok(Self::Hour),
+            other => anyhow::bail!(
+                "{} is partitioned by {other:?}; ais-tracks needs day(ts) or hour(ts)",
+                table.identifier()
+            ),
+        }
+    }
+
+    /// The day (days since the epoch) a partition value falls in.
+    fn day(self, value: i32) -> i32 {
+        match self {
+            Self::Day => value,
+            Self::Hour => value.div_euclid(24),
+        }
+    }
+}
+
 /// Rows per day, from a table's live files (metadata only). Files whose
-/// partition is not a day number are ignored.
-pub fn days_from_files(files: &[LiveFile]) -> BTreeMap<NaiveDate, u64> {
+/// partition value is not an int are ignored.
+pub fn days_from_files(files: &[LiveFile], unit: PartitionUnit) -> BTreeMap<NaiveDate, u64> {
     let mut out = BTreeMap::new();
     for f in files {
-        let day = f
+        let value = f
             .partition
             .as_ref()
             .and_then(|p| p.fields().first())
             .and_then(|l| l.as_ref())
             .and_then(|l| l.as_primitive_literal());
-        if let Some(PrimitiveLiteral::Int(d)) = day {
-            *out.entry(day_to_date(d)).or_insert(0) += f.records;
+        if let Some(PrimitiveLiteral::Int(v)) = value {
+            *out.entry(day_to_date(unit.day(v))).or_insert(0) += f.records;
         }
     }
     out
+}
+
+/// Rows per day of `table`, whatever its day or hour partitioning.
+pub async fn days_from_table(table: &Table) -> Result<BTreeMap<NaiveDate, u64>> {
+    let unit = PartitionUnit::of(table)?;
+    Ok(days_from_files(&live_files(table).await?, unit))
 }
 
 // ---- build log ------------------------------------------------------------------
@@ -461,11 +500,33 @@ mod tests {
             records,
             partition: Some(Struct::from_iter([Some(Literal::int(day))])),
         };
-        let days = days_from_files(&[file(20_500, 10), file(20_500, 5), file(20_501, 7)]);
+        let days = days_from_files(&[file(20_500, 10), file(20_500, 5), file(20_501, 7)], PartitionUnit::Day);
         assert_eq!(days.len(), 2);
         assert_eq!(days[&day_to_date(20_500)], 15);
         assert_eq!(days[&day_to_date(20_501)], 7);
         assert_eq!(date_to_day(day_to_date(20_500)), 20_500);
+    }
+
+    #[test]
+    fn hour_partitions_are_summed_into_their_day() {
+        let file = |hour: i32, records: u64| LiveFile {
+            path: format!("f{hour}-{records}"),
+            size: 1,
+            records,
+            partition: Some(Struct::from_iter([Some(Literal::int(hour))])),
+        };
+        // 2026-09-29 is day 20_725: its hours are 497_400..=497_423.
+        let day = 20_725;
+        let first = day * 24;
+        let days = days_from_files(
+            &[file(first, 10), file(first + 23, 5), file(first + 24, 7), file(first - 1, 3)],
+            PartitionUnit::Hour,
+        );
+        assert_eq!(days.len(), 3);
+        assert_eq!(days[&day_to_date(day)], 15);
+        assert_eq!(days[&day_to_date(day + 1)], 7);
+        assert_eq!(days[&day_to_date(day - 1)], 3);
+        assert_eq!(day_to_date(day), d("2026-09-29"));
     }
 
     fn row(step: &str, day: &str, token: &str, at: i64) -> LogRow {
