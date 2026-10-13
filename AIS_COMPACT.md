@@ -120,6 +120,30 @@ Steps, per table:
 5. **Consolidate manifests** (optional): merge the many small data manifests
    into one per partition spec.
 
+#### Progress output
+
+With `--apply`, each table reports how long planning took and how much it
+will rewrite, then one block per partition:
+
+```
+positions:
+  planned in 14.2s: 340 partitions need work (41.20 GiB), 12 skipped
+  [12/340] ts_day=2026-09-01: 48 files, 812.3 MiB
+    ts_day=2026-09-01: still writing (30.0s)
+    plan 9.8s · read 23.1s (6120334 rows, 3.41 GiB decoded) · sort 8.2s · write 51.0s · commit 1.2s
+  rewrote ts_day=2026-09-01: 48 files (812.3 MiB) -> 2 files (640.1 MiB)
+    progress: 9.71 GiB of 41.20 GiB (23.6%) · 18.3 MiB/s · elapsed 9m 03s · ETA 29m 20s
+```
+
+- **Phase timings** show where the time goes. A large `plan` means the
+  table has many manifests (consolidate them first). A large `decoded`
+  value means the partition nearly filled memory.
+- **`still <phase>`** lines appear every 30 s while a phase is running, so a
+  slow partition doesn't look hung.
+- **`progress`** counts compressed input bytes across this table's
+  partitions, failed ones included. The ETA assumes the rest run at the
+  average rate so far.
+
 #### What counts as "closed"
 
 A partition is closed once the end of its time range is at least

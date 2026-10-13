@@ -7,4 +7,5 @@ pub mod commit;
 pub mod compact;
 pub mod orphans;
 pub mod plan;
+pub mod progress;
 pub mod rewrite;

@@ -1,5 +1,7 @@
 //! Compaction driver: per closed partition, read → sort → write → replace.
 
+use std::time::Instant;
+
 use anyhow::{bail, Context, Result};
 use collect_core::iceberg::{table_ident, IcebergConfig};
 use iceberg::spec::{NullOrder, SortDirection};
@@ -9,6 +11,7 @@ use iceberg::{Catalog, TableIdent};
 
 use crate::commit::{prepare_consolidate, prepare_replace, RestClient, SMALL_MANIFEST_BYTES};
 use crate::plan::{self, PartitionPlan, PlanOptions, Skip, BLOOM_COLUMNS};
+use crate::progress::{fmt_bytes, fmt_duration, Heartbeat, Throughput};
 use crate::rewrite::{live_files, read_files, sort_batches, write_partition};
 
 /// Concurrent-ingest commits race ours; each retry reloads and re-plans.
@@ -91,25 +94,44 @@ async fn discard(table: &Table, files: &[iceberg::spec::DataFile]) {
 }
 
 /// Rewrites one partition. `Ok(None)` means it no longer needs work (someone
-/// else compacted it, or it vanished) after a reload.
+/// else compacted it, or it vanished) after a reload. Prints a line of phase
+/// timings when it commits, and a heartbeat while any phase runs long.
 async fn rewrite_partition(
     catalog: &impl Catalog,
     rest: &RestClient,
     ident: &TableIdent,
     key: &str,
+    label: &str,
     sort: &[String],
     opts: &CompactOptions,
 ) -> Result<Option<(PartitionPlan, usize, u64)>> {
+    let hb = Heartbeat::start(label);
     for attempt in 1..=MAX_COMMIT_ATTEMPTS {
+        hb.set("planning");
+        let t = Instant::now();
         let table = catalog.load_table(ident).await?;
         let (plans, _) = plan::plan(&table, live_files(&table).await?, opts.plan);
         let Some(p) = plans.into_iter().find(|p| p.key == key) else {
             return Ok(None);
         };
+        let t_plan = t.elapsed();
+
+        hb.set("reading");
+        let t = Instant::now();
         let paths = p.files.iter().map(|f| f.path.clone()).collect();
         let batches = read_files(&table, &paths).await?;
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let decoded: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
+        let t_read = t.elapsed();
+
+        hb.set("sorting");
+        let t = Instant::now();
         let sorted = sort_batches(&batches, sort)?;
         drop(batches);
+        let t_sort = t.elapsed();
+
+        hb.set("writing");
+        let t = Instant::now();
         let added = write_partition(
             &table,
             p.partition.clone(),
@@ -118,8 +140,12 @@ async fn rewrite_partition(
             &BLOOM_COLUMNS,
         )
         .await?;
+        let t_write = t.elapsed();
         let out_bytes = added.iter().map(|f| f.file_size_in_bytes()).sum();
         let out_files = added.len();
+
+        hb.set("committing");
+        let t = Instant::now();
         let prepared = match prepare_replace(&table, &paths, added.clone()).await {
             Ok(v) => v,
             Err(e) => {
@@ -131,6 +157,15 @@ async fn rewrite_partition(
             .commit(ident, &prepared.requirements, &prepared.updates)
             .await?
         {
+            println!(
+                "    plan {} · read {} ({rows} rows, {} decoded) · sort {} · write {} · commit {}",
+                fmt_duration(t_plan),
+                fmt_duration(t_read),
+                fmt_bytes(decoded as u64),
+                fmt_duration(t_sort),
+                fmt_duration(t_write),
+                fmt_duration(t.elapsed()),
+            );
             return Ok(Some((p, out_files, out_bytes)));
         }
         discard(&table, &added).await;
@@ -159,7 +194,16 @@ pub async fn compact_table(
         table = catalog.load_table(&ident).await?;
     }
 
+    let t = Instant::now();
     let (plans, skipped) = plan::plan(&table, live_files(&table).await?, opts.plan);
+    let total_bytes: u64 = plans.iter().map(|p| p.input_bytes).sum();
+    println!(
+        "  planned in {}: {} partitions need work ({}), {} skipped",
+        fmt_duration(t.elapsed()),
+        plans.len(),
+        fmt_bytes(total_bytes),
+        skipped.len()
+    );
     for (label, why) in &skipped {
         match why {
             Skip::Open => report.skipped_open += 1,
@@ -171,7 +215,9 @@ pub async fn compact_table(
         }
     }
 
-    for p in plans {
+    let n = plans.len();
+    let mut progress = Throughput::new(total_bytes);
+    for (i, p) in plans.into_iter().enumerate() {
         if !opts.apply {
             println!(
                 "  would rewrite {}: {} files, {:.1} MiB, sorted by [{}]",
@@ -185,7 +231,15 @@ pub async fn compact_table(
             report.bytes_in += p.input_bytes;
             continue;
         }
-        match rewrite_partition(catalog, rest, &ident, &p.key, &sort, opts).await {
+        println!(
+            "  [{}/{n}] {}: {} files, {}",
+            i + 1,
+            p.label,
+            p.files.len(),
+            fmt_bytes(p.input_bytes)
+        );
+        let planned_bytes = p.input_bytes;
+        match rewrite_partition(catalog, rest, &ident, &p.key, &p.label, &sort, opts).await {
             Ok(Some((p, out_files, out_bytes))) => {
                 println!(
                     "  rewrote {}: {} files ({:.1} MiB) -> {} files ({:.1} MiB)",
@@ -201,17 +255,20 @@ pub async fn compact_table(
                 report.files_out += out_files;
                 report.bytes_out += out_bytes;
             }
-            Ok(None) => {}
+            Ok(None) => println!("    {}: no longer needs work, skipped", p.label),
             Err(e) => {
                 eprintln!("  {}: FAILED: {e:#}", p.label);
                 report.partitions_failed += 1;
             }
         }
+        progress.add(planned_bytes);
+        println!("    {}", progress.line());
     }
 
     if opts.consolidate_min_manifests > 0 {
         let table = catalog.load_table(&ident).await?;
         if opts.apply {
+            println!("  checking manifests to consolidate...");
             if let Some((req, upd, replaced)) =
                 prepare_consolidate(&table, opts.consolidate_min_manifests).await?
             {
