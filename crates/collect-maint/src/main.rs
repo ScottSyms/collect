@@ -80,6 +80,14 @@ struct CompactArgs {
     /// Consolidate small manifests when at least this many exist (0 = never).
     #[arg(long, default_value_t = 20)]
     consolidate_manifests: usize,
+    /// Partitions rewritten in parallel.
+    #[arg(long, default_value_t = 2)]
+    jobs: usize,
+    /// Total compressed input, in MiB, of the partitions being rewritten at
+    /// once. Each is sorted in memory at several times its size, so this
+    /// bounds memory; a larger partition runs alone.
+    #[arg(long, default_value_t = 1024)]
+    max_inflight_mb: u64,
 }
 
 #[derive(Args, Debug)]
@@ -179,6 +187,8 @@ async fn run() -> Result<i32> {
                     sort_by: a.sort_by.clone(),
                     apply: a.apply,
                     consolidate_min_manifests: a.consolidate_manifests,
+                    jobs: a.jobs,
+                    max_inflight_bytes: a.max_inflight_mb << 20,
                 };
                 compact_table(&catalog, &rest, &config, &name, &opts).await.map(|r| {
                     let change = if a.apply {

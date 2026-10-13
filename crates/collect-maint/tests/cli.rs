@@ -129,16 +129,33 @@ async fn compact_expire_orphans_end_to_end() {
         .unwrap();
         table = catalog.load_table(&ident).await.unwrap();
     }
-    assert_eq!(live_files(&table).await.unwrap().len(), 6);
+    // Two more closed days, two rows each, so compaction has several
+    // partitions to rewrite in parallel and commit one after another.
+    const DAY_MS: i64 = 86_400_000;
+    for i in 6..10 {
+        let ts = day + (i / 2 - 2) * DAY_MS + i * 1000;
+        commit_batches(
+            &catalog,
+            &table,
+            vec![batch(ts, &format!("p{i}"))],
+            3,
+            TABLE_RAW,
+        )
+        .await
+        .unwrap();
+        table = catalog.load_table(&ident).await.unwrap();
+    }
+    assert_eq!(live_files(&table).await.unwrap().len(), 10);
 
     // Dry run changes nothing.
     let (code, text) = run(&rustfs, &["compact", "--min-age-hours", "0"]);
     assert_eq!(code, 0, "{text}");
     assert!(text.contains("would rewrite"), "{text}");
     let table = catalog.load_table(&ident).await.unwrap();
-    assert_eq!(live_files(&table).await.unwrap().len(), 6);
+    assert_eq!(live_files(&table).await.unwrap().len(), 10);
 
-    // Apply: one sorted file, sort order registered, small manifests merged.
+    // Apply, three partitions at once: one sorted file per day, sort order
+    // registered, small manifests merged.
     let (code, text) = run(
         &rustfs,
         &[
@@ -148,6 +165,10 @@ async fn compact_expire_orphans_end_to_end() {
             "0",
             "--consolidate-manifests",
             "2",
+            "--jobs",
+            "3",
+            "--max-inflight-mb",
+            "1",
         ],
     );
     assert_eq!(code, 0, "{text}");
@@ -157,21 +178,22 @@ async fn compact_expire_orphans_end_to_end() {
     );
     assert!(text.contains("consolidated"), "{text}");
     let table = catalog.load_table(&ident).await.unwrap();
+    assert_eq!(text.matches("rewrote ").count(), 3, "{text}");
     let files = live_files(&table).await.unwrap();
-    assert_eq!(files.len(), 1);
-    assert!(files[0]
-        .path
-        .rsplit('/')
-        .next()
-        .unwrap()
-        .starts_with("compact-"));
+    assert_eq!(files.len(), 3);
+    assert!(files
+        .iter()
+        .all(|f| f.path.rsplit('/').next().unwrap().starts_with("compact-")));
     assert_eq!(table.metadata().default_sort_order().fields.len(), 1);
     let paths: HashSet<String> = files.iter().map(|f| f.path.clone()).collect();
-    let rows = sort_batches(&read_files(&table, &paths).await.unwrap(), &[]).unwrap();
+    let rows = sort_batches(&read_files(&table, &paths).await.unwrap(), &["ts".into()]).unwrap();
     let payload = rows.column_by_name("payload").unwrap();
     let payload = payload.as_any().downcast_ref::<StringArray>().unwrap();
     let got: Vec<&str> = (0..payload.len()).map(|i| payload.value(i)).collect();
-    assert_eq!(got, ["p0", "p1", "p2", "p3", "p4", "p5"]);
+    assert_eq!(
+        got,
+        ["p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p9"]
+    );
 
     // Idempotent: nothing left to do (exit 2 = NOTHING_TO_DO).
     let (code, text) = run(&rustfs, &["compact", "--apply", "--min-age-hours", "0"]);
@@ -218,5 +240,5 @@ async fn compact_expire_orphans_end_to_end() {
     let files = live_files(&table).await.unwrap();
     let paths: HashSet<String> = files.iter().map(|f| f.path.clone()).collect();
     let rows = sort_batches(&read_files(&table, &paths).await.unwrap(), &[]).unwrap();
-    assert_eq!(rows.num_rows(), 6);
+    assert_eq!(rows.num_rows(), 10);
 }

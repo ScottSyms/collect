@@ -38,6 +38,15 @@ pub struct PreparedReplace {
     pub outcome: ReplaceOutcome,
 }
 
+/// Live data-file paths per manifest, kept across the commits of one run.
+/// Manifests are immutable, so an entry never goes stale; with it each
+/// replace commit loads only the manifests it rewrites and any written since
+/// the previous commit, instead of every manifest in the table.
+#[derive(Debug, Default)]
+pub struct ManifestIndex {
+    live: HashMap<String, Box<[String]>>,
+}
+
 /// Writes the new manifests and manifest list for a snapshot that removes the
 /// data files whose paths are in `remove` and adds `add`, and returns the
 /// catalog updates that would publish it.
@@ -48,6 +57,16 @@ pub async fn prepare_replace(
     table: &Table,
     remove: &HashSet<String>,
     add: Vec<DataFile>,
+) -> Result<PreparedReplace> {
+    prepare_replace_indexed(table, remove, add, &mut ManifestIndex::default()).await
+}
+
+/// [`prepare_replace`] reusing (and extending) `index` from earlier commits.
+pub async fn prepare_replace_indexed(
+    table: &Table,
+    remove: &HashSet<String>,
+    add: Vec<DataFile>,
+    index: &mut ManifestIndex,
 ) -> Result<PreparedReplace> {
     let metadata = table.metadata();
     if metadata.format_version() != FormatVersion::V2 {
@@ -84,15 +103,29 @@ pub async fn prepare_replace(
             manifests.push(mf.clone());
             continue;
         }
-        let manifest = mf.load_manifest(file_io).await?;
-        let touched = manifest
-            .entries()
-            .iter()
-            .any(|e| e.is_alive() && remove.contains(e.file_path()));
-        if !touched {
+        let mut loaded = None;
+        let live = match index.live.get(&mf.manifest_path) {
+            Some(live) => live,
+            None => {
+                let manifest = mf.load_manifest(file_io).await?;
+                let live = manifest
+                    .entries()
+                    .iter()
+                    .filter(|e| e.is_alive())
+                    .map(|e| e.file_path().to_string())
+                    .collect();
+                loaded = Some(manifest);
+                index.live.entry(mf.manifest_path.clone()).or_insert(live)
+            }
+        };
+        if !live.iter().any(|p| remove.contains(p)) {
             manifests.push(mf.clone());
             continue;
         }
+        let manifest = match loaded {
+            Some(m) => m,
+            None => mf.load_manifest(file_io).await?,
+        };
 
         // Rewrite this manifest: survivors become `existing`, removals `deleted`.
         let spec = metadata

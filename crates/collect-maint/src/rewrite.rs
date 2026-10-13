@@ -9,6 +9,7 @@ use arrow::compute::{concat_batches, lexsort_to_indices, take_record_batch, Sort
 use arrow::record_batch::RecordBatch;
 use futures_util::{StreamExt, TryStreamExt};
 use iceberg::arrow::ArrowReaderBuilder;
+use iceberg::scan::FileScanTask;
 use iceberg::spec::{DataFile, DataFileFormat, PartitionKey, Struct};
 use iceberg::table::Table;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
@@ -34,9 +35,12 @@ pub struct LiveFile {
     pub partition: Option<Struct>,
 }
 
-/// All data files in the current snapshot (no delete-file support: this
-/// project never writes deletes, and a table that has them is refused).
-pub async fn live_files(table: &Table) -> Result<Vec<LiveFile>> {
+/// One scan task per data file in the current snapshot (no delete-file
+/// support: this project never writes deletes, and a table that has them is
+/// refused). Reading every manifest is the expensive part of planning, so
+/// callers that read many partitions plan once and pass tasks to
+/// [`read_tasks`].
+pub async fn scan_tasks(table: &Table) -> Result<Vec<FileScanTask>> {
     if table.metadata().current_snapshot().is_none() {
         return Ok(Vec::new());
     }
@@ -48,33 +52,49 @@ pub async fn live_files(table: &Table) -> Result<Vec<LiveFile>> {
             "{} has delete files; compaction does not apply them",
             task.data_file_path
         );
-        out.push(LiveFile {
-            path: task.data_file_path,
-            size: task.file_size_in_bytes,
-            records: task.record_count.unwrap_or(0),
-            partition: task.partition,
-        });
+        out.push(task);
     }
     Ok(out)
 }
 
+impl From<&FileScanTask> for LiveFile {
+    fn from(task: &FileScanTask) -> Self {
+        LiveFile {
+            path: task.data_file_path.clone(),
+            size: task.file_size_in_bytes,
+            records: task.record_count.unwrap_or(0),
+            partition: task.partition.clone(),
+        }
+    }
+}
+
+/// All data files in the current snapshot.
+pub async fn live_files(table: &Table) -> Result<Vec<LiveFile>> {
+    Ok(scan_tasks(table)
+        .await?
+        .iter()
+        .map(LiveFile::from)
+        .collect())
+}
+
 /// Reads exactly the named files into memory.
 pub async fn read_files(table: &Table, paths: &HashSet<String>) -> Result<Vec<RecordBatch>> {
-    let tasks: Vec<_> = table
-        .scan()
-        .select_all()
-        .build()?
-        .plan_files()
+    let tasks: Vec<_> = scan_tasks(table)
         .await?
-        .try_filter(|t| futures_util::future::ready(paths.contains(&t.data_file_path)))
-        .try_collect()
-        .await?;
+        .into_iter()
+        .filter(|t| paths.contains(&t.data_file_path))
+        .collect();
     anyhow::ensure!(
         tasks.len() == paths.len(),
         "planned {} of {} files to read",
         tasks.len(),
         paths.len()
     );
+    read_tasks(table, tasks).await
+}
+
+/// Reads already-planned scan tasks into memory.
+pub async fn read_tasks(table: &Table, tasks: Vec<FileScanTask>) -> Result<Vec<RecordBatch>> {
     let reader = ArrowReaderBuilder::new(table.file_io().clone()).build();
     let stream = futures_util::stream::iter(tasks.into_iter().map(Ok)).boxed();
     Ok(reader.read(stream)?.try_collect().await?)
@@ -152,7 +172,10 @@ pub async fn write_partition(
         WriterProperties::builder()
             .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
             .set_max_row_group_size(MAX_ROW_GROUP_ROWS),
-        bloom_columns.iter().copied().filter(|c| schema.field_by_name(c).is_some()),
+        bloom_columns
+            .iter()
+            .copied()
+            .filter(|c| schema.field_by_name(c).is_some()),
     );
     let rolling = RollingFileWriterBuilder::new(
         ParquetWriterBuilder::new(props.build(), schema.clone()),

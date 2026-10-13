@@ -314,7 +314,7 @@ binary atons other`.
 | Subcommand | Flags | What it does |
 |---|---|---|
 | `inspect` | `--target-file-mb` (512) | File counts and sizes, partitions needing work, snapshots, small manifests, sort order |
-| `compact` | `--apply`, `--min-age-hours` (2), `--target-file-mb` (512), `--max-partition-mb` (1024), `--sort-by a,b` (`mmsi,ts`), `--consolidate-manifests <n>` (20, 0 = off) | Rewrites each *closed* partition that has any freshly ingested file, or two or more files under half the target, into sorted, right-sized zstd files (128Ki-row groups, bloom filters on `mmsi imo_number call_sign name`, sized per row group), committed as one Iceberg `replace` snapshot. Registers the sort order on the table. Merges small manifests when at least `n` exist |
+| `compact` | `--apply`, `--min-age-hours` (2), `--target-file-mb` (512), `--max-partition-mb` (1024), `--sort-by a,b` (`mmsi,ts`), `--consolidate-manifests <n>` (20, 0 = off), `--jobs <n>` (2), `--max-inflight-mb` (1024) | Rewrites each *closed* partition that has any freshly ingested file, or two or more files under half the target, into sorted, right-sized zstd files (128Ki-row groups, bloom filters on `mmsi imo_number call_sign name`, sized per row group), committed as one Iceberg `replace` snapshot. Registers the sort order on the table. Plans once per table; rewrites up to `--jobs` partitions in parallel within `--max-inflight-mb` of compressed input, committing one at a time. Merges small manifests when at least `n` exist |
 | `expire` | `--apply`, `--older-than-days` (7), `--retain-last` (5) | Drops old snapshots (never the current one or a branch/tag head). Metadata only |
 | `orphans` | `--apply`, `--older-than-days` (3), S3 connection flags | Deletes objects under the table location that no snapshot references. Run after `expire` to actually free space |
 
@@ -323,7 +323,8 @@ Notes:
 - **Sort:** `--sort-by` defaults to `mmsi,ts`, keeping only columns the table
   has, so `raw` (no `mmsi`) sorts by `ts`. Nulls sort last.
 - **Memory:** a partition is sorted in memory. `--max-partition-mb` bounds its
-  *compressed* input; expect several times that in RAM. Larger partitions are
+  *compressed* input and `--max-inflight-mb` the total across parallel
+  rewrites; expect several times that in RAM. Larger partitions are
   skipped with a message, not failed.
 - **Idempotent:** files written by the tool are named `compact-*`; a partition of
   full-size `compact-*` files is left alone, and one small tail file is not

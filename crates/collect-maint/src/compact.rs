@@ -1,20 +1,29 @@
-//! Compaction driver: per closed partition, read → sort → write → replace.
+//! Compaction driver: plan once, then per closed partition read → sort →
+//! write (several partitions in parallel) → replace (one at a time).
 
-use std::time::Instant;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use collect_core::iceberg::{table_ident, IcebergConfig};
-use iceberg::spec::{NullOrder, SortDirection};
+use futures_util::StreamExt;
+use iceberg::scan::FileScanTask;
+use iceberg::spec::{DataFile, NullOrder, SortDirection};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{Catalog, TableIdent};
+use tokio::sync::Semaphore;
 
-use crate::commit::{prepare_consolidate, prepare_replace, RestClient, SMALL_MANIFEST_BYTES};
+use crate::commit::{
+    prepare_consolidate, prepare_replace_indexed, ManifestIndex, RestClient, SMALL_MANIFEST_BYTES,
+};
 use crate::plan::{self, PartitionPlan, PlanOptions, Skip, BLOOM_COLUMNS};
 use crate::progress::{fmt_bytes, fmt_duration, Heartbeat, Throughput};
-use crate::rewrite::{live_files, read_files, sort_batches, write_partition};
+use crate::rewrite::{read_tasks, scan_tasks, sort_batches, write_partition, LiveFile};
 
-/// Concurrent-ingest commits race ours; each retry reloads and re-plans.
+/// Concurrent-ingest commits race ours; each retry reloads the table and
+/// rebuilds the commit.
 const MAX_COMMIT_ATTEMPTS: usize = 4;
 
 #[derive(Debug, Clone)]
@@ -24,6 +33,11 @@ pub struct CompactOptions {
     pub apply: bool,
     /// Consolidate small manifests when at least this many exist (0 = never).
     pub consolidate_min_manifests: usize,
+    /// Partitions rewritten at once.
+    pub jobs: usize,
+    /// Compressed input of the partitions being rewritten at once; bounds
+    /// memory, since each is sorted in memory at several times this size.
+    pub max_inflight_bytes: u64,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -93,63 +107,93 @@ async fn discard(table: &Table, files: &[iceberg::spec::DataFile]) {
     }
 }
 
-/// Rewrites one partition. `Ok(None)` means it no longer needs work (someone
-/// else compacted it, or it vanished) after a reload. Prints a line of phase
-/// timings when it commits, and a heartbeat while any phase runs long.
+/// A partition rewritten into new files that aren't committed yet.
+struct Rewritten {
+    added: Vec<DataFile>,
+    rows: usize,
+    decoded: u64,
+    t_read: Duration,
+    t_sort: Duration,
+    t_write: Duration,
+}
+
+/// Reads, sorts and writes one partition from scan tasks planned up front.
+/// Runs as its own tokio task so partitions rewrite in parallel, with the
+/// sort on the blocking pool. Nothing is committed (see [`commit_rewrite`]).
 async fn rewrite_partition(
+    table: &Table,
+    p: &PartitionPlan,
+    tasks: Vec<FileScanTask>,
+    sort: Arc<Vec<String>>,
+    target_bytes: u64,
+) -> Result<Rewritten> {
+    anyhow::ensure!(
+        tasks.len() == p.files.len(),
+        "planned {} of {} files to read",
+        tasks.len(),
+        p.files.len()
+    );
+    let hb = Heartbeat::start(&p.label);
+
+    hb.set("reading");
+    let t = Instant::now();
+    let batches = read_tasks(table, tasks).await?;
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    let decoded = batches
+        .iter()
+        .map(|b| b.get_array_memory_size() as u64)
+        .sum();
+    let t_read = t.elapsed();
+
+    hb.set("sorting");
+    let t = Instant::now();
+    // Moving `batches` in frees them as soon as the sorted copy exists.
+    let sorted = tokio::task::spawn_blocking(move || sort_batches(&batches, &sort)).await??;
+    let t_sort = t.elapsed();
+
+    hb.set("writing");
+    let t = Instant::now();
+    let added = write_partition(
+        table,
+        p.partition.clone(),
+        sorted,
+        target_bytes,
+        &BLOOM_COLUMNS,
+    )
+    .await?;
+    Ok(Rewritten {
+        added,
+        rows,
+        decoded,
+        t_read,
+        t_sort,
+        t_write: t.elapsed(),
+    })
+}
+
+/// Commits a rewritten partition as a `replace` of exactly the files it
+/// read. A concurrent commit (409) only invalidates the snapshot the commit
+/// was built on, not the rewritten files, so a retry reloads the table and
+/// rebuilds the commit without rewriting. If the input files are no longer
+/// live (someone else rewrote them), the new files are deleted.
+async fn commit_rewrite(
     catalog: &impl Catalog,
     rest: &RestClient,
     ident: &TableIdent,
-    key: &str,
-    label: &str,
-    sort: &[String],
-    opts: &CompactOptions,
-) -> Result<Option<(PartitionPlan, usize, u64)>> {
-    let hb = Heartbeat::start(label);
+    p: &PartitionPlan,
+    added: &[DataFile],
+    index: &mut ManifestIndex,
+) -> Result<()> {
+    let paths: HashSet<String> = p.files.iter().map(|f| f.path.clone()).collect();
+    let mut table = catalog.load_table(ident).await?;
     for attempt in 1..=MAX_COMMIT_ATTEMPTS {
-        hb.set("planning");
-        let t = Instant::now();
-        let table = catalog.load_table(ident).await?;
-        let (plans, _) = plan::plan(&table, live_files(&table).await?, opts.plan);
-        let Some(p) = plans.into_iter().find(|p| p.key == key) else {
-            return Ok(None);
-        };
-        let t_plan = t.elapsed();
-
-        hb.set("reading");
-        let t = Instant::now();
-        let paths = p.files.iter().map(|f| f.path.clone()).collect();
-        let batches = read_files(&table, &paths).await?;
-        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        let decoded: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
-        let t_read = t.elapsed();
-
-        hb.set("sorting");
-        let t = Instant::now();
-        let sorted = sort_batches(&batches, sort)?;
-        drop(batches);
-        let t_sort = t.elapsed();
-
-        hb.set("writing");
-        let t = Instant::now();
-        let added = write_partition(
-            &table,
-            p.partition.clone(),
-            sorted,
-            opts.plan.target_bytes,
-            &BLOOM_COLUMNS,
-        )
-        .await?;
-        let t_write = t.elapsed();
-        let out_bytes = added.iter().map(|f| f.file_size_in_bytes()).sum();
-        let out_files = added.len();
-
-        hb.set("committing");
-        let t = Instant::now();
-        let prepared = match prepare_replace(&table, &paths, added.clone()).await {
+        if attempt > 1 {
+            table = catalog.load_table(ident).await?;
+        }
+        let prepared = match prepare_replace_indexed(&table, &paths, added.to_vec(), index).await {
             Ok(v) => v,
             Err(e) => {
-                discard(&table, &added).await;
+                discard(&table, added).await;
                 return Err(e);
             }
         };
@@ -157,23 +201,14 @@ async fn rewrite_partition(
             .commit(ident, &prepared.requirements, &prepared.updates)
             .await?
         {
-            println!(
-                "    plan {} · read {} ({rows} rows, {} decoded) · sort {} · write {} · commit {}",
-                fmt_duration(t_plan),
-                fmt_duration(t_read),
-                fmt_bytes(decoded as u64),
-                fmt_duration(t_sort),
-                fmt_duration(t_write),
-                fmt_duration(t.elapsed()),
-            );
-            return Ok(Some((p, out_files, out_bytes)));
+            return Ok(());
         }
-        discard(&table, &added).await;
         eprintln!(
-            "  {}: table changed during rewrite, retrying ({attempt}/{MAX_COMMIT_ATTEMPTS})",
+            "  {}: table changed before commit, retrying ({attempt}/{MAX_COMMIT_ATTEMPTS})",
             p.label
         );
     }
+    discard(&table, added).await;
     bail!("gave up after {MAX_COMMIT_ATTEMPTS} conflicting commits")
 }
 
@@ -194,8 +229,12 @@ pub async fn compact_table(
         table = catalog.load_table(&ident).await?;
     }
 
+    // Plan once: scanning reads every manifest, which on a table built from
+    // one commit per ingested file is the most expensive step there is.
     let t = Instant::now();
-    let (plans, skipped) = plan::plan(&table, live_files(&table).await?, opts.plan);
+    let tasks = scan_tasks(&table).await?;
+    let live = tasks.iter().map(LiveFile::from).collect();
+    let (plans, skipped) = plan::plan(&table, live, opts.plan);
     let total_bytes: u64 = plans.iter().map(|p| p.input_bytes).sum();
     println!(
         "  planned in {}: {} partitions need work ({}), {} skipped",
@@ -215,10 +254,8 @@ pub async fn compact_table(
         }
     }
 
-    let n = plans.len();
-    let mut progress = Throughput::new(total_bytes);
-    for (i, p) in plans.into_iter().enumerate() {
-        if !opts.apply {
+    if !opts.apply {
+        for p in plans {
             println!(
                 "  would rewrite {}: {} files, {:.1} MiB, sorted by [{}]",
                 p.label,
@@ -229,40 +266,21 @@ pub async fn compact_table(
             report.partitions_rewritten += 1;
             report.files_in += p.files.len();
             report.bytes_in += p.input_bytes;
-            continue;
         }
-        println!(
-            "  [{}/{n}] {}: {} files, {}",
-            i + 1,
-            p.label,
-            p.files.len(),
-            fmt_bytes(p.input_bytes)
-        );
-        let planned_bytes = p.input_bytes;
-        match rewrite_partition(catalog, rest, &ident, &p.key, &p.label, &sort, opts).await {
-            Ok(Some((p, out_files, out_bytes))) => {
-                println!(
-                    "  rewrote {}: {} files ({:.1} MiB) -> {} files ({:.1} MiB)",
-                    p.label,
-                    p.files.len(),
-                    mib(p.input_bytes),
-                    out_files,
-                    mib(out_bytes)
-                );
-                report.partitions_rewritten += 1;
-                report.files_in += p.files.len();
-                report.bytes_in += p.input_bytes;
-                report.files_out += out_files;
-                report.bytes_out += out_bytes;
-            }
-            Ok(None) => println!("    {}: no longer needs work, skipped", p.label),
-            Err(e) => {
-                eprintln!("  {}: FAILED: {e:#}", p.label);
-                report.partitions_failed += 1;
-            }
-        }
-        progress.add(planned_bytes);
-        println!("    {}", progress.line());
+    } else {
+        rewrite_all(
+            catalog,
+            rest,
+            &ident,
+            &table,
+            tasks,
+            plans,
+            sort,
+            total_bytes,
+            opts,
+            &mut report,
+        )
+        .await;
     }
 
     if opts.consolidate_min_manifests > 0 {
@@ -287,6 +305,119 @@ pub async fn compact_table(
         }
     }
     Ok(report)
+}
+
+/// Rewrites `plans` with up to `opts.jobs` partitions in flight and at most
+/// `opts.max_inflight_bytes` of compressed input among them (a partition
+/// larger than that runs alone), committing each as it finishes. Commits are
+/// serial: each builds on the snapshot the previous one made.
+#[allow(clippy::too_many_arguments)]
+async fn rewrite_all(
+    catalog: &impl Catalog,
+    rest: &RestClient,
+    ident: &TableIdent,
+    table: &Table,
+    tasks: Vec<FileScanTask>,
+    plans: Vec<PartitionPlan>,
+    sort: Vec<String>,
+    total_bytes: u64,
+    opts: &CompactOptions,
+    report: &mut CompactReport,
+) {
+    let n = plans.len();
+    let sort = Arc::new(sort);
+    let budget_mib = (opts.max_inflight_bytes >> 20).clamp(1, u32::MAX as u64) as u32;
+    let budget = Arc::new(Semaphore::new(budget_mib as usize));
+    let target_bytes = opts.plan.target_bytes;
+    let mut by_path: HashMap<String, FileScanTask> = tasks
+        .into_iter()
+        .map(|t| (t.data_file_path.clone(), t))
+        .collect();
+
+    let spawn = |(i, p): (usize, PartitionPlan)| {
+        let tasks: Vec<_> = p
+            .files
+            .iter()
+            .filter_map(|f| by_path.remove(&f.path))
+            .collect();
+        let (table, sort, budget) = (table.clone(), sort.clone(), budget.clone());
+        tokio::spawn(async move {
+            let permits = (p.input_bytes.div_ceil(1 << 20) as u32).clamp(1, budget_mib);
+            let _held = budget
+                .acquire_many_owned(permits)
+                .await
+                .expect("budget semaphore is never closed");
+            println!(
+                "  [{}/{n}] {}: {} files, {}",
+                i + 1,
+                p.label,
+                p.files.len(),
+                fmt_bytes(p.input_bytes)
+            );
+            let result = rewrite_partition(&table, &p, tasks, sort, target_bytes).await;
+            (p, result)
+        })
+    };
+    let mut finished = futures_util::stream::iter(plans.into_iter().enumerate())
+        .map(spawn)
+        .buffer_unordered(opts.jobs.max(1));
+
+    let mut index = ManifestIndex::default();
+    let mut progress = Throughput::new(total_bytes);
+    while let Some(joined) = finished.next().await {
+        let (p, result) = match joined {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("  a partition rewrite panicked: {e}");
+                report.partitions_failed += 1;
+                continue;
+            }
+        };
+        let committed = match result {
+            Ok(r) => {
+                let hb = Heartbeat::start(&p.label);
+                hb.set("committing");
+                let t = Instant::now();
+                commit_rewrite(catalog, rest, ident, &p, &r.added, &mut index)
+                    .await
+                    .map(|()| (r, t.elapsed()))
+            }
+            Err(e) => Err(e),
+        };
+        match committed {
+            Ok((r, t_commit)) => {
+                let out_bytes = r.added.iter().map(|f| f.file_size_in_bytes()).sum();
+                println!(
+                    "  rewrote {}: {} files ({:.1} MiB) -> {} files ({:.1} MiB)",
+                    p.label,
+                    p.files.len(),
+                    mib(p.input_bytes),
+                    r.added.len(),
+                    mib(out_bytes)
+                );
+                println!(
+                    "    read {} ({} rows, {} decoded) · sort {} · write {} · commit {}",
+                    fmt_duration(r.t_read),
+                    r.rows,
+                    fmt_bytes(r.decoded),
+                    fmt_duration(r.t_sort),
+                    fmt_duration(r.t_write),
+                    fmt_duration(t_commit),
+                );
+                report.partitions_rewritten += 1;
+                report.files_in += p.files.len();
+                report.bytes_in += p.input_bytes;
+                report.files_out += r.added.len();
+                report.bytes_out += out_bytes;
+            }
+            Err(e) => {
+                eprintln!("  {}: FAILED: {e:#}", p.label);
+                report.partitions_failed += 1;
+            }
+        }
+        progress.add(p.input_bytes);
+        println!("    {}", progress.line());
+    }
 }
 
 pub async fn count_small_manifests(table: &Table) -> Result<usize> {

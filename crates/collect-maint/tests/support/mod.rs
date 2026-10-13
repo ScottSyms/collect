@@ -120,7 +120,10 @@ fn raw_http_get_ok(port: u16, path: &str) -> bool {
     };
     let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
     if stream
-        .write_all(format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").as_bytes())
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
         .is_err()
     {
         return false;

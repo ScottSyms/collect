@@ -18,7 +18,11 @@ pub fn fmt_duration(d: Duration) -> String {
     } else if s < 3600.0 {
         format!("{}m {:02}s", (s / 60.0) as u64, (s % 60.0) as u64)
     } else {
-        format!("{}h {:02}m", (s / 3600.0) as u64, ((s % 3600.0) / 60.0) as u64)
+        format!(
+            "{}h {:02}m",
+            (s / 3600.0) as u64,
+            ((s % 3600.0) / 60.0) as u64
+        )
     }
 }
 
@@ -51,7 +55,10 @@ impl Heartbeat {
             loop {
                 tick.tick().await;
                 let (phase, since) = *shared.lock().unwrap();
-                println!("    {label}: still {phase} ({})", fmt_duration(since.elapsed()));
+                println!(
+                    "    {label}: still {phase} ({})",
+                    fmt_duration(since.elapsed())
+                );
             }
         });
         Self { state, task }
@@ -78,7 +85,11 @@ pub struct Throughput {
 
 impl Throughput {
     pub fn new(total: u64) -> Self {
-        Self { start: Instant::now(), total, done: 0 }
+        Self {
+            start: Instant::now(),
+            total,
+            done: 0,
+        }
     }
 
     pub fn add(&mut self, bytes: u64) {
@@ -118,7 +129,10 @@ mod tests {
     fn durations() {
         assert_eq!(fmt_duration(Duration::from_millis(1500)), "1.5s");
         assert_eq!(fmt_duration(Duration::from_secs(192)), "3m 12s");
-        assert_eq!(fmt_duration(Duration::from_secs(2 * 3600 + 14 * 60 + 5)), "2h 14m");
+        assert_eq!(
+            fmt_duration(Duration::from_secs(2 * 3600 + 14 * 60 + 5)),
+            "2h 14m"
+        );
     }
 
     #[test]

@@ -100,15 +100,19 @@ Rewrites partitions into sorted, right-sized files.
 | `--max-partition-mb` | `1024` | Skip partitions whose compressed input is larger than this |
 | `--sort-by a,b` | `mmsi,ts` | Sort columns, ascending, nulls last |
 | `--consolidate-manifests <n>` | `20` | Merge small manifests once at least `n` exist; `0` turns it off |
+| `--jobs <n>` | `2` | Partitions rewritten in parallel |
+| `--max-inflight-mb` | `1024` | Total compressed input of the partitions being rewritten at once; a larger partition runs alone |
 
 Steps, per table:
 
 1. **Register the sort order** on the table (`--apply` only) if it isn't
    already the default. Engines and later writers can see it in table
    metadata.
-2. **Plan.** Group the live files by partition, then keep the partitions that
-   are *closed* and *need work* (below).
-3. **Rewrite each partition.** Read its files, sort all rows, and write new
+2. **Plan**, once per table. Group the live files by partition, then keep
+   the partitions that are *closed* and *need work* (below). Planning reads
+   every manifest, so it isn't repeated per partition.
+3. **Rewrite each partition**, up to `--jobs` at once within the
+   `--max-inflight-mb` memory budget. Read its files, sort all rows, and write new
    files with zstd compression, row groups of at most 128Ki rows, and bloom
    filters on `mmsi`, `imo_number`, `call_sign` and `name` (those the table
    has). Filters are sized per row group (32Ki distinct values; 1% false
@@ -116,28 +120,34 @@ Steps, per table:
    which cost about 1 MB per column per row group. `station` and `source` get
    none: they are near-constant, so a filter only adds size.
 4. **Commit** the swap as one Iceberg `replace` snapshot: old files out, new
-   files in.
+   files in. Commits happen one at a time as partitions finish, each on top
+   of the previous one. Manifests already read in this run aren't read again.
 5. **Consolidate manifests** (optional): merge the many small data manifests
    into one per partition spec.
 
 #### Progress output
 
 With `--apply`, each table reports how long planning took and how much it
-will rewrite, then one block per partition:
+will rewrite, then a line as each partition starts and a block as each one
+commits. With `--jobs` above 1, partitions finish out of order and their lines
+interleave; every line names its partition.
 
 ```
 positions:
   planned in 14.2s: 340 partitions need work (41.20 GiB), 12 skipped
   [12/340] ts_day=2026-09-01: 48 files, 812.3 MiB
+  [13/340] ts_day=2026-09-02: 51 files, 798.0 MiB
     ts_day=2026-09-01: still writing (30.0s)
-    plan 9.8s · read 23.1s (6120334 rows, 3.41 GiB decoded) · sort 8.2s · write 51.0s · commit 1.2s
   rewrote ts_day=2026-09-01: 48 files (812.3 MiB) -> 2 files (640.1 MiB)
+    read 23.1s (6120334 rows, 3.41 GiB decoded) · sort 8.2s · write 51.0s · commit 1.2s
     progress: 9.71 GiB of 41.20 GiB (23.6%) · 18.3 MiB/s · elapsed 9m 03s · ETA 29m 20s
 ```
 
-- **Phase timings** show where the time goes. A large `plan` means the
-  table has many manifests (consolidate them first). A large `decoded`
-  value means the partition nearly filled memory.
+- **`planned in`** is the one full read of the table's manifests. If it's
+  long, the table has many manifests: consolidate them first.
+- **Phase timings** show where the time goes. `decoded` is the partition's
+  size in memory; keep the sum across `--jobs` below the free RAM. The first
+  commit of a run reads every manifest, so it's slower than the rest.
 - **`still <phase>`** lines appear every 30 s while a phase is running, so a
   slow partition doesn't look hung.
 - **`progress`** counts compressed input bytes across this table's
@@ -253,10 +263,11 @@ Code `2` is normal for a scheduled run when nothing new has arrived.
 
 Ingest keeps appending while `ais-compact` works, so every commit is pinned to
 the snapshot it was planned against. If ingest commits first, the catalog
-answers `409 Conflict`; `ais-compact` deletes the files it just wrote,
-reloads the table, re-plans that partition, and tries again, up to four
-attempts. If a partition still can't commit it is reported as failed and the
-run continues with the next one. Data appended while a partition is being
+answers `409 Conflict`; `ais-compact` reloads the table, rebuilds the commit
+on the new snapshot, and tries again, up to four attempts. The rewritten files
+are still valid, so they aren't written again. If a partition still can't
+commit, its new files are deleted, it is reported as failed, and the run
+continues with the next one. Data appended while a partition is being
 rewritten is never lost: the replace only removes the exact files it read.
 
 A commit also fails, rather than corrupting anything, if any file it meant to
@@ -278,7 +289,9 @@ the partitions it would rewrite and how many small manifests it would merge.
 ## Limits
 
 - **Memory.** A partition is sorted in memory. `--max-partition-mb` bounds its
-  *compressed* input; expect several times that in RAM. Larger partitions are
+  *compressed* input, and `--max-inflight-mb` the total across partitions
+  rewritten in parallel; expect several times that in RAM. On a small host
+  lower `--max-inflight-mb` (and `--max-partition-mb` with it). Larger partitions are
   skipped with a message (not failed), so lower the partition granularity
   (`--partition hour`) for very busy tables, or raise the flag on a big host.
 - **Iceberg v2 only**, and tables **without delete files**. This project never
