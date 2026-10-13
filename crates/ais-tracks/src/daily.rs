@@ -20,7 +20,6 @@ use collect_core::iceberg::{
     TABLE_STATICS,
 };
 use collect_maint::commit::RestClient;
-use collect_maint::rewrite::live_files;
 use datafusion::prelude::SessionContext;
 use iceberg::spec::PartitionSpecBuilder;
 use iceberg::Catalog;
@@ -32,7 +31,7 @@ use crate::reduce::StreamState;
 use crate::reduce_day::{self, ReduceOptions};
 use crate::source;
 use crate::state::{
-    build_log_schema, STEP_STATICS_DAILY, STEP_STOPS, STEP_VESSELS, STEP_VESSEL_DAILY, STEP_VOYAGES, date_to_day, days_from_files, downstream_token, log_batch,
+    build_log_schema, STEP_STATICS_DAILY, STEP_STOPS, STEP_VESSELS, STEP_VESSEL_DAILY, STEP_VOYAGES, date_to_day, days_from_table, downstream_token, log_batch,
     read_states_before, scan_all, select_days, states_batch, track_points_token,
     vessel_state_schema, DaySelect, Log, LogRow, STEP_STOP_SEGMENTS, STEP_TRACKS,
     STEP_TRACK_POINTS, TABLE_BUILD_LOG, TABLE_VESSEL_STATE,
@@ -246,7 +245,7 @@ pub async fn run_track_points<C: Catalog>(env: &Env<'_, C>, run: &TrackPointsRun
         .load_table(&table_ident(env.input, TABLE_POSITIONS))
         .await
         .context("loading the silver positions table")?;
-    let silver = days_from_files(&live_files(&positions).await?);
+    let silver = days_from_table(&positions).await?;
     let candidates: Vec<NaiveDate> = silver.keys().copied().collect();
     let today = Utc::now().date_naive();
     let (days, force) = select_days(run.select, &candidates, today)?;
@@ -698,7 +697,7 @@ pub async fn run_statics_daily<C: Catalog>(env: &Env<'_, C>, run: &StaticsRun<'_
         return Ok(sum);
     }
     let statics = env.catalog.load_table(&ident).await?;
-    let silver = days_from_files(&live_files(&statics).await?);
+    let silver = days_from_table(&statics).await?;
     let candidates: Vec<NaiveDate> = silver.keys().copied().collect();
     let (days, force) = select_days(run.select, &candidates, Utc::now().date_naive())?;
     let mut log = load_log(env).await?;
@@ -1126,7 +1125,7 @@ async fn clear_stops<C: Catalog>(env: &Env<'_, C>, rest: &RestClient) -> Result<
         return Ok(());
     }
     let table = env.catalog.load_table(&ident).await?;
-    for day in days_from_files(&live_files(&table).await?).keys() {
+    for day in days_from_table(&table).await?.keys() {
         commit_day(env.catalog, rest, env.output, TABLE_STOPS, date_to_day(*day), Vec::new(), 0).await?;
     }
     Ok(())
