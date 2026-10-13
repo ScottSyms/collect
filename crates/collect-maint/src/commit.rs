@@ -6,6 +6,7 @@
 //! resulting `add-snapshot` / `set-snapshot-ref` updates straight to the REST
 //! catalog (through the same SigV4 proxy `open_catalog` uses).
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -201,7 +202,8 @@ pub async fn prepare_replace_indexed(
         removed_bytes,
         added_bytes,
     );
-    let (requirements, updates) = seal(table, snapshot_id, commit_uuid, manifests, summary).await?;
+    let (requirements, updates) =
+        seal(table, snapshot_id, commit_uuid, 0, manifests, summary).await?;
     Ok(PreparedReplace {
         requirements,
         updates,
@@ -222,6 +224,7 @@ async fn seal(
     table: &Table,
     snapshot_id: i64,
     commit_uuid: uuid::Uuid,
+    attempt: u32,
     manifests: Vec<ManifestFile>,
     summary: Summary,
 ) -> Result<(Vec<TableRequirement>, Vec<TableUpdate>)> {
@@ -230,7 +233,7 @@ async fn seal(
         .current_snapshot()
         .ok_or_else(|| anyhow!("table has no current snapshot"))?;
     let list_path = format!(
-        "{}/metadata/snap-{snapshot_id}-0-{commit_uuid}.avro",
+        "{}/metadata/snap-{snapshot_id}-{attempt}-{commit_uuid}.avro",
         metadata.location()
     );
     let mut list_writer = ManifestListWriter::v2(
@@ -277,14 +280,48 @@ async fn seal(
 /// Data manifests smaller than this are candidates for consolidation.
 pub const SMALL_MANIFEST_BYTES: i64 = 8 * 1024 * 1024;
 
+/// RustFS refuses any commit whose new snapshot lists more manifests than
+/// this (`TABLE_COMMIT_MAX_MANIFESTS`), so a table that reaches it can't be
+/// appended to until its manifests are merged.
+pub const RUSTFS_MAX_MANIFESTS: usize = 10_000;
+
+/// Entries per merged manifest. RustFS also caps a single manifest at
+/// 128 MiB of Avro; a data-file entry with column statistics is a few KB at
+/// most, so this stays well under it. A merged manifest this full is larger
+/// than [`SMALL_MANIFEST_BYTES`] and isn't merged again.
+const MAX_MERGED_ENTRIES: usize = 20_000;
+
+/// Small manifests merged into fewer, larger ones but not yet published (see
+/// [`seal_consolidation`]). The merged manifests stay valid across a
+/// conflicting commit, so publishing can be retried without redoing the
+/// merge.
+pub struct MergedManifests {
+    merged: Vec<ManifestFile>,
+    replaced: HashSet<String>,
+    snapshot_id: i64,
+    commit_uuid: uuid::Uuid,
+}
+
+impl MergedManifests {
+    /// How many small manifests this replaces.
+    pub fn replaced(&self) -> usize {
+        self.replaced.len()
+    }
+}
+
+fn is_small_data_manifest(m: &ManifestFile) -> bool {
+    m.content == ManifestContentType::Data && m.manifest_length < SMALL_MANIFEST_BYTES
+}
+
 /// A manifest-only rewrite: merges the many tiny manifests that one-commit-
-/// per-file ingest leaves behind into one per partition spec, changing no
-/// data files. Returns `None` when fewer than `min_manifests` small data
-/// manifests exist (not worth a snapshot).
-pub async fn prepare_consolidate(
+/// per-file ingest leaves behind into as few as possible per partition spec
+/// (at most [`MAX_MERGED_ENTRIES`] entries each), changing no data files.
+/// Returns `None` when fewer than `min_manifests` small data manifests exist
+/// (not worth a snapshot).
+pub async fn merge_small_manifests(
     table: &Table,
     min_manifests: usize,
-) -> Result<Option<(Vec<TableRequirement>, Vec<TableUpdate>, usize)>> {
+) -> Result<Option<MergedManifests>> {
     let metadata = table.metadata();
     anyhow::ensure!(
         metadata.format_version() == FormatVersion::V2,
@@ -298,55 +335,50 @@ pub async fn prepare_consolidate(
         .load_manifest_list(file_io, &metadata.clone())
         .await
         .context("loading current manifest list")?;
-
-    let small = |m: &ManifestFile| {
-        m.content == ManifestContentType::Data && m.manifest_length < SMALL_MANIFEST_BYTES
-    };
-    if list.entries().iter().filter(|m| small(m)).count() < min_manifests {
+    let small: Vec<&ManifestFile> = list
+        .entries()
+        .iter()
+        .filter(|m| is_small_data_manifest(m))
+        .collect();
+    if small.len() < min_manifests.max(1) {
         return Ok(None);
     }
 
     let snapshot_id = new_snapshot_id(table);
     let commit_uuid = uuid::Uuid::new_v4();
-    let mut kept = Vec::new();
-    let mut replaced = 0usize;
-    let mut writers: HashMap<i32, (iceberg::spec::ManifestWriter, usize)> = HashMap::new();
     let mut n = 0u32;
-    for mf in list.entries() {
-        if !small(mf) {
-            kept.push(mf.clone());
-            continue;
-        }
-        replaced += 1;
+    let mut new_writer = |spec_id: i32| -> Result<iceberg::spec::ManifestWriter> {
+        let spec = metadata
+            .partition_spec_by_id(spec_id)
+            .ok_or_else(|| anyhow!("unknown partition spec {spec_id}"))?;
+        let path = format!("{}/metadata/{commit_uuid}-m{n}.avro", metadata.location());
+        n += 1;
+        Ok(ManifestWriterBuilder::new(
+            file_io.new_output(path)?,
+            Some(snapshot_id),
+            None,
+            metadata.current_schema().clone(),
+            spec.as_ref().clone(),
+        )
+        .build_v2_data())
+    };
+
+    let mut merged = Vec::new();
+    let mut replaced = HashSet::new();
+    let mut writers: HashMap<i32, (iceberg::spec::ManifestWriter, usize)> = HashMap::new();
+    for mf in small {
+        replaced.insert(mf.manifest_path.clone());
         let manifest = mf.load_manifest(file_io).await?;
-        if !writers.contains_key(&mf.partition_spec_id) {
-            let spec = metadata
-                .partition_spec_by_id(mf.partition_spec_id)
-                .ok_or_else(|| anyhow!("unknown partition spec {}", mf.partition_spec_id))?;
-            let path = format!("{}/metadata/{commit_uuid}-m{n}.avro", metadata.location());
-            n += 1;
-            writers.insert(
-                mf.partition_spec_id,
-                (
-                    ManifestWriterBuilder::new(
-                        file_io.new_output(path)?,
-                        Some(snapshot_id),
-                        None,
-                        metadata.current_schema().clone(),
-                        spec.as_ref().clone(),
-                    )
-                    .build_v2_data(),
-                    0,
-                ),
-            );
-        }
-        let (writer, entries) = writers.get_mut(&mf.partition_spec_id).unwrap();
         for e in manifest.entries() {
             // Deleted entries only matter to incremental readers of the
             // snapshot that deleted them; a merge may drop them.
             if !e.is_alive() {
                 continue;
             }
+            let (writer, entries) = match writers.entry(mf.partition_spec_id) {
+                Entry::Occupied(e) => e.into_mut(),
+                Entry::Vacant(v) => v.insert((new_writer(mf.partition_spec_id)?, 0)),
+            };
             writer.add_existing_file(
                 e.data_file().clone(),
                 e.snapshot_id()
@@ -356,16 +388,45 @@ pub async fn prepare_consolidate(
                 e.file_sequence_number,
             )?;
             *entries += 1;
+            if *entries >= MAX_MERGED_ENTRIES {
+                let (full, _) = writers.remove(&mf.partition_spec_id).unwrap();
+                merged.push(full.write_manifest_file().await?);
+            }
         }
     }
-    let mut created = 0usize;
+    // A group whose entries were all deleted merges into nothing.
     for (_, (writer, entries)) in writers {
-        // A group whose entries were all deleted merges into nothing.
         if entries > 0 {
-            kept.push(writer.write_manifest_file().await?);
-            created += 1;
+            merged.push(writer.write_manifest_file().await?);
         }
     }
+    Ok(Some(MergedManifests {
+        merged,
+        replaced,
+        snapshot_id,
+        commit_uuid,
+    }))
+}
+
+/// Builds the commit that publishes `m` on top of `table`'s *current*
+/// snapshot: the merged manifests plus every current manifest it didn't
+/// replace, so manifests appended since the merge are kept. `attempt` keeps
+/// each try's manifest list at its own path. Fails if any replaced manifest
+/// is no longer in the current snapshot (another writer rewrote it).
+pub async fn seal_consolidation(
+    table: &Table,
+    m: &MergedManifests,
+    attempt: u32,
+) -> Result<(Vec<TableRequirement>, Vec<TableUpdate>)> {
+    let metadata = table.metadata();
+    let parent = metadata
+        .current_snapshot()
+        .ok_or_else(|| anyhow!("table has no current snapshot"))?;
+    let list = parent
+        .load_manifest_list(table.file_io(), &metadata.clone())
+        .await
+        .context("loading current manifest list")?;
+    let manifests = combine_manifests(list.entries(), m)?;
 
     // Carry only the running totals: the parent's added-/deleted-* counters
     // describe its own change, and RustFS rejects a snapshot whose counters
@@ -378,14 +439,42 @@ pub async fn prepare_consolidate(
         .filter(|(k, _)| k.starts_with("total-"))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    props.insert("manifests-created".into(), created.to_string());
-    props.insert("manifests-replaced".into(), replaced.to_string());
+    props.insert("manifests-created".into(), m.merged.len().to_string());
+    props.insert("manifests-replaced".into(), m.replaced.len().to_string());
     let summary = Summary {
         operation: Operation::Append,
         additional_properties: props,
     };
-    let (req, upd) = seal(table, snapshot_id, commit_uuid, kept, summary).await?;
-    Ok(Some((req, upd, replaced)))
+    seal(
+        table,
+        m.snapshot_id,
+        m.commit_uuid,
+        attempt,
+        manifests,
+        summary,
+    )
+    .await
+}
+
+/// The manifests of a consolidated snapshot: `current` minus what `m`
+/// replaced, plus what `m` merged them into.
+fn combine_manifests(current: &[ManifestFile], m: &MergedManifests) -> Result<Vec<ManifestFile>> {
+    let present = current
+        .iter()
+        .filter(|f| m.replaced.contains(&f.manifest_path))
+        .count();
+    anyhow::ensure!(
+        present == m.replaced.len(),
+        "{} of {} merged manifests are no longer in the table; another writer rewrote them",
+        m.replaced.len() - present,
+        m.replaced.len()
+    );
+    Ok(current
+        .iter()
+        .filter(|f| !m.replaced.contains(&f.manifest_path))
+        .cloned()
+        .chain(m.merged.iter().cloned())
+        .collect())
 }
 
 /// Snapshot ids to expire: everything older than `older_than_ms` except the
@@ -562,5 +651,58 @@ impl RestClient {
             );
         }
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest(path: &str) -> ManifestFile {
+        ManifestFile {
+            manifest_path: path.into(),
+            manifest_length: 100,
+            partition_spec_id: 0,
+            content: ManifestContentType::Data,
+            sequence_number: 1,
+            min_sequence_number: 1,
+            added_snapshot_id: 1,
+            added_files_count: Some(1),
+            existing_files_count: Some(0),
+            deleted_files_count: Some(0),
+            added_rows_count: Some(1),
+            existing_rows_count: Some(0),
+            deleted_rows_count: Some(0),
+            partitions: None,
+            key_metadata: None,
+            first_row_id: None,
+        }
+    }
+
+    fn merged(replaced: &[&str], into: &[&str]) -> MergedManifests {
+        MergedManifests {
+            merged: into.iter().map(|p| manifest(p)).collect(),
+            replaced: replaced.iter().map(|p| p.to_string()).collect(),
+            snapshot_id: 1,
+            commit_uuid: uuid::Uuid::nil(),
+        }
+    }
+
+    fn paths(list: &[ManifestFile]) -> Vec<&str> {
+        list.iter().map(|m| m.manifest_path.as_str()).collect()
+    }
+
+    #[test]
+    fn combine_keeps_manifests_appended_since_the_merge() {
+        let current = ["a", "b", "big", "new"].map(manifest);
+        let out = combine_manifests(&current, &merged(&["a", "b"], &["m0"])).unwrap();
+        assert_eq!(paths(&out), ["big", "new", "m0"]);
+    }
+
+    #[test]
+    fn combine_refuses_when_a_replaced_manifest_is_gone() {
+        let current = ["a", "m-other"].map(manifest);
+        let err = combine_manifests(&current, &merged(&["a", "b"], &["m0"])).unwrap_err();
+        assert!(err.to_string().contains("no longer in the table"), "{err}");
     }
 }

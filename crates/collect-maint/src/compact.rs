@@ -16,7 +16,8 @@ use iceberg::{Catalog, TableIdent};
 use tokio::sync::Semaphore;
 
 use crate::commit::{
-    prepare_consolidate, prepare_replace_indexed, ManifestIndex, RestClient, SMALL_MANIFEST_BYTES,
+    merge_small_manifests, prepare_replace_indexed, seal_consolidation, ManifestIndex, RestClient,
+    SMALL_MANIFEST_BYTES,
 };
 use crate::plan::{self, PartitionPlan, PlanOptions, Skip, BLOOM_COLUMNS};
 use crate::progress::{fmt_bytes, fmt_duration, Heartbeat, Throughput};
@@ -284,23 +285,20 @@ pub async fn compact_table(
     }
 
     if opts.consolidate_min_manifests > 0 {
-        let table = catalog.load_table(&ident).await?;
         if opts.apply {
-            println!("  checking manifests to consolidate...");
-            if let Some((req, upd, replaced)) =
-                prepare_consolidate(&table, opts.consolidate_min_manifests).await?
+            match consolidate_manifests(catalog, rest, &ident, opts.consolidate_min_manifests).await
             {
-                if rest.commit(&ident, &req, &upd).await? {
-                    report.manifests_replaced = replaced;
-                    println!("  consolidated {replaced} small manifests");
-                } else {
-                    eprintln!("  manifest consolidation skipped: table changed (rerun)");
+                Ok(replaced) => report.manifests_replaced = replaced,
+                Err(e) => {
+                    eprintln!("  manifest consolidation FAILED: {e:#}");
+                    report.partitions_failed += 1;
                 }
             }
         } else {
-            report.manifests_replaced = count_small_manifests(&table).await?;
-            if report.manifests_replaced < opts.consolidate_min_manifests {
-                report.manifests_replaced = 0;
+            let table = catalog.load_table(&ident).await?;
+            let small = manifest_counts(&table).await?.small;
+            if small >= opts.consolidate_min_manifests {
+                report.manifests_replaced = small;
             }
         }
     }
@@ -420,19 +418,69 @@ async fn rewrite_all(
     }
 }
 
-pub async fn count_small_manifests(table: &Table) -> Result<usize> {
+/// Manifests in a table's current snapshot.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ManifestCounts {
+    pub total: usize,
+    /// Data manifests under [`SMALL_MANIFEST_BYTES`]: what consolidation merges.
+    pub small: usize,
+}
+
+pub async fn manifest_counts(table: &Table) -> Result<ManifestCounts> {
     let Some(snap) = table.metadata().current_snapshot() else {
-        return Ok(0);
+        return Ok(ManifestCounts::default());
     };
     let list = snap
         .load_manifest_list(table.file_io(), &table.metadata_ref())
         .await?;
-    Ok(list
-        .entries()
-        .iter()
-        .filter(|m| {
-            m.content == iceberg::spec::ManifestContentType::Data
-                && m.manifest_length < SMALL_MANIFEST_BYTES
-        })
-        .count())
+    Ok(ManifestCounts {
+        total: list.entries().len(),
+        small: list
+            .entries()
+            .iter()
+            .filter(|m| {
+                m.content == iceberg::spec::ManifestContentType::Data
+                    && m.manifest_length < SMALL_MANIFEST_BYTES
+            })
+            .count(),
+    })
+}
+
+/// Merges the table's small manifests and publishes the result. Merging
+/// reads every small manifest, which takes long enough that live ingest
+/// usually commits meanwhile, so each attempt publishes on the freshly
+/// reloaded table (keeping manifests appended since) without redoing the
+/// merge. Returns how many manifests were replaced: 0 when fewer than
+/// `min_manifests` small ones exist.
+pub async fn consolidate_manifests(
+    catalog: &impl Catalog,
+    rest: &RestClient,
+    ident: &TableIdent,
+    min_manifests: usize,
+) -> Result<usize> {
+    let table = catalog.load_table(ident).await?;
+    let hb = Heartbeat::start(&format!("{} manifests", ident.name()));
+    hb.set("merging");
+    let t = Instant::now();
+    let Some(merged) = merge_small_manifests(&table, min_manifests).await? else {
+        return Ok(0);
+    };
+    hb.set("committing");
+    for attempt in 1..=MAX_COMMIT_ATTEMPTS {
+        let table = catalog.load_table(ident).await?;
+        let (req, upd) = seal_consolidation(&table, &merged, attempt as u32).await?;
+        if rest.commit(ident, &req, &upd).await? {
+            println!(
+                "  consolidated {} small manifests in {}",
+                merged.replaced(),
+                fmt_duration(t.elapsed())
+            );
+            return Ok(merged.replaced());
+        }
+        eprintln!(
+            "  manifest consolidation: table changed before commit, retrying \
+             ({attempt}/{MAX_COMMIT_ATTEMPTS})"
+        );
+    }
+    bail!("manifest consolidation gave up after {MAX_COMMIT_ATTEMPTS} conflicting commits")
 }

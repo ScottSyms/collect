@@ -3056,6 +3056,12 @@ async fn write_batch_job(
                     .silver_commits_failed
                     .fetch_add(1, Ordering::Relaxed);
                 eprintln!("⚠️  Silver commit failed for {}: {error:#}", path.display());
+                if format!("{error:#}").contains("manifest count exceeds the commit limit") {
+                    eprintln!(
+                        "   ↳ a silver table has reached RustFS's manifest limit; \
+                         run `ais-compact consolidate --apply` against this warehouse and namespace"
+                    );
+                }
             }
         }
     }

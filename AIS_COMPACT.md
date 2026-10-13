@@ -82,7 +82,8 @@ skipped with a message.
 
 Read-only. Per table: data files, total size, row count, how many files are
 under half the target size, how many partitions need compaction, snapshot
-count, small manifests, and whether a sort order is set.
+count, whether a sort order is set, and the manifest count against
+[RustFS's limit](#the-rustfs-manifest-limit), with a warning past half of it.
 
 | Flag | Default | |
 |---|---|---|
@@ -186,6 +187,42 @@ For map-region queries you may prefer a spatial key, e.g.
 `--sort-by hilbert,ts` on `positions`. Pick one order per table and keep it:
 changing it later only affects partitions that are rewritten afterwards.
 
+### `consolidate`
+
+Merges small manifests only: no data files are read or written. This is the
+step that keeps live ingest working on RustFS; see
+[The RustFS manifest limit](#the-rustfs-manifest-limit).
+
+| Flag | Default | |
+|---|---|---|
+| `--apply` | off | Actually merge and commit |
+| `--min-manifests` | `20` | Merge only when at least this many small (< 8 MiB) data manifests exist |
+
+The small manifests are merged into as few as possible per partition spec, at
+most 20,000 entries each so no single manifest gets near RustFS's 128 MiB
+manifest cap. The merge reads every small manifest, which can take minutes,
+and live ingest usually commits in the meantime. So publishing is retried on
+the reloaded table (up to four times) without redoing the merge, keeping any
+manifests appended since. `compact` runs the same step at the end when
+`--consolidate-manifests` is set.
+
+#### The RustFS manifest limit
+
+RustFS's catalog refuses any commit whose new snapshot lists more than
+**10,000 manifests**. The writer gets `400 snapshot manifest count exceeds the
+commit limit`. Every live ingest commit is a `fast_append` that adds one
+manifest and keeps all the existing ones, so at a commit a minute a table
+reaches the limit in about a week. From then on every append to that table
+fails, and `collect-*` keeps bronze locally and logs a hint pointing here.
+
+Only the new snapshot is checked, so `expire` and `orphans` don't help.
+Merging manifests does. Run `consolidate --apply` (or `inspect` to see the
+count) **with the writer's exact `--iceberg-warehouse` and
+`--iceberg-namespace`/`--iceberg-table-prefix`**; tables it can't find are
+skipped with a message. Schedule it hourly:
+[`nomad/ais-compact-consolidate.nomad`](nomad/ais-compact-consolidate.nomad)
+does that with the same variables as the `collect-aisstream` job.
+
 ### `expire`
 
 Drops old snapshots from the table metadata.
@@ -233,11 +270,13 @@ other binaries' `--completions` does.
 
 ## Running it routinely
 
-A reasonable schedule is `compact --apply` shortly after each partition
-closes, then `expire --apply` and `orphans --apply` daily. For example, from
-cron or a Nomad periodic job:
+A reasonable schedule is `consolidate --apply` hourly (required on RustFS
+with live ingest), `compact --apply` shortly after each partition closes,
+then `expire --apply` and `orphans --apply` daily. For example, from cron or
+a Nomad periodic job:
 
 ```bash
+ais-compact ... consolidate --apply
 ais-compact ... compact --apply --min-age-hours 2
 ais-compact ... expire  --apply --older-than-days 7 --retain-last 5
 ais-compact ... orphans --apply --older-than-days 3

@@ -10,8 +10,10 @@ use collect_core::iceberg::{
     TABLE_METEO, TABLE_OTHER, TABLE_POSITIONS, TABLE_RAW, TABLE_STATICS,
 };
 use collect_core::{exitcode, S3ConnectionArgs, S3Storage};
-use collect_maint::commit::{expire_commit, snapshots_to_expire, RestClient};
-use collect_maint::compact::{compact_table, count_small_manifests, mib, CompactOptions};
+use collect_maint::commit::{expire_commit, snapshots_to_expire, RestClient, RUSTFS_MAX_MANIFESTS};
+use collect_maint::compact::{
+    compact_table, consolidate_manifests, manifest_counts, mib, CompactOptions,
+};
 use collect_maint::orphans;
 use collect_maint::plan::{self, PlanOptions};
 use collect_maint::rewrite::live_files;
@@ -44,6 +46,9 @@ enum Command {
     Inspect(InspectArgs),
     /// Merge small files per closed partition into sorted, right-sized files.
     Compact(CompactArgs),
+    /// Merge small manifests only. Keeps tables under RustFS's limit of
+    /// 10,000 manifests per snapshot, past which every commit is refused.
+    Consolidate(ConsolidateArgs),
     /// Drop old snapshots (metadata only; run `orphans` afterwards to free space).
     Expire(ExpireArgs),
     /// Delete objects under the table location that no snapshot references.
@@ -88,6 +93,16 @@ struct CompactArgs {
     /// bounds memory; a larger partition runs alone.
     #[arg(long, default_value_t = 1024)]
     max_inflight_mb: u64,
+}
+
+#[derive(Args, Debug)]
+struct ConsolidateArgs {
+    /// Actually merge and commit. Without this, only report the counts.
+    #[arg(long)]
+    apply: bool,
+    /// Merge only when at least this many small manifests exist.
+    #[arg(long, default_value_t = 20)]
+    min_manifests: usize,
 }
 
 #[derive(Args, Debug)]
@@ -213,6 +228,7 @@ async fn run() -> Result<i32> {
                     r.partitions_rewritten + r.manifests_replaced
                 })
             }
+            Command::Consolidate(a) => consolidate(&catalog, &rest, &ident, &table, a).await,
             Command::Expire(a) => expire(&rest, &ident, &table, a).await,
             Command::Orphans(a) => orphans_cmd(&table, a).await,
             Command::Completions { .. } => unreachable!(),
@@ -257,15 +273,50 @@ async fn inspect(table: &iceberg::table::Table, a: &InspectArgs) -> Result<()> {
         small,
         a.target_file_mb / 2
     );
+    let manifests = manifest_counts(table).await?;
     println!(
-        "  {} partitions need compaction, {} are fine; {} snapshots, {} small manifests; sort order: {}",
+        "  {} partitions need compaction, {} are fine; {} snapshots; sort order: {}",
         needs.len(),
         fine.len(),
         table.metadata().snapshots().count(),
-        count_small_manifests(table).await?,
-        if sort.is_unsorted() { "unsorted".to_string() } else { format!("{} field(s)", sort.fields.len()) },
+        if sort.is_unsorted() {
+            "unsorted".to_string()
+        } else {
+            format!("{} field(s)", sort.fields.len())
+        },
     );
+    print_manifest_counts(manifests);
     Ok(())
+}
+
+fn print_manifest_counts(m: collect_maint::compact::ManifestCounts) {
+    println!(
+        "  {} manifests ({} small); RustFS refuses commits past {RUSTFS_MAX_MANIFESTS}",
+        m.total, m.small
+    );
+    if m.total * 2 > RUSTFS_MAX_MANIFESTS {
+        eprintln!("  WARNING: over half the manifest limit; run `ais-compact consolidate --apply`");
+    }
+}
+
+async fn consolidate(
+    catalog: &impl Catalog,
+    rest: &RestClient,
+    ident: &iceberg::TableIdent,
+    table: &iceberg::table::Table,
+    a: &ConsolidateArgs,
+) -> Result<usize> {
+    let counts = manifest_counts(table).await?;
+    print_manifest_counts(counts);
+    if counts.small < a.min_manifests.max(1) {
+        println!("  nothing to consolidate");
+        return Ok(0);
+    }
+    if !a.apply {
+        println!("  would merge {} small manifests", counts.small);
+        return Ok(counts.small);
+    }
+    consolidate_manifests(catalog, rest, ident, a.min_manifests).await
 }
 
 async fn expire(

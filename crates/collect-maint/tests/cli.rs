@@ -199,6 +199,11 @@ async fn compact_expire_orphans_end_to_end() {
     let (code, text) = run(&rustfs, &["compact", "--apply", "--min-age-hours", "0"]);
     assert_eq!(code, 2, "{text}");
 
+    // Manifests were merged above, so standalone consolidation has nothing to do.
+    let (code, text) = run(&rustfs, &["consolidate", "--apply", "--min-manifests", "2"]);
+    assert_eq!(code, 2, "{text}");
+    assert!(text.contains("nothing to consolidate"), "{text}");
+
     // Expire everything but the newest snapshot, then free the objects.
     let (code, text) = run(
         &rustfs,
