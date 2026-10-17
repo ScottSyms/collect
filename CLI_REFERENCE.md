@@ -381,3 +381,38 @@ Notes:
   (replaying or refolding when an earlier day changed). Each write is one Iceberg
   snapshot.
 - Exit codes: `0` success, `1` error, `2` no day in the range had data.
+
+## `collect-foundation`
+
+Loads foundation reference data into Iceberg: the GeoNames gazetteer, and
+vessel evidence (PSC inspections and detentions, marine occurrences). It
+takes the [Iceberg flags](#iceberg-icebergcliargs-all-binaries), given
+before the subcommand, plus S3 credentials in the environment. It sets two
+defaults of its own: `--iceberg-warehouse` defaults to **`maritimedata`** and
+`--iceberg-namespace` to **`foundation`**.
+
+Every command is a **dry run unless `--apply` is given**. A dry run downloads
+and parses but needs no catalog. Tables and behavior are in
+[COLLECT_FOUNDATION.md](COLLECT_FOUNDATION.md), and columns in
+[SCHEMAS.md](SCHEMAS.md#4-foundation-collect-foundation).
+
+Every load subcommand takes `--scratch <dir>` (default
+`$TMPDIR/collect-foundation`, removed after the run), `--keep-scratch` and
+`--apply`.
+
+| Subcommand | Flags | What it does |
+|---|---|---|
+| `placenames load` | `--source-url` (`GEONAMES_URL`, `https://download.geonames.org/export/dump/`), `--source-dir <dir>`, `--country <CC,...>`, `--feature-class <X,...>`, `--alternate-names` | Replaces `placenames` and the lookup tables `placename_feature_codes`, `placename_countries`, `placename_admin1_codes` and `placename_admin2_codes`. With `--alternate-names`, also `placename_alternate_names` |
+| `evidence paris-mou` | `--source-dir <dir>` (required) | Reads every `.xml` or `.zip` bulk file in the directory. Replaces the `paris_mou` partition of `vessel_events` and `vessel_event_findings`, plus `paris_mou_certificates` and `paris_mou_charterers` |
+| `evidence uscg` | `--source-dir <dir>`, `--file <name,...>`, `--user-agent` (`COLLECT_USER_AGENT`) | Downloads the MISLE deficiency workbooks (2018 onward), or reads every `.xlsx` in `--source-dir`. Replaces the `uscg_misle` partitions |
+| `evidence tsb` | `--source-url` (`TSB_MARSIS_URL`), `--source-dir <dir>`, `--user-agent` (`COLLECT_USER_AGENT`), `--no-raw` | Downloads the six MARSIS CSV files. Replaces the `tsb_marsis` partition of `vessel_events`, and the six `marsis_*` tables unless `--no-raw` |
+| `evidence tokyo-mou` | `--source-url` (`TOKYO_MOU_URL`), `--source-dir <dir>`, `--from YYYY-MM` (`2000-01`), `--to YYYY-MM` (this month), `--delay-ms` (250) | Fetches the monthly detention lists. Replaces the `tokyo_mou` partitions |
+| `evidence sources` | | Prints the sources. With `--apply`, rewrites only `evidence_sources` |
+| `completions <shell>` | | Prints shell completions |
+
+Notes:
+
+- `evidence` has the alias `interdictions`.
+- Every evidence load rewrites `evidence_sources` and replaces its whole
+  source partition. Give it the full history each time.
+- Exit codes: `0` success, `1` error.

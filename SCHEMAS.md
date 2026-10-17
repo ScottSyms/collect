@@ -13,6 +13,7 @@ disagree this page reflects the code:
 | [Bronze](#1-bronze-raw-feed) | `raw` (Parquet `(ts, payload)` files; Iceberg `raw`) | `collect-file`, `collect-socket`, `collect-kafka`, `collect-aisstream`, `collect-barentswatch` | `crates/collect-core/src/lib.rs` (`BatchBuf`), `iceberg/table_schemas.rs` |
 | [Silver](#2-silver-decoded-ais) | `positions`, `statics`, `meteo`, `binary`, `atons`, `other` | `ais-parse`, `aisstream-parse`, and any collector run with `--parser` | `crates/ais-parse/src/output*.rs`, `crates/aisstream-parse/src/output*.rs`, `crates/collect-core/src/iceberg/table_schemas.rs` |
 | [Derived](#3-derived-ais-tracks) | `track_points`, `tracks`, `stop_segments`, `stops`, `voyages`, `open_voyages`, `vessels`, `vessel_attributes`, `ref_ports`, plus daily and bookkeeping tables | `ais-tracks` | `crates/ais-tracks/src/*.rs` |
+| [Foundation](#4-foundation-collect-foundation) | `placenames` and lookups, `vessel_events`, `vessel_event_findings`, `evidence_sources`, `paris_mou_*`, `marsis_*` | `collect-foundation` | `crates/collect-foundation/src/geonames.rs`, `crates/collect-foundation/src/evidence/*.rs` |
 
 `ais-compact` ([AIS_COMPACT.md](AIS_COMPACT.md)) creates no tables of its own: it rewrites
 the files of the tables above, sorted by `mmsi, ts` by default, without
@@ -30,6 +31,9 @@ changing their schema.
   - [vessels](#vessels) · [vessel_attributes](#vessel_attributes) · [ref_ports](#ref_ports)
   - [Daily tables](#daily-tables): [vessel_daily](#vessel_daily) · [attribute_daily](#attribute_daily) · [static_daily](#static_daily) · [destination_daily](#destination_daily)
   - [Bookkeeping tables](#bookkeeping-tables): [vessel_state](#vessel_state) · [voyage_state](#voyage_state) · [build_log](#build_log)
+- [4. Foundation: collect-foundation](#4-foundation-collect-foundation)
+  - [placenames](#placenames) · [placename_alternate_names](#placename_alternate_names) · [Placename lookup tables](#placename-lookup-tables)
+  - [vessel_events](#vessel_events) · [vessel_event_findings](#vessel_event_findings) · [evidence_sources](#evidence_sources) · [Source-specific evidence tables](#source-specific-evidence-tables)
 - [Querying notes](#querying-notes)
 
 ## Conventions
@@ -778,6 +782,191 @@ day counts as built only once its row exists. The latest row for a
 
 ---
 
+## 4. Foundation: collect-foundation
+
+Reference tables written by `collect-foundation` to one namespace, by default
+`foundation` in warehouse `maritimedata`. How to load them and what each
+source covers: [COLLECT_FOUNDATION.md](COLLECT_FOUNDATION.md). All are Iceberg
+only, and each load replaces what it owns. That is the whole table, except
+for `vessel_events` and `vessel_event_findings`, where it is the loading
+source's partition.
+
+Two columns are added by the loader rather than read from the source:
+`loaded_at` (timestamptz, required), the time the load started, on every
+table; and `source_file` (string, required), the file the row came from, on
+every table except `evidence_sources`.
+
+### placenames
+
+The [GeoNames](https://www.geonames.org) gazetteer, from `allCountries.zip`
+or per-country `CC.zip`. Unpartitioned. Bloom filters on `geonameid` and
+`country_code`.
+
+| ID | Column | Type | Req. | Description |
+|----|--------|------|------|-------------|
+| 1 | `geonameid` | long | yes | GeoNames id. Unique. |
+| 2 | `name` | string | no | Name in UTF-8. |
+| 3 | `asciiname` | string | no | Name in plain ASCII. |
+| 4 | `alternatenames` | string | no | Comma-separated alternate names, inline. One row each in `placename_alternate_names`. |
+| 5–6 | `latitude`, `longitude` | double | no | WGS-84 decimal degrees. |
+| 7 | `feature_class` | string | no | One letter: `A` `H` `L` `P` `R` `S` `T` `U` `V`. |
+| 8 | `feature_code` | string | no | E.g. `PPL`, `BAY`, `FJD`. Names in `placename_feature_codes`. |
+| 9 | `country_code` | string | no | ISO 3166 alpha-2. |
+| 10 | `cc2` | string | no | Alternate country codes, comma-separated. |
+| 11–14 | `admin1_code` … `admin4_code` | string | no | Administrative division codes. `country_code.admin1_code` joins `placename_admin1_codes.code`. |
+| 15 | `population` | long | no | |
+| 16 | `elevation` | int | no | Metres. |
+| 17 | `dem` | int | no | Digital elevation model value in metres (SRTM3 or GTOPO30). |
+| 18 | `timezone` | string | no | IANA time zone id. |
+| 19 | `modification_date` | date | no | Last change in GeoNames. |
+| 20 | `loaded_at` | timestamptz | yes | |
+| 21 | `source_file` | string | yes | |
+
+### placename_alternate_names
+
+From `alternateNamesV2.zip`, or `alternatenames/CC.zip` per country. Loaded
+only with `--alternate-names`. Bloom filter on `geonameid`.
+
+| ID | Column | Type | Req. | Description |
+|----|--------|------|------|-------------|
+| 1 | `alternate_name_id` | long | yes | |
+| 2 | `geonameid` | long | yes | The place. |
+| 3 | `isolanguage` | string | no | ISO 639 language code, or a pseudo-code: `post`, `iata`, `icao`, `faac`, `abbr`, `link`, `wkdt`. |
+| 4 | `alternate_name` | string | no | |
+| 5–8 | `is_preferred_name`, `is_short_name`, `is_colloquial`, `is_historic` | boolean | yes | |
+| 9–10 | `from_period`, `to_period` | string | no | When the name was in use, as GeoNames writes it. |
+| 11 | `loaded_at` | timestamptz | yes | |
+| 12 | `source_file` | string | yes | |
+
+### Placename lookup tables
+
+Loaded whole with every `placenames load`.
+
+`placename_feature_codes` (from `featureCodes_en.txt`): `feature_class`
+(string, req.), `feature_code` (string, req.), `name`, `description`.
+
+`placename_countries` (from `countryInfo.txt`): `iso` (string, req.), `iso3`,
+`iso_numeric` (int), `fips`, `country`, `capital`, `area_sq_km` (double),
+`population` (long), `continent`, `tld`, `currency_code`, `currency_name`,
+`phone`, `postal_code_format`, `postal_code_regex`, `languages`, `geonameid`
+(long), `neighbours` (comma-separated ISO codes), `equivalent_fips_code`.
+
+`placename_admin1_codes` (from `admin1CodesASCII.txt`) and
+`placename_admin2_codes` (from `admin2Codes.txt`): `code` (string, req.;
+`CC.A1`, or `CC.A1.A2`), `name`, `asciiname`, `geonameid` (long).
+
+Columns are strings unless marked. Each table ends with `loaded_at` and
+`source_file`.
+
+### vessel_events
+
+One row per event per vessel, from every evidence source. Partitioned by
+identity on `source`. Bloom filters on `event_id`, `imo_number`, `mmsi` and
+`call_sign`.
+
+| ID | Column | Type | Req. | Description |
+|----|--------|------|------|-------------|
+| 1 | `event_id` | string | yes | `<source>:<source's id>`. Unique. |
+| 2 | `source` | string | yes | `paris_mou`, `uscg_misle`, `tsb_marsis`, `tokyo_mou`. Partition column. |
+| 3 | `evidence_category` | string | yes | `port_state_control`, `flag_state_control`, `marine_occurrence` (`enforcement` reserved). |
+| 4 | `event_type` | string | yes | `inspection`, `detention`, `refusal_of_access`, `expulsion`, `accident`, `incident`, `occurrence`. |
+| 5 | `event_subtype` | string | no | The source's classification: PSC inspection type, TSB accident/incident type. |
+| 6 | `severity` | string | no | The source's severity grading (TSB: IMO casualty class). |
+| 7 | `regime` | string | yes | `Paris MoU`, `Tokyo MoU`, `USCG`, `TSB Canada`. |
+| 8 | `authority` | string | no | Who acted: inspecting state, Coast Guard unit, TSB region. |
+| 9 | `source_record_id` | string | yes | The source's own record id. |
+| 10 | `case_id` | string | no | Groups rows of one case (TSB occurrence number). |
+| 11 | `event_date` | date | no | Inspection, detention or occurrence date. |
+| 12 | `event_end_date` | date | no | Final visit (Paris MoU) or release (Tokyo MoU). |
+| 13 | `event_time` | timestamptz | no | When the source gives a UTC time. |
+| 14 | `place_name` | string | no | Port or location. |
+| 15 | `place_code` | string | no | UN/LOCODE, when given. |
+| 16 | `place_country` | string | no | |
+| 17–18 | `latitude`, `longitude` | double | no | Occurrence position (TSB). |
+| 19 | `imo_number` | int | no | 7 digits; other values become null. |
+| 20 | `mmsi` | long | no | 9 digits; other values become null. |
+| 21 | `call_sign` | string | no | |
+| 22 | `vessel_name` | string | no | As reported. |
+| 23 | `vessel_id` | string | no | Another identifier, typed by `vessel_id_type`. |
+| 24 | `vessel_id_type` | string | no | E.g. `official_number`, `vessel_registration_number`. |
+| 25 | `flag` | string | no | As the source wrote it (name or code). |
+| 26 | `flag_code` | string | no | ISO alpha-2, when the source gives a code. |
+| 27 | `ship_type` | string | no | |
+| 28 | `gross_tonnage` | double | no | |
+| 29 | `year_built` | int | no | |
+| 30 | `company_imo` | string | no | ISM company IMO number. |
+| 31 | `company_name` | string | no | |
+| 32 | `classification_society` | string | no | |
+| 33 | `detained` | boolean | no | |
+| 34 | `detention_days` | int | no | |
+| 35 | `deficiency_count` | int | no | |
+| 36 | `detainable_deficiency_count` | int | no | Deficiencies that were grounds for detention. |
+| 37–39 | `deaths`, `injuries`, `missing_persons` | int | no | TSB. |
+| 40 | `pollution` | boolean | no | TSB. |
+| 41 | `summary` | string | no | Short description. |
+| 42 | `source_file` | string | yes | |
+| 43 | `loaded_at` | timestamptz | yes | |
+
+### vessel_event_findings
+
+What an event found, mostly PSC deficiencies, one row each. Joins to
+`vessel_events` on `event_id`. Partitioned by identity on `source`. Bloom
+filter on `event_id`. The TSB loads none.
+
+| ID | Column | Type | Req. | Description |
+|----|--------|------|------|-------------|
+| 1 | `event_id` | string | yes | |
+| 2 | `source` | string | yes | Partition column. |
+| 3 | `finding_seq` | int | yes | Position within the event, from 1. |
+| 4 | `finding_id` | string | no | The source's id, when it has one. |
+| 5 | `finding_date` | date | no | |
+| 6 | `finding_code` | string | no | Deficiency code (MoU defective item, USCG component). |
+| 7 | `finding_area` | string | no | E.g. `FIRE SAFETY`. |
+| 8 | `finding_subarea` | string | no | |
+| 9 | `finding_item` | string | no | E.g. `Fire-dampers`. |
+| 10 | `nature_of_defect_code` | string | no | |
+| 11 | `action_code` | string | no | Required action (USCG `30` = ship detained). |
+| 12 | `action` | string | no | |
+| 13 | `ground_for_detention` | boolean | no | |
+| 14 | `ro_related` | boolean | no | Whether the recognized organization (class) was held responsible. |
+| 15 | `responsible_ro` | string | no | |
+| 16 | `accidental_damage` | boolean | no | |
+| 17 | `due_date` | date | no | |
+| 18 | `resolved_date` | date | no | |
+| 19 | `description` | string | no | |
+| 20 | `source_file` | string | yes | |
+| 21 | `loaded_at` | timestamptz | yes | |
+
+### evidence_sources
+
+One row per evidence source, rewritten by every evidence load. Every column
+is a required string: `source`, `name`, `regime`, `evidence_categories`
+(comma-separated), `publisher`, `url`, `access`, `coverage`, `notes`. These
+are followed by `loaded_at`.
+
+### Source-specific evidence tables
+
+`paris_mou_certificates` holds certificates recorded at a Paris MoU
+inspection. Columns: `event_id`, `inspection_id`, `certificate_kind`
+(`class` or `statutory`), all required; then `certificate_code`,
+`issuing_authority_type`, `issuing_authority`, `class_status`,
+`date_of_status`, `date_of_issue`, `date_of_expiry`, `date_of_last_survey`
+(the four `date_*` columns are dates), `place_of_last_survey`,
+`surveying_authority_type`, `surveying_authority`, `source_file`.
+
+`paris_mou_charterers` holds charterers recorded at a Paris MoU inspection.
+Columns: `event_id`, `inspection_id` (both required), `name`, `address`,
+`city`, `country`, `charter_type` (`TIME`, `VOYAGE` and so on),
+`source_file`.
+
+The six `marsis_*` tables (`marsis_occurrence`, `marsis_occurrence_vessel`,
+`marsis_injuries`, `marsis_vessel_lsa_equipment`,
+`marsis_vessel_nav_equipment`, `marsis_vessel_rec_equipment`) hold the TSB
+MARSIS CSV files as published. Every column is an optional string, named as
+in the file, followed by `loaded_at` and `source_file`. Column meanings are
+in the TSB's data dictionary on the
+[MARSIS page](https://www.tsb.gc.ca/eng/stats/marine/data-6.html).
+
 ## Querying notes
 
 - **Reassemble a multi-day track or stop:** `GROUP BY track_id` (or `stop_id`).
@@ -789,5 +978,9 @@ day counts as built only once its row exists. The latest row for a
   `avg(implied_speed_kn)`.
 - **Exact distance:** `sum(dist_nm)` over `track_points` is exact thinned or not.
 - **Current vessel identity:** `vessels`, or `vessel_attributes WHERE is_current`.
+- **Vessel evidence by ship:** filter `vessel_events` on `imo_number` (or
+  `mmsi`, `call_sign`), and on `source` to prune partitions. Don't add up
+  counts across `evidence_category` values or sources: coverage differs (see
+  [COLLECT_FOUNDATION.md](COLLECT_FOUNDATION.md#caveats)).
 - **`h3` and `hilbert` in Iceberg** are signed `long`. H3 ids never use the top
   bit, so they read back unchanged; a `hilbert` value is also within `i64` range.

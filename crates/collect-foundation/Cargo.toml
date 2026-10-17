@@ -1,0 +1,29 @@
+[package]
+name = "collect-foundation"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+arrow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+iceberg.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+zip = { version = "2", default-features = false, features = ["deflate"] }
+collect-core = { path = "../collect-core" }
+collect-maint = { path = "../collect-maint" }
+ais-tracks = { path = "../ais-tracks" }
+csv = "1"
+calamine = { version = "0.36", default-features = false }
+quick-xml = "0.41"
+
+[dev-dependencies]
+rust_xlsxwriter = "0.99.1"
+tempfile.workspace = true
+
+[[bin]]
+name = "collect-foundation"
+path = "src/main.rs"
