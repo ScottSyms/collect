@@ -22,6 +22,7 @@ docs, not a guide.
 - **[`aisstream-parse`](AISSTREAM_PARSE.md)** — silver layer: decode aisstream.io JSON from bronze Parquet into the same typed tables; local or S3 on both sides
 - **[`ais-compact`](AIS_COMPACT.md)** — Iceberg table maintenance for RustFS and other catalogs with no compactor: sorted compaction, snapshot expiry, orphan cleanup
 - **[`ais-tracks`](AIS_TRACKS.md)** — derived tables built with DataFusion SQL: vessel identity, annotated track points, tracks, stops matched to World Port Index ports, and voyages; written to a namespace you choose
+- **[`collect-foundation`](COLLECT_FOUNDATION.md)** — foundation reference data in Iceberg (namespace `foundation`, warehouse `maritimedata` by default): the GeoNames placenames gazetteer and its lookup tables
 
 All four collectors support optional S3/MinIO/RustFS upload, and can
 register or fully decode into Apache Iceberg as they ingest — see
@@ -38,6 +39,7 @@ register or fully decode into Apache Iceberg as they ingest — see
 | [AIS_PARSE.md](AIS_PARSE.md) / [AISSTREAM_PARSE.md](AISSTREAM_PARSE.md) | Decoded (silver) table schemas, incremental/idempotent decoding |
 | [AIS_COMPACT.md](AIS_COMPACT.md) | Compacting, sorting, expiring and cleaning Iceberg tables |
 | [AIS_TRACKS.md](AIS_TRACKS.md) | Derived vessel, track, stop and voyage tables: design, columns, run order, queries, limits |
+| [COLLECT_FOUNDATION.md](COLLECT_FOUNDATION.md) | Foundation reference tables: GeoNames placenames, lookups, load semantics |
 | [DOCKER_HEALTH_CHECK.md](DOCKER_HEALTH_CHECK.md) | Health-check mechanics for containers |
 | [NOMAD.md](NOMAD.md) | Nomad job definitions and cluster deployment |
 

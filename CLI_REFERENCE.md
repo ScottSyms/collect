@@ -381,3 +381,19 @@ Notes:
   (replaying or refolding when an earlier day changed). Each write is one Iceberg
   snapshot.
 - Exit codes: `0` success, `1` error, `2` no day in the range had data.
+
+## `collect-foundation`
+
+Loads foundation (reference) datasets into Iceberg; today the GeoNames
+gazetteer. Takes the [Iceberg flags](#iceberg-icebergcliargs-all-binaries)
+plus S3 credentials in the environment, with two defaults of its own:
+`--iceberg-warehouse` defaults to **`maritimedata`** and `--iceberg-namespace`
+to **`foundation`**. Every command is a **dry run unless `--apply` is given**;
+a dry run downloads and parses but needs no catalog. Tables and behavior:
+[COLLECT_FOUNDATION.md](COLLECT_FOUNDATION.md).
+
+| Subcommand | Flags | What it does |
+|---|---|---|
+| `placenames load` | `--source-url` (`GEONAMES_URL`, `https://download.geonames.org/export/dump/`), `--source-dir <dir>`, `--country <CC,...>`, `--feature-class <X,...>`, `--alternate-names`, `--scratch`, `--keep-scratch`, `--apply` | Replaces `placenames` and the lookup tables `placename_feature_codes`, `placename_countries`, `placename_admin1_codes`, `placename_admin2_codes`; with `--alternate-names` also `placename_alternate_names` |
+
+- Exit codes: `0` success, `1` error.
