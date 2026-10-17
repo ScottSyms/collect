@@ -1,8 +1,12 @@
 //! `collect-foundation`: loads foundation (reference) datasets into Iceberg,
-//! by default namespace `foundation` in warehouse `maritimedata`. Today that
-//! is the GeoNames gazetteer. Every command is a dry run unless `--apply`.
+//! by default namespace `foundation` in warehouse `maritimedata`: the GeoNames
+//! gazetteer, and vessel evidence (port state control inspections and
+//! detentions, marine occurrences) from several publishers. Every command is
+//! a dry run unless `--apply`.
 
 mod download;
+mod evidence;
+mod evidence_cli;
 mod geonames;
 
 use std::collections::HashSet;
@@ -28,7 +32,7 @@ const DEFAULT_NAMESPACE: &str = "foundation";
 #[command(
     name = "collect-foundation",
     version,
-    about = "Load foundation reference data (GeoNames placenames) into Iceberg (dry run unless --apply)"
+    about = "Load foundation reference data (GeoNames placenames, vessel evidence) into Iceberg (dry run unless --apply)"
 )]
 struct Cli {
     /// Defaults here: warehouse `maritimedata`, namespace `foundation`.
@@ -43,6 +47,11 @@ struct Cli {
 enum Command {
     /// The GeoNames gazetteer (geonames.org, CC-BY 4.0).
     Placenames(PlacenamesArgs),
+    /// Vessel evidence: PSC inspections and detentions, marine occurrences
+    /// and enforcement actions, into `vessel_events` and
+    /// `vessel_event_findings` (one partition per source).
+    #[command(visible_alias = "interdictions")]
+    Evidence(evidence_cli::EvidenceArgs),
     /// Print shell completions to stdout.
     Completions { shell: clap_complete::Shell },
 }
@@ -129,14 +138,39 @@ async fn run() -> Result<i32> {
         Command::Placenames(PlacenamesArgs { command: PlacenamesCommand::Load(a) }) => {
             load_placenames(&cli.iceberg, a).await
         }
+        Command::Evidence(a) => evidence_cli::run(&cli.iceberg, a).await,
     }
 }
 
 /// Where and how tables are written, present only with `--apply`.
-struct Writer<C> {
-    catalog: C,
-    rest: RestClient,
-    config: IcebergConfig,
+pub(crate) struct Writer<C> {
+    pub(crate) catalog: C,
+    pub(crate) rest: RestClient,
+    pub(crate) config: IcebergConfig,
+}
+
+/// Connects to the catalog when `apply`; fails fast on a bad catalog.
+pub(crate) async fn connect(
+    iceberg: &IcebergCliArgs,
+    apply: bool,
+) -> Result<Option<Writer<impl Catalog>>> {
+    if !apply {
+        return Ok(None);
+    }
+    iceberg.validate()?;
+    anyhow::ensure!(iceberg.is_iceberg_mode(), "--iceberg-catalog-uri is required with --apply");
+    let config = IcebergConfig::from(iceberg);
+    let catalog = open_catalog(&config).await?;
+    let rest = RestClient::connect(&config).await?;
+    Ok(Some(Writer { catalog, rest, config }))
+}
+
+pub(crate) fn print_dry_run(iceberg: &IcebergCliArgs) {
+    println!(
+        "dry run; pass --apply to write to {}.{}",
+        iceberg.iceberg_warehouse.as_deref().unwrap_or(DEFAULT_WAREHOUSE),
+        iceberg.iceberg_namespace
+    );
 }
 
 impl<C: Catalog> Writer<C> {
@@ -185,16 +219,7 @@ async fn load_placenames(iceberg: &IcebergCliArgs, a: &LoadArgs) -> Result<i32> 
     })?;
 
     // Connect before downloading anything so a bad catalog fails fast.
-    let writer = if a.apply {
-        iceberg.validate()?;
-        anyhow::ensure!(iceberg.is_iceberg_mode(), "--iceberg-catalog-uri is required with --apply");
-        let config = IcebergConfig::from(iceberg);
-        let catalog = open_catalog(&config).await?;
-        let rest = RestClient::connect(&config).await?;
-        Some(Writer { catalog, rest, config })
-    } else {
-        None
-    };
+    let writer = connect(iceberg, a.apply).await?;
 
     let source = Source::new(&a.source_url, a.source_dir.clone(), a.scratch.clone())?;
     let loaded_at = Utc::now();
@@ -205,11 +230,7 @@ async fn load_placenames(iceberg: &IcebergCliArgs, a: &LoadArgs) -> Result<i32> 
     result?;
 
     if writer.is_none() {
-        println!(
-            "dry run; pass --apply to write to {}.{}",
-            iceberg.iceberg_warehouse.as_deref().unwrap_or(DEFAULT_WAREHOUSE),
-            iceberg.iceberg_namespace
-        );
+        print_dry_run(iceberg);
     }
     Ok(exitcode::SUCCESS)
 }

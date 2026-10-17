@@ -1524,6 +1524,7 @@ dependencies = [
  "iceberg",
  "quick-xml 0.41.0",
  "reqwest",
+ "rust_xlsxwriter",
  "tempfile",
  "tokio",
  "zip 2.4.2",
@@ -5161,6 +5162,15 @@ checksum = "796e8d2b6696392a43bea58116b667fb4c29727dc5abd27d6acf338bb4f688c7"
 dependencies = [
  "cfg-if",
  "ordered-multimap",
+]
+
+[[package]]
+name = "rust_xlsxwriter"
+version = "0.99.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34f2d2cda7223168a14fb86bc7411dbc3379bd7d49749ecc53b91ed98585b6b0"
+dependencies = [
+ "zip 8.6.0",
 ]
 
 [[package]]

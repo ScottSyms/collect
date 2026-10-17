@@ -183,8 +183,60 @@ pub async fn commit_day(
     added: Vec<DataFile>,
     rows: usize,
 ) -> Result<WriteReport> {
+    commit_partition(catalog, rest, config, base_name, day_partition(days_since_epoch), added, rows).await
+}
+
+/// The partition value for a table partitioned by identity on one string column.
+pub fn string_partition(value: &str) -> Struct {
+    Struct::from_iter([Some(Literal::string(value))])
+}
+
+/// Replaces the rows of a table partitioned by identity on the string column
+/// `column` whose value is `value`, creating the table when missing. Other
+/// partitions are untouched, so several loaders can share one table and
+/// each rerun is idempotent for its own slice. Like [`replace_table`], an
+/// empty result is refused rather than wiping the slice.
+#[allow(clippy::too_many_arguments)]
+pub async fn replace_string_partition(
+    catalog: &impl Catalog,
+    rest: &RestClient,
+    config: &IcebergConfig,
+    base_name: &str,
+    schema: Schema,
+    column: &str,
+    value: &str,
+    batches: &[RecordBatch],
+    bloom: &[&str],
+) -> Result<WriteReport> {
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    if rows == 0 {
+        bail!("{base_name}: computed 0 rows for {column}={value}; leaving the table untouched");
+    }
+    ensure_namespace(catalog, config).await?;
+    let spec = PartitionSpecBuilder::new(schema.clone()).add_partition_field(
+        column,
+        column,
+        iceberg::spec::Transform::Identity,
+    )?;
+    let table = ensure_table(catalog, config, base_name, schema, spec).await?;
+    let all = concat_batches(&batches[0].schema(), batches).context("concatenating batches")?;
+    let partition = string_partition(value);
+    let added = write_partition(&table, Some(partition.clone()), all, TARGET_FILE_BYTES, bloom).await?;
+    commit_partition(catalog, rest, config, base_name, partition, added, rows).await
+}
+
+/// Publishes `added` as the whole content of `partition`, replacing whatever
+/// files it held, in a single snapshot. On failure the new files are deleted.
+async fn commit_partition(
+    catalog: &impl Catalog,
+    rest: &RestClient,
+    config: &IcebergConfig,
+    base_name: &str,
+    partition: Struct,
+    added: Vec<DataFile>,
+    rows: usize,
+) -> Result<WriteReport> {
     let ident = table_ident(config, base_name);
-    let partition = day_partition(days_since_epoch);
     for attempt in 1..=MAX_COMMIT_ATTEMPTS {
         let table = catalog.load_table(&ident).await?;
         let remove: HashSet<String> = live_files(&table)
@@ -215,7 +267,7 @@ pub async fn commit_day(
                 }
                 Err(e) => {
                     discard(&table, &added).await;
-                    return Err(e).context("committing day");
+                    return Err(e).context("committing partition");
                 }
             }
         }

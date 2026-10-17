@@ -21,6 +21,7 @@ calamine = { version = "0.36", default-features = false }
 quick-xml = "0.41"
 
 [dev-dependencies]
+rust_xlsxwriter = "0.99.1"
 tempfile.workspace = true
 
 [[bin]]

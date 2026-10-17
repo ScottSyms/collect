@@ -22,3 +22,6 @@ NOMAD.pdf
 # Incremental commit manifests / watermarks written by the parsers (run state)
 /ais-parse-state/
 /aisstream-parse-state/
+
+# Local RustFS credentials (run_foundation_rustfs.sh)
+/.rustfs.env
