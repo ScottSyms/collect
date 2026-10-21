@@ -41,3 +41,33 @@ pub const DATA_DROUGHT: i32 = 4;
 /// A batch parser (`ais-parse`/`aisstream-parse`) skipped more
 /// partitions/files than `--max-partition-failures` allows.
 pub const PARTIAL_FAILURE_THRESHOLD: i32 = 5;
+
+/// Returned as an `Err` by [`crate::run_ingest`] when it stopped for a
+/// classified reason (upstream gave up, data drought) *after* flushing and
+/// draining every buffered row, so the caller can exit with `code` rather
+/// than `std::process::exit`-ing from inside the loop and losing them.
+#[derive(Debug)]
+pub struct ExitRequested {
+    pub code: i32,
+    pub reason: String,
+}
+
+impl std::fmt::Display for ExitRequested {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} (exit code {})", self.reason, self.code)
+    }
+}
+
+impl std::error::Error for ExitRequested {}
+
+/// Pass `main`'s result through: an [`ExitRequested`] error exits with its
+/// code (it was already logged where it was raised); anything else is
+/// returned unchanged for `anyhow`'s default handling.
+pub fn exit_if_requested<T>(result: anyhow::Result<T>) -> anyhow::Result<T> {
+    if let Err(error) = &result {
+        if let Some(exit) = error.downcast_ref::<ExitRequested>() {
+            std::process::exit(exit.code);
+        }
+    }
+    result
+}

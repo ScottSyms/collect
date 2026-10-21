@@ -12,7 +12,7 @@
 //! operator) can take over instead of the process sitting in a silent,
 //! permanent retry loop.
 
-use crate::{exitcode, log};
+use crate::{exitcode, log, ReaderTransition};
 use clap::Args;
 use std::cmp::min;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -83,18 +83,19 @@ impl Backoff {
     }
 }
 
-/// Log the exhaustion of a reconnect deadline and exit
-/// [`exitcode::UPSTREAM_UNAVAILABLE`]. Called at the point a caller's own
-/// retry loop gives up; never returns.
-pub fn give_up(upstream: &str, max_reconnect_seconds: u64) -> ! {
-    log::error(
-        "upstream_unavailable",
-        &format!(
-            "giving up on {upstream} after {max_reconnect_seconds}s of bounded retry"
-        ),
-        &[("upstream", upstream)],
-    );
-    std::process::exit(exitcode::UPSTREAM_UNAVAILABLE);
+/// Log the exhaustion of a reconnect deadline and return the transition
+/// that tells [`crate::run_ingest`] to stop. `run_ingest` then flushes
+/// buffered rows (including any pending transformer state) and drains
+/// writes/uploads before returning [`exitcode::ExitRequested`] with
+/// [`exitcode::UPSTREAM_UNAVAILABLE`] — exiting here directly would discard
+/// everything still in memory.
+pub fn give_up(upstream: &str, max_reconnect_seconds: u64) -> ReaderTransition {
+    let reason = format!("giving up on {upstream} after {max_reconnect_seconds}s of bounded retry");
+    log::error("upstream_unavailable", &reason, &[("upstream", upstream)]);
+    ReaderTransition::GiveUp(exitcode::ExitRequested {
+        code: exitcode::UPSTREAM_UNAVAILABLE,
+        reason,
+    })
 }
 
 #[cfg(test)]
