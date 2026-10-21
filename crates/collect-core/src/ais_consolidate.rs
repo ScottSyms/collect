@@ -97,6 +97,40 @@ fn parse_pghp_timestamp_ms(sentence: &str) -> Option<i64> {
     Some(dt.timestamp_millis().saturating_add(ms as i64))
 }
 
+/// Fields MSSIS-style feeds append after the NMEA checksum, e.g. the
+/// `L10EAC,1792569950` in `!AIVDM,…,0*54,L10EAC,1792569950`. Empty when the
+/// sentence ends at its checksum.
+fn mssis_suffix_fields(sentence: &str) -> Vec<&str> {
+    let Some(star) = sentence.rfind('*') else { return Vec::new() };
+    let Some(rest) = sentence.get(star + 3..) else { return Vec::new() };
+    let Some(rest) = rest.strip_prefix(',') else { return Vec::new() };
+    rest.split(',').map(str::trim).collect()
+}
+
+/// Earliest receiver time accepted from an MSSIS suffix (2000-01-01).
+const MSSIS_MIN_SECS: i64 = 946_684_800;
+
+fn parse_mssis_epoch_ms(sentence: &str) -> Option<i64> {
+    let last = *mssis_suffix_fields(sentence).last()?;
+    if last.is_empty() || !last.bytes().all(|b| b.is_ascii_digit()) { return None; }
+    let ms = match last.len() {
+        9 | 10 => last.parse::<i64>().ok()?.checked_mul(1000)?,
+        12 | 13 => last.parse::<i64>().ok()?,
+        _ => return None,
+    };
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    if ms < MSSIS_MIN_SECS * 1000 || ms > now_ms + 86_400_000 { return None; }
+    Some(ms)
+}
+
+/// The receiver/station field MSSIS places between the checksum and the
+/// trailing epoch, when present.
+fn parse_mssis_station(sentence: &str) -> Option<&str> {
+    let fields = mssis_suffix_fields(sentence);
+    let (_, rest) = fields.split_last()?;
+    rest.iter().copied().find(|f| !f.is_empty() && !f.bytes().all(|b| b.is_ascii_digit()))
+}
+
 // ---------------------------------------------------------------------------
 // NMEa checksum
 // ---------------------------------------------------------------------------
@@ -158,6 +192,12 @@ pub struct AisConsolidatorConfig {
     /// Process `$PGHP` timestamp lines and tag-block `c:` carry-forward.
     /// When on, timestamps from `$PGHP` and `c:` override the arrival timestamp.
     pub process_timestamps: bool,
+    /// Use the MSSIS receiver epoch appended after the checksum
+    /// (`!AIVDM,…*CS,1792569950`, optionally `*CS,<station>,<epoch>`) as the
+    /// row timestamp. The station, when present, is carried into consolidated
+    /// output as tag-block `s:`. A tag-block `c:` still wins when
+    /// `process_timestamps` is also on.
+    pub mssis_timestamps: bool,
     /// Buffer and reassemble multi-part AIS sentences (fragments with
     /// fragment_count > 1). When off, each fragment is emitted individually.
     pub consolidate_multipart: bool,
@@ -165,7 +205,7 @@ pub struct AisConsolidatorConfig {
 
 impl Default for AisConsolidatorConfig {
     fn default() -> Self {
-        AisConsolidatorConfig { process_timestamps: true, consolidate_multipart: true }
+        AisConsolidatorConfig { process_timestamps: true, mssis_timestamps: false, consolidate_multipart: true }
     }
 }
 
@@ -233,22 +273,20 @@ impl LineTransformer for AisConsolidator {
             return out;
         }
 
-        // Resolve output timestamp: tag block c: > pending > arrival
-        let resolved_ts = if self.config.process_timestamps {
-            if let Some(t) = tag_ts {
-                if meta.is_fragmented() { self.pending_timestamp_ms = Some(t); }
-                else { self.pending_timestamp_ms = None; }
-                t
-            } else if let Some(t) = self.pending_timestamp_ms {
-                if meta.is_fragmented() && meta.fragment_number == meta.fragment_count {
-                    self.pending_timestamp_ms = None;
-                } else if !meta.is_fragmented() {
-                    self.pending_timestamp_ms = None;
-                }
-                t
-            } else {
-                arrival_ts_ms
-            }
+        let mssis_ts = if self.config.mssis_timestamps { parse_mssis_epoch_ms(sentence) } else { None };
+        let ends_group = !meta.is_fragmented() || meta.fragment_number == meta.fragment_count;
+
+        // Resolve output timestamp: tag block c: > MSSIS epoch > pending > arrival
+        let resolved_ts = if let Some(t) = tag_ts {
+            if meta.is_fragmented() { self.pending_timestamp_ms = Some(t); }
+            else { self.pending_timestamp_ms = None; }
+            t
+        } else if let Some(t) = mssis_ts {
+            if ends_group { self.pending_timestamp_ms = None; }
+            t
+        } else if let Some(t) = self.pending_timestamp_ms.filter(|_| self.config.process_timestamps) {
+            if ends_group { self.pending_timestamp_ms = None; }
+            t
         } else {
             arrival_ts_ms
         };
@@ -293,9 +331,11 @@ impl LineTransformer for AisConsolidator {
                 slots[fn_] = Some(sentence.to_string());
             }
             // station is always preserved when consolidating, regardless of
-            // process_timestamps
-            let station = parse_tag_block_field(tag_prefix, "s");
-            let tb = match (tag_ts, station) {
+            // process_timestamps; MSSIS suffix fields fill in when no tag
+            // block carries them
+            let station = parse_tag_block_field(tag_prefix, "s")
+                .or_else(|| if self.config.mssis_timestamps { parse_mssis_station(sentence) } else { None });
+            let tb = match (tag_ts.or(mssis_ts), station) {
                 (Some(t), Some(s)) => Some(format!("c:{},s:{}", t / 1000, s)),
                 (Some(t), None) => Some(format!("c:{}", t / 1000)),
                 (None, Some(s)) => Some(format!("s:{}", s)),
@@ -323,5 +363,92 @@ impl LineTransformer for AisConsolidator {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ARRIVAL: i64 = 1_800_000_000_000;
+    const EPOCH_MS: i64 = 1_792_569_950_000;
+
+    fn consolidator(process_timestamps: bool, mssis_timestamps: bool) -> AisConsolidator {
+        AisConsolidator::new(AisConsolidatorConfig {
+            process_timestamps,
+            mssis_timestamps,
+            consolidate_multipart: true,
+        })
+    }
+
+    #[test]
+    fn mssis_epoch_sets_single_sentence_timestamp() {
+        let mut c = consolidator(false, true);
+        let line = "!AIVDM,1,1,9,B,B3INcN000@3VQ761Vq?Q3woQjDa:,0*75,1792569950";
+        assert_eq!(c.transform(line, ARRIVAL), vec![(EPOCH_MS, line.to_string())]);
+    }
+
+    #[test]
+    fn mssis_station_and_epoch_parse() {
+        let s = "!AIVDM,2,1,4,A,55?Adv,0*54,L10EAC,1792569950";
+        assert_eq!(parse_mssis_epoch_ms(s), Some(EPOCH_MS));
+        assert_eq!(parse_mssis_station(s), Some("L10EAC"));
+        assert_eq!(parse_mssis_station("!AIVDM,1,1,,B,13Ee,0*4F,1792569950"), None);
+    }
+
+    #[test]
+    fn mssis_millisecond_epoch_is_accepted() {
+        assert_eq!(parse_mssis_epoch_ms("!AIVDM,1,1,,B,13Ee,0*4F,1792569950123"), Some(EPOCH_MS + 123));
+    }
+
+    #[test]
+    fn mssis_group_keeps_epoch_and_station_in_tag_block() {
+        let mut c = consolidator(false, true);
+        assert!(c
+            .transform("!AIVDM,2,1,4,A,55?Adv42;Kw7<IIKL004DLD4r0EQ18E=<000001:A@N:A6bPNB2CSECP0000,0*54,L10EAC,1792569950", ARRIVAL)
+            .is_empty());
+        let out = c.transform("!AIVDM,2,2,4,A,00000000000,2*20,L10EAC,1792569950", ARRIVAL);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, EPOCH_MS);
+        assert!(out[0].1.starts_with("\\c:1792569950,s:L10EAC*"), "{}", out[0].1);
+        assert!(out[0].1.contains("!AIVDM,1,1,,A,55?Adv"), "{}", out[0].1);
+    }
+
+    #[test]
+    fn mssis_group_without_station_gets_epoch_only() {
+        let mut c = consolidator(false, true);
+        c.transform("!AIVDM,2,1,0,B,53FCI:82>LLHD4dJ221<58lTDq@v0@F0L4l8t61J2@m3=6`80AURAkp88888,0*07,1792569950", ARRIVAL);
+        let out = c.transform("!AIVDM,2,2,0,B,88888888880,2*27,1792569950", ARRIVAL);
+        assert!(out[0].1.starts_with("\\c:1792569950*"), "{}", out[0].1);
+    }
+
+    #[test]
+    fn missing_or_junk_suffix_falls_back_to_arrival() {
+        let mut c = consolidator(false, true);
+        for line in [
+            "!AIVDM,1,1,,B,13Ee`L7P0NP20WfEv94EngwP2<0D,0*4F",
+            "!AIVDM,1,1,,B,13Ee`L7P0NP20WfEv94EngwP2<0D,0*4F,L10EAC",
+            "!AIVDM,1,1,,B,13Ee`L7P0NP20WfEv94EngwP2<0D,0*4F,12345",
+            "!AIVDM,1,1,,B,13Ee`L7P0NP20WfEv94EngwP2<0D,0*4F,9999999999",
+        ] {
+            assert_eq!(c.transform(line, ARRIVAL)[0].0, ARRIVAL, "{line}");
+        }
+    }
+
+    #[test]
+    fn mssis_flag_off_keeps_arrival() {
+        let mut c = consolidator(true, false);
+        let out = c.transform("!AIVDM,1,1,9,B,B3INcN000@3VQ761Vq?Q3woQjDa:,0*75,1792569950", ARRIVAL);
+        assert_eq!(out[0].0, ARRIVAL);
+        c.transform("!AIVDM,2,1,0,B,53FCI:82>LLHD4dJ221<58lTDq@v0@F0L4l8t61J2@m3=6`80AURAkp88888,0*07,L10EAC,1792569950", ARRIVAL);
+        let out = c.transform("!AIVDM,2,2,0,B,88888888880,2*27,L10EAC,1792569950", ARRIVAL);
+        assert!(out[0].1.starts_with('!'), "{}", out[0].1);
+    }
+
+    #[test]
+    fn tag_block_timestamp_beats_mssis() {
+        let mut c = consolidator(true, true);
+        let line = "\\c:1700000000*00\\!AIVDM,1,1,,B,13Ee`L7P0NP20WfEv94EngwP2<0D,0*4F,1792569950";
+        assert_eq!(c.transform(line, ARRIVAL)[0].0, 1_700_000_000_000);
     }
 }

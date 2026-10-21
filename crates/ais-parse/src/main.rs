@@ -228,6 +228,12 @@ struct Args {
     #[arg(long, env = "PROCESS_TIMESTAMPS", value_parser = clap::builder::FalseyValueParser::new())]
     process_timestamps: bool,
 
+    /// Use the MSSIS receiver epoch appended after the NMEA checksum
+    /// (`!AIVDM,...*CS,<epoch>` or `...*CS,<station>,<epoch>`) as the row
+    /// timestamp, and keep the station. Independent of --process-timestamps.
+    #[arg(long, env = "MSSIS", value_parser = clap::builder::FalseyValueParser::new())]
+    mssis: bool,
+
     /// List the partitions that would be processed and exit without
     /// decoding, writing, or touching the output target
     #[arg(long, env = "DRY_RUN")]
@@ -788,6 +794,7 @@ async fn main() -> Result<()> {
     let output_prefix = args.output_prefix.clone();
     let consolidate_ais = args.consolidate_ais;
     let process_timestamps = args.process_timestamps;
+    let mssis = args.mssis;
     let compression_level = args.compression_level;
     let fail_fast = args.fail_fast;
     let max_partition_failures = args.max_partition_failures;
@@ -858,6 +865,7 @@ async fn main() -> Result<()> {
                             &output_prefix_for_task,
                             consolidate_ais,
                             process_timestamps,
+                            mssis,
                         )
                     })
                     .await
@@ -1121,6 +1129,7 @@ async fn main() -> Result<()> {
                             batch_size,
                             consolidate_ais,
                             process_timestamps,
+                            mssis,
                         )
                     })
                     .await
@@ -1314,6 +1323,7 @@ fn process_partition(
     output_prefix: &str,
     consolidate_ais: bool,
     process_timestamps: bool,
+    mssis: bool,
 ) -> Result<(ParseStats, PartitionOutputs)> {
     let rel_dir = partition_key.relative_dir_time_only();
     let dir_for = |tree: &str| output_root.join(tree).join(&rel_dir);
@@ -1358,6 +1368,7 @@ fn process_partition(
             &mut stateful,
             consolidate_ais,
             process_timestamps,
+            mssis,
         )
         .with_context(|| format!("processing {}", file.path.display()))?;
         if remove_after {
@@ -1601,6 +1612,7 @@ fn process_partition_iceberg(
     batch_size: usize,
     consolidate_ais: bool,
     process_timestamps: bool,
+    mssis: bool,
 ) -> Result<(ParseStats, IcebergPartitionOutput)> {
     let mut stats = ParseStats::default();
     let mut writers = IcebergWriters {
@@ -1634,6 +1646,7 @@ fn process_partition_iceberg(
             &mut stateful,
             consolidate_ais,
             process_timestamps,
+            mssis,
         )
         .with_context(|| format!("processing {}", file.path.display()))?;
         if remove_after {
@@ -1665,6 +1678,7 @@ fn process_parquet_file<W: WriterSet>(
     stateful: &mut StatefulDecoder,
     consolidate_ais: bool,
     process_timestamps: bool,
+    mssis: bool,
 ) -> Result<()> {
     let file = StdFile::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut reader = ParquetRecordBatchReaderBuilder::try_new(file)
@@ -1678,9 +1692,10 @@ fn process_parquet_file<W: WriterSet>(
     // column (present in normalized data, per-row after a dedup merge pooled
     // several sources) takes precedence; bronze has none, so we fall back to
     // the source parsed from the file's partition path.
-    let mut consolidator = if consolidate_ais || process_timestamps {
+    let mut consolidator = if consolidate_ais || process_timestamps || mssis {
         Some(AisConsolidator::new(AisConsolidatorConfig {
             process_timestamps,
+            mssis_timestamps: mssis,
             consolidate_multipart: consolidate_ais,
         }))
     } else {

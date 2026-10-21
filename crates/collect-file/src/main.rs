@@ -76,6 +76,12 @@ struct Args {
     #[arg(long, env = "PROCESS_TIMESTAMPS", value_parser = clap::builder::FalseyValueParser::new())]
     process_timestamps: bool,
 
+    /// Use the MSSIS receiver epoch appended after the NMEA checksum
+    /// (`!AIVDM,...*CS,<epoch>` or `...*CS,<station>,<epoch>`) as the row
+    /// timestamp, and keep the station. Independent of --process-timestamps.
+    #[arg(long, env = "MSSIS", value_parser = clap::builder::FalseyValueParser::new())]
+    mssis: bool,
+
     /// Print shell completions for the given shell to stdout and exit
     #[arg(long, exclusive = true)]
     completions: Option<clap_complete::Shell>,
@@ -155,6 +161,7 @@ async fn main() -> Result<()> {
         args.concurrency,
         args.consolidate_ais,
         args.process_timestamps,
+        args.mssis,
         quiet,
         iceberg,
         silver,
@@ -172,6 +179,7 @@ async fn run_file_ingest(
     concurrency: Option<usize>,
     consolidate_ais: bool,
     process_timestamps: bool,
+    mssis: bool,
     quiet: bool,
     iceberg: Option<IcebergHandle>,
     silver: Option<Arc<dyn SilverCommit>>,
@@ -258,9 +266,10 @@ async fn run_file_ingest(
         // The parallel path sweeps once below; per-worker sweeps would race
         // over the same out_dir.
         sweep_orphans: false,
-        line_transformer: if consolidate_ais || process_timestamps {
+        line_transformer: if consolidate_ais || process_timestamps || mssis {
             Some(Box::new(AisConsolidator::new(AisConsolidatorConfig {
                 process_timestamps,
+                mssis_timestamps: mssis,
                 consolidate_multipart: consolidate_ais,
             })))
         } else {
@@ -318,9 +327,10 @@ async fn run_file_ingest(
                 shutdown: Some(stop.clone()),
                 write_workers: None,
                 sweep_orphans: true,
-                line_transformer: if consolidate_ais || process_timestamps {
+                line_transformer: if consolidate_ais || process_timestamps || mssis {
                     Some(Box::new(AisConsolidator::new(AisConsolidatorConfig {
                         process_timestamps,
+                        mssis_timestamps: mssis,
                         consolidate_multipart: consolidate_ais,
                     })))
                 } else {
@@ -365,6 +375,7 @@ async fn run_file_ingest(
         stop,
         use_consolidator,
         use_timestamps,
+        mssis,
         quiet,
     )
     .await
@@ -382,6 +393,7 @@ async fn run_parallel_file_ingest(
     stop: Arc<AtomicBool>,
     consolidate_ais: bool,
     process_timestamps: bool,
+    mssis: bool,
     quiet: bool,
 ) -> Result<()> {
     let running = Arc::new(AtomicBool::new(true));
@@ -465,9 +477,10 @@ async fn run_parallel_file_ingest(
         let completed_files = completed_files.clone();
         let manifest_path = manifest_path.clone();
         let mut worker_options = options.clone();
-        worker_options.line_transformer = if consolidate_ais || process_timestamps {
+        worker_options.line_transformer = if consolidate_ais || process_timestamps || mssis {
             Some(Box::new(AisConsolidator::new(AisConsolidatorConfig {
                 process_timestamps,
+                mssis_timestamps: mssis,
                 consolidate_multipart: consolidate_ais,
             })))
         } else {

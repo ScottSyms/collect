@@ -49,6 +49,12 @@ struct Args {
     #[arg(long, env = "PROCESS_TIMESTAMPS", value_parser = clap::builder::FalseyValueParser::new())]
     process_timestamps: bool,
 
+    /// Use the MSSIS receiver epoch appended after the NMEA checksum
+    /// (`!AIVDM,...*CS,<epoch>` or `...*CS,<station>,<epoch>`) as the row
+    /// timestamp, and keep the station. Independent of --process-timestamps.
+    #[arg(long, env = "MSSIS", value_parser = clap::builder::FalseyValueParser::new())]
+    mssis: bool,
+
     #[command(flatten)]
     common: CommonCliArgs,
 
@@ -251,9 +257,10 @@ async fn main() -> Result<()> {
             shutdown: None,
             write_workers: None,
             sweep_orphans: true,
-            line_transformer: if args.consolidate_ais || args.process_timestamps {
+            line_transformer: if args.consolidate_ais || args.process_timestamps || args.mssis {
                 Some(Box::new(AisConsolidator::new(AisConsolidatorConfig {
                     process_timestamps: args.process_timestamps,
+                    mssis_timestamps: args.mssis,
                     consolidate_multipart: args.consolidate_ais,
                 })))
             } else {

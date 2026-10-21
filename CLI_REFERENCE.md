@@ -201,6 +201,7 @@ Shared across all binaries (`collect_core::exitcode`):
 | `-q, --quiet` | `QUIET` | Suppress routine progress lines |
 | `--consolidate-ais` | `CONSOLIDATE_AIS` | Reassemble fragmented NMEA sentences before writing |
 | `--process-timestamps` | `PROCESS_TIMESTAMPS` | Correct row timestamps from `$PGHP`/tag-block `c:` |
+| `--mssis` | `MSSIS` | Use the MSSIS epoch after the checksum (`…*CS[,station],epoch`) as the row timestamp; keeps the station |
 
 Plus [Common](#common-to-the-five-collectors-commoncliargs), [S3](#s3--collectors-s3cliargs-one-sink), [Iceberg](#iceberg-icebergcliargs-all-binaries), [inline parsing](#inline-parsing-collectors-only-parsercliargs), [reconnect](#reconnect-the-four-streaming-collectors), and the [shared flags](#shared-across-all-binaries).
 
@@ -228,6 +229,7 @@ Plus [Common](#common-to-the-five-collectors-commoncliargs), [S3](#s3--collector
 | `-q, --quiet` | `QUIET` | |
 | `--consolidate-ais` | `CONSOLIDATE_AIS` | |
 | `--process-timestamps` | `PROCESS_TIMESTAMPS` | |
+| `--mssis` | `MSSIS` | |
 
 Plus [Common](#common-to-the-five-collectors-commoncliargs), [S3](#s3--collectors-s3cliargs-one-sink), [Iceberg](#iceberg-icebergcliargs-all-binaries), [inline parsing](#inline-parsing-collectors-only-parsercliargs), and the [shared flags](#shared-across-all-binaries). No reconnect flags — no live connection to lose.
 
@@ -262,7 +264,7 @@ Plus [Common](#common-to-the-five-collectors-commoncliargs), [S3](#s3--collector
 
 Field-for-field identical between the two except where noted; `ais-parse`
 also applies AIS-specific pre-processing (`--consolidate-ais`,
-`--process-timestamps`) since its NMEA input can carry multi-part
+`--process-timestamps`, `--mssis`) since its NMEA input can carry multi-part
 sentences and capture timestamps that `aisstream-parse`'s JSON payloads
 don't.
 
@@ -287,6 +289,7 @@ don't.
 | `--scratch-dir <dir>` | `SCRATCH_DIR` | system temp | Set to `/dev/shm` or a ramdisk for faster I/O |
 | `--consolidate-ais[=false]` *(ais-parse only)* | `CONSOLIDATE_AIS` | on | Reassemble multi-part sentences before decoding; `=false` to disable |
 | `--process-timestamps` *(ais-parse only)* | `PROCESS_TIMESTAMPS` | off | |
+| `--mssis` *(ais-parse only)* | `MSSIS` | off | Trailing MSSIS epoch becomes the row timestamp |
 | `--dry-run` | `DRY_RUN` | off | List matching partitions, touch nothing |
 | `-q, --quiet` | `QUIET` | | |
 | `--fail-fast` | `FAIL_FAST` | off | Abort on the first partition failure instead of skipping it |

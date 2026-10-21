@@ -62,7 +62,8 @@ Iceberg only.
 
 **Time.** Every `ts` is UTC. In bronze and silver it is the corrected capture
 time of the message (from `$PGHP` / NMEA tag-block `c:` when
-`--process-timestamps` is used, otherwise the collector's receive time), not
+`--process-timestamps` is used, from the trailing MSSIS epoch with `--mssis`,
+otherwise the collector's receive time), not
 a time decoded from the AIS payload. Silver keeps millisecond precision
 (Parquet) and `ais-tracks` tables use microseconds.
 

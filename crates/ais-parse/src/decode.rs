@@ -253,6 +253,19 @@ fn tag_field<'a>(tag_body: &'a str, key: &str) -> Option<&'a str> {
     None
 }
 
+/// The station field an MSSIS feed places between the checksum and its
+/// trailing epoch (`!AIVDM,…*54,L10EAC,1792569950`), or `None` if absent.
+fn mssis_station(sentence: &str) -> Option<&str> {
+    let star = sentence.rfind('*')?;
+    let rest = sentence.get(star + 3..)?.strip_prefix(',')?;
+    let fields: Vec<&str> = rest.split(',').map(str::trim).collect();
+    let (_, before_epoch) = fields.split_last()?;
+    before_epoch
+        .iter()
+        .copied()
+        .find(|f| !f.is_empty() && !f.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// Decode one payload using this thread's parser, which keeps multi-part and
 /// Type 24 pairing state between calls. Only deterministic when every call for
 /// a stream comes from one thread in order; the parallel parse path uses
@@ -322,7 +335,9 @@ fn decode_core(
     if sentence.is_empty() {
         return Some(Decoded::Failed);
     }
-    let station = tag_field(tag_body, "s").map(str::to_string);
+    let station = tag_field(tag_body, "s")
+        .or_else(|| mssis_station(sentence))
+        .map(str::to_string);
     let src: Arc<str> = Arc::from(source);
 
     let fragments = extract_ais_payload(sentence).map(|p| p.fragment_count);
@@ -767,6 +782,23 @@ mod tests {
         let (tag, sentence) = split_tag_block(r"\c:12345");
         assert_eq!(tag, "");
         assert_eq!(sentence, r"\c:12345");
+    }
+
+    #[test]
+    fn reads_station_from_mssis_suffix() {
+        let decoded = decode_payload(
+            1_700_000_000_000,
+            "mssis",
+            "!AIVDM,1,1,,A,15RTgt0PAso;90TKcjM8h6g208CQ,0*4A,L10EAC,1792569950",
+        );
+        let Decoded::Position(row) = decoded else {
+            panic!("expected a position row");
+        };
+        assert_eq!(row.mmsi, 371_798_000);
+        assert_eq!(row.station.as_deref(), Some("L10EAC"));
+
+        assert_eq!(mssis_station("!AIVDM,1,1,,A,15RT,0*4A,1792569950"), None);
+        assert_eq!(mssis_station("!AIVDM,1,1,,A,15RT,0*4A"), None);
     }
 
     #[test]
