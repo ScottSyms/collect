@@ -14,6 +14,8 @@ disagree this page reflects the code:
 | [Silver](#2-silver-decoded-ais) | `positions`, `statics`, `meteo`, `binary`, `atons`, `other` | `ais-parse`, `aisstream-parse`, and any collector run with `--parser` | `crates/ais-parse/src/output*.rs`, `crates/aisstream-parse/src/output*.rs`, `crates/collect-core/src/iceberg/table_schemas.rs` |
 | [Derived](#3-derived-ais-tracks) | `track_points`, `tracks`, `stop_segments`, `stops`, `voyages`, `open_voyages`, `vessels`, `vessel_attributes`, `ref_ports`, plus daily and bookkeeping tables | `ais-tracks` | `crates/ais-tracks/src/*.rs` |
 | [Foundation](#4-foundation-collect-foundation) | `placenames` and lookups, `vessel_events`, `vessel_event_findings`, `evidence_sources`, `paris_mou_*`, `marsis_*` | `collect-foundation` | `crates/collect-foundation/src/geonames.rs`, `crates/collect-foundation/src/evidence/*.rs` |
+| [Identity](VESSEL_IDENTITY.md#tables) | `source_catalog`, `ingestion_runs`, `source_records`, `rejected_records`, `identity_assertions`, `vessels`, `vessel_attributes`, `vessel_identifiers`, `vessel_history`, `vessel_subjects`, `vessel_id_redirects`, `identity_conflicts`, `identity_review_queue`, `identity_decisions`, `reconciliation_runs` (namespace `identity`) | `vessel-identity` | `crates/vessel-identity/src/tables.rs` |
+| [Imagery](VESSEL_IMAGERY.md#tables) | `vessel_images`, `image_observations`, `vessel_visual_profile` (namespace `imagery`) | `vessel-imagery` | `crates/vessel-imagery/src/tables.rs` |
 
 `ais-compact` ([AIS_COMPACT.md](AIS_COMPACT.md)) creates no tables of its own: it rewrites
 the files of the tables above, sorted by `mmsi, ts` by default, without

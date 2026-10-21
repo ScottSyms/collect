@@ -1,0 +1,23 @@
+# Transport Canada: Small Commercial Vessel Registry (open.canada.ca).
+source_id = "tc_small_vessels"
+name = "Transport Canada - Small Commercial Vessel Registry"
+publisher = "Transport Canada"
+adapter = "tc_small"
+source_url = "https://opendatatc.tc.canada.ca/small-vessel-registry_dataset_en.xlsx"
+dataset_url = "https://open.canada.ca/data/en/dataset/5cb32773-e7b1-4681-b82a-43cc39778c1a"
+access_method = "http_download"
+data_format = "xlsx"
+refresh_policy = "weekly"
+license = "Open Government Licence - Canada"
+permitted_uses = ["access", "automated_download", "retain_history", "combine", "redistribute", "commercial"]
+access_status = "approved"
+authorization_basis = "Published on open.canada.ca under the Open Government Licence - Canada. The resource's own data date (June 2025 when checked) lags its metadata; the collector records both."
+authentication = "none"
+enabled = true
+priority = 85
+trust = "registry"
+issues = ["NATIONAL_REGISTRY"]
+jurisdiction = "CA"
+removal_semantics = "snapshot"
+max_removal_fraction = 0.2
+retain_raw = true

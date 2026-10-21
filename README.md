@@ -23,6 +23,8 @@ docs, not a guide.
 - **[`ais-compact`](AIS_COMPACT.md)** — Iceberg table maintenance for RustFS and other catalogs with no compactor: sorted compaction, snapshot expiry, orphan cleanup
 - **[`ais-tracks`](AIS_TRACKS.md)** — derived tables built with DataFusion SQL: vessel identity, annotated track points, tracks, stops matched to World Port Index ports, and voyages; written to a namespace you choose
 - **[`collect-foundation`](COLLECT_FOUNDATION.md)** — foundation reference data in Iceberg (namespace `foundation`, warehouse `maritimedata` by default): the GeoNames placenames gazetteer, and vessel evidence (Paris MoU, Tokyo MoU and USCG port state control; TSB Canada marine occurrences)
+- **[`vessel-identity`](VESSEL_IDENTITY.md)** — the vessel identity registry in Iceberg (namespace `identity`, warehouse `maritimedata` by default): collects Transport Canada, IACS, USCG PSIX and USCG MISLE inspection vessel records with full provenance and history, and reconciles them into one record per physical vessel with a permanent id
+- **[`vessel-imagery`](VESSEL_IMAGERY.md)** — ship photos for the registry's vessels (namespace `imagery`): freely licensed photos from Wikimedia Commons by IMO number, held/restricted photos from a manifest, each with its licence, plus visual attributes (type, colours, funnels, masts, gear) read by a System 1 model (Laya) and rolled up into a per-vessel visual profile
 
 All four collectors support optional S3/MinIO/RustFS upload, and can
 register or fully decode into Apache Iceberg as they ingest — see
@@ -40,6 +42,8 @@ register or fully decode into Apache Iceberg as they ingest — see
 | [AIS_COMPACT.md](AIS_COMPACT.md) | Compacting, sorting, expiring and cleaning Iceberg tables |
 | [AIS_TRACKS.md](AIS_TRACKS.md) | Derived vessel, track, stop and voyage tables: design, columns, run order, queries, limits |
 | [COLLECT_FOUNDATION.md](COLLECT_FOUNDATION.md) | Foundation reference tables: GeoNames placenames and vessel evidence; sources, data model, load semantics, caveats |
+| [VESSEL_IDENTITY.md](VESSEL_IDENTITY.md) | Vessel identity registry: sources and their authorization, ingest and reconciliation rules, tables, queries, departures from the specification |
+| [VESSEL_IMAGERY.md](VESSEL_IMAGERY.md) | Vessel imagery: Commons and held photos, licence handling, the System 1 question set, profiles, the eval, tables |
 | [DOCKER_HEALTH_CHECK.md](DOCKER_HEALTH_CHECK.md) | Health-check mechanics for containers |
 | [NOMAD.md](NOMAD.md) | Nomad job definitions and cluster deployment |
 
@@ -55,7 +59,7 @@ docker run -d --name data-ingest \
 
 The image defaults to `collect-socket`; use `--entrypoint /usr/local/bin/<binary>`
 (`collect-file`, `collect-kafka`, `collect-aisstream`, `ais-parse`, `collect-foundation`,
-`aisstream-parse`) to run any other binary the image ships. A
+`vessel-identity`, `vessel-imagery`, `aisstream-parse`) to run any other binary the image ships. A
 docker-compose example lives in [docker-compose.yml](docker-compose.yml);
 see [NOMAD.md](NOMAD.md) for cluster deployment instead.
 

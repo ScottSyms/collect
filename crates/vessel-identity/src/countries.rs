@@ -1,0 +1,437 @@
+//! Flag states: country names and codes as sources write them, to ISO 3166
+//! alpha-3 (`CANADA` -> `CAN`).
+
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
+use crate::normalize::name_key;
+
+/// `alpha-2 alpha-3 name`, one per line (ISO 3166-1, plus a few codes flag
+/// registers still use).
+const ISO: &str = "\
+AF AFG AFGHANISTAN
+AX ALA ALAND ISLANDS
+AL ALB ALBANIA
+DZ DZA ALGERIA
+AS ASM AMERICAN SAMOA
+AD AND ANDORRA
+AO AGO ANGOLA
+AI AIA ANGUILLA
+AQ ATA ANTARCTICA
+AG ATG ANTIGUA AND BARBUDA
+AR ARG ARGENTINA
+AM ARM ARMENIA
+AW ABW ARUBA
+AU AUS AUSTRALIA
+AT AUT AUSTRIA
+AZ AZE AZERBAIJAN
+BS BHS BAHAMAS
+BH BHR BAHRAIN
+BD BGD BANGLADESH
+BB BRB BARBADOS
+BY BLR BELARUS
+BE BEL BELGIUM
+BZ BLZ BELIZE
+BJ BEN BENIN
+BM BMU BERMUDA
+BT BTN BHUTAN
+BO BOL BOLIVIA
+BQ BES BONAIRE SINT EUSTATIUS AND SABA
+BA BIH BOSNIA AND HERZEGOVINA
+BW BWA BOTSWANA
+BV BVT BOUVET ISLAND
+BR BRA BRAZIL
+IO IOT BRITISH INDIAN OCEAN TERRITORY
+VG VGB BRITISH VIRGIN ISLANDS
+BN BRN BRUNEI DARUSSALAM
+BG BGR BULGARIA
+BF BFA BURKINA FASO
+BI BDI BURUNDI
+CV CPV CABO VERDE
+KH KHM CAMBODIA
+CM CMR CAMEROON
+CA CAN CANADA
+KY CYM CAYMAN ISLANDS
+CF CAF CENTRAL AFRICAN REPUBLIC
+TD TCD CHAD
+CL CHL CHILE
+CN CHN CHINA
+CX CXR CHRISTMAS ISLAND
+CC CCK COCOS KEELING ISLANDS
+CO COL COLOMBIA
+KM COM COMOROS
+CG COG CONGO
+CD COD DEMOCRATIC REPUBLIC OF THE CONGO
+CK COK COOK ISLANDS
+CR CRI COSTA RICA
+CI CIV COTE DIVOIRE
+HR HRV CROATIA
+CU CUB CUBA
+CW CUW CURACAO
+CY CYP CYPRUS
+CZ CZE CZECHIA
+DK DNK DENMARK
+DJ DJI DJIBOUTI
+DM DMA DOMINICA
+DO DOM DOMINICAN REPUBLIC
+EC ECU ECUADOR
+EG EGY EGYPT
+SV SLV EL SALVADOR
+GQ GNQ EQUATORIAL GUINEA
+ER ERI ERITREA
+EE EST ESTONIA
+SZ SWZ ESWATINI
+ET ETH ETHIOPIA
+FK FLK FALKLAND ISLANDS
+FO FRO FAROE ISLANDS
+FJ FJI FIJI
+FI FIN FINLAND
+FR FRA FRANCE
+GF GUF FRENCH GUIANA
+PF PYF FRENCH POLYNESIA
+TF ATF FRENCH SOUTHERN TERRITORIES
+GA GAB GABON
+GM GMB GAMBIA
+GE GEO GEORGIA
+DE DEU GERMANY
+GH GHA GHANA
+GI GIB GIBRALTAR
+GR GRC GREECE
+GL GRL GREENLAND
+GD GRD GRENADA
+GP GLP GUADELOUPE
+GU GUM GUAM
+GT GTM GUATEMALA
+GG GGY GUERNSEY
+GN GIN GUINEA
+GW GNB GUINEA BISSAU
+GY GUY GUYANA
+HT HTI HAITI
+HM HMD HEARD ISLAND AND MCDONALD ISLANDS
+VA VAT HOLY SEE
+HN HND HONDURAS
+HK HKG HONG KONG
+HU HUN HUNGARY
+IS ISL ICELAND
+IN IND INDIA
+ID IDN INDONESIA
+IR IRN IRAN
+IQ IRQ IRAQ
+IE IRL IRELAND
+IM IMN ISLE OF MAN
+IL ISR ISRAEL
+IT ITA ITALY
+JM JAM JAMAICA
+JP JPN JAPAN
+JE JEY JERSEY
+JO JOR JORDAN
+KZ KAZ KAZAKHSTAN
+KE KEN KENYA
+KI KIR KIRIBATI
+KP PRK NORTH KOREA
+KR KOR SOUTH KOREA
+KW KWT KUWAIT
+KG KGZ KYRGYZSTAN
+LA LAO LAOS
+LV LVA LATVIA
+LB LBN LEBANON
+LS LSO LESOTHO
+LR LBR LIBERIA
+LY LBY LIBYA
+LI LIE LIECHTENSTEIN
+LT LTU LITHUANIA
+LU LUX LUXEMBOURG
+MO MAC MACAO
+MG MDG MADAGASCAR
+MW MWI MALAWI
+MY MYS MALAYSIA
+MV MDV MALDIVES
+ML MLI MALI
+MT MLT MALTA
+MH MHL MARSHALL ISLANDS
+MQ MTQ MARTINIQUE
+MR MRT MAURITANIA
+MU MUS MAURITIUS
+YT MYT MAYOTTE
+MX MEX MEXICO
+FM FSM MICRONESIA
+MD MDA MOLDOVA
+MC MCO MONACO
+MN MNG MONGOLIA
+ME MNE MONTENEGRO
+MS MSR MONTSERRAT
+MA MAR MOROCCO
+MZ MOZ MOZAMBIQUE
+MM MMR MYANMAR
+NA NAM NAMIBIA
+NR NRU NAURU
+NP NPL NEPAL
+NL NLD NETHERLANDS
+NC NCL NEW CALEDONIA
+NZ NZL NEW ZEALAND
+NI NIC NICARAGUA
+NE NER NIGER
+NG NGA NIGERIA
+NU NIU NIUE
+NF NFK NORFOLK ISLAND
+MK MKD NORTH MACEDONIA
+MP MNP NORTHERN MARIANA ISLANDS
+NO NOR NORWAY
+OM OMN OMAN
+PK PAK PAKISTAN
+PW PLW PALAU
+PS PSE PALESTINE
+PA PAN PANAMA
+PG PNG PAPUA NEW GUINEA
+PY PRY PARAGUAY
+PE PER PERU
+PH PHL PHILIPPINES
+PN PCN PITCAIRN
+PL POL POLAND
+PT PRT PORTUGAL
+PR PRI PUERTO RICO
+QA QAT QATAR
+RE REU REUNION
+RO ROU ROMANIA
+RU RUS RUSSIA
+RW RWA RWANDA
+BL BLM SAINT BARTHELEMY
+SH SHN SAINT HELENA
+KN KNA SAINT KITTS AND NEVIS
+LC LCA SAINT LUCIA
+MF MAF SAINT MARTIN
+PM SPM SAINT PIERRE AND MIQUELON
+VC VCT SAINT VINCENT AND THE GRENADINES
+WS WSM SAMOA
+SM SMR SAN MARINO
+ST STP SAO TOME AND PRINCIPE
+SA SAU SAUDI ARABIA
+SN SEN SENEGAL
+RS SRB SERBIA
+SC SYC SEYCHELLES
+SL SLE SIERRA LEONE
+SG SGP SINGAPORE
+SX SXM SINT MAARTEN
+SK SVK SLOVAKIA
+SI SVN SLOVENIA
+SB SLB SOLOMON ISLANDS
+SO SOM SOMALIA
+ZA ZAF SOUTH AFRICA
+GS SGS SOUTH GEORGIA AND THE SOUTH SANDWICH ISLANDS
+SS SSD SOUTH SUDAN
+ES ESP SPAIN
+LK LKA SRI LANKA
+SD SDN SUDAN
+SR SUR SURINAME
+SJ SJM SVALBARD AND JAN MAYEN
+SE SWE SWEDEN
+CH CHE SWITZERLAND
+SY SYR SYRIA
+TW TWN TAIWAN
+TJ TJK TAJIKISTAN
+TZ TZA TANZANIA
+TH THA THAILAND
+TL TLS TIMOR LESTE
+TG TGO TOGO
+TK TKL TOKELAU
+TO TON TONGA
+TT TTO TRINIDAD AND TOBAGO
+TN TUN TUNISIA
+TR TUR TURKIYE
+TM TKM TURKMENISTAN
+TC TCA TURKS AND CAICOS ISLANDS
+TV TUV TUVALU
+UG UGA UGANDA
+UA UKR UKRAINE
+AE ARE UNITED ARAB EMIRATES
+GB GBR UNITED KINGDOM
+US USA UNITED STATES
+UM UMI UNITED STATES MINOR OUTLYING ISLANDS
+VI VIR UNITED STATES VIRGIN ISLANDS
+UY URY URUGUAY
+UZ UZB UZBEKISTAN
+VU VUT VANUATU
+VE VEN VENEZUELA
+VN VNM VIET NAM
+WF WLF WALLIS AND FUTUNA
+EH ESH WESTERN SAHARA
+YE YEM YEMEN
+ZM ZMB ZAMBIA
+ZW ZWE ZIMBABWE
+AN ANT NETHERLANDS ANTILLES
+";
+
+/// Other names sources use, to the alpha-3 code.
+const ALIASES: &[(&str, &str)] = &[
+    ("BAHAMAS THE", "BHS"),
+    ("THE BAHAMAS", "BHS"),
+    ("BOLIVIA PLURINATIONAL STATE OF", "BOL"),
+    ("BRUNEI", "BRN"),
+    ("BURMA", "MMR"),
+    ("CAPE VERDE", "CPV"),
+    ("CONGO DEMOCRATIC REPUBLIC OF THE", "COD"),
+    ("CONGO REPUBLIC OF THE", "COG"),
+    ("DEMOCRATIC REPUBLIC OF CONGO", "COD"),
+    ("ZAIRE", "COD"),
+    ("IVORY COAST", "CIV"),
+    ("CZECH REPUBLIC", "CZE"),
+    ("SWAZILAND", "SWZ"),
+    ("FALKLAND ISLANDS MALVINAS", "FLK"),
+    ("FAROE", "FRO"),
+    ("FAEROE ISLANDS", "FRO"),
+    ("GAMBIA THE", "GMB"),
+    ("THE GAMBIA", "GMB"),
+    ("HONG KONG CHINA", "HKG"),
+    ("HONG KONG SAR", "HKG"),
+    ("HONG KONG SAR CHINA", "HKG"),
+    ("MACAU", "MAC"),
+    ("MACAO CHINA", "MAC"),
+    ("IRAN ISLAMIC REPUBLIC OF", "IRN"),
+    ("ISLAMIC REPUBLIC OF IRAN", "IRN"),
+    ("KOREA DEMOCRATIC PEOPLES REPUBLIC OF", "PRK"),
+    ("DEMOCRATIC PEOPLES REPUBLIC OF KOREA", "PRK"),
+    ("KOREA NORTH", "PRK"),
+    ("KOREA REPUBLIC OF", "KOR"),
+    ("REPUBLIC OF KOREA", "KOR"),
+    ("KOREA SOUTH", "KOR"),
+    ("KOREA", "KOR"),
+    ("LAO PEOPLES DEMOCRATIC REPUBLIC", "LAO"),
+    ("MACEDONIA", "MKD"),
+    ("MICRONESIA FEDERATED STATES OF", "FSM"),
+    ("FEDERATED STATES OF MICRONESIA", "FSM"),
+    ("MOLDOVA REPUBLIC OF", "MDA"),
+    ("REPUBLIC OF MOLDOVA", "MDA"),
+    ("NETHERLANDS THE", "NLD"),
+    ("HOLLAND", "NLD"),
+    ("PALESTINE STATE OF", "PSE"),
+    ("RUSSIAN FEDERATION", "RUS"),
+    ("ST KITTS AND NEVIS", "KNA"),
+    ("ST KITTS NEVIS", "KNA"),
+    ("SAINT KITTS NEVIS", "KNA"),
+    ("ST LUCIA", "LCA"),
+    ("ST VINCENT AND THE GRENADINES", "VCT"),
+    ("ST VINCENT AND GRENADINES", "VCT"),
+    ("SAINT VINCENT AND GRENADINES", "VCT"),
+    ("ST VINCENT", "VCT"),
+    ("ST PIERRE AND MIQUELON", "SPM"),
+    ("ST HELENA", "SHN"),
+    ("SYRIAN ARAB REPUBLIC", "SYR"),
+    ("TAIWAN PROVINCE OF CHINA", "TWN"),
+    ("CHINESE TAIPEI", "TWN"),
+    ("TANZANIA UNITED REPUBLIC OF", "TZA"),
+    ("UNITED REPUBLIC OF TANZANIA", "TZA"),
+    ("ZANZIBAR", "TZA"),
+    ("TURKEY", "TUR"),
+    ("EAST TIMOR", "TLS"),
+    ("UNITED STATES OF AMERICA", "USA"),
+    ("USA", "USA"),
+    ("U S A", "USA"),
+    ("US", "USA"),
+    ("UK", "GBR"),
+    ("GREAT BRITAIN", "GBR"),
+    ("UNITED KINGDOM OF GREAT BRITAIN AND NORTHERN IRELAND", "GBR"),
+    ("VENEZUELA BOLIVARIAN REPUBLIC OF", "VEN"),
+    ("VIETNAM", "VNM"),
+    ("VIRGIN ISLANDS BRITISH", "VGB"),
+    ("VIRGIN ISLANDS US", "VIR"),
+    ("VIRGIN ISLANDS U S", "VIR"),
+    ("US VIRGIN ISLANDS", "VIR"),
+    ("PEOPLES REPUBLIC OF CHINA", "CHN"),
+    ("CHINA PEOPLES REPUBLIC OF", "CHN"),
+    ("SAO TOME AND PRINCIPE DEMOCRATIC REPUBLIC OF", "STP"),
+    ("SAINT MARTIN FRENCH PART", "MAF"),
+    ("SINT MAARTEN DUTCH PART", "SXM"),
+    ("HOLY SEE VATICAN CITY STATE", "VAT"),
+    ("VATICAN", "VAT"),
+    ("REUNION ISLAND", "REU"),
+    ("COCOS ISLANDS", "CCK"),
+    ("UNKNOWN", ""),
+    ("STATELESS", ""),
+];
+
+struct Tables {
+    by_name: HashMap<String, &'static str>,
+    by_alpha2: HashMap<&'static str, &'static str>,
+    alpha3: HashMap<&'static str, &'static str>,
+}
+
+fn tables() -> &'static Tables {
+    static T: OnceLock<Tables> = OnceLock::new();
+    T.get_or_init(|| {
+        let mut t = Tables { by_name: HashMap::new(), by_alpha2: HashMap::new(), alpha3: HashMap::new() };
+        for line in ISO.lines().filter(|l| !l.is_empty()) {
+            let a2 = &line[..2];
+            let a3 = &line[3..6];
+            let name = &line[7..];
+            t.by_alpha2.insert(a2, a3);
+            t.alpha3.insert(a3, a2);
+            if let Some(k) = name_key(name) {
+                t.by_name.insert(k, a3);
+            }
+        }
+        for (name, a3) in ALIASES {
+            if let Some(k) = name_key(name) {
+                t.by_name.insert(k, a3);
+            }
+        }
+        t
+    })
+}
+
+/// The ISO 3166 alpha-3 code for a flag written as a name, an alpha-3 or an
+/// alpha-2 code. `None` when unrecognised, or for `UNKNOWN`/`STATELESS`.
+pub fn alpha3(s: &str) -> Option<&'static str> {
+    let t = tables();
+    let up = s.trim().to_ascii_uppercase();
+    if up.len() == 3 {
+        if let Some((a3, _)) = t.alpha3.get_key_value(up.as_str()) {
+            return Some(a3);
+        }
+    }
+    if up.len() == 2 {
+        if let Some(a3) = t.by_alpha2.get(up.as_str()) {
+            return Some(a3);
+        }
+    }
+    let key = name_key(&up)?;
+    t.by_name.get(&key).copied().filter(|a3| !a3.is_empty())
+}
+
+/// The alpha-3 code for an ISO alpha-2 code.
+pub fn alpha3_of_alpha2(a2: &str) -> Option<&'static str> {
+    tables().by_alpha2.get(a2.to_ascii_uppercase().as_str()).copied()
+}
+
+/// The alpha-2 code for an ISO alpha-3 code.
+pub fn alpha2_of_alpha3(a3: &str) -> Option<&'static str> {
+    let a3 = a3.to_ascii_uppercase();
+    tables().by_alpha2.iter().find(|(_, v)| **v == a3).map(|(k, _)| *k)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_and_codes() {
+        assert_eq!(alpha3("CANADA"), Some("CAN"));
+        assert_eq!(alpha3("canada"), Some("CAN"));
+        assert_eq!(alpha3("UNITED STATES"), Some("USA"));
+        assert_eq!(alpha3("Korea, Republic of"), Some("KOR"));
+        assert_eq!(alpha3("ST. VINCENT AND THE GRENADINES"), Some("VCT"));
+        assert_eq!(alpha3("Côte d'Ivoire"), Some("CIV"));
+        assert_eq!(alpha3("PAN"), Some("PAN"));
+        assert_eq!(alpha3("NO"), Some("NOR"));
+        assert_eq!(alpha3("UNKNOWN"), None);
+        assert_eq!(alpha3("ATLANTIS"), None);
+        assert_eq!(alpha3_of_alpha2("ca"), Some("CAN"));
+        assert_eq!(alpha2_of_alpha3("vgb"), Some("VG"));
+    }
+
+    #[test]
+    fn table_is_well_formed() {
+        let t = tables();
+        assert!(t.alpha3.len() > 245, "{}", t.alpha3.len());
+        assert_eq!(t.alpha3.len(), t.by_alpha2.len());
+    }
+}

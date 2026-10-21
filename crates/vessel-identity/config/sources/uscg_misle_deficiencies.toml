@@ -1,0 +1,31 @@
+# USCG MISLE Deficiency Data Report: the yearly deficiency workbooks, read
+# for the identity of each inspected vessel (the same files feed
+# `collect-foundation evidence uscg`).
+source_id = "uscg_misle_deficiencies"
+name = "USCG MISLE Deficiency Data Report (vessel identities)"
+publisher = "United States Coast Guard"
+adapter = "uscg_misle"
+source_url = "https://www.dco.uscg.mil/Our-Organization/Assistant-Commandant-for-Prevention-Policy-CG-5P/Inspections-Compliance-CG-5PC-/Commercial-Vessel-Compliance/MISLE-DEF-DATA-REPORT/"
+dataset_url = "https://www.dco.uscg.mil/Our-Organization/Assistant-Commandant-for-Prevention-Policy-CG-5P/Inspections-Compliance-CG-5PC-/Commercial-Vessel-Compliance/MISLE-DEF-DATA-REPORT/"
+# The site refuses non-browser downloads: save the workbooks by hand and
+# ingest them with --source-dir.
+access_method = "manual"
+data_format = "xlsx"
+refresh_policy = "manual"
+license = "US federal government work (17 U.S.C. 105), public domain"
+permitted_uses = ["access", "retain_history", "combine", "redistribute", "commercial"]
+access_status = "approved"
+authorization_basis = "Published by the US Coast Guard as public yearly workbooks; works of the US federal government are not subject to copyright in the US."
+authentication = "none"
+enabled = true
+priority = 60
+# The Coast Guard records each vessel's identifiers from its documents at
+# inspection, and issues US official numbers itself.
+trust = "registry"
+issues = ["NATIONAL_REGISTRY"]
+jurisdiction = "US"
+# Each workbook covers one year of inspections; a vessel not inspected
+# lately simply isn't in the newest files, which says nothing about it.
+removal_semantics = "incremental"
+max_removal_fraction = 0.2
+retain_raw = true

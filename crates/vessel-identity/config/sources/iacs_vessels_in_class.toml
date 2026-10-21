@@ -1,0 +1,26 @@
+# IACS: Vessels in Class, the weekly Equasis-to-IACS CSV snapshot.
+source_id = "iacs_vessels_in_class"
+name = "IACS - Vessels in Class"
+publisher = "International Association of Classification Societies"
+adapter = "iacs"
+# The page listing the weekly zip files; the newest one is downloaded.
+source_url = "https://iacs.org.uk/membership/vessels-in-class"
+dataset_url = "https://iacs.org.uk/membership/vessels-in-class"
+access_method = "http_download"
+data_format = "csv"
+refresh_policy = "weekly"
+license = "IACS website terms (not an open licence)"
+permitted_uses = ["access", "automated_download", "retain_history", "combine"]
+# Approved by the operator on 2026-10-18 after reviewing the website terms
+# (https://iacs.org.uk/terms-and-conditions), which allow personal reference
+# and sharing within the organisation; not redistributed or used commercially.
+access_status = "approved"
+authorization_basis = "Offered as a public weekly download. Website terms (iacs.org.uk/terms-and-conditions) reviewed; approved by the operator on 2026-10-18 for internal use, without redistribution or commercial use."
+authentication = "none"
+enabled = true
+priority = 70
+trust = "registry"
+issues = []
+removal_semantics = "snapshot"
+max_removal_fraction = 0.2
+retain_raw = true

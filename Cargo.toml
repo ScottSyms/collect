@@ -12,6 +12,8 @@ members = [
     "crates/collect-barentswatch",
     "crates/ais-tracks",
     "crates/collect-foundation",
+    "crates/vessel-identity",
+    "crates/vessel-imagery",
 ]
 resolver = "2"
 
