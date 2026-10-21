@@ -908,12 +908,14 @@ mod tests {
                         reader = next_reader;
                     }
                     ReaderTransition::Stop => return Err(error.into()),
+                    ReaderTransition::GiveUp(exit) => return Err(exit.into()),
                 },
                 None => match source.on_stream_end(&shutdown, max_line_length).await? {
                     ReaderTransition::Continue(next_reader) => {
                         reader = next_reader;
                     }
                     ReaderTransition::Stop => break,
+                    ReaderTransition::GiveUp(exit) => return Err(exit.into()),
                 },
             }
         }

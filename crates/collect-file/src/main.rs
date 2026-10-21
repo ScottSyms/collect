@@ -146,7 +146,7 @@ async fn main() -> Result<()> {
         )
         .await?
     };
-    run_file_ingest(
+    let result = run_file_ingest(
         source,
         common_options,
         args.s3.to_options(),
@@ -159,7 +159,9 @@ async fn main() -> Result<()> {
         iceberg,
         silver,
     )
-    .await
+    .await;
+    // A data drought exits DATA_DROUGHT, after buffered rows are flushed.
+    collect_core::exitcode::exit_if_requested(result)
 }
 
 #[allow(clippy::too_many_arguments)]
