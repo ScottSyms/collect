@@ -34,6 +34,7 @@ use tokio::task::JoinSet;
 use tokio_util::codec::{FramedRead, LinesCodec};
 
 pub mod ais_consolidate;
+pub mod availability;
 pub mod backoff;
 pub mod dataset;
 pub mod exitcode;
@@ -1094,6 +1095,22 @@ pub async fn run_ingest<S>(source: &mut S, options: IngestOptions) -> Result<()>
 where
     S: LineSource + Send,
 {
+    // Every return path closes the source's availability interval (a no-op
+    // unless the collector installed a tracker with `availability::init_stream`).
+    let result = run_ingest_inner(source, options).await;
+    match &result {
+        Ok(()) => availability::finish(availability::EndReason::Shutdown, None).await,
+        Err(error) => {
+            availability::finish(availability::EndReason::Exit, Some(format!("{error:#}"))).await
+        }
+    }
+    result
+}
+
+async fn run_ingest_inner<S>(source: &mut S, options: IngestOptions) -> Result<()>
+where
+    S: LineSource + Send,
+{
     validate_source_name(source.source_name())?;
 
     let IngestOptions {
@@ -1202,7 +1219,16 @@ where
         Vec::new()
     };
 
-    let mut reader = source.open(common.max_line_length).await?;
+    let mut reader = match source.open(common.max_line_length).await {
+        Ok(reader) => {
+            availability::mark_up();
+            reader
+        }
+        Err(error) => {
+            availability::mark_down(&format!("{error:#}"));
+            return Err(error);
+        }
+    };
 
     let shutdown = external_shutdown.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     let shutdown_signal = shutdown.clone();
@@ -1306,6 +1332,10 @@ where
         tokio::select! {
             _ = heartbeat.tick() => {
                 metrics.touch_heartbeat();
+                availability::observe(
+                    metrics.rows_processed.load(Ordering::Relaxed),
+                    metrics.last_row_unix_ms.load(Ordering::Relaxed) as i64,
+                );
                 let state = metrics.health_state();
                 if manage_health {
                     if let Err(error) =
@@ -1333,6 +1363,7 @@ where
                     if manage_health {
                         let _ = update_health_status_async(&health_file, false, Some(reason)).await;
                     }
+                    availability::finish(availability::EndReason::Exit, Some(reason.to_string())).await;
                     std::process::exit(exitcode::DATA_DROUGHT);
                 }
             }
@@ -1471,8 +1502,10 @@ where
                         );
                     }
                     Some(Err(error)) => {
+                        availability::mark_down(&format!("stream error: {error}"));
                         match source.on_stream_error(&error, &shutdown, common.max_line_length).await? {
                             ReaderTransition::Continue(new_reader) => {
+                                availability::mark_up();
                                 reader = new_reader;
                                 continue;
                             }
@@ -1485,8 +1518,14 @@ where
                         }
                     }
                     None => {
+                        // A file source moving to its next input also ends a
+                        // stream; that is a no-op here unless a tracker is installed.
+                        if !shutdown.load(Ordering::SeqCst) {
+                            availability::mark_down("stream ended");
+                        }
                         match source.on_stream_end(&shutdown, common.max_line_length).await? {
                             ReaderTransition::Continue(new_reader) => {
+                                availability::mark_up();
                                 reader = new_reader;
                                 continue;
                             }

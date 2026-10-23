@@ -17,6 +17,7 @@ use ais_tracks::output::replace_table;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
+use collect_core::availability::{self, AvailabilityCliArgs};
 use collect_core::exitcode;
 use collect_core::iceberg::{open_catalog, IcebergCliArgs, IcebergConfig};
 use collect_maint::commit::RestClient;
@@ -38,6 +39,11 @@ struct Cli {
     /// Defaults here: warehouse `maritimedata`, namespace `foundation`.
     #[command(flatten)]
     iceberg: IcebergCliArgs,
+
+    /// Each `--apply` run that downloads records one row in
+    /// `sources.availability`.
+    #[command(flatten)]
+    availability: AvailabilityCliArgs,
 
     #[command(subcommand)]
     command: Command,
@@ -136,9 +142,9 @@ async fn run() -> Result<i32> {
             Ok(exitcode::SUCCESS)
         }
         Command::Placenames(PlacenamesArgs { command: PlacenamesCommand::Load(a) }) => {
-            load_placenames(&cli.iceberg, a).await
+            load_placenames(&cli.iceberg, &cli.availability, a).await
         }
-        Command::Evidence(a) => evidence_cli::run(&cli.iceberg, a).await,
+        Command::Evidence(a) => evidence_cli::run(&cli.iceberg, &cli.availability, a).await,
     }
 }
 
@@ -210,7 +216,10 @@ fn normalize(values: &[String], what: &str, valid: impl Fn(&str) -> bool) -> Res
     Ok(out)
 }
 
-async fn load_placenames(iceberg: &IcebergCliArgs, a: &LoadArgs) -> Result<i32> {
+/// The binary name recorded with each run's availability row.
+pub(crate) const BINARY: &str = "collect-foundation";
+
+async fn load_placenames(iceberg: &IcebergCliArgs, avail: &AvailabilityCliArgs, a: &LoadArgs) -> Result<i32> {
     let countries = normalize(&a.country, "country code", |c| {
         c.len() == 2 && c.bytes().all(|b| b.is_ascii_uppercase())
     })?;
@@ -223,7 +232,12 @@ async fn load_placenames(iceberg: &IcebergCliArgs, a: &LoadArgs) -> Result<i32> 
 
     let source = Source::new(&a.source_url, a.source_dir.clone(), a.scratch.clone())?;
     let loaded_at = Utc::now();
+    let run = availability::Run::start(&a.source_url, "geonames");
     let result = load_all(&source, writer.as_ref(), a, &countries, &classes, loaded_at).await;
+    // Only an applied run that went to the network says anything about the source.
+    if writer.is_some() && a.source_dir.is_none() {
+        availability::record_run(iceberg, avail, BINARY, &run, &result, None).await;
+    }
     if a.source_dir.is_none() && !a.keep_scratch {
         let _ = std::fs::remove_dir_all(&a.scratch);
     }

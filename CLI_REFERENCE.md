@@ -100,6 +100,44 @@ which has no live connection to lose.
 |---|---|---|---|
 | `--max-reconnect-seconds <n>` | `MAX_RECONNECT_SECONDS` | `300` | Give up and exit [`UPSTREAM_UNAVAILABLE`](#exit-codes) after this much *total* bounded-backoff retrying; `0` retries forever |
 
+## Source availability (`AvailabilityCliArgs`)
+
+The four streaming collectors and `collect-foundation` record when the
+upstream they read from is up, down or degraded, as closed intervals in
+`<availability-namespace>.availability` in the same warehouse (columns in
+[SCHEMAS.md](SCHEMAS.md#5-sources-source-availability)). It is **on whenever
+Iceberg output is configured** (`--iceberg-catalog-uri`; for
+`collect-foundation`, an `--apply` run that downloads) and off otherwise.
+`collect-file` reads local files and records nothing. A catalog that can't be
+reached, or a failed write, only logs a warning; ingest carries on.
+
+| Flag | Env | Default | Notes |
+|---|---|---|---|
+| `--availability <bool>` | `COLLECT_AVAILABILITY` | `true` | `--availability false` turns recording off |
+| `--availability-namespace <ns>` | `AVAILABILITY_NAMESPACE` | `sources` | Independent of `--iceberg-namespace` |
+| `--availability-flush-seconds <n>` | `AVAILABILITY_FLUSH_SECONDS` | `300` | Streaming only. Buffered rows are committed at most this often (and at shutdown), so a flapping source costs at most one commit per interval |
+| `--availability-checkpoint-seconds <n>` | `AVAILABILITY_CHECKPOINT_SECONDS` | `3600` | Streaming only. An open interval is closed and reopened this often, so the table is at most about this far behind and a hard kill loses at most this much |
+| `--availability-quiet-seconds <n>` | `AVAILABILITY_QUIET_SECONDS` | `300` | Streaming only. A connected source with no rows for this long is `degraded`, from its last row; `0` never degrades. Separate from `--data-drought-seconds`, which exits |
+
+How the state is decided:
+
+- **Streaming:** a successful connect is `up`; a failed connect, a closed or
+  broken stream, and the reconnect attempts after it are `down`; a reconnect
+  is `up` again; silence is `degraded` and the next row is `up`. Giving up
+  (`--max-reconnect-seconds`), a data drought and a normal shutdown close the
+  open interval before exiting. Kafka's client reconnects to brokers on its
+  own, so a broker outage usually shows as `degraded` rather than `down`.
+- **Batch (`collect-foundation`):** one row per `--apply` run that downloads
+  (not `--source-dir` loads). `down` when a download fails to connect or gets
+  an HTTP error, `degraded` when the files came but couldn't be parsed or
+  loaded, `up` otherwise.
+
+The table is unpartitioned and gets about 24 commits a day per running
+collector (one per checkpoint), up to 288 a day while a source flaps. That stays far
+below RustFS's 10,000-manifest limit for months; fold the small manifests
+now and then with `ais-compact consolidate --iceberg-namespace sources --table
+availability`.
+
 ## Logging
 
 Every binary emits operationally-significant events (startup/shutdown,
@@ -418,6 +456,10 @@ Notes:
 - `evidence` has the alias `interdictions`.
 - Every evidence load rewrites `evidence_sources` and replaces its whole
   source partition. Give it the full history each time.
+- `--apply` runs that download (`placenames load`, `evidence uscg`, `tsb`,
+  `tokyo-mou` without `--source-dir`) record one row in
+  `sources.availability`; see [Source availability](#source-availability-availabilitycliargs).
+  The `--availability*` flags go before the subcommand, like the Iceberg flags.
 - Exit codes: `0` success, `1` error.
 
 ## `vessel-identity`

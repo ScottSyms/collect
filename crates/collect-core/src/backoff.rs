@@ -94,6 +94,10 @@ pub fn give_up(upstream: &str, max_reconnect_seconds: u64) -> ! {
         ),
         &[("upstream", upstream)],
     );
+    crate::availability::finish_blocking(
+        crate::availability::EndReason::Exit,
+        Some(format!("gave up after {max_reconnect_seconds}s of bounded retry")),
+    );
     std::process::exit(exitcode::UPSTREAM_UNAVAILABLE);
 }
 

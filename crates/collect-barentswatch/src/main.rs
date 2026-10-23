@@ -7,6 +7,7 @@ use collect_core::{
     ReaderTransition, S3CliArgs,
     log::LoggingCliArgs,
 };
+use collect_core::availability::{self, AvailabilityCliArgs};
 use collect_core::iceberg::{init_raw_handle, IcebergCliArgs};
 use collect_core::silver::ParserCliArgs;
 use serde::{Deserialize, Serialize};
@@ -73,6 +74,9 @@ struct Args {
 
     #[command(flatten)]
     iceberg: IcebergCliArgs,
+
+    #[command(flatten)]
+    availability: AvailabilityCliArgs,
 
     #[command(flatten)]
     parser: ParserCliArgs,
@@ -558,8 +562,23 @@ async fn main() -> Result<()> {
 
     let health_file = health_file_path("collect-barentswatch");
 
+    if !args.common.health_check {
+        availability::init_stream(
+            &args.iceberg,
+            &args.availability,
+            "collect-barentswatch",
+            &endpoint,
+            &source_name,
+        )
+        .await;
+    }
+
     let token_manager = Arc::new(TokenManager::new(client_id, client_secret));
-    token_manager.get_token().await.context("Initial token fetch failed")?;
+    if let Err(error) = token_manager.get_token().await.context("Initial token fetch failed") {
+        availability::mark_down(&format!("{error:#}"));
+        availability::finish(availability::EndReason::Exit, None).await;
+        return Err(error);
+    }
 
     let common_options = args.common.to_options();
     let iceberg = if common_options.health_check {
