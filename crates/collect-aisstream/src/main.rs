@@ -6,6 +6,7 @@ use collect_core::{
     run_ingest, CommonCliArgs, IngestOptions, LineReader, LineSource, ReaderTransition, S3CliArgs,
     log::LoggingCliArgs,
 };
+use collect_core::availability::{self, AvailabilityCliArgs};
 use collect_core::iceberg::{init_raw_handle, IcebergCliArgs};
 use collect_core::silver::{ParserCliArgs, ParserKind};
 use futures_util::{SinkExt, StreamExt};
@@ -70,6 +71,9 @@ struct Args {
 
     #[command(flatten)]
     iceberg: IcebergCliArgs,
+
+    #[command(flatten)]
+    availability: AvailabilityCliArgs,
 
     #[command(flatten)]
     parser: ParserCliArgs,
@@ -359,6 +363,17 @@ async fn main() -> Result<()> {
         .bounding_boxes
         .context("missing bounding boxes; set --bounding-boxes or BOUNDING_BOXES")?;
     let source_name = args.source.unwrap_or_else(|| "aisstream".to_string());
+
+    if !args.common.health_check {
+        availability::init_stream(
+            &args.iceberg,
+            &args.availability,
+            "collect-aisstream",
+            &WS_URL,
+            &source_name,
+        )
+        .await;
+    }
 
     let health_file = health_file_path("collect-aisstream");
     let mut source = AisStreamSource::new(

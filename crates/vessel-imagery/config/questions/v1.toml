@@ -1,0 +1,205 @@
+# Question set v1: what vessel-imagery asks a System 1 model about each
+# ship photo. Laya and other Jev-style models answer only typed questions
+# (choice / yes_no / score) with probabilities; they don't write text, so
+# every visual feature worth recording has to be a question here.
+#
+# role = "gate": an image must get one of `pass` (with at least
+#   min_probability) for its other answers to count in the profile.
+# enabled = false: still asked, never used in the profile (set this for
+#   questions the eval shows the model gets wrong).
+#
+# Changing a question's wording or options means a new version: copy this
+# file to v2.toml and bump `version`, so old observations stay comparable.
+
+version = "v1"
+# Answers below this probability are ignored by `profile`.
+min_probability = 0.5
+# Below this, the runner-up label is stored beside the top answer.
+runner_up_below = 0.6
+
+[[questions]]
+id = "photo_kind"
+role = "gate"
+type = "choice"
+text = "What does this image mainly show?"
+criteria = ["a photograph of a ship's exterior", "a ship's interior or deck detail", "a drawing, painting or model", "a map, document or screenshot", "no ship"]
+pass = ["a photograph of a ship's exterior"]
+
+[[questions]]
+id = "single_ship"
+role = "gate"
+type = "yes_no"
+text = "Is one ship clearly the main subject of the photo, rather than a harbour scene with several ships of similar prominence?"
+pass = ["yes"]
+
+[[questions]]
+id = "view"
+type = "choice"
+text = "From which side is the ship seen?"
+criteria = ["broadside", "bow quarter", "stern quarter", "bow on", "stern on", "from above"]
+
+[[questions]]
+id = "ship_type"
+type = "choice"
+text = "What type of ship is this?"
+criteria = ["container ship", "oil or chemical tanker", "gas carrier", "bulk carrier", "general cargo ship", "ro-ro or car carrier", "cruise ship", "passenger ferry", "fishing vessel", "tug", "offshore supply or service vessel", "research vessel", "icebreaker", "naval or coast guard vessel", "yacht", "dredger", "sailing ship", "other"]
+
+[[questions]]
+id = "hull_colour"
+type = "choice"
+text = "What is the main colour of the hull above the waterline?"
+criteria = ["black", "dark blue", "light blue", "red", "green", "grey", "white", "orange", "yellow", "brown", "other"]
+
+[[questions]]
+id = "boot_topping_colour"
+type = "choice"
+text = "What colour is the hull at and just above the waterline (the boot topping)?"
+criteria = ["red", "black", "blue", "green", "grey", "same as hull", "not visible"]
+
+[[questions]]
+id = "superstructure_colour"
+type = "choice"
+text = "What is the main colour of the superstructure (accommodation and bridge)?"
+criteria = ["white", "cream or beige", "grey", "orange", "blue", "red", "yellow", "green", "other"]
+
+[[questions]]
+id = "funnel_colour"
+type = "choice"
+text = "What is the main colour of the funnel?"
+criteria = ["black", "white", "red", "blue", "yellow", "orange", "green", "grey", "multicoloured", "no funnel visible"]
+
+[[questions]]
+id = "funnel_top_contrast"
+type = "yes_no"
+text = "Is the top of the funnel a different colour from the rest of the funnel (a contrasting top band)?"
+
+[[questions]]
+id = "funnel_logo"
+type = "yes_no"
+text = "Does the funnel carry a company logo, emblem or distinctive painted symbol?"
+
+[[questions]]
+id = "funnel_count"
+type = "choice"
+text = "How many funnels does the ship have?"
+criteria = ["none", "one", "two", "three or more"]
+
+[[questions]]
+id = "funnel_arrangement"
+type = "choice"
+text = "How are the funnels or exhausts arranged?"
+criteria = ["single central funnel", "twin side-by-side funnels", "funnels in line fore and aft", "exhausts integrated into superstructure", "no funnel visible"]
+
+[[questions]]
+id = "mast_count"
+type = "choice"
+text = "How many masts does the ship have, excluding the funnel?"
+criteria = ["none", "one", "two", "three or more"]
+
+[[questions]]
+id = "superstructure_position"
+type = "choice"
+text = "Where is the main superstructure (bridge and accommodation) located?"
+criteria = ["aft", "midships", "forward", "split between forward and aft", "no distinct superstructure"]
+
+[[questions]]
+id = "bridge_wings_enclosed"
+type = "yes_no"
+text = "Are the bridge wings enclosed?"
+
+[[questions]]
+id = "deck_cranes"
+type = "choice"
+text = "How many deck cranes does the ship carry?"
+criteria = ["none", "one", "two", "three", "four", "five or more"]
+
+[[questions]]
+id = "crane_colour"
+type = "choice"
+text = "What colour are the deck cranes?"
+criteria = ["yellow", "white", "orange", "grey", "red", "blue", "green", "no cranes"]
+
+[[questions]]
+id = "derricks_or_kingposts"
+type = "yes_no"
+text = "Does the ship have derricks or kingposts (older-style cargo gear) rather than modern cranes?"
+
+[[questions]]
+id = "containers_on_deck"
+type = "yes_no"
+text = "Are shipping containers stacked on deck?"
+
+[[questions]]
+id = "helideck"
+type = "yes_no"
+text = "Does the ship have a helicopter deck?"
+
+[[questions]]
+id = "stern_ramp"
+type = "yes_no"
+text = "Does the ship have a visible stern door or vehicle ramp?"
+
+[[questions]]
+id = "a_frame_or_gantry"
+type = "yes_no"
+text = "Is there an A-frame or gantry at the stern?"
+
+[[questions]]
+id = "bulbous_bow"
+type = "yes_no"
+text = "Is a bulbous bow visible at the waterline?"
+
+[[questions]]
+id = "ice_bow"
+type = "yes_no"
+text = "Does the bow have an icebreaking or ice-strengthened profile (sloped, spoon-shaped)?"
+
+[[questions]]
+id = "bow_shape"
+type = "choice"
+text = "What shape is the bow above the waterline?"
+criteria = ["raked straight", "flared or clipper", "vertical or axe bow", "spoon or icebreaker", "x-bow (inverted)"]
+
+[[questions]]
+id = "stern_shape"
+type = "choice"
+text = "What shape is the stern?"
+criteria = ["transom", "cruiser or rounded", "open stern with work deck", "not visible"]
+
+[[questions]]
+id = "hull_stripe"
+type = "yes_no"
+text = "Does the hull carry a contrasting stripe, band or livery pattern?"
+
+[[questions]]
+id = "hull_lettering"
+type = "yes_no"
+text = "Is large company lettering or a website painted on the hull?"
+
+[[questions]]
+id = "racing_stripe"
+type = "yes_no"
+text = "Does the hull carry diagonal 'racing stripes' (coast guard or government style)?"
+
+[[questions]]
+id = "rust_streaking"
+type = "yes_no"
+text = "Is the hull noticeably rust-streaked or weathered?"
+
+[[questions]]
+id = "lifeboat_type"
+type = "choice"
+text = "What kind of lifeboats are visible?"
+criteria = ["free-fall lifeboat at the stern", "davit-launched lifeboats at the sides", "liferaft canisters only", "not visible"]
+
+[[questions]]
+id = "deck_equipment_density"
+type = "choice"
+text = "How cluttered is the open deck with equipment?"
+criteria = ["clear deck", "some equipment", "heavily equipped working deck"]
+
+[[questions]]
+id = "size_estimate"
+type = "score"
+text = "How large is the ship, from a small harbour craft (low) to an ultra-large ocean-going ship (high)?"
+criteria = ["small (under 30 m)", "medium (30-100 m)", "large (100-250 m)", "very large (over 250 m)"]

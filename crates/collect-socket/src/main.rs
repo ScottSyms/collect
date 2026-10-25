@@ -7,6 +7,7 @@ use collect_core::{
     run_ingest, CommonCliArgs, IngestOptions, LineReader, LineSource, ReaderTransition, S3CliArgs,
     log::LoggingCliArgs,
 };
+use collect_core::availability::{self, AvailabilityCliArgs};
 use collect_core::iceberg::{init_raw_handle, IcebergCliArgs};
 use collect_core::silver::ParserCliArgs;
 use std::path::PathBuf;
@@ -49,6 +50,12 @@ struct Args {
     #[arg(long, env = "PROCESS_TIMESTAMPS", value_parser = clap::builder::FalseyValueParser::new())]
     process_timestamps: bool,
 
+    /// Use the MSSIS receiver epoch appended after the NMEA checksum
+    /// (`!AIVDM,...*CS,<epoch>` or `...*CS,<station>,<epoch>`) as the row
+    /// timestamp, and keep the station. Independent of --process-timestamps.
+    #[arg(long, env = "MSSIS", value_parser = clap::builder::FalseyValueParser::new())]
+    mssis: bool,
+
     #[command(flatten)]
     common: CommonCliArgs,
 
@@ -63,6 +70,9 @@ struct Args {
 
     #[command(flatten)]
     iceberg: IcebergCliArgs,
+
+    #[command(flatten)]
+    availability: AvailabilityCliArgs,
 
     #[command(flatten)]
     parser: ParserCliArgs,
@@ -208,6 +218,17 @@ async fn main() -> Result<()> {
         .context("missing TCP port; set --tcp-port or TCP_PORT")?;
     let source_name = args.source.unwrap_or_else(|| "tcp".to_string());
 
+    if !args.common.health_check {
+        availability::init_stream(
+            &args.iceberg,
+            &args.availability,
+            "collect-socket",
+            &format!("tcp://{host}:{port}"),
+            &source_name,
+        )
+        .await;
+    }
+
     let health_file = health_file_path("collect-socket");
     let mut source = TcpInputSource::new(
         host,
@@ -254,9 +275,10 @@ async fn main() -> Result<()> {
             shutdown: None,
             write_workers: None,
             sweep_orphans: true,
-            line_transformer: if args.consolidate_ais || args.process_timestamps {
+            line_transformer: if args.consolidate_ais || args.process_timestamps || args.mssis {
                 Some(Box::new(AisConsolidator::new(AisConsolidatorConfig {
                     process_timestamps: args.process_timestamps,
+                    mssis_timestamps: args.mssis,
                     consolidate_multipart: args.consolidate_ais,
                 })))
             } else {

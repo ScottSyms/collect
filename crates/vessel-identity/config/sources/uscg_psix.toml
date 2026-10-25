@@ -1,0 +1,36 @@
+# USCG Port State Information Exchange (PSIX) XML web service.
+source_id = "uscg_psix"
+name = "USCG Port State Information Exchange (PSIX)"
+publisher = "United States Coast Guard"
+adapter = "psix"
+source_url = "https://cgmix.uscg.mil/xml/PSIXData.asmx"
+dataset_url = "https://cgmix.uscg.mil/PSIX/PSIXHelp.aspx"
+access_method = "api"
+data_format = "xml"
+refresh_policy = "weekly"
+license = "US federal government information (releasable PSIX records)"
+permitted_uses = ["access", "automated_download", "retain_history", "combine"]
+# Pending until the Coast Guard's terms for automated use are confirmed.
+access_status = "pending"
+authorization_basis = "Documented public SOAP web service; weekly snapshots of releasable MISLE records."
+authentication = "none"
+enabled = true
+priority = 80
+trust = "registry"
+issues = ["NATIONAL_REGISTRY"]
+jurisdiction = "US"
+# A run that completes every slice is a full snapshot; a run with a failed
+# slice is not, and never removes records.
+removal_semantics = "snapshot"
+max_removal_fraction = 0.2
+retain_raw = true
+
+[options]
+# The service has no bulk export, so the whole register is fetched in slices
+# by build year (plus one slice for an unknown year).
+first_build_year = 1850
+# Pause between requests; the service answers 503 when pressed.
+request_delay_ms = 3000
+max_attempts = 6
+# Service types to skip (PSIX holds every US recreational boat).
+exclude_service_types = ["Recreational"]

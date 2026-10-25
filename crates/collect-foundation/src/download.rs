@@ -6,7 +6,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
+use collect_core::availability::SourceUnavailable;
 
 pub const USER_AGENT: &str = concat!("collect-foundation/", env!("CARGO_PKG_VERSION"));
 
@@ -91,7 +92,8 @@ pub async fn save(
     started: Instant,
 ) -> Result<()> {
     if !resp.status().is_success() {
-        bail!("{url}: HTTP {}", resp.status());
+        // Marked so a failed run is recorded as the source being down.
+        return Err(SourceUnavailable(format!("{url}: HTTP {}", resp.status())).into());
     }
     let partial = path.with_extension("part");
     let mut out = File::create(&partial).with_context(|| format!("creating {}", partial.display()))?;

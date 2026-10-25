@@ -70,6 +70,7 @@ Exits [`NOTHING_TO_DO`](CLI_REFERENCE.md#exit-codes) (`2`, instead of `0`) when 
 |------|-----|---------|-------------|
 | `--consolidate-ais` | `CONSOLIDATE_AIS` | off | Reassemble multi-part NMEA fragments into single sentences |
 | `--process-timestamps` | `PROCESS_TIMESTAMPS` | off | Extract `$PGHP` and tag-block `c:` timestamps |
+| `--mssis` | `MSSIS` | off | Use the MSSIS epoch after the checksum as the row timestamp; keep the station |
 
 ### Common + S3 + Iceberg
 

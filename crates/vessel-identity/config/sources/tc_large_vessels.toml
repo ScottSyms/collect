@@ -1,0 +1,29 @@
+# Transport Canada: Canadian Register of Large Vessels (open.canada.ca).
+source_id = "tc_large_vessels"
+name = "Transport Canada - Canadian Register of Large Vessels"
+publisher = "Transport Canada"
+adapter = "tc_large"
+source_url = "https://opendatatc.tc.canada.ca/large-vessel-registry_dataset_en.xlsx"
+dataset_url = "https://open.canada.ca/data/en/dataset/bf00b7f4-e370-46b7-94e4-0bdedc98531b"
+access_method = "http_download"
+data_format = "xlsx"
+refresh_policy = "daily"
+license = "Open Government Licence - Canada"
+permitted_uses = ["access", "automated_download", "retain_history", "combine", "redistribute", "commercial"]
+access_status = "approved"
+authorization_basis = "Published on open.canada.ca under the Open Government Licence - Canada, which permits copying, modification, redistribution and commercial use with attribution."
+authentication = "none"
+enabled = true
+# Higher wins when sources disagree on a preferred value.
+priority = 90
+# `registry`: the publisher keeps the register itself, so its identifiers are
+# independently supported. `self_reported`: what a vessel says about itself.
+trust = "registry"
+# Identifiers this source issues: the Canadian official number.
+issues = ["NATIONAL_REGISTRY"]
+jurisdiction = "CA"
+# The file is a full snapshot, so a record missing from it was removed from
+# the source (not necessarily deregistered).
+removal_semantics = "snapshot"
+max_removal_fraction = 0.2
+retain_raw = true

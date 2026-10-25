@@ -100,6 +100,44 @@ which has no live connection to lose.
 |---|---|---|---|
 | `--max-reconnect-seconds <n>` | `MAX_RECONNECT_SECONDS` | `300` | Give up and exit [`UPSTREAM_UNAVAILABLE`](#exit-codes) after this much *total* bounded-backoff retrying; `0` retries forever |
 
+## Source availability (`AvailabilityCliArgs`)
+
+The four streaming collectors and `collect-foundation` record when the
+upstream they read from is up, down or degraded, as closed intervals in
+`<availability-namespace>.availability` in the same warehouse (columns in
+[SCHEMAS.md](SCHEMAS.md#5-sources-source-availability)). It is **on whenever
+Iceberg output is configured** (`--iceberg-catalog-uri`; for
+`collect-foundation`, an `--apply` run that downloads) and off otherwise.
+`collect-file` reads local files and records nothing. A catalog that can't be
+reached, or a failed write, only logs a warning; ingest carries on.
+
+| Flag | Env | Default | Notes |
+|---|---|---|---|
+| `--availability <bool>` | `COLLECT_AVAILABILITY` | `true` | `--availability false` turns recording off |
+| `--availability-namespace <ns>` | `AVAILABILITY_NAMESPACE` | `sources` | Independent of `--iceberg-namespace` |
+| `--availability-flush-seconds <n>` | `AVAILABILITY_FLUSH_SECONDS` | `300` | Streaming only. Buffered rows are committed at most this often (and at shutdown), so a flapping source costs at most one commit per interval |
+| `--availability-checkpoint-seconds <n>` | `AVAILABILITY_CHECKPOINT_SECONDS` | `3600` | Streaming only. An open interval is closed and reopened this often, so the table is at most about this far behind and a hard kill loses at most this much |
+| `--availability-quiet-seconds <n>` | `AVAILABILITY_QUIET_SECONDS` | `300` | Streaming only. A connected source with no rows for this long is `degraded`, from its last row; `0` never degrades. Separate from `--data-drought-seconds`, which exits |
+
+How the state is decided:
+
+- **Streaming:** a successful connect is `up`; a failed connect, a closed or
+  broken stream, and the reconnect attempts after it are `down`; a reconnect
+  is `up` again; silence is `degraded` and the next row is `up`. Giving up
+  (`--max-reconnect-seconds`), a data drought and a normal shutdown close the
+  open interval before exiting. Kafka's client reconnects to brokers on its
+  own, so a broker outage usually shows as `degraded` rather than `down`.
+- **Batch (`collect-foundation`):** one row per `--apply` run that downloads
+  (not `--source-dir` loads). `down` when a download fails to connect or gets
+  an HTTP error, `degraded` when the files came but couldn't be parsed or
+  loaded, `up` otherwise.
+
+The table is unpartitioned and gets about 24 commits a day per running
+collector (one per checkpoint), up to 288 a day while a source flaps. That stays far
+below RustFS's 10,000-manifest limit for months; fold the small manifests
+now and then with `ais-compact consolidate --iceberg-namespace sources --table
+availability`.
+
 ## Logging
 
 Every binary emits operationally-significant events (startup/shutdown,
@@ -206,6 +244,7 @@ with the code. Rows received before the upstream went away are not lost.
 | `-q, --quiet` | `QUIET` | Suppress routine progress lines |
 | `--consolidate-ais` | `CONSOLIDATE_AIS` | Reassemble fragmented NMEA sentences before writing |
 | `--process-timestamps` | `PROCESS_TIMESTAMPS` | Correct row timestamps from `$PGHP`/tag-block `c:` |
+| `--mssis` | `MSSIS` | Use the MSSIS epoch after the checksum (`…*CS[,station],epoch`) as the row timestamp; keeps the station |
 
 Plus [Common](#common-to-the-five-collectors-commoncliargs), [S3](#s3--collectors-s3cliargs-one-sink), [Iceberg](#iceberg-icebergcliargs-all-binaries), [inline parsing](#inline-parsing-collectors-only-parsercliargs), [reconnect](#reconnect-the-four-streaming-collectors), and the [shared flags](#shared-across-all-binaries).
 
@@ -233,6 +272,7 @@ Plus [Common](#common-to-the-five-collectors-commoncliargs), [S3](#s3--collector
 | `-q, --quiet` | `QUIET` | |
 | `--consolidate-ais` | `CONSOLIDATE_AIS` | |
 | `--process-timestamps` | `PROCESS_TIMESTAMPS` | |
+| `--mssis` | `MSSIS` | |
 
 Plus [Common](#common-to-the-five-collectors-commoncliargs), [S3](#s3--collectors-s3cliargs-one-sink), [Iceberg](#iceberg-icebergcliargs-all-binaries), [inline parsing](#inline-parsing-collectors-only-parsercliargs), and the [shared flags](#shared-across-all-binaries). No reconnect flags — no live connection to lose.
 
@@ -267,7 +307,7 @@ Plus [Common](#common-to-the-five-collectors-commoncliargs), [S3](#s3--collector
 
 Field-for-field identical between the two except where noted; `ais-parse`
 also applies AIS-specific pre-processing (`--consolidate-ais`,
-`--process-timestamps`) since its NMEA input can carry multi-part
+`--process-timestamps`, `--mssis`) since its NMEA input can carry multi-part
 sentences and capture timestamps that `aisstream-parse`'s JSON payloads
 don't.
 
@@ -292,6 +332,7 @@ don't.
 | `--scratch-dir <dir>` | `SCRATCH_DIR` | system temp | Set to `/dev/shm` or a ramdisk for faster I/O |
 | `--consolidate-ais[=false]` *(ais-parse only)* | `CONSOLIDATE_AIS` | on | Reassemble multi-part sentences before decoding; `=false` to disable |
 | `--process-timestamps` *(ais-parse only)* | `PROCESS_TIMESTAMPS` | off | |
+| `--mssis` *(ais-parse only)* | `MSSIS` | off | Trailing MSSIS epoch becomes the row timestamp |
 | `--dry-run` | `DRY_RUN` | off | List matching partitions, touch nothing |
 | `-q, --quiet` | `QUIET` | | |
 | `--fail-fast` | `FAIL_FAST` | off | Abort on the first partition failure instead of skipping it |
@@ -420,4 +461,72 @@ Notes:
 - `evidence` has the alias `interdictions`.
 - Every evidence load rewrites `evidence_sources` and replaces its whole
   source partition. Give it the full history each time.
+- `--apply` runs that download (`placenames load`, `evidence uscg`, `tsb`,
+  `tokyo-mou` without `--source-dir`) record one row in
+  `sources.availability`; see [Source availability](#source-availability-availabilitycliargs).
+  The `--availability*` flags go before the subcommand, like the Iceberg flags.
 - Exit codes: `0` success, `1` error.
+
+## `vessel-identity`
+
+The vessel identity registry. It takes the
+[Iceberg flags](#iceberg-icebergcliargs-all-binaries), given before the
+subcommand, plus S3 credentials in the environment. It sets two defaults of
+its own: `--iceberg-warehouse` defaults to **`maritimedata`** and
+`--iceberg-namespace` to **`identity`**. `--config-dir <dir>`
+(`VESSEL_IDENTITY_CONFIG_DIR`) replaces the built-in source configurations
+with a directory of `*.toml` files.
+
+Every command that writes is a **dry run unless `--apply` is given**. A dry
+run of `ingest` fetches and parses. With a catalog configured, it also
+reports the real delta against bronze. Behavior and tables are in
+[VESSEL_IDENTITY.md](VESSEL_IDENTITY.md).
+
+| Subcommand | Flags | What it does |
+|---|---|---|
+| `init` | `--apply` | Creates the namespace and the 15 tables, and writes `source_catalog` |
+| `sources list` | | Each source with its licence, permitted uses and whether it may be collected |
+| `ingest` | `--source <id,...>` \| `--all` \| `--due`, `--source-dir <dir>`, `--scratch <dir>` (`$TMPDIR/vessel-identity`, kept between runs), `--force`, `--accept-removals`, `--user-agent` (`VESSEL_IDENTITY_USER_AGENT`), `--raw-archive <uri>` (`VESSEL_IDENTITY_RAW_ARCHIVE`), `--reconcile`, `--apply` | Collects sources into `source_records` and `identity_assertions` and logs each run. `--due` picks collectable sources whose refresh policy is due. `--reconcile` reconciles afterwards |
+| `reconcile` | `--apply` | Rebuilds `vessels`, `vessel_attributes`, `vessel_identifiers`, `vessel_history`, `vessel_subjects`, `vessel_id_redirects`, `identity_conflicts` and `identity_review_queue`, keeping vessel ids stable |
+| `decide keep-apart <a> <b>` / `decide link <a> <b>` / `decide revoke <decision_id>` | `--reason` (required), `--by` (`USER`), `--apply` | Appends a manual decision to `identity_decisions`. Subjects are `<source_id>/<subject_id>` |
+| `status` | | Each source's authorization, last run and last good fetch, and whether it is due |
+| `lookup` | one of `--imo`, `--mmsi`, `--callsign`, `--registration`, `--name`, `--id` | Prints matching vessels and their identifiers. `--id` follows redirects from retired ids |
+| `completions <shell>` | | Prints shell completions |
+
+Notes:
+
+- Exit codes: `0` success; `1` error, any failed or quarantined source, or
+  `lookup` finding nothing.
+- `run_identity_rustfs.sh <args>` runs it against the local RustFS with the
+  credentials in `.rustfs.env`.
+
+## `vessel-imagery`
+
+Ship photos for the identity registry's vessels, and the visual attributes a System 1 model reads from them. It takes the
+[Iceberg flags](#iceberg-icebergcliargs-all-binaries), given before the
+subcommand, plus S3 credentials in the environment. It sets two defaults of its own: `--iceberg-warehouse` defaults to **`maritimedata`** and `--iceberg-namespace` to **`imagery`**.
+Its global flags are:
+
+- `--identity-namespace` (`VESSEL_IMAGERY_IDENTITY_NAMESPACE`, default `identity`): where to read the registry from.
+- `--config-dir <dir>` (`VESSEL_IMAGERY_CONFIG_DIR`): read question sets from `<dir>/questions/<version>.toml`.
+- `--archive-root <uri>` (`VESSEL_IMAGERY_ARCHIVE_ROOT`): where to store image bytes.
+
+Every command that writes is a **dry run unless `--apply` is given**. Behavior and tables are in [VESSEL_IMAGERY.md](VESSEL_IMAGERY.md).
+
+| Subcommand | Flags | What it does |
+|---|---|---|
+| `init` | `--apply` | Creates the namespace and the three tables |
+| `fetch commons` | `--contact` (`VESSEL_IMAGERY_CONTACT`, required), `--imo` \| `--vessel-id`, `--limit`, `--per-vessel` (10), `--depth` (2), `--refresh`, `--delay-ms` (`VESSEL_IMAGERY_COMMONS_DELAY_MS`, 1000), `--thumb-width` (1280), `--max-requests` (`VESSEL_IMAGERY_COMMONS_MAX_REQUESTS`, 2000), `--apply` | Finds photos in Wikimedia Commons' `Category:IMO <n>` categories, stores them and records them in `vessel_images` |
+| `import` | `--manifest <csv>`, `--apply` | Records held photos (restricted by default) from a CSV manifest |
+| `describe` | `--question-set` (v1), `--model` (`VESSEL_IMAGERY_MODEL`, `laya-vision`), `--systemone-url` (`VESSEL_IMAGERY_SYSTEMONE_URL`, `http://localhost:8765`), `--systemone-token` (`VESSEL_IMAGERY_SYSTEMONE_TOKEN`), `--limit`, `--skip-restricted`, `--apply` | Asks the System 1 server each question about each photo not yet described; appends to `image_observations` |
+| `profile` | `--question-set`, `--model`, `--include-unknown-licence`, `--apply` | Rebuilds `vessel_visual_profile` from the observations |
+| `eval` | `--labels <csv>`, `--question-set`, `--model`, `--threshold` (0.8) | Accuracy of each question against hand labels |
+| `status` | | Photos by source and licence class, photos described per model, profile rows |
+| `lookup` | `--imo` \| `--vessel-id` | One vessel's photos (licence, credit, page) and visual profile |
+| `completions <shell>` | | Prints shell completions |
+
+Notes:
+
+- Exit codes: `0` success; `1` error.
+- `run_imagery_rustfs.sh <args>` runs it against the local RustFS with the
+  credentials in `.rustfs.env`.
