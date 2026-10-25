@@ -294,7 +294,10 @@ impl AisStreamSource {
                 if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
                     return Ok(ReaderTransition::Stop);
                 }
-                collect_core::backoff::give_up(UPSTREAM, self.max_reconnect_seconds);
+                return Ok(collect_core::backoff::give_up(
+                    UPSTREAM,
+                    self.max_reconnect_seconds,
+                ));
             }
         }
     }
@@ -412,7 +415,7 @@ async fn main() -> Result<()> {
         .await?
     };
 
-    run_ingest(
+    let result = run_ingest(
         &mut source,
         IngestOptions {
             common: common_options,
@@ -430,5 +433,8 @@ async fn main() -> Result<()> {
             silver,
         },
     )
-    .await
+    .await;
+    // Exits UPSTREAM_UNAVAILABLE / DATA_DROUGHT only after run_ingest has
+    // flushed and drained every buffered row.
+    collect_core::exitcode::exit_if_requested(result)
 }

@@ -229,6 +229,11 @@ Shared across all binaries (`collect_core::exitcode`):
 | `4` | `DATA_DROUGHT` — a collector received no rows within its drought window despite a healthy connection |
 | `5` | `PARTIAL_FAILURE_THRESHOLD` — a batch parser skipped more partitions than `--max-partition-failures` allows (or hit one with `--fail-fast`) |
 
+A collector exiting with `3` or `4` shuts down the same way as on SIGINT/SIGTERM
+first: the in-memory batch, any buffered AIS fragments (`--consolidate-ais`),
+and queued writes and uploads are flushed and drained, then the process exits
+with the code. Rows received before the upstream went away are not lost.
+
 ## `collect-socket`
 
 | Flag | Env | Notes |

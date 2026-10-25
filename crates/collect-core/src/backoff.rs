@@ -12,7 +12,7 @@
 //! operator) can take over instead of the process sitting in a silent,
 //! permanent retry loop.
 
-use crate::{exitcode, log};
+use crate::{exitcode, log, ReaderTransition};
 use clap::Args;
 use std::cmp::min;
 use std::sync::atomic::{AtomicBool, Ordering};

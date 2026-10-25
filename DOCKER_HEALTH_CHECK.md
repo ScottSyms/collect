@@ -18,6 +18,10 @@ A collector that gives up exits non-zero with a code that says why:
 | `4` | No rows ingested within the drought window despite a healthy connection (`--data-drought-seconds`) |
 | `1` | Any other unclassified error (bad config, etc.) |
 
+Before exiting with `3` or `4` the collector flushes its buffered rows and
+drains pending uploads, exactly as on a clean shutdown, so a restart picks up
+after the last received row rather than losing the tail.
+
 This is what a restart policy (Nomad `restart {}`, Docker's own
 `restart: unless-stopped`) actually acts on. The other two mechanisms below
 are for observing a still-*running* process.
