@@ -11,3 +11,6 @@ tokio.workspace = true
 
 collect-core = { path = "../collect-core" }
 collect-silver = { path = "../collect-silver" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

@@ -10,13 +10,22 @@ use collect_core::{
 use collect_core::availability::{self, AvailabilityCliArgs};
 use collect_core::iceberg::{init_raw_handle, IcebergCliArgs};
 use collect_core::silver::ParserCliArgs;
+use std::future::Future;
+use std::io;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::AtomicBool;
+use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
+use tokio::io::{AsyncRead, ReadBuf};
 use tokio::net::TcpStream;
+use tokio::time::{Instant, Sleep};
 
 const TCP_RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(1);
 const TCP_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(5);
+/// Well under the 300s data-drought exit, so a half-open or stalled upstream
+/// gets several reconnect attempts before the process gives up entirely.
+const DEFAULT_IDLE_RECONNECT_SECONDS: u64 = 60;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -56,6 +65,11 @@ struct Args {
     #[arg(long, env = "MSSIS", value_parser = clap::builder::FalseyValueParser::new())]
     mssis: bool,
 
+    /// Drop and re-establish the TCP connection after this many seconds with
+    /// no bytes received from upstream (0 = never; rely on the OS to notice)
+    #[arg(long, env = "IDLE_RECONNECT_SECONDS", default_value_t = DEFAULT_IDLE_RECONNECT_SECONDS)]
+    idle_reconnect_seconds: u64,
+
     #[command(flatten)]
     common: CommonCliArgs,
 
@@ -88,20 +102,76 @@ struct Args {
     config: Option<PathBuf>,
 }
 
+/// Wraps a reader so that a read pending for longer than `timeout` with no
+/// bytes arriving fails with `TimedOut`. A silently dead upstream (half-open
+/// socket, stalled feed) otherwise never produces EOF or an error, so the
+/// ingest loop would wait forever and only the data-drought exit would fire.
+struct IdleTimeoutRead<R> {
+    inner: R,
+    timeout: Duration,
+    deadline: Pin<Box<Sleep>>,
+}
+
+impl<R> IdleTimeoutRead<R> {
+    fn new(inner: R, timeout: Duration) -> Self {
+        Self {
+            inner,
+            timeout,
+            deadline: Box::pin(tokio::time::sleep(timeout)),
+        }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for IdleTimeoutRead<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = &mut *self;
+        let before = buf.filled().len();
+        match Pin::new(&mut this.inner).poll_read(cx, buf) {
+            Poll::Ready(result) => {
+                if buf.filled().len() > before {
+                    let next = Instant::now() + this.timeout;
+                    this.deadline.as_mut().reset(next);
+                }
+                Poll::Ready(result)
+            }
+            Poll::Pending => match this.deadline.as_mut().poll(cx) {
+                Poll::Ready(()) => Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("no data received for {}s", this.timeout.as_secs()),
+                ))),
+                Poll::Pending => Poll::Pending,
+            },
+        }
+    }
+}
+
 struct TcpInputSource {
     host: String,
     port: u16,
     source: String,
     max_reconnect_seconds: u64,
+    idle_timeout: Option<Duration>,
 }
 
 impl TcpInputSource {
-    fn new(host: String, port: u16, source: String, max_reconnect_seconds: u64) -> Self {
+    fn new(
+        host: String,
+        port: u16,
+        source: String,
+        max_reconnect_seconds: u64,
+        idle_reconnect_seconds: u64,
+    ) -> Self {
         Self {
             host,
             port,
             source,
             max_reconnect_seconds,
+            idle_timeout: (idle_reconnect_seconds > 0)
+                .then(|| Duration::from_secs(idle_reconnect_seconds)),
         }
     }
 
@@ -110,7 +180,12 @@ impl TcpInputSource {
             .await
             .with_context(|| format!("connect to TCP {}:{}", self.host, self.port))?;
         stream.set_nodelay(true).context("set TCP nodelay")?;
-        Ok(line_reader_from_async_read(stream, max_line_length))
+        Ok(match self.idle_timeout {
+            Some(timeout) => {
+                line_reader_from_async_read(IdleTimeoutRead::new(stream, timeout), max_line_length)
+            }
+            None => line_reader_from_async_read(stream, max_line_length),
+        })
     }
 
     async fn reconnect(
@@ -186,10 +261,16 @@ impl LineSource for TcpInputSource {
 
     async fn on_stream_error(
         &mut self,
-        _error: &collect_core::LinesCodecError,
+        error: &collect_core::LinesCodecError,
         shutdown: &AtomicBool,
         max_line_length: usize,
     ) -> Result<ReaderTransition> {
+        let upstream = format!("TCP {}:{}", self.host, self.port);
+        log::warn(
+            "stream_error",
+            &format!("{upstream} read failed: {error}"),
+            &[("upstream", &upstream)],
+        );
         self.reconnect(shutdown, max_line_length).await
     }
 }
@@ -235,6 +316,7 @@ async fn main() -> Result<()> {
         port,
         source_name,
         args.reconnect.max_reconnect_seconds,
+        args.idle_reconnect_seconds,
     );
 
     let common_options = args.common.to_options();
@@ -291,4 +373,39 @@ async fn main() -> Result<()> {
     // Exits UPSTREAM_UNAVAILABLE / DATA_DROUGHT only after run_ingest has
     // flushed and drained every buffered row.
     collect_core::exitcode::exit_if_requested(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_read_times_out_when_upstream_goes_quiet() {
+        let (mut tx, rx) = tokio::io::duplex(64);
+        let mut reader = IdleTimeoutRead::new(rx, Duration::from_secs(60));
+        let mut buf = [0u8; 16];
+
+        tx.write_all(b"hello\n").await.unwrap();
+        assert_eq!(reader.read(&mut buf).await.unwrap(), 6);
+
+        // Keep the writer open but send nothing: the read must fail rather
+        // than hang, so the source reconnects.
+        let error = reader.read(&mut buf).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        drop(tx);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_deadline_resets_on_each_read() {
+        let (mut tx, rx) = tokio::io::duplex(64);
+        let mut reader = IdleTimeoutRead::new(rx, Duration::from_secs(60));
+        let mut buf = [0u8; 16];
+
+        for _ in 0..3 {
+            tokio::time::advance(Duration::from_secs(45)).await;
+            tx.write_all(b"x").await.unwrap();
+            assert_eq!(reader.read(&mut buf).await.unwrap(), 1);
+        }
+    }
 }
