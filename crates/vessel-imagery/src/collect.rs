@@ -1,19 +1,22 @@
-//! Getting photos in: from Wikimedia Commons by IMO category, or from a
-//! manifest of files already held (licensed or restricted sets).
+//! Getting photos in: from Wikimedia Commons by IMO category, from Commons
+//! files Wikidata links to an IMO number or MMSI, or from a manifest of
+//! files already held (licensed or restricted sets).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use chrono::{DateTime, NaiveDate, Utc};
+use iceberg::table::Table;
 use iceberg::Catalog;
 use serde::Deserialize;
 
-use crate::commons::Commons;
+use crate::commons::{Commons, CommonsFile};
 use crate::identity::{Target, Targets};
 use crate::images;
 use crate::tables::{ImageRow, Store, IMAGES, IMAGE_COLUMNS};
+use crate::wikidata::{self, title_from_page_url};
 
 /// Rows are appended every this many images, so an interrupted run keeps
 /// most of its work.
@@ -42,9 +45,7 @@ pub async fn fetch_commons<C: Catalog>(
         None => Vec::new(),
     };
     let have_vessel: HashSet<&str> = existing.iter().filter(|r| r.source == "wikimedia_commons").map(|r| r.vessel_id.as_str()).collect();
-    let mut have_url: HashSet<(String, String)> =
-        existing.iter().filter_map(|r| r.original_url.clone().map(|u| (r.vessel_id.clone(), u))).collect();
-    let mut have_image: HashSet<(String, String)> = existing.iter().map(|r| (r.vessel_id.clone(), r.image_id.clone())).collect();
+    let mut held = Held::from_rows(&existing);
 
     let todo: Vec<&&Target> = targets
         .iter()
@@ -62,6 +63,7 @@ pub async fn fetch_commons<C: Catalog>(
         (Some(t), Some(s)) => Some(images::root_for(t, &s.config.namespace, opts.archive_root.as_deref())),
         _ => None,
     };
+    let sink = table.as_ref().zip(root.as_deref());
     let (mut pending, mut total, mut vessels_with) = (Vec::new(), 0usize, 0usize);
     for t in todo {
         let mut files = Vec::new();
@@ -83,53 +85,8 @@ pub async fn fetch_commons<C: Catalog>(
         }
         vessels_with += 1;
         println!("  {} (IMO {}): {} photo(s)", t.name.as_deref().unwrap_or("?"), t.imo().unwrap_or("?"), files.len());
-        for f in files {
-            if !have_url.insert((t.vessel_id.clone(), f.original_url.clone())) {
-                continue;
-            }
-            println!("    {} [{}] {}", f.title, f.licence_short.as_deref().unwrap_or("no licence"), f.author.as_deref().unwrap_or(""));
-            let (Some(table), Some(root)) = (&table, &root) else { continue };
-            let bytes = match commons.download(&f.thumb_url).await {
-                Ok(b) => b,
-                Err(e) => {
-                    eprintln!("    {e:#}");
-                    continue;
-                }
-            };
-            let sniffed = match images::sniff(&bytes) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("    {}: {e:#}", f.title);
-                    continue;
-                }
-            };
-            let (sha, uri) = images::store(table, root, false, bytes, sniffed.ext).await?;
-            if !have_image.insert((t.vessel_id.clone(), sha.clone())) {
-                continue;
-            }
-            pending.push(ImageRow {
-                image_id: sha,
-                vessel_id: t.vessel_id.clone(),
-                imo_number: t.imo().map(String::from),
-                mmsi: t.mmsis.first().cloned(),
-                match_basis: "commons_imo_category".into(),
-                source: "wikimedia_commons".into(),
-                source_page_url: Some(f.page_url.clone()),
-                original_url: Some(f.original_url.clone()),
-                object_uri: uri,
-                mime: sniffed.mime.into(),
-                width: Some(sniffed.width as i32),
-                height: Some(sniffed.height as i32),
-                licence_short: f.licence_short.clone(),
-                licence_url: f.licence_url.clone(),
-                licence_class: f.licence_class().into(),
-                restricted: false,
-                attribution_required: f.attribution_required,
-                author: f.author.clone(),
-                credit: f.credit.clone(),
-                captured_at: f.captured_at,
-                retrieved_at: Utc::now(),
-            });
+        for f in &files {
+            take_commons_file(commons, t, f, "commons_imo_category", &mut held, sink, &mut pending).await?;
             if pending.len() >= FLUSH_EVERY {
                 total += flush(store, &mut pending).await?;
             }
@@ -141,6 +98,196 @@ pub async fn fetch_commons<C: Catalog>(
     }
     total += flush(store, &mut pending).await?;
     println!("{vessels_with} vessel(s) had photos; {total} new image(s) recorded; {} request(s)", commons.requests);
+    Ok(())
+}
+
+/// Photos already recorded, so none is recorded twice for a vessel.
+struct Held {
+    url: HashSet<(String, String)>,
+    image: HashSet<(String, String)>,
+    /// Commons titles, from the page URLs.
+    title: HashSet<(String, String)>,
+}
+
+impl Held {
+    fn from_rows(rows: &[ImageRow]) -> Self {
+        Held {
+            url: rows.iter().filter_map(|r| r.original_url.clone().map(|u| (r.vessel_id.clone(), u))).collect(),
+            image: rows.iter().map(|r| (r.vessel_id.clone(), r.image_id.clone())).collect(),
+            title: rows
+                .iter()
+                .filter(|r| r.source == "wikimedia_commons")
+                .filter_map(|r| r.source_page_url.as_deref().and_then(title_from_page_url).map(|t| (r.vessel_id.clone(), t)))
+                .collect(),
+        }
+    }
+}
+
+/// Downloads one Commons file for `t` and queues its row (on a dry run, only
+/// reports it). Files already held for the vessel are passed over.
+async fn take_commons_file(
+    commons: &mut Commons,
+    t: &Target,
+    f: &CommonsFile,
+    basis: &str,
+    held: &mut Held,
+    sink: Option<(&Table, &str)>,
+    pending: &mut Vec<ImageRow>,
+) -> Result<()> {
+    if !held.url.insert((t.vessel_id.clone(), f.original_url.clone())) {
+        return Ok(());
+    }
+    println!("    {} [{}] {}", f.title, f.licence_short.as_deref().unwrap_or("no licence"), f.author.as_deref().unwrap_or(""));
+    let Some((table, root)) = sink else { return Ok(()) };
+    let bytes = match commons.download(&f.thumb_url).await {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("    {e:#}");
+            return Ok(());
+        }
+    };
+    let sniffed = match images::sniff(&bytes) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("    {}: {e:#}", f.title);
+            return Ok(());
+        }
+    };
+    let (sha, uri) = images::store(table, root, false, bytes, sniffed.ext).await?;
+    if !held.image.insert((t.vessel_id.clone(), sha.clone())) {
+        return Ok(());
+    }
+    held.title.insert((t.vessel_id.clone(), f.title.clone()));
+    pending.push(ImageRow {
+        image_id: sha,
+        vessel_id: t.vessel_id.clone(),
+        imo_number: t.imo().map(String::from),
+        mmsi: t.mmsis.first().cloned(),
+        match_basis: basis.into(),
+        source: "wikimedia_commons".into(),
+        source_page_url: Some(f.page_url.clone()),
+        original_url: Some(f.original_url.clone()),
+        object_uri: uri,
+        mime: sniffed.mime.into(),
+        width: Some(sniffed.width as i32),
+        height: Some(sniffed.height as i32),
+        licence_short: f.licence_short.clone(),
+        licence_url: f.licence_url.clone(),
+        licence_class: f.licence_class().into(),
+        restricted: false,
+        attribution_required: f.attribution_required,
+        author: f.author.clone(),
+        credit: f.credit.clone(),
+        captured_at: f.captured_at,
+        retrieved_at: Utc::now(),
+    });
+    Ok(())
+}
+
+/// The Commons files Wikidata ties to one vessel, and how it was matched.
+struct Found<'a> {
+    target: &'a Target,
+    basis: &'static str,
+    titles: Vec<String>,
+}
+
+/// Fetches the Commons files Wikidata links to `targets` (already narrowed
+/// by the caller) through an IMO number or an MMSI only one vessel carried.
+pub async fn fetch_wikidata<C: Catalog>(
+    store: Option<&Store<C>>,
+    commons: &mut Commons,
+    registry: &Targets,
+    targets: &[&Target],
+    sparql: Option<&str>,
+    opts: &FetchOptions,
+) -> Result<()> {
+    let existing = match store {
+        Some(s) => images::rows(&s.read(IMAGES).await?)?,
+        None => Vec::new(),
+    };
+    let mut held = Held::from_rows(&existing);
+    let wanted: HashSet<&str> = targets.iter().map(|t| t.vessel_id.as_str()).collect();
+
+    let items = wikidata::items(commons, sparql).await?;
+    let (mut by_vessel, mut unmatched): (HashMap<&str, Found>, usize) = (HashMap::new(), 0);
+    let mut order = Vec::new();
+    for item in &items {
+        let Some((t, basis)) = item.resolve(registry) else {
+            unmatched += 1;
+            continue;
+        };
+        if !wanted.contains(t.vessel_id.as_str()) {
+            continue;
+        }
+        let e = by_vessel.entry(t.vessel_id.as_str()).or_insert_with(|| {
+            order.push(t.vessel_id.as_str());
+            Found { target: t, basis, titles: Vec::new() }
+        });
+        if basis == "wikidata_imo" {
+            e.basis = basis;
+        }
+        for f in &item.files {
+            if !e.titles.contains(f) && !held.title.contains(&(t.vessel_id.clone(), f.clone())) {
+                e.titles.push(f.clone());
+            }
+        }
+    }
+    println!(
+        "{} Wikidata item(s) with an image; {} matched {} selected vessel(s), {unmatched} matched no vessel (or a shared MMSI)",
+        items.len(),
+        items.len() - unmatched,
+        by_vessel.len()
+    );
+
+    let table = match (store, opts.apply) {
+        (Some(s), true) => Some(s.table(IMAGES).await?),
+        _ => None,
+    };
+    let root = match (&table, store) {
+        (Some(t), Some(s)) => Some(images::root_for(t, &s.config.namespace, opts.archive_root.as_deref())),
+        _ => None,
+    };
+    let sink = table.as_ref().zip(root.as_deref());
+    let (mut pending, mut total, mut vessels_with) = (Vec::new(), 0usize, 0usize);
+    let todo = order.into_iter().filter(|v| !by_vessel[v].titles.is_empty()).take(opts.limit.unwrap_or(usize::MAX)).collect::<Vec<_>>();
+    for v in todo {
+        let Found { target: t, basis, titles } = &by_vessel[v];
+        let titles: Vec<String> = titles.iter().take(opts.per_vessel).cloned().collect();
+        let files = match commons.files_by_title(&titles, "Wikidata").await {
+            Ok(f) => f,
+            Err(e) if e.to_string().contains("request cap") => {
+                eprintln!("{e}");
+                break;
+            }
+            Err(e) => {
+                eprintln!("  {v}: {e:#}");
+                continue;
+            }
+        };
+        if files.is_empty() {
+            continue;
+        }
+        vessels_with += 1;
+        println!(
+            "  {} (IMO {}, MMSI {}) by {basis}: {} photo(s)",
+            t.name.as_deref().unwrap_or("?"),
+            t.imo().unwrap_or("?"),
+            t.mmsis.first().map_or("?", String::as_str),
+            files.len()
+        );
+        for f in &files {
+            take_commons_file(commons, t, f, basis, &mut held, sink, &mut pending).await?;
+            if pending.len() >= FLUSH_EVERY {
+                total += flush(store, &mut pending).await?;
+            }
+        }
+        if commons.requests >= commons.max_requests {
+            println!("request cap reached; stopping");
+            break;
+        }
+    }
+    total += flush(store, &mut pending).await?;
+    println!("{vessels_with} vessel(s) had new photos; {total} new image(s) recorded; {} request(s)", commons.requests);
     Ok(())
 }
 

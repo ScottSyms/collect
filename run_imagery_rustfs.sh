@@ -5,11 +5,13 @@
 # Usage: ./run_imagery_rustfs.sh <vessel-imagery arguments...>
 #
 #   ./run_imagery_rustfs.sh init --apply
+#   ./run_imagery_rustfs.sh fetch wikidata --contact you@example.org --limit 200 --apply
 #   ./run_imagery_rustfs.sh fetch commons --contact you@example.org --limit 50 --apply
 #   ./run_imagery_rustfs.sh import --manifest held/manifest.csv --apply
 #   ./run_imagery_rustfs.sh describe --limit 20 --apply
 #   ./run_imagery_rustfs.sh profile --apply
 #   ./run_imagery_rustfs.sh lookup --imo 9321483
+#   ./run_imagery_rustfs.sh lookup --mmsi 316001325
 #
 # Credentials and endpoints work as in run_foundation_rustfs.sh: read from
 # .rustfs.env next to this script, overridable in the environment
@@ -21,7 +23,7 @@ set -euo pipefail
 
 case "${1:-}" in
     ""|-h|--help)
-        sed -n '3,18p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '3,20p' "$0" | sed 's/^# \{0,1\}//'
         exit 0
         ;;
 esac

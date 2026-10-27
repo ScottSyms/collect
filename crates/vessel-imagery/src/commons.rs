@@ -195,7 +195,9 @@ impl Commons {
         Ok(Commons { http, api: api.unwrap_or(API).to_string(), delay, thumb_width, requests: 0, max_requests })
     }
 
-    async fn get(&mut self, url: &str, query: &[(&str, &str)]) -> Result<reqwest::Response> {
+    /// A GET with Wikimedia's etiquette: the request cap, the pause between
+    /// requests, and backing off on 429, 5xx or replication lag.
+    pub(crate) async fn get(&mut self, url: &str, query: &[(&str, &str)]) -> Result<reqwest::Response> {
         for attempt in 1..=5u32 {
             if self.requests >= self.max_requests {
                 bail!("request cap reached ({}); run again to continue", self.max_requests);
@@ -285,6 +287,26 @@ impl Commons {
                 return Ok(out);
             }
         }
+    }
+
+    /// Raster files by title (`File:...`), 50 to a request. Titles Commons
+    /// doesn't have are left out.
+    pub async fn files_by_title(&mut self, titles: &[String], label: &str) -> Result<Vec<CommonsFile>> {
+        let width = self.thumb_width.to_string();
+        let mut out = Vec::new();
+        for chunk in titles.chunks(50) {
+            let joined = chunk.join("|");
+            let p = vec![
+                ("titles", joined.as_str()),
+                ("prop", "imageinfo"),
+                ("iiprop", "url|mime|sha1|extmetadata"),
+                ("iiextmetadatafilter", EXTMETADATA),
+                ("iiurlwidth", &width),
+            ];
+            let v = self.api(&p).await?;
+            out.extend(parse_files(&v, label).into_iter().filter(|f| RASTER.contains(&f.mime.as_str())));
+        }
+        Ok(out)
     }
 
     /// Photos filed under `Category:IMO <imo>`, walking at most `depth`

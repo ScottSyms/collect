@@ -245,6 +245,7 @@ with the code. Rows received before the upstream went away are not lost.
 | `--consolidate-ais` | `CONSOLIDATE_AIS` | Reassemble fragmented NMEA sentences before writing |
 | `--process-timestamps` | `PROCESS_TIMESTAMPS` | Correct row timestamps from `$PGHP`/tag-block `c:` |
 | `--mssis` | `MSSIS` | Use the MSSIS epoch after the checksum (`…*CS[,station],epoch`) as the row timestamp; keeps the station |
+| `--idle-reconnect-seconds <n>` | `IDLE_RECONNECT_SECONDS` | Default `60`. Drop and reconnect when no bytes arrive for this long (catches half-open/stalled sockets before the `--data-drought-seconds` exit); `0` disables |
 
 Plus [Common](#common-to-the-five-collectors-commoncliargs), [S3](#s3--collectors-s3cliargs-one-sink), [Iceberg](#iceberg-icebergcliargs-all-binaries), [inline parsing](#inline-parsing-collectors-only-parsercliargs), [reconnect](#reconnect-the-four-streaming-collectors), and the [shared flags](#shared-across-all-binaries).
 
@@ -516,13 +517,14 @@ Every command that writes is a **dry run unless `--apply` is given**. Behavior a
 | Subcommand | Flags | What it does |
 |---|---|---|
 | `init` | `--apply` | Creates the namespace and the three tables |
-| `fetch commons` | `--contact` (`VESSEL_IMAGERY_CONTACT`, required), `--imo` \| `--vessel-id`, `--limit`, `--per-vessel` (10), `--depth` (2), `--refresh`, `--delay-ms` (`VESSEL_IMAGERY_COMMONS_DELAY_MS`, 1000), `--thumb-width` (1280), `--max-requests` (`VESSEL_IMAGERY_COMMONS_MAX_REQUESTS`, 2000), `--apply` | Finds photos in Wikimedia Commons' `Category:IMO <n>` categories, stores them and records them in `vessel_images` |
+| `fetch commons` | `--contact` (`VESSEL_IMAGERY_CONTACT`, required), `--imo` \| `--mmsi` \| `--vessel-id`, `--limit`, `--per-vessel` (10), `--depth` (2), `--refresh`, `--delay-ms` (`VESSEL_IMAGERY_COMMONS_DELAY_MS`, 1000), `--thumb-width` (1280), `--max-requests` (`VESSEL_IMAGERY_COMMONS_MAX_REQUESTS`, 2000), `--apply` | Finds photos in Wikimedia Commons' `Category:IMO <n>` categories, stores them and records them in `vessel_images` |
+| `fetch wikidata` | `--contact` (required), `--imo` \| `--mmsi` \| `--vessel-id`, `--limit`, `--per-vessel` (10), `--delay-ms`, `--thumb-width`, `--max-requests`, `--apply` | Finds the Commons photos that Wikidata ship items link to an IMO number or MMSI, and records them in `vessel_images` |
 | `import` | `--manifest <csv>`, `--apply` | Records held photos (restricted by default) from a CSV manifest |
 | `describe` | `--question-set` (v1), `--model` (`VESSEL_IMAGERY_MODEL`, `laya-vision`), `--systemone-url` (`VESSEL_IMAGERY_SYSTEMONE_URL`, `http://localhost:8765`), `--systemone-token` (`VESSEL_IMAGERY_SYSTEMONE_TOKEN`), `--limit`, `--skip-restricted`, `--apply` | Asks the System 1 server each question about each photo not yet described; appends to `image_observations` |
 | `profile` | `--question-set`, `--model`, `--include-unknown-licence`, `--apply` | Rebuilds `vessel_visual_profile` from the observations |
 | `eval` | `--labels <csv>`, `--question-set`, `--model`, `--threshold` (0.8) | Accuracy of each question against hand labels |
 | `status` | | Photos by source and licence class, photos described per model, profile rows |
-| `lookup` | `--imo` \| `--vessel-id` | One vessel's photos (licence, credit, page) and visual profile |
+| `lookup` | `--imo` \| `--mmsi` \| `--vessel-id` | One vessel's photos (licence, credit, page) and visual profile |
 | `completions <shell>` | | Prints shell completions |
 
 Notes:

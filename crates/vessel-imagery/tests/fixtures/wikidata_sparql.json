@@ -1,0 +1,32 @@
+{
+  "head": {"vars": ["item", "imo", "mmsi", "image"]},
+  "results": {
+    "bindings": [
+      {
+        "item": {"type": "uri", "value": "http://www.wikidata.org/entity/Q100144448"},
+        "image": {"type": "uri", "value": "http://commons.wikimedia.org/wiki/Special:FilePath/ELBE%206523.jpg"},
+        "imo": {"type": "literal", "value": "9074729"}
+      },
+      {
+        "item": {"type": "uri", "value": "http://www.wikidata.org/entity/Q100144448"},
+        "image": {"type": "uri", "value": "http://commons.wikimedia.org/wiki/Special:FilePath/ELBE%206523.jpg"},
+        "mmsi": {"type": "literal", "value": "316001325"}
+      },
+      {
+        "item": {"type": "uri", "value": "http://www.wikidata.org/entity/Q100198141"},
+        "image": {"type": "uri", "value": "http://commons.wikimedia.org/wiki/Special:FilePath/Eis%20Ed%203%2C%2005027310%2001.jpg"},
+        "mmsi": {"type": "literal", "value": "211753340"}
+      },
+      {
+        "item": {"type": "uri", "value": "http://www.wikidata.org/entity/Q100198141"},
+        "image": {"type": "uri", "value": "http://commons.wikimedia.org/wiki/Special:FilePath/M%C3%BCller%20%282019%29.jpg"},
+        "mmsi": {"type": "literal", "value": "211753340"}
+      },
+      {
+        "item": {"type": "uri", "value": "http://www.wikidata.org/entity/Q100254293"},
+        "image": {"type": "uri", "value": "http://commons.wikimedia.org/wiki/Special:FilePath/James%20Laughlin%20LCCN2016795860.jpg"},
+        "imo": {"type": "literal", "value": "5168986"}
+      }
+    ]
+  }
+}

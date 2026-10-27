@@ -85,6 +85,9 @@ enum Command {
 enum FetchSource {
     /// Wikimedia Commons, through its `Category:IMO <number>` categories.
     Commons(FetchArgs),
+    /// Commons files that Wikidata ship items link to an IMO number (P458)
+    /// or MMSI (P587) through their image (P18).
+    Wikidata(WikidataArgs),
 }
 
 #[derive(Args, Debug)]
@@ -102,6 +105,43 @@ struct Select {
     /// Only this registry vessel id.
     #[arg(long, conflicts_with = "imo")]
     vessel_id: Option<String>,
+    /// Only the vessel with this MMSI (refused when more than one vessel
+    /// has carried it).
+    #[arg(long, conflicts_with_all = ["imo", "vessel_id"])]
+    mmsi: Option<String>,
+}
+
+impl Select {
+    fn any(&self) -> bool {
+        self.imo.is_some() || self.vessel_id.is_some() || self.mmsi.is_some()
+    }
+}
+
+/// Talking to Wikimedia's services politely.
+#[derive(Args, Debug)]
+struct Wikimedia {
+    /// Contact details for the User-Agent Wikimedia requires (an email
+    /// address or URL).
+    #[arg(long, env = "VESSEL_IMAGERY_CONTACT")]
+    contact: String,
+    /// Pause between requests.
+    #[arg(long, env = "VESSEL_IMAGERY_COMMONS_DELAY_MS", default_value_t = 1000)]
+    delay_ms: u64,
+    /// Thumbnail width to download (the model takes at most 1568 px).
+    #[arg(long, default_value_t = 1280)]
+    thumb_width: u32,
+    /// Stop after this many requests to Wikimedia.
+    #[arg(long, env = "VESSEL_IMAGERY_COMMONS_MAX_REQUESTS", default_value_t = 2000)]
+    max_requests: usize,
+    #[arg(long, hide = true)]
+    commons_api: Option<String>,
+}
+
+impl Wikimedia {
+    fn client(&self) -> Result<Commons> {
+        let ua = format!("vessel-imagery/{} ({}) reqwest", env!("CARGO_PKG_VERSION"), self.contact);
+        Commons::new(&ua, self.commons_api.as_deref(), Duration::from_millis(self.delay_ms), self.thumb_width, self.max_requests)
+    }
 }
 
 #[derive(Args, Debug)]
@@ -120,21 +160,26 @@ struct FetchArgs {
     /// Look again at vessels that already have Commons photos.
     #[arg(long)]
     refresh: bool,
-    /// Contact details for the User-Agent Wikimedia requires (an email
-    /// address or URL).
-    #[arg(long, env = "VESSEL_IMAGERY_CONTACT")]
-    contact: String,
-    /// Pause between requests.
-    #[arg(long, env = "VESSEL_IMAGERY_COMMONS_DELAY_MS", default_value_t = 1000)]
-    delay_ms: u64,
-    /// Thumbnail width to download (the model takes at most 1568 px).
-    #[arg(long, default_value_t = 1280)]
-    thumb_width: u32,
-    /// Stop after this many requests to Commons.
-    #[arg(long, env = "VESSEL_IMAGERY_COMMONS_MAX_REQUESTS", default_value_t = 2000)]
-    max_requests: usize,
+    #[command(flatten)]
+    wikimedia: Wikimedia,
+    #[command(flatten)]
+    apply: Apply,
+}
+
+#[derive(Args, Debug)]
+struct WikidataArgs {
+    #[command(flatten)]
+    select: Select,
+    /// At most this many vessels.
+    #[arg(long)]
+    limit: Option<usize>,
+    /// At most this many new photos per vessel.
+    #[arg(long, default_value_t = 10)]
+    per_vessel: usize,
+    #[command(flatten)]
+    wikimedia: Wikimedia,
     #[arg(long, hide = true)]
-    commons_api: Option<String>,
+    sparql_endpoint: Option<String>,
     #[command(flatten)]
     apply: Apply,
 }
@@ -249,9 +294,10 @@ fn dry_run_note(cli: &Cli) {
 }
 
 fn select<'a>(targets: &'a Targets, s: &Select) -> Result<Vec<&'a Target>> {
-    Ok(match (&s.imo, &s.vessel_id) {
-        (Some(imo), _) => vec![targets.by_imo(imo).with_context(|| format!("no vessel with IMO {imo} in the registry"))?],
-        (_, Some(id)) => vec![targets.by_id(id).with_context(|| format!("no vessel {id} in the registry"))?],
+    Ok(match (&s.imo, &s.vessel_id, &s.mmsi) {
+        (Some(imo), _, _) => vec![targets.by_imo(imo).with_context(|| format!("no vessel with IMO {imo} in the registry"))?],
+        (_, Some(id), _) => vec![targets.by_id(id).with_context(|| format!("no vessel {id} in the registry"))?],
+        (_, _, Some(m)) => vec![targets.by_mmsi(m).with_context(|| format!("MMSI {m} matches no vessel in the registry, or more than one"))?],
         _ => targets.vessels.iter().collect(),
     })
 }
@@ -280,17 +326,35 @@ async fn run() -> Result<i32> {
             let targets = Targets::load(&s.identity).await?;
             println!("{} vessel(s) in {}", targets.vessels.len(), s.identity.config.namespace);
             let chosen = select(&targets, &a.select)?;
-            let ua = format!("vessel-imagery/{} ({}) reqwest", env!("CARGO_PKG_VERSION"), a.contact);
-            let mut commons = Commons::new(&ua, a.commons_api.as_deref(), Duration::from_millis(a.delay_ms), a.thumb_width, a.max_requests)?;
+            let mut commons = a.wikimedia.client()?;
             let opts = FetchOptions {
                 apply: a.apply.apply,
                 limit: a.limit,
                 per_vessel: a.per_vessel,
                 depth: a.depth,
-                refresh: a.refresh || a.select.imo.is_some() || a.select.vessel_id.is_some(),
+                refresh: a.refresh || a.select.any(),
                 archive_root: cli.archive_root.clone(),
             };
             collect::fetch_commons(Some(&s.imagery), &mut commons, &chosen, &opts).await?;
+            if !a.apply.apply {
+                dry_run_note(&cli);
+            }
+        }
+        Command::Fetch { source: FetchSource::Wikidata(a) } => {
+            let s = connect(&cli).await?;
+            let targets = Targets::load(&s.identity).await?;
+            println!("{} vessel(s) in {}", targets.vessels.len(), s.identity.config.namespace);
+            let chosen = select(&targets, &a.select)?;
+            let mut commons = a.wikimedia.client()?;
+            let opts = FetchOptions {
+                apply: a.apply.apply,
+                limit: a.limit,
+                per_vessel: a.per_vessel,
+                depth: 0,
+                refresh: false,
+                archive_root: cli.archive_root.clone(),
+            };
+            collect::fetch_wikidata(Some(&s.imagery), &mut commons, &targets, &chosen, a.sparql_endpoint.as_deref(), &opts).await?;
             if !a.apply.apply {
                 dry_run_note(&cli);
             }
@@ -370,11 +434,11 @@ async fn run() -> Result<i32> {
             println!("{PROFILE}: {} row(s)", profile.iter().map(|b| b.num_rows()).sum::<usize>());
         }
         Command::Lookup(a) => {
-            anyhow::ensure!(a.select.imo.is_some() || a.select.vessel_id.is_some(), "give --imo or --vessel-id");
+            anyhow::ensure!(a.select.any(), "give --imo, --mmsi or --vessel-id");
             let s = connect(&cli).await?;
             let targets = Targets::load(&s.identity).await?;
             let t = select(&targets, &a.select)?[0];
-            println!("{} {} (IMO {})", t.vessel_id, t.name.as_deref().unwrap_or("?"), t.imos.join(", "));
+            println!("{} {} (IMO {}; MMSI {})", t.vessel_id, t.name.as_deref().unwrap_or("?"), t.imos.join(", "), t.mmsis.join(", "));
             let imgs: Vec<_> = images::rows(&s.imagery.read(IMAGES).await?)?.into_iter().filter(|i| i.vessel_id == t.vessel_id).collect();
             println!("{} photo(s):", imgs.len());
             for i in &imgs {
