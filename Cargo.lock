@@ -4265,7 +4265,7 @@ dependencies = [
 [[package]]
 name = "nmea-parser"
 version = "0.12.0-dev"
-source = "git+https://github.com/ScottSyms/nmea-parser?rev=a4ddb297c1ce654d329f158c2a709d410d016849#a4ddb297c1ce654d329f158c2a709d410d016849"
+source = "git+https://github.com/ScottSyms/nmea-parser?rev=d48c1c96ce3136128c4b52eec9556eece0530659#d48c1c96ce3136128c4b52eec9556eece0530659"
 dependencies = [
  "bitvec",
  "chrono",
