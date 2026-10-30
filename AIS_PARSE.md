@@ -235,7 +235,7 @@ cargo run -p ais-parse -- --input-s3-bucket normalized-ais --output-s3-bucket si
 | `--since <HOURS>` | *(off)* | rolling window (env `SINCE`); with `--incremental`, first-run seed only |
 | `--incremental` | *(off)* | watermark at the output (`_ais-parse/watermark.json`), env `INCREMENTAL=true` |
 | `--batch-size` | `8192` | Parquet read batch rows (env `BATCH_SIZE`) |
-| `--compression-level` | `5` | Zstd level for output (env `COMPRESSION_LEVEL`) |
+| `--compression-level` | `5` | Zstd level for output (env `COMPRESSION_LEVEL`). The `payload` column is always written at level 9 with no dictionary |
 | `--concurrency` | cores, clamped `[1, 8]` | partitions decoded in parallel (env `CONCURRENCY`) |
 | `--download-concurrency` | `4` | concurrent S3 downloads per partition; lower if MinIO is overloaded (env `DOWNLOAD_CONCURRENCY`) |
 | `--output-prefix` | `ais` | output file name prefix (added before tree suffix, env `OUTPUT_PREFIX`) |

@@ -58,6 +58,26 @@ const DEFAULT_MAX_BATCH_BYTES: usize = 64 * 1024 * 1024;
 /// with a concrete `default_value_t`, reference the same constant instead of
 /// a duplicated literal `5`.
 pub const DEFAULT_COMPRESSION_LEVEL: i32 = 5;
+
+/// Zstd level for the decoded tables' `payload` column (the raw NMEA
+/// sentence, about half of each positions/statics file). Measured on a
+/// 2.7M-row MSSIS day: level 9 shrank payload 6.5% over level 5 for ~10%
+/// more parse time; 12 and 15 added little, 19 saved 18% but took 7x as long.
+pub const PAYLOAD_ZSTD_LEVEL: i32 = 9;
+
+/// Writer settings for a decoded table's `payload` column. Every sentence is
+/// distinct, so a dictionary only fills up and falls back to plain; it is
+/// skipped. `DELTA_LENGTH_BYTE_ARRAY` measured no smaller than plain here.
+/// Setting a column that a file lacks is harmless.
+pub fn with_payload_props(
+    builder: parquet::file::properties::WriterPropertiesBuilder,
+) -> parquet::file::properties::WriterPropertiesBuilder {
+    let col = ColumnPath::from("payload");
+    let level = ZstdLevel::try_new(PAYLOAD_ZSTD_LEVEL).expect("PAYLOAD_ZSTD_LEVEL is a valid zstd level");
+    builder
+        .set_column_dictionary_enabled(col.clone(), false)
+        .set_column_compression(col, Compression::ZSTD(level))
+}
 const DEFAULT_S3_REGION: &str = "us-east-1";
 const DEFAULT_HEALTH_STALE_WINDOW_SECONDS: u64 = 60;
 /// On by default (see Phase 3b of the reliability hardening plan): a

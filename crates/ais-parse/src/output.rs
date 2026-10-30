@@ -46,9 +46,11 @@ pub(crate) const SORT_CHUNK_ROWS: usize = MAX_ROW_GROUP_ROWS;
 /// `BYTE_STREAM_SPLIT`. Once rows are grouped by vessel, `ts` jumps backwards
 /// at every vessel boundary, which defeats delta encoding.
 pub(crate) fn base_props(level: ZstdLevel) -> parquet::file::properties::WriterPropertiesBuilder {
-    WriterProperties::builder()
-        .set_max_row_group_size(MAX_ROW_GROUP_ROWS)
-        .set_compression(Compression::ZSTD(level))
+    collect_core::with_payload_props(
+        WriterProperties::builder()
+            .set_max_row_group_size(MAX_ROW_GROUP_ROWS)
+            .set_compression(Compression::ZSTD(level)),
+    )
 }
 
 /// Sort a batch by `(mmsi, ts)`.
