@@ -6,6 +6,7 @@ use collect_core::{
     run_ingest, CommonCliArgs, IngestOptions, LineReader, LineSource, ReaderTransition, S3CliArgs,
     log::LoggingCliArgs,
 };
+use collect_core::availability::{self, AvailabilityCliArgs};
 use collect_core::iceberg::{init_raw_handle, IcebergCliArgs};
 use collect_core::silver::ParserCliArgs;
 use futures_util::StreamExt;
@@ -78,6 +79,9 @@ struct Args {
 
     #[command(flatten)]
     iceberg: IcebergCliArgs,
+
+    #[command(flatten)]
+    availability: AvailabilityCliArgs,
 
     #[command(flatten)]
     parser: ParserCliArgs,
@@ -172,7 +176,10 @@ impl KafkaInputSource {
                 if self.shutdown.load(Ordering::SeqCst) {
                     return Ok(ReaderTransition::Stop);
                 }
-                collect_core::backoff::give_up(UPSTREAM, self.max_reconnect_seconds);
+                return Ok(collect_core::backoff::give_up(
+                    UPSTREAM,
+                    self.max_reconnect_seconds,
+                ));
             }
         }
     }
@@ -359,6 +366,17 @@ async fn main() -> Result<()> {
 
     let source_name = args.source.unwrap_or_else(|| topic.clone());
 
+    if !args.common.health_check {
+        availability::init_stream(
+            &args.iceberg,
+            &args.availability,
+            "collect-kafka",
+            &format!("kafka://{brokers}/{topic}"),
+            &source_name,
+        )
+        .await;
+    }
+
     let shutdown = Arc::new(AtomicBool::new(false));
     let health_file = health_file_path("collect-kafka");
 
@@ -396,7 +414,7 @@ async fn main() -> Result<()> {
         .await?
     };
 
-    run_ingest(
+    let result = run_ingest(
         &mut source,
         IngestOptions {
             common: common_options,
@@ -414,5 +432,8 @@ async fn main() -> Result<()> {
             silver,
         },
     )
-    .await
+    .await;
+    // Exits UPSTREAM_UNAVAILABLE / DATA_DROUGHT only after run_ingest has
+    // flushed and drained every buffered row.
+    collect_core::exitcode::exit_if_requested(result)
 }

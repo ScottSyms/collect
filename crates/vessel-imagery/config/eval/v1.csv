@@ -1,0 +1,5 @@
+# Hand labels for the v1 question set: one row per (image, question).
+# image_id is the sha256 from vessel_images; expected is one of the
+# question's labels (yes/no for yes_no questions). Fill this from real
+# photos, then run `vessel-imagery eval --labels config/eval/v1.csv`.
+image_id,question,expected

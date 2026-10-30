@@ -34,6 +34,8 @@ COPY --from=builder /usr/src/app/target/release/collect-aisstream /usr/local/bin
 COPY --from=builder /usr/src/app/target/release/ais-parse /usr/local/bin/ais-parse
 COPY --from=builder /usr/src/app/target/release/aisstream-parse /usr/local/bin/aisstream-parse
 COPY --from=builder /usr/src/app/target/release/collect-foundation /usr/local/bin/collect-foundation
+COPY --from=builder /usr/src/app/target/release/vessel-identity /usr/local/bin/vessel-identity
+COPY --from=builder /usr/src/app/target/release/vessel-imagery /usr/local/bin/vessel-imagery
 
 # Create data directory
 RUN mkdir -p /data && chown appuser:appuser /data

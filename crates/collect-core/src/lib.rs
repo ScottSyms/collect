@@ -34,6 +34,7 @@ use tokio::task::JoinSet;
 use tokio_util::codec::{FramedRead, LinesCodec};
 
 pub mod ais_consolidate;
+pub mod availability;
 pub mod backoff;
 pub mod dataset;
 pub mod exitcode;
@@ -57,6 +58,26 @@ const DEFAULT_MAX_BATCH_BYTES: usize = 64 * 1024 * 1024;
 /// with a concrete `default_value_t`, reference the same constant instead of
 /// a duplicated literal `5`.
 pub const DEFAULT_COMPRESSION_LEVEL: i32 = 5;
+
+/// Zstd level for the decoded tables' `payload` column (the raw NMEA
+/// sentence, about half of each positions/statics file). Measured on a
+/// 2.7M-row MSSIS day: level 9 shrank payload 6.5% over level 5 for ~10%
+/// more parse time; 12 and 15 added little, 19 saved 18% but took 7x as long.
+pub const PAYLOAD_ZSTD_LEVEL: i32 = 9;
+
+/// Writer settings for a decoded table's `payload` column. Every sentence is
+/// distinct, so a dictionary only fills up and falls back to plain; it is
+/// skipped. `DELTA_LENGTH_BYTE_ARRAY` measured no smaller than plain here.
+/// Setting a column that a file lacks is harmless.
+pub fn with_payload_props(
+    builder: parquet::file::properties::WriterPropertiesBuilder,
+) -> parquet::file::properties::WriterPropertiesBuilder {
+    let col = ColumnPath::from("payload");
+    let level = ZstdLevel::try_new(PAYLOAD_ZSTD_LEVEL).expect("PAYLOAD_ZSTD_LEVEL is a valid zstd level");
+    builder
+        .set_column_dictionary_enabled(col.clone(), false)
+        .set_column_compression(col, Compression::ZSTD(level))
+}
 const DEFAULT_S3_REGION: &str = "us-east-1";
 const DEFAULT_HEALTH_STALE_WINDOW_SECONDS: u64 = 60;
 /// On by default (see Phase 3b of the reliability hardening plan): a
@@ -411,6 +432,9 @@ pub struct IngestProgress {
 pub enum ReaderTransition {
     Continue(LineReader),
     Stop,
+    /// Stop, flush and drain everything buffered, then have `run_ingest`
+    /// return this as its error (see [`backoff::give_up`]).
+    GiveUp(exitcode::ExitRequested),
 }
 
 #[async_trait]
@@ -832,6 +856,110 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn upstream_give_up_flushes_buffered_rows_before_exiting() -> anyhow::Result<()> {
+        use super::{
+            async_trait, backoff, exitcode, line_reader_from_async_read, run_ingest, CommonOptions,
+            IngestOptions, LineReader, LineSource, LineTransformer, ReaderTransition,
+        };
+        use std::sync::atomic::AtomicBool;
+
+        // The upstream closes after three lines and every reconnect attempt
+        // fails, so on_stream_end gives up — what collect-socket and the
+        // other streaming collectors do once --max-reconnect-seconds runs
+        // out. That path used to std::process::exit from inside the source,
+        // dropping both the buffered batch and pending transformer state.
+        struct ClosesThenGivesUp;
+
+        #[async_trait]
+        impl LineSource for ClosesThenGivesUp {
+            fn source_name(&self) -> &str {
+                "give-up-test"
+            }
+
+            async fn open(&mut self, max_line_length: usize) -> anyhow::Result<LineReader> {
+                Ok(line_reader_from_async_read(
+                    std::io::Cursor::new(b"line-1\nline-2\nfragment-1-of-2\n".to_vec()),
+                    max_line_length,
+                ))
+            }
+
+            async fn on_stream_end(
+                &mut self,
+                _shutdown: &AtomicBool,
+                _max_line_length: usize,
+            ) -> anyhow::Result<ReaderTransition> {
+                Ok(backoff::give_up("test upstream", 1))
+            }
+        }
+
+        // Holds "fragment" lines back until flush, like an AIS consolidator
+        // waiting for the rest of a multipart message.
+        struct HoldsFragments(Vec<(i64, String)>);
+
+        impl LineTransformer for HoldsFragments {
+            fn transform(&mut self, line: &str, arrival_ts_ms: i64) -> Vec<(i64, String)> {
+                if line.starts_with("fragment") {
+                    self.0.push((arrival_ts_ms, line.to_string()));
+                    Vec::new()
+                } else {
+                    vec![(arrival_ts_ms, line.to_string())]
+                }
+            }
+
+            fn flush(&mut self) -> Vec<(i64, String)> {
+                std::mem::take(&mut self.0)
+            }
+        }
+
+        let dir = tempfile::tempdir()?;
+        let out_dir = dir.path().join("out");
+
+        let result = run_ingest(
+            &mut ClosesThenGivesUp,
+            IngestOptions {
+                common: CommonOptions {
+                    out_dir: out_dir.clone(),
+                    partition: PartitionGranularity::Year,
+                    max_rows: None,
+                    max_batch_bytes: 64 * 1024 * 1024,
+                    compression_level: 3,
+                    upload_concurrency: 4,
+                    upload_drain_timeout_seconds: 1,
+                    max_line_length: 1024,
+                    health_check: false,
+                    metrics_addr: None,
+                    data_drought_seconds: 0,
+                },
+                s3: None,
+                s3_storage: None,
+                iceberg: None,
+                health_file: dir.path().join("health"),
+                manage_health: false,
+                report_progress: false,
+                log_writes: false,
+                shutdown: None,
+                write_workers: None,
+                sweep_orphans: false,
+                line_transformer: Some(Box::new(HoldsFragments(Vec::new()))),
+                silver: None,
+            },
+        )
+        .await;
+
+        let error = result.expect_err("giving up on the upstream must surface as an error");
+        let exit = error
+            .downcast_ref::<exitcode::ExitRequested>()
+            .expect("error must carry the exit code to use");
+        assert_eq!(exit.code, exitcode::UPSTREAM_UNAVAILABLE);
+        assert_eq!(
+            count_parquet_rows(&out_dir)?,
+            3,
+            "buffered rows and pending transformer state must be on disk before the give-up exit"
+        );
+        Ok(())
+    }
+
     #[test]
     fn finds_only_hive_layout_parquet_orphans() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -1094,6 +1222,22 @@ pub async fn run_ingest<S>(source: &mut S, options: IngestOptions) -> Result<()>
 where
     S: LineSource + Send,
 {
+    // Every return path closes the source's availability interval (a no-op
+    // unless the collector installed a tracker with `availability::init_stream`).
+    let result = run_ingest_inner(source, options).await;
+    match &result {
+        Ok(()) => availability::finish(availability::EndReason::Shutdown, None).await,
+        Err(error) => {
+            availability::finish(availability::EndReason::Exit, Some(format!("{error:#}"))).await
+        }
+    }
+    result
+}
+
+async fn run_ingest_inner<S>(source: &mut S, options: IngestOptions) -> Result<()>
+where
+    S: LineSource + Send,
+{
     validate_source_name(source.source_name())?;
 
     let IngestOptions {
@@ -1202,7 +1346,16 @@ where
         Vec::new()
     };
 
-    let mut reader = source.open(common.max_line_length).await?;
+    let mut reader = match source.open(common.max_line_length).await {
+        Ok(reader) => {
+            availability::mark_up();
+            reader
+        }
+        Err(error) => {
+            availability::mark_down(&format!("{error:#}"));
+            return Err(error);
+        }
+    };
 
     let shutdown = external_shutdown.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     let shutdown_signal = shutdown.clone();
@@ -1298,6 +1451,11 @@ where
     progress_heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     progress_heartbeat.tick().await;
 
+    // Set when the loop stops for a classified reason (upstream gave up,
+    // data drought). Buffered rows are still flushed and drained below
+    // before it is returned, so the caller exits without losing them.
+    let mut exit_requested: Option<exitcode::ExitRequested> = None;
+
     loop {
         if shutdown.load(Ordering::SeqCst) {
             break;
@@ -1306,6 +1464,10 @@ where
         tokio::select! {
             _ = heartbeat.tick() => {
                 metrics.touch_heartbeat();
+                availability::observe(
+                    metrics.rows_processed.load(Ordering::Relaxed),
+                    metrics.last_row_unix_ms.load(Ordering::Relaxed) as i64,
+                );
                 let state = metrics.health_state();
                 if manage_health {
                     if let Err(error) =
@@ -1333,6 +1495,7 @@ where
                     if manage_health {
                         let _ = update_health_status_async(&health_file, false, Some(reason)).await;
                     }
+                    availability::finish(availability::EndReason::Exit, Some(reason.to_string())).await;
                     std::process::exit(exitcode::DATA_DROUGHT);
                 }
             }
@@ -1471,8 +1634,10 @@ where
                         );
                     }
                     Some(Err(error)) => {
+                        availability::mark_down(&format!("stream error: {error}"));
                         match source.on_stream_error(&error, &shutdown, common.max_line_length).await? {
                             ReaderTransition::Continue(new_reader) => {
+                                availability::mark_up();
                                 reader = new_reader;
                                 continue;
                             }
@@ -1482,15 +1647,29 @@ where
                                 }
                                 return Err(error.into());
                             }
+                            ReaderTransition::GiveUp(exit) => {
+                                exit_requested = Some(exit);
+                                break;
+                            }
                         }
                     }
                     None => {
+                        // A file source moving to its next input also ends a
+                        // stream; that is a no-op here unless a tracker is installed.
+                        if !shutdown.load(Ordering::SeqCst) {
+                            availability::mark_down("stream ended");
+                        }
                         match source.on_stream_end(&shutdown, common.max_line_length).await? {
                             ReaderTransition::Continue(new_reader) => {
+                                availability::mark_up();
                                 reader = new_reader;
                                 continue;
                             }
                             ReaderTransition::Stop => break,
+                            ReaderTransition::GiveUp(exit) => {
+                                exit_requested = Some(exit);
+                                break;
+                            }
                         }
                     }
                 }
@@ -1591,6 +1770,13 @@ where
 
     if let Some(metrics_server) = metrics_server {
         metrics_server.abort();
+    }
+
+    if let Some(exit) = exit_requested {
+        if manage_health {
+            update_health_status_async(&health_file, false, Some(&exit.reason)).await?;
+        }
+        return Err(exit.into());
     }
 
     if manage_health {

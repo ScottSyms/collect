@@ -6,6 +6,7 @@ use collect_core::{
     run_ingest, CommonCliArgs, IngestOptions, LineReader, LineSource, ReaderTransition, S3CliArgs,
     log::LoggingCliArgs,
 };
+use collect_core::availability::{self, AvailabilityCliArgs};
 use collect_core::iceberg::{init_raw_handle, IcebergCliArgs};
 use collect_core::silver::{ParserCliArgs, ParserKind};
 use futures_util::{SinkExt, StreamExt};
@@ -70,6 +71,9 @@ struct Args {
 
     #[command(flatten)]
     iceberg: IcebergCliArgs,
+
+    #[command(flatten)]
+    availability: AvailabilityCliArgs,
 
     #[command(flatten)]
     parser: ParserCliArgs,
@@ -290,7 +294,10 @@ impl AisStreamSource {
                 if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
                     return Ok(ReaderTransition::Stop);
                 }
-                collect_core::backoff::give_up(UPSTREAM, self.max_reconnect_seconds);
+                return Ok(collect_core::backoff::give_up(
+                    UPSTREAM,
+                    self.max_reconnect_seconds,
+                ));
             }
         }
     }
@@ -357,6 +364,17 @@ async fn main() -> Result<()> {
         .context("missing bounding boxes; set --bounding-boxes or BOUNDING_BOXES")?;
     let source_name = args.source.unwrap_or_else(|| "aisstream".to_string());
 
+    if !args.common.health_check {
+        availability::init_stream(
+            &args.iceberg,
+            &args.availability,
+            "collect-aisstream",
+            &WS_URL,
+            &source_name,
+        )
+        .await;
+    }
+
     let health_file = health_file_path("collect-aisstream");
     let mut source = AisStreamSource::new(
         api_key,
@@ -397,7 +415,7 @@ async fn main() -> Result<()> {
         .await?
     };
 
-    run_ingest(
+    let result = run_ingest(
         &mut source,
         IngestOptions {
             common: common_options,
@@ -415,5 +433,8 @@ async fn main() -> Result<()> {
             silver,
         },
     )
-    .await
+    .await;
+    // Exits UPSTREAM_UNAVAILABLE / DATA_DROUGHT only after run_ingest has
+    // flushed and drained every buffered row.
+    collect_core::exitcode::exit_if_requested(result)
 }

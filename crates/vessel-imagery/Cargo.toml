@@ -1,0 +1,36 @@
+[package]
+name = "vessel-imagery"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+arrow.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+iceberg.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
+base64 = "0.22"
+csv = "1"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+collect-core = { path = "../collect-core" }
+collect-maint = { path = "../collect-maint" }
+ais-tracks = { path = "../ais-tracks" }
+vessel-identity = { path = "../vessel-identity" }
+
+[dev-dependencies]
+axum.workspace = true
+
+[lib]
+name = "vessel_imagery"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vessel-imagery"
+path = "src/main.rs"

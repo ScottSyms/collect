@@ -1,0 +1,60 @@
+# Global Fishing Watch: vessel identity through the Vessels API
+# (dataset public-global-vessel-identity), looked up by the IMO numbers and
+# MMSIs the registry already holds.
+source_id = "gfw_vessel_identity"
+name = "Global Fishing Watch - Vessel Identity"
+publisher = "Global Fishing Watch"
+adapter = "gfw"
+# The API base; the collector calls <source_url>/vessels/search.
+source_url = "https://gateway.api.globalfishingwatch.org/v3"
+dataset_url = "https://globalfishingwatch.org/our-apis/documentation/docs/v3/vessels"
+access_method = "authenticated_api"
+data_format = "json"
+refresh_policy = "weekly"
+license = "CC BY-NC 4.0 and the GFW API Terms of Use (noncommercial; attribution 'Powered by Global Fishing Watch')"
+# Approved by the operator on 2026-10-18 for noncommercial use, including
+# keeping history and combining with other sources. GFW's terms forbid
+# "derivative products from the API" (section 2E) and don't address local
+# databases; anything built from this data must carry "Powered by Global
+# Fishing Watch" attribution.
+permitted_uses = ["access", "automated_download", "retain_history", "combine"]
+access_status = "approved"
+authorization_basis = "Public API for noncommercial use with a personal token (https://globalfishingwatch.org/our-apis/documentation/docs/license-rate-limits#terms-of-use). Approved by the operator on 2026-10-18 for noncommercial use, keeping history and combining; attribution required."
+# A personal token from https://globalfishingwatch.org/our-apis/tokens; never
+# shared or put in this file.
+authentication = "env:GFW_API_TOKEN"
+enabled = true
+priority = 50
+# Registry records come from registries GFW compiles; the adapter asserts an
+# IMO only from those, never from what a ship broadcasts.
+trust = "registry"
+issues = []
+# Lookups cover only vessels the registry already knows, so a vessel
+# missing from a run says nothing.
+removal_semantics = "incremental"
+max_removal_fraction = 0.2
+retain_raw = true
+
+[options]
+# The registry's IMO numbers (check-digit valid) and MMSIs from the other
+# sources are looked up, OR-ed together `batch_size` at a time (each batch
+# is one request, split in half when its matches overflow a 50-vessel
+# page). `max_batches` limits a run to the first N (0 = all); `queries` adds
+# raw `where` clauses, one page each.
+batch_size = 20
+max_batches = 0
+queries = []
+batch_max_age_hours = 72
+# GFW allows 50,000 requests a day and 1,500,000 a month per user, across
+# all of the user's tokens, and blocks for 24 hours (30 days for the monthly
+# limit) once exceeded. Every request, retries included, is counted in a
+# ledger kept across runs (~/.local/state/vessel-identity/<source>_usage.json,
+# or `usage_file`); nothing is sent once a cap is reached or while a 429
+# block lasts. The caps leave a margin for other use of the same account and
+# can't be set above GFW's limits.
+daily_request_cap = 45000
+monthly_request_cap = 1350000
+# Per run, on top of the caps.
+max_requests = 40000
+request_delay_ms = 250
+max_attempts = 5

@@ -186,7 +186,9 @@ they reach the NMEA parser (`--consolidate-ais`, on by default; the collectors
 have the same flag, off by default, for doing it at ingest). Sentences that
 were already combined at ingest pass through unchanged. The `AisConsolidator`
 also handles `$PGHP` timestamp lines (with `--process-timestamps`), tag-block
-`c:` carry-forward and `s:` station preservation, with an 8K-group buffer and
+`c:` carry-forward and `s:` station preservation, and the MSSIS receiver epoch
+and station appended after the checksum (`!AIVDM,…*CS,L10EAC,1792569950`,
+with `--mssis`; a reassembled message carries them as tag-block `c:`/`s:`), with an 8K-group buffer and
 oldest-first eviction. A reassembled message takes the timestamp and station of
 its first fragment.
 
@@ -233,12 +235,13 @@ cargo run -p ais-parse -- --input-s3-bucket normalized-ais --output-s3-bucket si
 | `--since <HOURS>` | *(off)* | rolling window (env `SINCE`); with `--incremental`, first-run seed only |
 | `--incremental` | *(off)* | watermark at the output (`_ais-parse/watermark.json`), env `INCREMENTAL=true` |
 | `--batch-size` | `8192` | Parquet read batch rows (env `BATCH_SIZE`) |
-| `--compression-level` | `5` | Zstd level for output (env `COMPRESSION_LEVEL`) |
+| `--compression-level` | `5` | Zstd level for output (env `COMPRESSION_LEVEL`). The `payload` column is always written at level 9 with no dictionary |
 | `--concurrency` | cores, clamped `[1, 8]` | partitions decoded in parallel (env `CONCURRENCY`) |
 | `--download-concurrency` | `4` | concurrent S3 downloads per partition; lower if MinIO is overloaded (env `DOWNLOAD_CONCURRENCY`) |
 | `--output-prefix` | `ais` | output file name prefix (added before tree suffix, env `OUTPUT_PREFIX`) |
 | `--consolidate-ais[=false]` | `true` | reassemble fragmented NMEA sentences before decoding; `=false` turns it off (env `CONSOLIDATE_AIS`) |
 | `--process-timestamps` | *(off)* | correct row timestamps from `$PGHP`/tag-block `c:` capture timestamps (env `PROCESS_TIMESTAMPS`) |
+| `--mssis` | *(off)* | use the MSSIS epoch appended after the NMEA checksum as the row timestamp and keep its station; a tag-block `c:` still wins under `--process-timestamps` (env `MSSIS`) |
 | `--fail-fast` | *(off)* | abort the run on the first partition failure instead of skipping it and continuing (env `FAIL_FAST`) |
 | `--max-partition-failures` | `5` | abort the run once this many partitions have failed and been skipped (env `MAX_PARTITION_FAILURES`) |
 | `--dry-run` | *(off)* | list the partitions that would be processed and exit; never connects to the output (env `DRY_RUN`) — see [below](#dry-run) |

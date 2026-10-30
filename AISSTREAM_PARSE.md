@@ -185,7 +185,7 @@ Full column-by-column reference for every table: [SCHEMAS.md](SCHEMAS.md).
 | `--since <HOURS>` | `SINCE` | — | Rolling window |
 | `--incremental` | `INCREMENTAL` | off | Watermark-based incremental |
 | `--batch-size` | `BATCH_SIZE` | `8192` | Parquet read batch rows |
-| `--compression-level` | `COMPRESSION_LEVEL` | `5` | Zstd level |
+| `--compression-level` | `COMPRESSION_LEVEL` | `5` | Zstd level (`payload` is always level 9, no dictionary) |
 | `--concurrency` | `CONCURRENCY` | auto | Partition concurrency |
 | `--download-concurrency` | `DOWNLOAD_CONCURRENCY` | `4` | Concurrent S3 downloads per partition; lower if MinIO is overloaded |
 | `--output-prefix` | `OUTPUT_PREFIX` | `aisstream` | Output file name prefix |

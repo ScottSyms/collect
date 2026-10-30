@@ -12,7 +12,7 @@
 //! operator) can take over instead of the process sitting in a silent,
 //! permanent retry loop.
 
-use crate::{exitcode, log};
+use crate::{exitcode, log, ReaderTransition};
 use clap::Args;
 use std::cmp::min;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -93,6 +93,10 @@ pub fn give_up(upstream: &str, max_reconnect_seconds: u64) -> ! {
             "giving up on {upstream} after {max_reconnect_seconds}s of bounded retry"
         ),
         &[("upstream", upstream)],
+    );
+    crate::availability::finish_blocking(
+        crate::availability::EndReason::Exit,
+        Some(format!("gave up after {max_reconnect_seconds}s of bounded retry")),
     );
     std::process::exit(exitcode::UPSTREAM_UNAVAILABLE);
 }

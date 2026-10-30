@@ -7,6 +7,7 @@ use collect_core::{
     ReaderTransition, S3CliArgs,
     log::LoggingCliArgs,
 };
+use collect_core::availability::{self, AvailabilityCliArgs};
 use collect_core::iceberg::{init_raw_handle, IcebergCliArgs};
 use collect_core::silver::ParserCliArgs;
 use serde::{Deserialize, Serialize};
@@ -73,6 +74,9 @@ struct Args {
 
     #[command(flatten)]
     iceberg: IcebergCliArgs,
+
+    #[command(flatten)]
+    availability: AvailabilityCliArgs,
 
     #[command(flatten)]
     parser: ParserCliArgs,
@@ -494,7 +498,10 @@ impl BarentsWatchSource {
                 if shutdown.load(Ordering::SeqCst) {
                     return Ok(ReaderTransition::Stop);
                 }
-                collect_core::backoff::give_up(upstream, self.max_reconnect_seconds);
+                return Ok(collect_core::backoff::give_up(
+                    upstream,
+                    self.max_reconnect_seconds,
+                ));
             }
         }
     }
@@ -558,8 +565,23 @@ async fn main() -> Result<()> {
 
     let health_file = health_file_path("collect-barentswatch");
 
+    if !args.common.health_check {
+        availability::init_stream(
+            &args.iceberg,
+            &args.availability,
+            "collect-barentswatch",
+            &endpoint,
+            &source_name,
+        )
+        .await;
+    }
+
     let token_manager = Arc::new(TokenManager::new(client_id, client_secret));
-    token_manager.get_token().await.context("Initial token fetch failed")?;
+    if let Err(error) = token_manager.get_token().await.context("Initial token fetch failed") {
+        availability::mark_down(&format!("{error:#}"));
+        availability::finish(availability::EndReason::Exit, None).await;
+        return Err(error);
+    }
 
     let common_options = args.common.to_options();
     let iceberg = if common_options.health_check {
@@ -592,7 +614,7 @@ async fn main() -> Result<()> {
         None
     };
 
-    run_ingest(
+    let result = run_ingest(
         &mut BarentsWatchSource::new(
             token_manager,
             endpoint,
@@ -617,5 +639,8 @@ async fn main() -> Result<()> {
             silver,
         },
     )
-    .await
+    .await;
+    // Exits UPSTREAM_UNAVAILABLE / DATA_DROUGHT only after run_ingest has
+    // flushed and drained every buffered row.
+    collect_core::exitcode::exit_if_requested(result)
 }

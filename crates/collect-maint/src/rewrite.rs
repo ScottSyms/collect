@@ -168,10 +168,13 @@ pub async fn write_partition(
         Some("iceberg".to_string()),
         DataFileFormat::Parquet,
     );
+    // Keep the parsers' payload settings so compaction doesn't undo them.
     let props = with_bloom_filters(
-        WriterProperties::builder()
-            .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
-            .set_max_row_group_size(MAX_ROW_GROUP_ROWS),
+        collect_core::with_payload_props(
+            WriterProperties::builder()
+                .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
+                .set_max_row_group_size(MAX_ROW_GROUP_ROWS),
+        ),
         bloom_columns
             .iter()
             .copied()

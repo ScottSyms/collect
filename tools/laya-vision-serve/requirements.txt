@@ -1,0 +1,16 @@
+# laya-vision duplicates DecisionModel.forward from this exact laya version.
+laya==0.3.24
+transformers==4.49.0
+torch
+safetensors
+huggingface_hub
+numpy
+pillow
+fastapi
+uvicorn[standard]
+# laya-vision SDK (not on PyPI): git clone into .deps/ and install editable, see README.
+# -e .deps/laya-vision
+
+# tests
+httpx
+pytest

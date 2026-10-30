@@ -55,7 +55,8 @@ network beyond reading the file itself.
 
 If your input is raw NMEA/AIVDM sentences and you want multi-part message
 reassembly or `$PGHP`/tag-block timestamp correction done as data lands,
-add `--consolidate-ais` and/or `--process-timestamps` (available on
+add `--consolidate-ais` and/or `--process-timestamps` (or `--mssis` for
+feeds that append a receiver epoch after the checksum) (available on
 `collect-file`, `collect-socket`, and as a batch pass on `ais-parse`).
 
 ## Stage 2 — Partitioning (already happening)

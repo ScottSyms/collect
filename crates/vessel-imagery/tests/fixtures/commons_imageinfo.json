@@ -1,0 +1,48 @@
+{
+  "batchcomplete": true,
+  "query": {
+    "pages": [
+      {
+        "pageid": 1,
+        "ns": 6,
+        "title": "File:Example ship 2019.jpg",
+        "imageinfo": [
+          {
+            "url": "https://upload.wikimedia.org/wikipedia/commons/a/ab/Example_ship_2019.jpg",
+            "descriptionurl": "https://commons.wikimedia.org/wiki/File:Example_ship_2019.jpg",
+            "thumburl": "https://upload.wikimedia.org/wikipedia/commons/thumb/a/ab/Example_ship_2019.jpg/1280px-Example_ship_2019.jpg",
+            "thumbwidth": 1280,
+            "thumbheight": 853,
+            "mime": "image/jpeg",
+            "sha1": "0123456789abcdef0123456789abcdef01234567",
+            "extmetadata": {
+              "LicenseShortName": {"value": "CC BY-SA 4.0", "source": "commons-desc-page"},
+              "LicenseUrl": {"value": "https://creativecommons.org/licenses/by-sa/4.0", "source": "commons-desc-page"},
+              "Artist": {"value": "<a href=\"//commons.wikimedia.org/wiki/User:Jane\" title=\"User:Jane\">Jane Shipspotter</a>", "source": "commons-desc-page"},
+              "Credit": {"value": "<span class=\"int-own-work\">Own work</span>", "source": "commons-desc-page"},
+              "DateTimeOriginal": {"value": "2019-06-02 14:31:07", "source": "commons-desc-page"},
+              "Copyrighted": {"value": "True", "source": "commons-desc-page"}
+            }
+          }
+        ]
+      },
+      {
+        "pageid": 2,
+        "ns": 6,
+        "title": "File:Example ship USCG.jpg",
+        "imageinfo": [
+          {
+            "url": "https://upload.wikimedia.org/wikipedia/commons/c/cd/Example_ship_USCG.jpg",
+            "descriptionurl": "https://commons.wikimedia.org/wiki/File:Example_ship_USCG.jpg",
+            "mime": "image/jpeg",
+            "extmetadata": {
+              "LicenseShortName": {"value": "Public domain", "source": "commons-desc-page"},
+              "AttributionRequired": {"value": "false", "source": "commons-desc-page"},
+              "Copyrighted": {"value": "False", "source": "commons-desc-page"}
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

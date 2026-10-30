@@ -32,6 +32,12 @@ cargo run -p collect-socket -- \
   --tcp-host 153.44.253.27 --tcp-port 5631 \
   --consolidate-ais \
   --process-timestamps
+
+# MSSIS-style feed (receiver epoch appended after the checksum)
+cargo run -p collect-socket -- \
+  --tcp-host 127.0.0.1 --tcp-port 5555 \
+  --consolidate-ais \
+  --mssis
 ```
 
 ## CLI Reference
@@ -59,6 +65,7 @@ cargo run -p collect-socket -- \
 |------|---------|-------------|
 | `--consolidate-ais` | off | Reassemble multi-part NMEA fragments into single sentences |
 | `--process-timestamps` | off | Extract `$PGHP` and tag-block `c:` timestamps |
+| `--mssis` | off | Use the MSSIS epoch after the checksum (`!AIVDM,…*CS[,station],epoch`) as the row timestamp; keep the station (env `MSSIS`) |
 
 See [AIS_PARSE.md](AIS_PARSE.md) for details on the consolidation pipeline.
 

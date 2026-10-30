@@ -14,6 +14,9 @@ disagree this page reflects the code:
 | [Silver](#2-silver-decoded-ais) | `positions`, `statics`, `meteo`, `binary`, `atons`, `other` | `ais-parse`, `aisstream-parse`, and any collector run with `--parser` | `crates/ais-parse/src/output*.rs`, `crates/aisstream-parse/src/output*.rs`, `crates/collect-core/src/iceberg/table_schemas.rs` |
 | [Derived](#3-derived-ais-tracks) | `track_points`, `tracks`, `stop_segments`, `stops`, `voyages`, `open_voyages`, `vessels`, `vessel_attributes`, `ref_ports`, plus daily and bookkeeping tables | `ais-tracks` | `crates/ais-tracks/src/*.rs` |
 | [Foundation](#4-foundation-collect-foundation) | `placenames` and lookups, `vessel_events`, `vessel_event_findings`, `evidence_sources`, `paris_mou_*`, `marsis_*` | `collect-foundation` | `crates/collect-foundation/src/geonames.rs`, `crates/collect-foundation/src/evidence/*.rs` |
+| [Identity](VESSEL_IDENTITY.md#tables) | `source_catalog`, `ingestion_runs`, `source_records`, `rejected_records`, `identity_assertions`, `vessels`, `vessel_attributes`, `vessel_identifiers`, `vessel_history`, `vessel_subjects`, `vessel_id_redirects`, `identity_conflicts`, `identity_review_queue`, `identity_decisions`, `reconciliation_runs` (namespace `identity`) | `vessel-identity` | `crates/vessel-identity/src/tables.rs` |
+| [Sources](#5-sources-source-availability) | `availability` (namespace `sources`) | `collect-socket`, `collect-kafka`, `collect-aisstream`, `collect-barentswatch`, `collect-foundation` | `crates/collect-core/src/availability.rs` |
+| [Imagery](VESSEL_IMAGERY.md#tables) | `vessel_images`, `image_observations`, `vessel_visual_profile` (namespace `imagery`) | `vessel-imagery` | `crates/vessel-imagery/src/tables.rs` |
 
 `ais-compact` ([AIS_COMPACT.md](AIS_COMPACT.md)) creates no tables of its own: it rewrites
 the files of the tables above, sorted by `mmsi, ts` by default, without
@@ -34,6 +37,8 @@ changing their schema.
 - [4. Foundation: collect-foundation](#4-foundation-collect-foundation)
   - [placenames](#placenames) · [placename_alternate_names](#placename_alternate_names) · [Placename lookup tables](#placename-lookup-tables)
   - [vessel_events](#vessel_events) · [vessel_event_findings](#vessel_event_findings) · [evidence_sources](#evidence_sources) · [Source-specific evidence tables](#source-specific-evidence-tables)
+- [5. Sources: source availability](#5-sources-source-availability)
+  - [availability](#availability)
 - [Querying notes](#querying-notes)
 
 ## Conventions
@@ -62,7 +67,8 @@ Iceberg only.
 
 **Time.** Every `ts` is UTC. In bronze and silver it is the corrected capture
 time of the message (from `$PGHP` / NMEA tag-block `c:` when
-`--process-timestamps` is used, otherwise the collector's receive time), not
+`--process-timestamps` is used, from the trailing MSSIS epoch with `--mssis`,
+otherwise the collector's receive time), not
 a time decoded from the AIS payload. Silver keeps millisecond precision
 (Parquet) and `ais-tracks` tables use microseconds.
 
@@ -966,6 +972,64 @@ MARSIS CSV files as published. Every column is an optional string, named as
 in the file, followed by `loaded_at` and `source_file`. Column meanings are
 in the TSB's data dictionary on the
 [MARSIS page](https://www.tsb.gc.ca/eng/stats/marine/data-6.html).
+
+## 5. Sources: source availability
+
+### availability
+
+When each upstream a collector reads from was up, down or degraded, written
+by the four streaming collectors and by `collect-foundation`'s downloading
+`--apply` runs to namespace `sources` (`--availability-namespace`) in the
+same warehouse as their other tables. Flags and how each state is decided:
+[CLI_REFERENCE.md](CLI_REFERENCE.md#source-availability-availabilitycliargs).
+Iceberg only, append-only, unpartitioned.
+
+Each row is a **closed interval**. A streaming collector writes a row when the
+source changes state, when it stops, and at every checkpoint (hourly by
+default) while a state lasts, so one long outage or long healthy spell is
+several consecutive rows with `end_reason = 'checkpoint'`. A batch loader
+writes one `kind = 'run'` row per run. Time after a source's latest
+`ended_at` is unknown: either the interval is still open (less than a
+checkpoint old) or the collector isn't running.
+
+| ID | Column | Type | Req. | Description |
+|----|--------|------|------|-------------|
+| 1 | `started_at` | timestamptz | yes | |
+| 2 | `ended_at` | timestamptz | yes | |
+| 3 | `duration_ms` | long | yes | `ended_at - started_at`. |
+| 4 | `source_id` | string | yes | The upstream: `tcp://host:port`, `wss://stream.aisstream.io/v0/stream`, the BarentsWatch endpoint URL, `kafka://brokers/topic`, or the download URL of a foundation source. |
+| 5 | `source_label` | string | yes | The logical source: a collector's `--source` (joins `raw.source` and silver `source`), or `geonames`, `uscg_misle`, `tsb_marsis`, `tokyo_mou` (joins `vessel_events.source`). |
+| 6 | `state` | string | yes | `up`, `down` or `degraded` (connected but silent for `--availability-quiet-seconds`, or a batch whose download worked but couldn't be loaded). |
+| 7 | `kind` | string | yes | `stream` or `run`. |
+| 8 | `reason` | string | no | Why the source was down or degraded: the connect error, `stream ended`, `no rows for 300s`, `gave up after 300s of bounded retry`, a run's error chain. Null when up. |
+| 9 | `end_reason` | string | yes | `state_change`, `checkpoint`, `shutdown` (stopped normally), `exit` (stopped on an error) or `run_end`. |
+| 10 | `rows` | long | no | Rows ingested during a stream interval. Null for runs. |
+| 11 | `binary` | string | yes | E.g. `collect-socket`. |
+| 12 | `host` | string | yes | Host name of the machine the collector ran on. |
+| 13 | `instance_id` | string | yes | Random per process start, so restarts and two collectors on one source are told apart. |
+| 14 | `recorded_at` | timestamptz | yes | When the row was committed. |
+
+Uptime of one source over the last 7 days, clipping intervals to the window:
+
+```sql
+WITH w AS (SELECT now() - INTERVAL '7 days' AS lo, now() AS hi),
+clipped AS (
+  SELECT state,
+         greatest(started_at, lo) AS s,
+         least(ended_at, hi)      AS e
+  FROM sources.availability, w
+  WHERE source_id = 'tcp://10.0.0.5:5631'
+    AND ended_at > lo AND started_at < hi
+)
+SELECT state,
+       sum(date_diff('millisecond', s, e)) / 1000.0 / 3600 AS hours
+FROM clipped
+GROUP BY state;
+```
+
+`up` hours over the whole window is the uptime; whatever the three states
+don't cover is time nothing was recorded. For the latest state of every
+source, take the row with the greatest `ended_at` per `source_id`.
 
 ## Querying notes
 

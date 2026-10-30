@@ -114,7 +114,8 @@ Steps, per table:
    every manifest, so it isn't repeated per partition.
 3. **Rewrite each partition**, up to `--jobs` at once within the
    `--max-inflight-mb` memory budget. Read its files, sort all rows, and write new
-   files with zstd compression, row groups of at most 128Ki rows, and bloom
+   files with zstd compression (`payload` at level 9 with no dictionary, matching
+   the parsers), row groups of at most 128Ki rows, and bloom
    filters on `mmsi`, `imo_number`, `call_sign` and `name` (those the table
    has). Filters are sized per row group (32Ki distinct values; 1% false
    positives on `mmsi`, 5% elsewhere) rather than parquet's 1M-value default,

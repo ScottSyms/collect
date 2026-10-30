@@ -10,6 +10,7 @@ use ais_tracks::output::{replace_string_partition, replace_table};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Args, Subcommand};
+use collect_core::availability::{self, AvailabilityCliArgs};
 use collect_core::exitcode;
 use collect_core::iceberg::IcebergCliArgs;
 use iceberg::Catalog;
@@ -231,7 +232,7 @@ impl<C: Catalog> Writer<C> {
     }
 }
 
-pub async fn run(iceberg: &IcebergCliArgs, a: &EvidenceArgs) -> Result<i32> {
+pub async fn run(iceberg: &IcebergCliArgs, avail: &AvailabilityCliArgs, a: &EvidenceArgs) -> Result<i32> {
     let common = match &a.command {
         EvidenceCommand::ParisMou(x) => &x.common,
         EvidenceCommand::Uscg(x) => &x.common,
@@ -248,6 +249,14 @@ pub async fn run(iceberg: &IcebergCliArgs, a: &EvidenceArgs) -> Result<i32> {
         EvidenceCommand::TokyoMou(x) => x.source_dir.is_none(),
         _ => false,
     };
+    // The upstream each downloading source reads, for its availability row.
+    let upstream = match &a.command {
+        EvidenceCommand::Uscg(_) => Some((uscg::url(""), uscg::SOURCE)),
+        EvidenceCommand::Tsb(x) => Some((x.source_url.clone(), tsb::SOURCE)),
+        EvidenceCommand::TokyoMou(x) => Some((x.source_url.clone(), tokyo::SOURCE)),
+        _ => None,
+    };
+    let run = upstream.as_ref().map(|(id, label)| availability::Run::start(id, label));
 
     let result = match &a.command {
         EvidenceCommand::ParisMou(x) => load_paris(writer.as_ref(), x, loaded_at).await,
@@ -265,6 +274,9 @@ pub async fn run(iceberg: &IcebergCliArgs, a: &EvidenceArgs) -> Result<i32> {
             }
         },
     };
+    if let (Some(run), true, true) = (&run, downloads, writer.is_some()) {
+        availability::record_run(iceberg, avail, crate::BINARY, run, &result, None).await;
+    }
     if downloads && !common.keep_scratch {
         let _ = std::fs::remove_dir_all(&common.scratch);
     }

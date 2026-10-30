@@ -25,3 +25,11 @@ NOMAD.pdf
 
 # Local RustFS credentials (run_foundation_rustfs.sh)
 /.rustfs.env
+
+# Identity service runner: holds credentials
+/run_identity_service.sh
+/.identity-service.lock/
+/logs/
+
+# graphify knowledge graph build output
+/graphify-out/
