@@ -30,3 +30,6 @@ NOMAD.pdf
 /run_identity_service.sh
 /.identity-service.lock/
 /logs/
+
+# graphify knowledge graph build output
+/graphify-out/
